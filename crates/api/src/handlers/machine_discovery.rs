@@ -88,6 +88,8 @@ pub(crate) async fn discover_machine(
         })?;
     log_machine_id(&stable_machine_id);
 
+    println!("SDM discover_machine {:#?}", stable_machine_id);
+
     // Before opening a database transaction, get information from nvlink if we need it.
     // Discover NMX-M info if this is a GBX00 machine
     let nvlink_info = if hardware_info.is_gbx00()

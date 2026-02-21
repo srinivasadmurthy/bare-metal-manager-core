@@ -62,7 +62,10 @@ pub async fn create_or_update(
     let topology_data = find_latest_by_machine_ids(txn, &[*machine_id]).await?;
     let topology_data = topology_data.get(machine_id);
 
+    println!("SDM create_or_update {:#?}", topology_data);
+
     if let Some(topology) = topology_data {
+        println!("SDM create_or_update topology {:#?}", topology);
         if topology.topology_update_needed {
             return update(txn, machine_id, hardware_info).await;
         }
@@ -108,6 +111,8 @@ pub async fn create_or_update_with_bom_validation(
 ) -> DatabaseResult<MachineTopology> {
     let topology_data = find_latest_by_machine_ids(txn, &[*machine_id]).await?;
     let topology_data = topology_data.get(machine_id);
+
+    println!("SDM create_or_update_with_bom_validation {:#?}", topology_data);
 
     if let Some(topology) = topology_data {
         let age = Utc::now() - topology.updated;
