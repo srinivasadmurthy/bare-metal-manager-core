@@ -38,7 +38,7 @@ use crate::state_controller::state_change_emitter::{
 };
 use crate::state_controller::state_handler::{
     StateHandler, StateHandlerContext, StateHandlerContextObjects, StateHandlerError,
-    StateHandlerOutcome, StateHandlerOutcomeWithTransaction,
+    StateHandlerOutcome,
 };
 use crate::tests::common::test_meter::TestMeter;
 
@@ -393,10 +393,10 @@ async fn test_queue_objects(pool: sqlx::PgPool) -> sqlx::Result<()> {
 struct TestStateControllerIO {}
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TestObject {
     pub id: String,
     pub controller_state: Versioned<TestObjectControllerState>,
+    #[allow(dead_code)]
     pub controller_state_outcome: Option<PersistentStateHandlerOutcome>,
 }
 
@@ -633,7 +633,7 @@ impl StateHandler for TestConcurrencyStateHandler {
         state: &mut TestObject,
         _controller_state: &Self::ControllerState,
         _ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcomeWithTransaction<Self::ControllerState>, StateHandlerError> {
+    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
         assert_eq!(state.id, *object_id);
         self.count.fetch_add(1, Ordering::SeqCst);
         {
@@ -641,7 +641,7 @@ impl StateHandler for TestConcurrencyStateHandler {
             *guard.entry(object_id.to_string()).or_default() += 1;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        Ok(StateHandlerOutcome::do_nothing().with_txn(None))
+        Ok(StateHandlerOutcome::do_nothing())
     }
 }
 
@@ -732,15 +732,15 @@ impl StateHandler for TestTransitionStateHandler {
         _state: &mut TestObject,
         controller_state: &Self::ControllerState,
         _ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcomeWithTransaction<Self::ControllerState>, StateHandlerError> {
+    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
         match controller_state {
-            TestObjectControllerState::A => {
-                Ok(StateHandlerOutcome::transition(TestObjectControllerState::B).with_txn(None))
-            }
-            TestObjectControllerState::B => {
-                Ok(StateHandlerOutcome::transition(TestObjectControllerState::C).with_txn(None))
-            }
-            TestObjectControllerState::C => Ok(StateHandlerOutcome::do_nothing().with_txn(None)),
+            TestObjectControllerState::A => Ok(StateHandlerOutcome::transition(
+                TestObjectControllerState::B,
+            )),
+            TestObjectControllerState::B => Ok(StateHandlerOutcome::transition(
+                TestObjectControllerState::C,
+            )),
+            TestObjectControllerState::C => Ok(StateHandlerOutcome::do_nothing()),
         }
     }
 }
@@ -762,14 +762,14 @@ impl StateHandler for CyclicTransitionStateHandler {
         _state: &mut TestObject,
         controller_state: &Self::ControllerState,
         _ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcomeWithTransaction<Self::ControllerState>, StateHandlerError> {
+    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
         match controller_state {
-            TestObjectControllerState::A => {
-                Ok(StateHandlerOutcome::transition(TestObjectControllerState::B).with_txn(None))
-            }
-            TestObjectControllerState::B => {
-                Ok(StateHandlerOutcome::transition(TestObjectControllerState::A).with_txn(None))
-            }
+            TestObjectControllerState::A => Ok(StateHandlerOutcome::transition(
+                TestObjectControllerState::B,
+            )),
+            TestObjectControllerState::B => Ok(StateHandlerOutcome::transition(
+                TestObjectControllerState::A,
+            )),
             TestObjectControllerState::C => Err(StateHandlerError::InvalidState("C".to_string())),
         }
     }

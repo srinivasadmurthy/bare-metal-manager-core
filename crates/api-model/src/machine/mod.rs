@@ -567,7 +567,7 @@ impl Display for MachineLastRebootRequestedMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct MachineLastRebootRequested {
     pub time: DateTime<Utc>,
     pub mode: MachineLastRebootRequestedMode,
@@ -1663,11 +1663,6 @@ pub enum ReprovisioningPhase {
     DeleteDpu,
     // Following is a sync state.
     WaitingForAllDpusUnderReprovisioningToBeDeleted,
-}
-
-pub enum WaitForNetworkConfigAndRemoveAnnotationResult {
-    NetworkConfigPending(MachineId),
-    ConfigSyncedAndAnnotationRemoved,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, PartialOrd, Ord)]

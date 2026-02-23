@@ -2,6 +2,8 @@
 
 - [Introduction](README.md)
 - [Hardware Compatbility List (WIP)](HCL.md)
+- [Release Notes](release-notes.md)
+- [FAQs](faqs.md)
 
 # Architecture
 
@@ -21,12 +23,16 @@
 
 # Manuals
 
-- [Ingesting Machines](manuals/ingesting_machines.md)
-- [Removing Machines](manuals/removing_machines.md)
-- [Updating Expected Machines Manifest](manuals/expected_machine_update.md)
-- [Machine Updates](manuals/machine_updates.md)
-- [Machine Validation](manuals/machine_validation.md)
+- [Site Setup](manuals/site-setup.md)
+    - [Site Reference Architecture](manuals/site-reference-arch.md)
+- [Building BMM Containers](manuals/building_bmm_containers.md)
+- [Ingesting Hosts](manuals/ingesting_machines.md)
+- [Removing Hosts](manuals/removing_machines.md)
+- [Updating Expected Hosts Manifest](manuals/expected_machine_update.md)
+- [Updating Hosts](manuals/machine_updates.md)
+- [Host Validation](manuals/machine_validation.md)
 - [SKU Validation](manuals/sku_validation.md)
+- [NVLink Partitioning](manuals/nvlink_partitioning.md)
 - [Release Instance API Enhancements](manuals/breakfix_integration.md)
 - [Managing VPC Peering](manuals/vpc_peering_management.md)
 - [Metrics]()

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::str::FromStr;
 
 use ::rpc::forge as rpc;
@@ -38,8 +38,8 @@ pub(crate) async fn find_interfaces(
 
     let mut interfaces: Vec<rpc::MachineInterface> = match (id, ip) {
         (Some(id), _) => vec![db::machine_interface::find_one(&mut txn, id).await?.into()],
-        (None, Some(ip)) => match Ipv4Addr::from_str(ip.as_ref()) {
-            Ok(ip) => match db::machine_interface::find_by_ip(&mut txn, IpAddr::V4(ip)).await? {
+        (None, Some(ip)) => match IpAddr::from_str(ip.as_ref()) {
+            Ok(ip) => match db::machine_interface::find_by_ip(&mut txn, ip).await? {
                 Some(interface) => vec![interface.into()],
                 None => {
                     return Err(CarbideError::internal(format!(
@@ -150,13 +150,17 @@ pub(crate) async fn find_mac_address_by_bmc_ip(
     let req = request.into_inner();
     let bmc_ip = req.bmc_ip;
 
-    let interface =
-        db::machine_interface::find_by_ip(&api.database_connection, bmc_ip.parse().unwrap())
-            .await?
-            .ok_or_else(|| CarbideError::NotFoundError {
-                kind: "machine_interface",
-                id: bmc_ip.clone(),
-            })?;
+    let interface = db::machine_interface::find_by_ip(
+        &api.database_connection,
+        bmc_ip
+            .parse()
+            .map_err(|e| tonic::Status::invalid_argument(format!("Invalid IP address: {e}")))?,
+    )
+    .await?
+    .ok_or_else(|| CarbideError::NotFoundError {
+        kind: "machine_interface",
+        id: bmc_ip.clone(),
+    })?;
 
     Ok(Response::new(rpc::MacAddressBmcIp {
         bmc_ip,

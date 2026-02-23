@@ -176,7 +176,7 @@ Update the password of the admin as follows. The default password of the admin i
 * Maximum length is 30, composed of alphanumeric and "_" characters
 
 ```
-root:/# curl -s -k -XPUT -H "Content-Type: application/json" -u admin:123456 -d '{"password": "45364nnfgd"}' https://172.16.110.44:443/ufmRest/app/users/admin
+root:/# curl -s -k -XPUT -H "Content-Type: application/json" -u admin:123456 -d '{"password": "45364nnfgd"}' https://ufm.example.org:443/ufmRest/app/users/admin
 {
   "name": "admin"
 }
@@ -185,9 +185,9 @@ root:/# curl -s -k -XPUT -H "Content-Type: application/json" -u admin:123456 -d 
 Generate a token for admin as follows:
 
 ```
-root:/# curl -s -k -XPOST -u admin:45364nnfgd https://172.16.110.44:443/ufmRest/app/tokens | jq
+root:/# curl -s -k -XPOST -u admin:x https://ufm.example.org:443/ufmRest/app/tokens | jq
 {
-  "access_token": "XlojlA7zgotVegyIEIP5vnw5C7ZYT9",
+  "access_token": "x",
   "revoked": false,
   "issued_at": 1711608244,
   "expires_in": 315360000,
@@ -208,11 +208,11 @@ And then check UFM HA cluster status:
 root:/# ufm_ha_cluster status
 ```
 
-## Carbide
+## BMM
 
 ### Installation
 
-No additional steps are required to enable Infiniband in Carbide.
+No additional steps are required to enable Infiniband in NVIDIA Bare Metal Manager (BMM).
 
 ### Configuration
 
@@ -226,10 +226,10 @@ Follow the instructions in the section that applies to the selected option.
 Get the token of the admin user in UFM in above step, or get it again by following the rest api (the password of the admin user is required to get the token):
 
 ```
-root:/# curl -s -k -XGET -u admin:45364nnfgd https://172.16.110.44:443/ufmRest/app/tokens | jq
+root:/# curl -s -k -XGET -u admin:password https://ufm:443/ufmRest/app/tokens | jq
 [
   {
-    "access_token": "XlojlA7zgotVegyIEIP5vnw5C7ZYT9",
+    "access_token": "token",
     "revoked": false,
     "issued_at": 1711609276,
     "expires_in": 315360000,
@@ -238,7 +238,7 @@ root:/# curl -s -k -XGET -u admin:45364nnfgd https://172.16.110.44:443/ufmRest/a
 ]
 ```
 
-Create the credential for UFM client in Carbide by carbide-admin-cli as follows:
+Create the credential for UFM client in BMM by carbide-admin-cli as follows:
 
 ```
 root:/# carbide-admin-cli credential add-ufm --url=https://<address:port> --token=<access_token>
@@ -255,10 +255,10 @@ Zero Trust means that no user, device, or network traffic is trusted by default,
 UFM Server Certificates should include UFM Host Name `<ufm host name>` into The Subject Alternative Name (SAN) extension to the X.509 specification.
 
 Note:
-- `<ufm host name>` should be as `default.ufm.forge`, `default.ufm.<site domain name>`. Where <site domain name> is taken from `initial_domain_name` carbide configuration parameter.
+- `<ufm host name>` should be as `default.ufm.forge`, `default.ufm.<site domain name>`. Where <site domain name> is taken from `initial_domain_name` BMM configuration parameter.
 ```
 openssl x509 -in server.crt -text -noout | grep DNS
-                DNS:default.ufm.forge, DNS:default.ufm.az22.frg.nvidia.com
+                DNS:default.ufm.forge, DNS:default.ufm.bmm.example.org
 ```
 - direct IP address is not supported.
 - for UFM version less than 6.18.0-5 following patch should be applied as
@@ -277,7 +277,7 @@ openssl x509 -in server.crt -text -noout | grep DNS
 
 **Select Client Authentication mode.**
 
-Existing carbide certificates such as `/run/secrets/spiffe.io/{tls.crt,tls.key,ca.crt}` are used for client side.
+Existing BMM certificates such as `/run/secrets/spiffe.io/{tls.crt,tls.key,ca.crt}` are used for client side.
 
     carbide-admin-cli credential add-ufm --url=<ufm host name>
 
@@ -464,10 +464,10 @@ endpoints = ["https://10.217.161.194:443/"]
 pkeys = [{ start = "256", end = "2303" }]
 ```
 
-Note that currently Carbide only supports only a single IB fabric. Therefore only
+Note that currently BMM only supports only a single IB fabric. Therefore only
 the fabric ID `default` will be accepted here.
 
-**NOTES**: The Carbide will generate pkey for all partitions that are managed by Carbide; please make sure the range does not conflict with existing pkey in UFM if any.
+**NOTE**: A pkey will be generated for all partitions that are managed by BMM; ensure sure the range does not conflict with the existing pkey in UFM (if any).
 
 Update the configmap `carbide-api-site-config-files` to enable Infiniband features as follows:
 
@@ -542,9 +542,9 @@ Ports          :
     1070fd0300bd588c    -                   pf        1070fd0300bd588c    7         Active    1070fd0300bd588c_1  localhost ibp202s0f0
 ```
 
-### How to check the auth token and UFM IP in Carbide?
+### How to check the auth token and UFM IP in BMM?
 
-After configuring UFM credentials in Carbide, using the following commands to check whether the token was updated in Vault accordingly.
+After configuring UFM credentials in BMM, using the following commands to check whether the token was updated in Vault accordingly.
 
 ```
 kubectl exec -it vault-0 -n vault -- /bin/sh
@@ -573,9 +573,9 @@ UsernamePassword    map[password:ABCDEF username:https://1.2.3.4:443/]
 
 The `username` here encodes the UFM address, while the `password` identifies the auth token.
 
-SRE can also check the InfiniBand fabric monitor metrics emitted by Carbide to determine whether carbide can reach UFM. E.g. the following graph shows a scenario where
+SRE can also check the InfiniBand fabric monitor metrics emitted by BMM to determine whether it can reach UFM. E.g. the following graph shows a scenario where
 
-* First carbide could not connect to UFM to invalid credentials
+* First BMM could not connect to UFM to invalid credentials
 * Fixing the credentials provided access and lead UFM metrics (version number) to be emitted
 
 ![alt text](../images/ib_ufm_ver.png)

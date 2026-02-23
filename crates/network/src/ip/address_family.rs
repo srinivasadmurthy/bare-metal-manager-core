@@ -22,6 +22,26 @@ pub enum IpAddressFamily {
     Ipv6,
 }
 
+impl IpAddressFamily {
+    /// Returns the prefix length for a single interface address in this family
+    /// (32 for IPv4, 128 for IPv6).
+    pub const fn interface_prefix_len(self) -> u8 {
+        match self {
+            IpAddressFamily::Ipv4 => 32,
+            IpAddressFamily::Ipv6 => 128,
+        }
+    }
+
+    /// pg_family returns the Postgre `family()` integer for
+    /// this address family (4 for IPv4, 6 for IPv6).
+    pub const fn pg_family(self) -> i32 {
+        match self {
+            IpAddressFamily::Ipv4 => 4,
+            IpAddressFamily::Ipv6 => 6,
+        }
+    }
+}
+
 pub trait IdentifyAddressFamily {
     /// Return the address family for this value.
     fn address_family(&self) -> IpAddressFamily;
@@ -100,5 +120,28 @@ mod tests {
             addr.require_address_family_or_else(IpAddressFamily::Ipv6, |_| 42),
             Err(42)
         )
+    }
+
+    #[test]
+    fn test_interface_prefix_len() {
+        assert_eq!(IpAddressFamily::Ipv4.interface_prefix_len(), 32);
+        assert_eq!(IpAddressFamily::Ipv6.interface_prefix_len(), 128);
+
+        // Also test via the IdentifyAddressFamily trait on IpAddr.
+        let v4: IpAddr = "10.0.0.1".parse().unwrap();
+        let v6: IpAddr = "fd00::1".parse().unwrap();
+        assert_eq!(v4.address_family().interface_prefix_len(), 32);
+        assert_eq!(v6.address_family().interface_prefix_len(), 128);
+    }
+
+    #[test]
+    fn test_pg_family() {
+        assert_eq!(IpAddressFamily::Ipv4.pg_family(), 4);
+        assert_eq!(IpAddressFamily::Ipv6.pg_family(), 6);
+
+        let v4: IpAddr = "10.0.0.1".parse().unwrap();
+        let v6: IpAddr = "fd00::1".parse().unwrap();
+        assert_eq!(v4.address_family().pg_family(), 4);
+        assert_eq!(v6.address_family().pg_family(), 6);
     }
 }

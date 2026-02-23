@@ -181,6 +181,7 @@ service Forge {
   rpc FindMachineStateHistories(MachineStateHistoriesRequest) returns (MachineStateHistories);
   rpc FindMachineHealthHistories(MachineHealthHistoriesRequest) returns (MachineHealthHistories);
   rpc FindPowerShelfStateHistories(PowerShelfStateHistoriesRequest) returns (PowerShelfStateHistories);
+  rpc FindRackStateHistories(RackStateHistoriesRequest) returns (RackStateHistories);
   rpc FindSwitchStateHistories(SwitchStateHistoriesRequest) returns (SwitchStateHistories);
   rpc FindTenantOrganizationIds(TenantSearchFilter) returns (TenantOrganizationIdList);
   rpc FindTenantsByOrganizationIds(TenantByOrganizationIdsRequest) returns (TenantList);
@@ -1025,6 +1026,8 @@ message RuntimeConfig {
 
   string dpa_subnet_ip = 47;
   int32 dpa_subnet_mask = 48;
+
+  bool dpf_enabled = 49;
 }
 
 message EchoRequest {
@@ -1122,6 +1125,15 @@ message TenantSearchQuery {
   optional string tenantOrganizationId = 1; // protolint:disable:this FIELD_NAMES_LOWER_SNAKE_CASE
 }
 
+// 
+message VpcStatus {
+  // The actual VNI allocated to the VPC. If a VNI had been
+  // explicitly requested, we'd expect this to match the VNI
+  // of the Vpc message. If not explicitly requested, we'd
+  // expect the VNI of the Vpc message to be unset.
+  optional uint32 vni = 1;
+}
+
 message Vpc {
   common.VpcId id = 1;
   string name = 2;
@@ -1135,19 +1147,30 @@ message Vpc {
   google.protobuf.Timestamp deleted = 6;
 
   optional string tenantKeysetId = 7; // protolint:disable:this FIELD_NAMES_LOWER_SNAKE_CASE
-  optional uint32 vni = 8;
+
+  // We'll keep populating this field but it will come from
+  // status.vni
+  // We'll be able to trim it out later after some deprecation window.
+  optional uint32 deprecated_vni = 8; // Deprecated
+
   optional VpcVirtualizationType network_virtualization_type = 9;
   Metadata metadata = 10;
 
   // Sets the desired NSG ID for a VPC
   optional string network_security_group_id  = 11;
 
-  optional uint32 dpa_vni = 12;
+  // dpa_vni
+  reserved 12;
 
   // The ID of the default NVLink Logical Partition for a VPC
   // This is the NVLink Logical Partition that will be used by default for all instances in the VPC.
   optional common.NVLinkLogicalPartitionId default_nvlink_logical_partition_id = 13;
 
+  optional VpcStatus status = 14;
+
+  // This will only be populated if the VNI was explicitly
+  // requested during creation of the VPC.
+  optional uint32 vni = 15;
 }
 
 message VpcCreationRequest {
@@ -1295,7 +1318,7 @@ message VpcPrefixStatus {
   uint32 total_31_segments = 1;
   uint32 available_31_segments = 2;
   uint64 total_linknet_segments = 3;
-  uint64 available_linknet_segments = 4;
+  uint64 available_linknet_segments = 4; 
 }
 
 message VpcPrefixCreationRequest {
@@ -1369,6 +1392,9 @@ message VpcPeeringList {
 message VpcPeeringCreationRequest {
   common.VpcId vpc_id = 1;
   common.VpcId peer_vpc_id = 2;
+
+  // The desired ID for this VPC peering. If the ID is not provided, a random one will be generated.
+  optional common.VpcPeeringId id = 3; 
 }
 
 message VpcPeeringSearchFilter {
@@ -3093,7 +3119,7 @@ message ManagedHostNetworkConfigResponse {
   // Remote ID. Used by DPU to update host's DHCP request with option 82.
   string remote_id = 15;
 
-  // IPv4 prefixes to be denied in the DPU ACL rules.
+  // IP prefixes to be denied in the DPU ACL rules.
   // This is an old field that was hijacked to hold
   // a combination of site_fabric_prefixes _and_ the
   // actual deny_prefixes.  We need to keep populating it
@@ -3104,10 +3130,10 @@ message ManagedHostNetworkConfigResponse {
   // Network monitor pinger type
   optional string dpu_network_pinger_type = 17;
 
-  // IPv4 prefixes to be denied in the DPU ACL rules.
+  // IP prefixes to be denied in the DPU ACL rules.
   repeated string deny_prefixes = 18;
 
-  // List of IPv4 prefixes (in CIDR notation) that are assigned for tenant
+  // List of IP prefixes (in CIDR notation) that are assigned for tenant
   // use within this site.
   repeated string site_fabric_prefixes = 19;
 
@@ -3179,7 +3205,7 @@ message ManagedHostNetworkConfigResponse {
   //       imports
   optional RoutingProfile routing_profile = 114;
 
-  // List of aggregate IPv4 prefixes (in CIDR notation) that contain prefixes assigned
+  // List of aggregate IP prefixes (in CIDR notation) that contain prefixes assigned
   // to tenants so that they themselves can announce to the DPU.  E.g., BYOIP
   repeated string  anycast_site_prefixes = 115;
 
@@ -3333,7 +3359,7 @@ message FlatInterfaceConfig {
   // then this value is set and specifies the virtual function ID that is configured
   // for this network interface.
   optional uint32 virtual_function_id = 6;
-  // A list of IPv4 prefixes that belong to this VPC. Note this may contain
+  // A list of IP prefixes that belong to this VPC. Note this may contain
   // the prefix from the network segment this interface is attached to (which
   // could be independently derived from the `gateway` field).
   repeated string vpc_prefixes = 7;
@@ -4126,6 +4152,8 @@ message Range {
 enum ResourcePoolType {
   Integer = 0;
   Ipv4 = 1;
+  Ipv6 = 2;
+  Ipv6Prefix = 3;
 }
 
 message MigrateVpcVniResponse {
@@ -5666,6 +5694,24 @@ message Rack {
   google.protobuf.Timestamp created = 9;
   google.protobuf.Timestamp updated = 10;
   google.protobuf.Timestamp deleted = 11;
+}
+
+message RackStateHistoryRecord {
+  string state = 1;
+  string version = 2;
+  google.protobuf.Timestamp time = 3;
+}
+
+message RackStateHistoriesRequest {
+  repeated common.RackId rack_ids = 1;
+}
+
+message RackStateHistories {
+  map<string, RackStateHistoryRecords> histories = 1;
+}
+
+message RackStateHistoryRecords {
+  repeated RackStateHistoryRecord records = 1;
 }
 
 message DeleteRackRequest {

@@ -276,6 +276,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "forge.NetworkSegmentStateHistory",
             "#[derive(serde::Serialize)]",
         )
+        .type_attribute(
+            "forge.RackStateHistory",
+            "#[derive(serde::Serialize)]",
+        )
         .type_attribute("forge.Tenant", "#[derive(serde::Serialize)]")
         .type_attribute("forge.TenantContent", "#[derive(serde::Serialize)]")
         .type_attribute("forge.TenantList", "#[derive(serde::Serialize)]")
@@ -309,6 +313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[derive(serde::Serialize)]",
         )
         .type_attribute("forge.Vpc", "#[derive(serde::Serialize)]")
+        .type_attribute("forge.VpcStatus", "#[derive(serde::Serialize)]")
         .type_attribute("forge.VpcList", "#[derive(serde::Serialize)]")
         .type_attribute(
             "forge.StorageClusterAttributes",
@@ -749,7 +754,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/machine_discovery.proto",
                 "proto/mlx_device.proto",
                 "proto/nmx_c.proto",
-                "proto/rack_manager.proto",
                 "proto/site_explorer.proto",
                 "proto/dns.proto",
             ],
@@ -857,18 +861,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     client_wrapper_generator.write_rpc_client_wrapper("src/protos/forge_api_client.rs")?;
     client_wrapper_generator
         .write_rpc_convenience_converters("src/protos/convenience_converters.rs")?;
-
-    // enable the code generator for the rack manager proto
-    let rms_client_wrapper = codegen::CodeGenerator::new(codegen::Config {
-        wrapper_name: "RackManagerApiClient".to_string(),
-        inner_rpc_client_type: "crate::forge_tls_client::RackManagerClientT".to_string(),
-        proto_files: vec!["proto/rack_manager.proto".to_string()],
-        include_paths: vec!["proto".to_string()],
-        extern_paths: vec![],
-        generated_types_path_within_crate: "protos".to_string(),
-    })?;
-    rms_client_wrapper.write_rpc_client_wrapper("src/protos/rack_manager_client.rs")?;
-    rms_client_wrapper.write_rpc_convenience_converters("src/protos/rack_manager_converters.rs")?;
 
     // enable the code generator for the nmx-c proto
     let nmx_c_client_wrapper = codegen::CodeGenerator::new(codegen::Config {

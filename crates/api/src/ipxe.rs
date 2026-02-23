@@ -20,8 +20,8 @@ use db::{self};
 use mac_address::MacAddress;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::{
-    DpuInitState, FailureCause, FailureDetails, InstanceState, ManagedHostState, MeasuringState,
-    ReprovisionState, ValidationState,
+    DpuInitState, FailureCause, FailureDetails, HostReprovisionState, InstanceState,
+    ManagedHostState, MeasuringState, ReprovisionState, ValidationState,
 };
 use model::pxe::PxeInstructionRequest;
 use sqlx::PgConnection;
@@ -203,21 +203,23 @@ exit ||
                 return Ok(UNKNOWN_HOST_INSTRUCTIONS.to_string());
             };
 
+            let (machine_type, console) = match target.arch {
+                rpc::MachineArchitecture::X86 => (MachineType::PredictedHost, console),
+                rpc::MachineArchitecture::Arm => {
+                    if endpoint.is_bluefield_model() {
+                        (MachineType::Dpu, console)
+                    } else {
+                        (MachineType::PredictedHost, "ttyAMA0")
+                    }
+                }
+            };
+
             return Ok(PxeInstructions::get_pxe_instruction_for_arch(
                 target.arch,
                 target.interface_id,
                 interface.mac_address,
                 console,
-                match target.arch {
-                    rpc::MachineArchitecture::X86 => MachineType::PredictedHost,
-                    rpc::MachineArchitecture::Arm => {
-                        if endpoint.is_bluefield_model() {
-                            MachineType::Dpu
-                        } else {
-                            MachineType::PredictedHost
-                        }
-                    }
-                },
+                machine_type,
             ));
         };
 
@@ -288,7 +290,9 @@ exit ||
             }
         }
 
-        if let Some(hardware_info) = machine.hardware_info.as_ref()
+        if target.arch == rpc::MachineArchitecture::Arm {
+            console = "ttyAMA0";
+        } else if let Some(hardware_info) = machine.hardware_info.as_ref()
             && let Some(dmi_info) = hardware_info.dmi_data.as_ref()
             && (dmi_info.sys_vendor == "Lenovo" || dmi_info.sys_vendor == "Supermicro")
         {
@@ -441,6 +445,16 @@ exit ||
 
                 _ => error_instructions(machine_id, target.interface_id, machine.current_state()),
             },
+            ManagedHostState::HostReprovision {
+                reprovision_state: HostReprovisionState::WaitingForManualUpgrade { .. },
+                ..
+            } => PxeInstructions::get_pxe_instruction_for_arch(
+                target.arch,
+                target.interface_id,
+                interface.mac_address,
+                console,
+                machine.id.machine_type(),
+            ),
             x => error_instructions(machine_id, target.interface_id, x),
         };
 

@@ -26,7 +26,8 @@ authors = ["NVIDIA Carbide Engineering <carbide-dev@exchange.nvidia.com>"]
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-libredfish = { git = "https://github.com/NVIDIA/libredfish.git", tag = "v0.39.3" }
+libredfish = { git = "https://github.com/NVIDIA/libredfish.git", tag = "v0.42.2" }
+librms = { git = "https://github.com/NVIDIA/nv-rms-client.git", tag = "v0.0.3" }
 ansi-to-html = "0.2.2"
 
 tokio = { version = "1", features = ["full", "tracing"] }
@@ -58,14 +59,12 @@ tracing-appender = "0.2.4"
 tracing-opentelemetry = "0.29.0"
 
 # NV-Redfish
-nv-redfish = { version = "0.1.4", features = [
+nv-redfish = { version = "0.2.4", features = [
+  "bmc-http",
   "std-redfish",
   "update-service",
   "resource-status",
 ] }
-nv-redfish-core = { version = "0.1.4" }
-nv-redfish-bmc-http = { version = "0.1.4", features = ["reqwest"] }
-nv-redfish-csdl-compiler = { version = "0.1.4" }
 
 ########
 # MARK: - Pinned packages that we can't upgrade due to conflicts or just bugs

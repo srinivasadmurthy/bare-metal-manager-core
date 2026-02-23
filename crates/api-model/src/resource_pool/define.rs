@@ -24,6 +24,8 @@ pub struct ResourcePoolDef {
     pub prefix: Option<String>,
     #[serde(rename = "type")]
     pub pool_type: ResourcePoolType,
+    #[serde(default)]
+    pub delegate_prefix_len: Option<u8>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -38,6 +40,8 @@ pub struct Range {
 #[serde(rename_all = "lowercase")]
 pub enum ResourcePoolType {
     Ipv4,
+    Ipv6,
+    Ipv6Prefix,
     Integer,
 }
 

@@ -29,6 +29,7 @@ use figment::providers::{Env, Format, Toml};
 use forge_secrets::ForgeVaultClient;
 use forge_secrets::credentials::CredentialProvider;
 use futures_util::TryFutureExt;
+use librms::RackManagerClientPool;
 use model::attestation::spdm::VerifierImpl;
 use model::expected_machine::ExpectedMachine;
 use model::ib::DEFAULT_IB_FABRIC_NAME;
@@ -64,7 +65,6 @@ use crate::mqtt_state_change_hook::hook::MqttStateChangeHook;
 use crate::nvl_partition_monitor::NvlPartitionMonitor;
 use crate::nvlink::{NmxmClientPool, NmxmClientPoolImpl};
 use crate::preingestion_manager::PreingestionManager;
-use crate::rack::rms_client::{RackManagerClientPool, RmsClientPool};
 use crate::redfish::RedfishClientPool;
 use crate::scout_stream::ConnectionRegistry;
 use crate::site_explorer::{BmcEndpointExplorer, SiteExplorer};
@@ -163,6 +163,10 @@ pub fn parse_carbide_config(
         }
     }
 
+    // Validate that the firmware profile config keys match their inner
+    // part_number and psid values. Mismatches are logged as warnings.
+    config.validate_supernic_firmware_profiles();
+
     tracing::trace!("Carbide config: {:#?}", config.redacted());
     Ok(Arc::new(config))
 }
@@ -234,7 +238,11 @@ pub async fn start_api(
 
     let rms_client = match carbide_config.rms_api_url.clone() {
         Some(url) if !url.is_empty() => {
-            let rms_client_pool = RmsClientPool::new(&url);
+            // let the crate pick up default certs, enforce tls
+            let rms_client_config =
+                librms::client_config::RmsClientConfig::new(None, None, None, true);
+            let rms_api_config = librms::client::RmsApiConfig::new(&url, &rms_client_config);
+            let rms_client_pool = librms::RmsClientPool::new(&rms_api_config);
             let shared_rms_client = rms_client_pool.create_client().await;
             Some(shared_rms_client)
         }
@@ -515,6 +523,7 @@ pub async fn initialize_and_start_controllers(
                     pool_type: model::resource_pool::define::ResourcePoolType::Integer,
                     ranges: x.pkeys.clone(),
                     prefix: None,
+                    delegate_prefix_len: None,
                 },
             )
             .await?;
@@ -740,8 +749,6 @@ pub async fn initialize_and_start_controllers(
         .build_and_spawn()
         .expect("Unable to build NetworkSegmentController");
 
-    let dpa_pool_vni = common_pools.dpa.pool_dpa_vni.clone();
-
     let mut _dpa_interface_state_controller_handle: Option<
         crate::state_controller::controller::StateControllerHandle,
     > = None;
@@ -757,7 +764,7 @@ pub async fn initialize_and_start_controllers(
                 .iteration_config(
                     (&carbide_config.dpa_interface_state_controller.controller).into(),
                 )
-                .state_handler(Arc::new(DpaInterfaceStateHandler::new(dpa_pool_vni)))
+                .state_handler(Arc::new(DpaInterfaceStateHandler::new()))
                 .build_and_spawn()
                 .expect("Unable to build DpaInterfaceStateController"),
         );

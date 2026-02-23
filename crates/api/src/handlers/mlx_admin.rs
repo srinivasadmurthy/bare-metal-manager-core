@@ -19,7 +19,7 @@ use ::rpc::forge::{scout_stream_api_bound_message, scout_stream_scout_bound_mess
 use ::rpc::protos::forge::ScoutStreamScoutBoundMessage;
 use ::rpc::protos::mlx_device;
 use carbide_uuid::machine::MachineId;
-use mlxconfig_profile::serialization::SerializableProfile;
+use libmlx::profile::serialization::SerializableProfile;
 use tonic::{Request, Response, Status};
 
 use crate::api::{Api, log_request_data};
@@ -1173,15 +1173,13 @@ async fn get_device_lockdown_key(
     machine_id: MachineId,
     device_id: &str,
 ) -> Result<String, Status> {
-    let mut txn = api.txn_begin().await?;
-
     // Note that, while all of the code up to this point, including the CLI,
     // and mlxconfig-* crates, refer to it as the "device_id", internally we
     // refer to as the "pci_name".
     //
     // In other words, device_id == pci_name.
     let dpa_interface =
-        db::dpa_interface::get_for_pci_name(&mut txn, &machine_id, device_id)
+        db::dpa_interface::get_for_pci_name(&api.database_connection, &machine_id, device_id)
             .await
             .map_err(|e| {
                 Status::not_found(format!(
@@ -1190,7 +1188,7 @@ async fn get_device_lockdown_key(
             })?;
 
     let lockdown_key = crate::dpa::lockdown::build_supernic_lockdown_key(
-        &mut txn,
+        &api.database_connection,
         dpa_interface.id,
         &*api.credential_provider,
     )
@@ -1201,6 +1199,5 @@ async fn get_device_lockdown_key(
         ))
     })?;
 
-    txn.rollback().await?;
     Ok(lockdown_key)
 }

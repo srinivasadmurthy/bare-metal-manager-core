@@ -117,7 +117,7 @@ use crate::state_controller::power_shelf::io::PowerShelfStateControllerIO;
 use crate::state_controller::spdm::handler::SpdmAttestationStateHandler;
 use crate::state_controller::spdm::io::SpdmStateControllerIO;
 use crate::state_controller::state_handler::{
-    StateHandler, StateHandlerContext, StateHandlerError, StateHandlerOutcomeWithTransaction,
+    StateHandler, StateHandlerContext, StateHandlerError, StateHandlerOutcome,
 };
 use crate::state_controller::switch::handler::SwitchStateHandler;
 use crate::state_controller::switch::io::SwitchStateControllerIO;
@@ -258,6 +258,8 @@ pub struct TestEnvOverrides {
     pub dpf_config: Option<DpfConfig>,
     pub fnn_config: Option<FnnConfig>,
     pub nmxm_default_partition: Option<bool>,
+    // After n create_requests succeed, they will start failing.
+    pub nmxm_fail_after_n_creates: Option<usize>,
 }
 
 impl TestEnvOverrides {
@@ -330,9 +332,7 @@ pub struct TestEnv {
     pub machine_state_handler: SwapHandler<MachineStateHandler>,
     network_segment_controller: Arc<Mutex<StateController<NetworkSegmentStateControllerIO>>>,
     ib_partition_controller: Arc<Mutex<StateController<IBPartitionStateControllerIO>>>,
-    #[allow(dead_code)]
     power_shelf_controller: Arc<Mutex<StateController<PowerShelfStateControllerIO>>>,
-    #[allow(dead_code)]
     switch_controller: Arc<Mutex<StateController<SwitchStateControllerIO>>>,
     pub reachability_params: ReachabilityParams,
     pub test_meter: TestMeter,
@@ -587,7 +587,6 @@ impl TestEnv {
     /// Runs one iteration of the power shelf state controller handler with the services
     /// in this test environment
     #[allow(clippy::await_holding_refcell_ref)]
-    #[allow(dead_code)]
     pub async fn run_power_shelf_controller_iteration(&self) {
         self.power_shelf_controller
             .lock()
@@ -599,7 +598,6 @@ impl TestEnv {
     /// Runs one iteration of the switch state controller handler with the services
     /// in this test environment
     #[allow(clippy::await_holding_refcell_ref)]
-    #[allow(dead_code)]
     pub async fn run_switch_controller_iteration(&self) {
         self.switch_controller
             .lock()
@@ -609,7 +607,6 @@ impl TestEnv {
     }
 
     /// Runs power shelf controller iterations until a condition is met
-    #[allow(dead_code)]
     pub async fn run_power_shelf_controller_iteration_until_condition(
         &self,
         max_iterations: u32,
@@ -628,7 +625,6 @@ impl TestEnv {
     }
 
     /// Runs switch controller iterations until a condition is met
-    #[allow(dead_code)]
     pub async fn run_switch_controller_iteration_until_condition(
         &self,
         max_iterations: u32,
@@ -825,10 +821,10 @@ impl TestEnv {
 
         (
             vpc.id,
-            vpc.vni,
+            vpc.status.as_ref().and_then(|s| s.vni),
             tenant_network_id,
             peer_vpc.id,
-            peer_vpc.vni,
+            peer_vpc.status.as_ref().and_then(|s| s.vni),
             peer_tenant_network_id,
         )
     }
@@ -1164,6 +1160,7 @@ pub fn get_config() -> CarbideConfig {
         dpf: crate::cfg::file::DpfConfig::default(),
         x86_pxe_boot_url_override: None,
         arm_pxe_boot_url_override: None,
+        supernic_firmware_profiles: HashMap::default(),
     }
 }
 
@@ -1268,7 +1265,9 @@ pub async fn create_test_env_with_overrides(
     let certificate_provider = Arc::new(TestCertificateProvider::new());
     let redfish_sim = Arc::new(RedfishSim::default());
     let nmxm_sim: Arc<dyn NmxmClientPool> =
-        Arc::new(if overrides.nmxm_default_partition == Some(true) {
+        Arc::new(if let Some(n) = overrides.nmxm_fail_after_n_creates {
+            NmxmSimClient::with_fail_after_n_creates(n)
+        } else if overrides.nmxm_default_partition == Some(true) {
             NmxmSimClient::with_default_partition()
         } else {
             NmxmSimClient::default()
@@ -1662,10 +1661,8 @@ pub async fn create_test_env_with_overrides(
         machine_state_handler: machine_swap,
         ib_fabric_monitor: Arc::new(ib_fabric_monitor),
         ib_partition_controller: Arc::new(Mutex::new(ib_controller)),
-        #[allow(dead_code)]
         switch_controller: Arc::new(Mutex::new(switch_controller)),
         network_segment_controller: Arc::new(Mutex::new(network_controller)),
-        #[allow(dead_code)]
         power_shelf_controller: Arc::new(Mutex::new(power_shelf_controller)),
         reachability_params,
         attestation_enabled,
@@ -1877,6 +1874,7 @@ fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> 
                 },
             ],
             prefix: None,
+            delegate_prefix_len: None,
         },
     );
     defs.insert(
@@ -1890,6 +1888,7 @@ fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> 
                 end: "10.255.255.127".to_string(),
                 auto_assign: true,
             }],
+            delegate_prefix_len: None,
         },
     );
     defs.insert(
@@ -1899,6 +1898,7 @@ fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> 
             // Must match a network_prefix in fixtures/create_network_segment.sql
             prefix: Some("172.20.0.0/24".to_string()),
             ranges: vec![],
+            delegate_prefix_len: None,
         },
     );
     defs.insert(
@@ -1911,6 +1911,7 @@ fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> 
                 auto_assign: true,
             }],
             prefix: None,
+            delegate_prefix_len: None,
         },
     );
     defs.insert(
@@ -1923,6 +1924,7 @@ fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> 
                 auto_assign: true,
             }],
             prefix: None,
+            delegate_prefix_len: None,
         },
     );
     defs.insert(
@@ -1942,6 +1944,7 @@ fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> 
                 },
             ],
             prefix: None,
+            delegate_prefix_len: None,
         },
     );
 
@@ -1955,18 +1958,7 @@ fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> 
                 auto_assign: true,
             }],
             prefix: None,
-        },
-    );
-    defs.insert(
-        model::resource_pool::common::DPA_VNI.to_string(),
-        resource_pool::ResourcePoolDef {
-            pool_type: resource_pool::ResourcePoolType::Integer,
-            ranges: vec![resource_pool::Range {
-                start: 30001.to_string(),
-                end: (30001 + fabric_len as u16 - 1).to_string(),
-                auto_assign: true,
-            }],
-            prefix: None,
+            delegate_prefix_len: None,
         },
     );
     defs.insert(
@@ -1979,6 +1971,7 @@ fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> 
                 auto_assign: true,
             }],
             prefix: None,
+            delegate_prefix_len: None,
         },
     );
     defs.insert(
@@ -1987,6 +1980,7 @@ fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> 
             pool_type: resource_pool::ResourcePoolType::Ipv4,
             prefix: Some("172.30.0.0/24".to_string()),
             ranges: vec![],
+            delegate_prefix_len: None,
         },
     );
     defs
@@ -2560,9 +2554,17 @@ pub async fn get_vpc_fixture_id(env: &TestEnv) -> VpcId {
 /// A hot swappable machine state handler.
 /// Allows modifying the handler behavior without reconstructing the machine
 /// state controller (which leads to stale metrics being saved).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SwapHandler<H: StateHandler> {
     pub inner: Arc<Mutex<H>>,
+}
+
+impl<H: StateHandler> Clone for SwapHandler<H> {
+    fn clone(&self) -> Self {
+        SwapHandler {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -2584,7 +2586,7 @@ where
         state: &mut Self::State,
         controller_state: &Self::ControllerState,
         ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcomeWithTransaction<Self::ControllerState>, StateHandlerError> {
+    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
         self.inner
             .lock()
             .await

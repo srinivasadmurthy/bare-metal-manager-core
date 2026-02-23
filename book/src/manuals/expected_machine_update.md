@@ -1,6 +1,6 @@
-# Updating Expected Machines Manifest
+# Updating Expected Hosts Manifest
 
-There is a table in the carbide-api database, that holds the following information about the expected machines:
+There is a table in the carbide-api database, that holds the following information about the expected hosts:
 * Chassis Serial Number
 * BMC MAC Address
 * BMC manufacturer's set login

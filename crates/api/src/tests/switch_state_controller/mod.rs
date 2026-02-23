@@ -30,7 +30,6 @@ use crate::state_controller::config::IterationConfig;
 use crate::state_controller::controller::StateController;
 use crate::state_controller::state_handler::{
     StateHandler, StateHandlerContext, StateHandlerError, StateHandlerOutcome,
-    StateHandlerOutcomeWithTransaction,
 };
 use crate::state_controller::switch::context::SwitchStateHandlerContextObjects;
 use crate::state_controller::switch::io::SwitchStateControllerIO;
@@ -61,7 +60,7 @@ impl StateHandler for TestSwitchStateHandler {
         state: &mut Switch,
         _controller_state: &Self::ControllerState,
         _ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcomeWithTransaction<Self::ControllerState>, StateHandlerError> {
+    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
         assert_eq!(state.id, *switch_id);
         self.count.fetch_add(1, Ordering::SeqCst);
         {
@@ -69,7 +68,7 @@ impl StateHandler for TestSwitchStateHandler {
             *guard.entry(switch_id.to_string()).or_default() += 1;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        Ok(StateHandlerOutcome::do_nothing().with_txn(None))
+        Ok(StateHandlerOutcome::do_nothing())
     }
 }
 

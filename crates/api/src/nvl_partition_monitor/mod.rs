@@ -33,6 +33,7 @@ use model::machine::nvlink::{MachineNvLinkGpuStatusObservation, MachineNvLinkSta
 use model::machine::{HostHealthConfig, LoadSnapshotOptions, ManagedHostStateSnapshot};
 use sqlx::PgPool;
 use tokio::sync::oneshot;
+use tracing::Instrument;
 
 use crate::api::TransactionVending;
 use crate::cfg::file::NvLinkConfig;
@@ -60,6 +61,14 @@ enum NmxmPartitionOperationType {
     Pending(String), // Operation ID
 }
 
+#[derive(Debug, Clone)]
+enum GpuAction {
+    AddToPartition,
+    RemoveFromPartition,
+    RemoveFromDefaultPartition,
+    NoOp,
+}
+
 // Context for GPU helper functions in check_nv_link_partitions
 struct GpuProcessingContext {
     gpu_nmx_m_id: String,
@@ -70,13 +79,26 @@ struct GpuProcessingContext {
     partition_nmx_m_id: String,
 }
 
+impl Default for GpuProcessingContext {
+    fn default() -> Self {
+        Self {
+            gpu_nmx_m_id: "".to_string(),
+            domain_uuid: NvLinkDomainId::default(),
+            logical_partition_id: None,
+            partition_id: None,
+            partition_name: "".to_string(),
+            partition_nmx_m_id: "".to_string(),
+        }
+    }
+}
+
 // Context for partition helper functions in check_nv_link_partitions.
 pub struct PartitionProcessingContext {
     nmx_m_partitions: HashMap<String, libnmxm::nmxm_model::Partition>,
     db_nvl_logical_partitions: HashMap<NvLinkLogicalPartitionId, LogicalPartition>,
     db_nvl_partitions: HashMap<String, NvlPartition>, // NMX-M ID to NvlPartition
     machine_nvlink_info: HashMap<MachineId, Option<MachineNvLinkInfo>>,
-    gpu_map: HashMap<String, libnmxm::nmxm_model::Partition>, // NMX-M GPU ID to NMX-M partition
+    gpu_to_partition_map: HashMap<String, libnmxm::nmxm_model::Partition>, // NMX-M GPU ID to NMX-M partition
     nmx_m_operations: HashMap<NvLinkLogicalPartitionId, Vec<NmxmPartitionOperation>>,
     default_partition_removal_operations: HashMap<String, Vec<NmxmPartitionOperation>>,
 }
@@ -106,7 +128,7 @@ impl PartitionProcessingContext {
             db_nvl_logical_partitions,
             db_nvl_partitions,
             machine_nvlink_info,
-            gpu_map,
+            gpu_to_partition_map: gpu_map,
             nmx_m_operations: HashMap::new(),
             default_partition_removal_operations: HashMap::new(),
         }
@@ -124,22 +146,6 @@ impl PartitionProcessingContext {
             }
         }
         gpu_map
-    }
-
-    // Get the NMX-M GPU ID for a specific GPU index on a machine
-    fn get_gpu_nvlink_info(
-        &self,
-        machine_id: &MachineId,
-        device_instance: u32,
-    ) -> Option<NvLinkGpu> {
-        self.machine_nvlink_info.get(machine_id).and_then(|info| {
-            info.as_ref().map(|info| {
-                info.gpus
-                    .iter()
-                    .find(|g| g.device_id as u32 == device_instance + 1) // NMX-M GPU indices are 1-based
-                    .cloned()
-            })
-        })?
     }
 
     // Validate that a logical partition exists and is not deleted
@@ -642,7 +648,36 @@ impl NvlPartitionMonitor {
 
     pub async fn run_single_iteration(&self) -> CarbideResult<usize> {
         let mut metrics = NvlPartitionMonitorMetrics::new();
+        let span_id: String = format!("{:#x}", u64::from_le_bytes(rand::random::<[u8; 8]>()));
+        let check_nvl_partition_span = tracing::span!(
+            parent: None,
+            tracing::Level::INFO,
+            "nvl_partition_monitor",
+            span_id,
+            otel.status_code = tracing::field::Empty,
+            otel.status_message = tracing::field::Empty,
+            metrics = tracing::field::Empty,
+        );
+        let result = self
+            .run_single_iteration_inner(&mut metrics)
+            .instrument(check_nvl_partition_span.clone())
+            .await;
+        check_nvl_partition_span.record(
+            "otel.status_code",
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        if let Err(ref e) = result {
+            check_nvl_partition_span.record("otel.status_message", format!("{e:?}"));
+        }
+        check_nvl_partition_span.record("metrics", metrics.to_string());
+        self.metric_holder.update_metrics(metrics);
+        result
+    }
 
+    async fn run_single_iteration_inner(
+        &self,
+        metrics: &mut NvlPartitionMonitorMetrics,
+    ) -> CarbideResult<usize> {
         let _lock = match self
             .work_lock_manager_handle
             .try_acquire_lock(Self::ITERATION_WORK_KEY.into())
@@ -661,29 +696,12 @@ impl NvlPartitionMonitor {
             "NvlPartitionMonitor acquired the lock",
         );
 
-        let span_id: String = format!("{:#x}", u64::from_le_bytes(rand::random::<[u8; 8]>()));
-        let check_nvl_partition_span = tracing::span!(
-            parent: None,
-            tracing::Level::INFO,
-            "nvlink_partition_monitor",
-            span_id,
-            otel.status_code = tracing::field::Empty,
-            otel.status_message = tracing::field::Empty,
-            metrics = tracing::field::Empty,
-        );
-
         let nmxm_client = self
             .nmxm_client_pool
             .create_client(&self.config.nmx_m_endpoint, None)
             .await
             .map_err(|e| {
                 metrics.nmxm.connect_error = "Failed to create NMXM client".to_string();
-                check_nvl_partition_span.record("otel.status_code", "error");
-                check_nvl_partition_span.record(
-                    "otel.status_message",
-                    format!("Failed to create NMMX client {e:?}"),
-                );
-
                 CarbideError::internal(format!("Failed to create NMXM client: {e}"))
             })?;
 
@@ -707,24 +725,11 @@ impl NvlPartitionMonitor {
 
         let nmx_m_partitions = nmxm_client.get_partitions_list().await.map_err(|e| {
             metrics.nmxm.connect_error = "Failed to get NMXM partitions list".to_string();
-
-            check_nvl_partition_span.record("otel.status_code", "error");
-            check_nvl_partition_span.record(
-                "otel.status_message",
-                format!("Failed to get NMXM partitions list {e:?}"),
-            );
-
             CarbideError::internal(format!("Failed to get NMXM partitions list: {e}"))
         })?;
 
         let nmx_m_gpus = nmxm_client.get_gpu(None).await.map_err(|e| {
             metrics.nmxm.connect_error = "Failed to get NMXM gpu list".to_string();
-            check_nvl_partition_span.record("otel.status_code", "error");
-            check_nvl_partition_span.record(
-                "otel.status_message",
-                format!("Failed to get NMXM gpu list {e:?}"),
-            );
-
             CarbideError::internal(format!("Failed to get NMXM gpu list: {e}"))
         })?;
 
@@ -736,7 +741,7 @@ impl NvlPartitionMonitor {
                 &nmx_m_gpus,
                 db_nvl_partitions,
                 &nmx_m_partitions,
-                &mut metrics,
+                metrics,
             )
             .await?;
 
@@ -755,10 +760,10 @@ impl NvlPartitionMonitor {
         let observations = self.check_nv_link_partitions(
             &mut partition_processing_context,
             managed_host_snapshots,
-            &mut metrics,
-        );
+            metrics,
+        )?;
 
-        self.record_nvlink_status_observation(observations?).await?;
+        self.record_nvlink_status_observation(observations).await?;
 
         let nmx_m_operations = partition_processing_context.nmx_m_operations;
 
@@ -775,7 +780,7 @@ impl NvlPartitionMonitor {
 
         // Poll NMX-M operation IDs with timeout
         let completed_nmx_m_operations = self
-            .poll_nmx_m_operations_with_timeout(pending_nmx_m_operations, &mut metrics)
+            .poll_nmx_m_operations_with_timeout(pending_nmx_m_operations, metrics)
             .await?;
 
         if !completed_nmx_m_operations.is_empty() {
@@ -788,23 +793,12 @@ impl NvlPartitionMonitor {
         let num_completed_operations = completed_nmx_m_operations.len();
         metrics.num_completed_operations = num_completed_operations;
 
-        check_nvl_partition_span.record("metrics", metrics.to_string());
-
         // Get a fresh list of partitions from NMX-M.
         let nmx_m_partitions = nmxm_client.get_partitions_list().await.map_err(|e| {
             metrics.nmxm.connect_error =
                 "Failed to get NMXM partitions list when updating db".to_string();
-            check_nvl_partition_span.record("otel.status_code", "error");
-            check_nvl_partition_span.record(
-                "otel.status_message",
-                format!("Failed to get NMXM partitions list when updating db {e:?}"),
-            );
             CarbideError::internal(format!("Failed to get NMXM partitions list: {e}"))
         })?;
-
-        check_nvl_partition_span.record("otel.status_code", "ok");
-
-        self.metric_holder.update_metrics(metrics);
 
         // Update db.
         let mut txn = self.db_pool.txn_begin().await?;
@@ -993,224 +987,214 @@ impl NvlPartitionMonitor {
 
         for mh in mh_snapshots.values() {
             metrics.num_machines_scanned += 1;
-            if let Some(instance) = &mh.instance {
-                metrics.num_instances_scanned += 1;
-                let mut instance_gpu_statuses = Vec::new();
-                for instance_gpu_config in &instance.config.nvlink.gpu_configs {
-                    metrics.num_gpus_scanned += 1;
-                    // Start with an empty observation and build it, so that we still get a status observation when we have an error.
-                    let mut gpu_status_observation = MachineNvLinkGpuStatusObservation {
-                        device_instance: instance_gpu_config.device_instance,
-                        ..Default::default()
-                    };
-                    // Get domain UUID for this machine
-                    let domain_uuid = match partition_ctx
-                        .machine_nvlink_info
-                        .get(&instance.machine_id)
-                        .and_then(|info| info.as_ref().map(|info| info.domain_uuid))
-                    {
-                        Some(uuid) => uuid,
-                        None => {
-                            tracing::error!(
-                                "NMX-M info not found for machine {}",
-                                instance.machine_id
-                            );
-                            instance_gpu_statuses.push(gpu_status_observation);
-                            continue;
-                        }
-                    };
-                    gpu_status_observation.domain_id = domain_uuid;
+            let Some(instance) = &mh.instance else {
+                // For machines with no instance, check if machine is in admin network and any cleanup is required
+                let _ = self.check_machine_and_handle_gpu_removals(mh, partition_ctx);
+                continue;
+            };
+            metrics.num_instances_scanned += 1;
+            let mut instance_gpu_statuses = Vec::new();
+            let Some(info) = partition_ctx
+                .machine_nvlink_info
+                .get(&instance.machine_id)
+                .cloned()
+            else {
+                tracing::warn!("No nvlink_info found for machine {}", instance.machine_id);
+                machine_gpu_statuses.insert(
+                    instance.machine_id,
+                    MachineNvLinkStatusObservation {
+                        observed_at: Utc::now(),
+                        nvlink_gpus: instance_gpu_statuses,
+                    },
+                );
+                continue;
+            };
+            match info {
+                Some(info) => {
+                    for nvlink_gpu in &info.gpus {
+                        metrics.num_gpus_scanned += 1;
+                        // NMX-M ID is 1-based so subtract 1 to get our device_instance.
+                        let device_instance: u32 = nvlink_gpu.device_id as u32 - 1;
+                        let instance_gpu_config = &instance
+                            .config
+                            .nvlink
+                            .gpu_configs
+                            .iter()
+                            .find(|gpu| gpu.device_instance == device_instance);
+                        let mut gpu_status_observation = MachineNvLinkGpuStatusObservation {
+                            device_instance,
+                            domain_id: info.domain_uuid,
+                            gpu_id: nvlink_gpu.nmx_m_id.clone(),
+                            guid: nvlink_gpu.guid,
+                            ..Default::default()
+                        };
+                        let mut gpu_ctx = GpuProcessingContext {
+                            gpu_nmx_m_id: nvlink_gpu.nmx_m_id.clone(),
+                            domain_uuid: info.domain_uuid,
+                            ..Default::default()
+                        };
 
-                    // Get the NMX-M GPU ID
-                    let gpu_nvlink_info = match partition_ctx.get_gpu_nvlink_info(
-                        &instance.machine_id,
-                        instance_gpu_config.device_instance,
-                    ) {
-                        Some(info) => info,
-                        None => {
-                            tracing::error!(
-                                machine_id = %instance.machine_id,
-                                device_instance = instance_gpu_config.device_instance,
-                                "NMX-M GPU not found for machine"
-                            );
-                            instance_gpu_statuses.push(gpu_status_observation);
-                            continue;
-                        }
-                    };
-                    gpu_status_observation.gpu_id = gpu_nvlink_info.nmx_m_id.clone();
-                    gpu_status_observation.guid = gpu_nvlink_info.guid;
+                        let nmxm_partition = partition_ctx
+                            .gpu_to_partition_map
+                            .get(&nvlink_gpu.nmx_m_id)
+                            .cloned();
 
-                    // Get partition information from database if it exists
-                    let nmxm_partition = partition_ctx
-                        .gpu_map
-                        .get(&gpu_nvlink_info.nmx_m_id)
-                        .cloned();
-                    let (
-                        db_partition_id,
-                        db_logical_partition_id,
-                        db_partition_name,
-                        db_partition_nmx_m_id,
-                    ) = if let Some(nmxm_partition) = nmxm_partition {
-                        match partition_ctx.get_db_partition_info(&nmxm_partition.id) {
-                            Some(info) => info,
-                            None => {
-                                // carbide does not know about this partition. If the tenant has requested this GPU be part of a logical partition,
-                                // and the partition it's in is a default partition, remove it from the default partition.
-                                if instance_gpu_config.logical_partition_id.is_some()
-                                    && is_nmx_m_default_partition(&nmxm_partition)
-                                {
-                                    tracing::info!(
-                                        "Removing GPU {} from default partition {}",
-                                        gpu_nvlink_info.nmx_m_id,
-                                        nmxm_partition.id
-                                    );
-                                    // Enqueue a removal operation for this GPU.
-                                    if let Some(gpus_to_keep) = partition_ctx
-                                        .get_gpus_to_keep_in_default_partition_after_removal(
-                                            &nmxm_partition.id,
-                                            &gpu_nvlink_info.nmx_m_id,
-                                            &instance.machine_id,
-                                            instance_gpu_config.device_instance,
-                                        )
-                                    {
-                                        partition_ctx.handle_gpu_removal_from_default_partition(
-                                            &nmxm_partition.id,
-                                            &gpu_nvlink_info.nmx_m_id,
-                                            gpus_to_keep,
-                                        )?;
+                        // Decide on what action the monitor will take with this GPU, and finish building the gpu_ctx.
+                        let gpu_action: GpuAction;
+                        if let Some(nmxm_partition) = nmxm_partition {
+                            match partition_ctx.get_db_partition_info(&nmxm_partition.id) {
+                                Some((
+                                    db_partition_id,
+                                    db_logical_partition_id,
+                                    db_partition_name,
+                                    db_partition_nmx_m_id,
+                                )) => {
+                                    if let Some(gpu_config) = instance_gpu_config {
+                                        gpu_ctx.logical_partition_id =
+                                            gpu_config.logical_partition_id;
+                                        if db_logical_partition_id.is_none() {
+                                            // How can this happen?
+                                            tracing::error!(
+                                                "No logical partition ID associated with physical partition {nmxm_partition:?}"
+                                            );
+                                            continue;
+                                        } else if gpu_config.logical_partition_id
+                                            != db_logical_partition_id
+                                        {
+                                            // This covers both the case where the tenant has asked for the GPU to be removed from the partition
+                                            // (i.e. gpu_config.logical_partition_id is None), and the case where the GPU is in logical partition
+                                            // A and the tenant wants it to be in logical partition B. In the latter case, we need to remove the GPU
+                                            // from the current partition before adding it to the new one.
+                                            gpu_action = GpuAction::RemoveFromPartition;
+                                        } else {
+                                            gpu_action = GpuAction::NoOp;
+                                        }
                                     } else {
-                                        tracing::error!(
-                                            "No default partition found with nmx_m_id = {}",
+                                        // There is no gpu config, which means the tenant does not want it to be part of a partition.
+                                        gpu_action = GpuAction::RemoveFromPartition;
+                                    }
+                                    gpu_ctx.logical_partition_id = db_logical_partition_id;
+                                    gpu_ctx.partition_id = db_partition_id;
+                                    gpu_ctx.partition_name = db_partition_name;
+                                    gpu_ctx.partition_nmx_m_id = db_partition_nmx_m_id;
+
+                                    // Update the observation.
+                                    gpu_status_observation.logical_partition_id =
+                                        db_logical_partition_id;
+                                    gpu_status_observation.partition_id = db_partition_id;
+                                }
+                                None => {
+                                    // TODO: should we add the partition NMX-M ID to the status obs?
+                                    if is_nmx_m_default_partition(&nmxm_partition)
+                                        && instance_gpu_config.is_some()
+                                    {
+                                        tracing::info!(
+                                            "Removing GPU {} in machine {} and instance {} from default partition {}",
+                                            nvlink_gpu.nmx_m_id,
+                                            instance.machine_id,
+                                            instance.id,
                                             nmxm_partition.id
                                         );
+                                        gpu_action = GpuAction::RemoveFromDefaultPartition;
+                                        gpu_ctx.partition_nmx_m_id = nmxm_partition.id;
+                                    } else {
+                                        gpu_action = GpuAction::NoOp;
                                     }
+                                }
+                            }
+                        } else {
+                            // This GPU isn't in a partition yet.
+                            if let Some(gpu_config) = instance_gpu_config
+                                && let Some(logical_partition_id) = gpu_config.logical_partition_id
+                            {
+                                // Tenant has asked to put it in a partition
+                                gpu_action = GpuAction::AddToPartition;
+                                gpu_ctx.logical_partition_id = Some(logical_partition_id);
+                            } else {
+                                gpu_action = GpuAction::NoOp;
+                            }
+                        }
+
+                        instance_gpu_statuses.push(gpu_status_observation);
+
+                        if let Some(logical_partition_id) = gpu_ctx.logical_partition_id
+                            && !partition_ctx.validate_logical_partition(&logical_partition_id)
+                        {
+                            continue;
+                        }
+
+                        match gpu_action {
+                            GpuAction::AddToPartition => {
+                                // Check if there are other physical partitions in the logical partition
+                                if let Some(partition) = partition_ctx
+                                    .db_nvl_partitions
+                                    .values()
+                                    .find(|p| {
+                                        p.logical_partition_id == gpu_ctx.logical_partition_id
+                                            && p.domain_uuid == info.domain_uuid
+                                    })
+                                    .cloned()
+                                {
+                                    // Add to existing partition in the same domain
+                                    partition_ctx.handle_gpu_addition_existing_partition(
+                                        &gpu_ctx, &partition,
+                                    )?;
+                                } else {
+                                    // Create new partition in a different domain
+                                    partition_ctx.handle_gpu_addition_new_partition(&gpu_ctx)?;
+                                }
+                            }
+                            GpuAction::RemoveFromPartition => {
+                                let Some(gpus_to_keep) = partition_ctx
+                                    .get_gpus_to_keep_after_removal(
+                                        gpu_ctx.logical_partition_id,
+                                        &gpu_ctx.partition_nmx_m_id,
+                                        &gpu_ctx.gpu_nmx_m_id,
+                                        &instance.machine_id,
+                                        device_instance,
+                                    )
+                                else {
+                                    continue;
+                                };
+
+                                partition_ctx.handle_gpu_removal(&gpu_ctx, gpus_to_keep)?;
+                            }
+                            GpuAction::RemoveFromDefaultPartition => {
+                                if let Some(gpus_to_keep) = partition_ctx
+                                    .get_gpus_to_keep_in_default_partition_after_removal(
+                                        &gpu_ctx.partition_nmx_m_id,
+                                        &gpu_ctx.gpu_nmx_m_id,
+                                        &instance.machine_id,
+                                        device_instance,
+                                    )
+                                {
+                                    partition_ctx.handle_gpu_removal_from_default_partition(
+                                        &gpu_ctx.partition_nmx_m_id,
+                                        &gpu_ctx.gpu_nmx_m_id,
+                                        gpus_to_keep,
+                                    )?;
                                 } else {
                                     tracing::error!(
-                                        "No partition found with nmx_m_id = {}",
-                                        nmxm_partition.id
+                                        "No default partition found with nmx_m_id = {}",
+                                        gpu_ctx.gpu_nmx_m_id
                                     );
+                                    continue;
                                 }
-                                instance_gpu_statuses.push(gpu_status_observation);
-                                continue;
                             }
-                        }
-                    } else {
-                        (None, None, String::new(), String::new())
-                    };
-
-                    // ADd the rest of the status obs from the db. The db gets populated after NMX-M gets updated, so technically we're
-                    // just "observing" the db, but indirectly we're observing the NMX-M as well.
-                    gpu_status_observation.partition_id = db_partition_id;
-                    gpu_status_observation.logical_partition_id = db_logical_partition_id;
-                    gpu_status_observation.guid = gpu_nvlink_info.guid;
-                    instance_gpu_statuses.push(gpu_status_observation.clone());
-
-                    // Validate logical partition exists and is not deleted
-                    if let Some(logical_partition_id) = db_logical_partition_id
-                        && !partition_ctx.validate_logical_partition(&logical_partition_id)
-                    {
-                        continue;
-                    }
-
-                    // Create context for processing this GPU. The logical partition ID comes from the config if it exists, otherwise it comes from the status.
-                    let gpu_ctx = GpuProcessingContext {
-                        gpu_nmx_m_id: gpu_nvlink_info.nmx_m_id.clone(),
-                        domain_uuid,
-                        partition_id: db_partition_id,
-                        partition_name: db_partition_name.clone(),
-                        partition_nmx_m_id: db_partition_nmx_m_id.clone(),
-                        logical_partition_id: if let Some(logical_partition_id) =
-                            instance_gpu_config.logical_partition_id
-                        {
-                            // If the config logical partition is set use it
-                            Some(logical_partition_id)
-                        } else {
-                            // ...or if the obs one is set use it, or None.
-                            gpu_status_observation.logical_partition_id
-                        },
-                    };
-
-                    match (
-                        instance_gpu_config.logical_partition_id,
-                        gpu_status_observation.logical_partition_id,
-                    ) {
-                        (None, Some(_status_logical_partition_id)) => {
-                            // The tenant has requested this GPU be removed from a logical partition
-                            let gpus_to_keep = match partition_ctx.get_gpus_to_keep_after_removal(
-                                gpu_status_observation.logical_partition_id,
-                                &db_partition_nmx_m_id,
-                                &gpu_nvlink_info.nmx_m_id,
-                                &instance.machine_id,
-                                instance_gpu_config.device_instance,
-                            ) {
-                                Some(gpus) => gpus,
-                                None => continue,
-                            };
-
-                            partition_ctx.handle_gpu_removal(&gpu_ctx, gpus_to_keep)?;
-                        }
-                        (Some(_config_logical_partition_id), None) => {
-                            // Tenant has requested this GPU be part of a logical partition.
-                            if let Some(partition_id) = gpu_status_observation.partition_id {
-                                tracing::error!(
-                                    "Instance GPU {} is part of physical partition {}, but not in a logical partition",
-                                    instance_gpu_config.device_instance,
-                                    partition_id
-                                );
-                                continue;
-                            }
-
-                            // Check if there are other physical partitions in the logical partition
-                            let matching_partitions: Vec<NvlPartition> = partition_ctx
-                                .db_nvl_partitions
-                                .values()
-                                .filter(|p| {
-                                    p.logical_partition_id.unwrap_or_default()
-                                        == instance_gpu_config
-                                            .logical_partition_id
-                                            .unwrap_or_default()
-                                })
-                                .cloned()
-                                .collect();
-
-                            let partition_with_same_domain = matching_partitions
-                                .iter()
-                                .find(|p| p.domain_uuid == domain_uuid);
-
-                            if matching_partitions.is_empty() {
-                                // No other physical partitions in the logical partition - create new
-                                partition_ctx.handle_gpu_addition_new_partition(&gpu_ctx)?;
-                            } else if let Some(partition) = partition_with_same_domain {
-                                // Add to existing partition in the same domain
-                                partition_ctx
-                                    .handle_gpu_addition_existing_partition(&gpu_ctx, partition)?;
-                            } else {
-                                // Create new partition in a different domain
-                                partition_ctx.handle_gpu_addition_new_partition(&gpu_ctx)?;
-                            }
-                        }
-                        (Some(config_logical_partition_id), Some(status_logical_partition_id)) => {
-                            if config_logical_partition_id != status_logical_partition_id {
-                                // TODO: move to new logical partition.
-                                // Not sure how much this path will be exercised. Most use cases will involve an explicit delete of the logical
-                                // partition before adding GPU to a new partition.
-                            }
-                        }
-                        (None, None) => {
-                            // No op
+                            GpuAction::NoOp => (),
                         }
                     }
                 }
-                // Now we've generated the operations, record an observation.
-                let observation = MachineNvLinkStatusObservation {
-                    observed_at: Utc::now(),
-                    nvlink_gpus: instance_gpu_statuses,
-                };
-                machine_gpu_statuses.insert(instance.machine_id, observation);
-            } else {
-                // For machines with no instance, check if machine is in admin network and any cleanup is required
-                let _ = self.check_machine_and_handle_gpu_removals(mh, partition_ctx);
+                None => {
+                    tracing::warn!("No nvlink_info found for machine {}", instance.machine_id);
+                }
             }
+            // Now we've generated the operations, record an observation.
+            let observation = MachineNvLinkStatusObservation {
+                observed_at: Utc::now(),
+                nvlink_gpus: instance_gpu_statuses,
+            };
+            machine_gpu_statuses.insert(instance.machine_id, observation);
         }
 
         metrics.num_machine_nvl_status_updates = machine_gpu_statuses.len();
@@ -1251,7 +1235,8 @@ impl NvlPartitionMonitor {
         if let Some(nvlink_info) = &mh.host_snapshot.nvlink_info {
             for gpu in &nvlink_info.gpus {
                 // Get partition information from database if it exists
-                let Some(nmxm_partition) = partition_ctx.gpu_map.get(&gpu.nmx_m_id) else {
+                let Some(nmxm_partition) = partition_ctx.gpu_to_partition_map.get(&gpu.nmx_m_id)
+                else {
                     continue;
                 };
 
@@ -1262,7 +1247,12 @@ impl NvlPartitionMonitor {
                     db_partition_nmx_m_id,
                 )) = partition_ctx.get_db_partition_info(&nmxm_partition.id)
                 else {
-                    tracing::error!("No partition found with nmx_m_id = {}", nmxm_partition.id);
+                    if !is_nmx_m_default_partition(nmxm_partition) {
+                        tracing::error!(
+                            "No partition found with nmx_m_id = {} while processing removal of GPU {gpu:?} in admin network",
+                            nmxm_partition.id,
+                        );
+                    }
                     continue;
                 };
 
@@ -1338,92 +1328,105 @@ impl NvlPartitionMonitor {
                 match operation.operation_type {
                     NmxmPartitionOperationType::Create => {
                         // Create the nvl partition.
+                        let name =
+                            format!("{}{}", logical_partition_id, operation.gpu_ids.join(","));
+                        // NMX-M has a limit of 244 characters for the partition name
+                        let name: String = name.chars().take(240).collect();
                         let request = libnmxm::nmxm_model::CreatePartitionRequest {
                             // For integration test to pass, till we can fix SimClient to cache partition info dynamically
-                            name: format!(
-                                "{}{}",
-                                logical_partition_id,
-                                operation.gpu_ids.join(",")
-                            ),
+                            name,
                             members: Box::new(libnmxm::nmxm_model::PartitionMembers::Ids(
                                 operation.gpu_ids.clone(),
                             )),
                         };
-                        let result =
-                            nmxm_client
-                                .create_partition(Some(request))
-                                .await
-                                .map_err(|e| {
-                                    CarbideError::internal(format!(
-                                        "Failed to create partition: {e}"
-                                    ))
-                                })?;
-                        pending_operations
-                            .entry(logical_partition_id)
-                            .and_modify(|ops| {
-                                ops.push(NmxmPartitionOperation {
-                                    domain_uuid: operation.domain_uuid,
-                                    operation_type: NmxmPartitionOperationType::Pending(
-                                        result.operation_id.clone(),
-                                    ),
-                                    original_operation_type: Some(
-                                        NmxmPartitionOperationType::Create,
-                                    ),
-                                    gpu_ids: operation.gpu_ids.clone(),
-                                    name: operation.name.clone(),
-                                    db_partition_id: operation.db_partition_id,
-                                });
-                            })
-                            .or_insert(vec![NmxmPartitionOperation {
-                                domain_uuid: operation.domain_uuid,
-                                operation_type: NmxmPartitionOperationType::Pending(
-                                    result.operation_id.clone(),
-                                ),
-                                original_operation_type: Some(NmxmPartitionOperationType::Create),
-                                gpu_ids: operation.gpu_ids.clone(),
-                                name: operation.name.clone(),
-                                db_partition_id: operation.db_partition_id,
-                            }]);
+                        match nmxm_client.create_partition(Some(request)).await {
+                            Ok(result) => {
+                                pending_operations
+                                    .entry(logical_partition_id)
+                                    .and_modify(|ops| {
+                                        ops.push(NmxmPartitionOperation {
+                                            domain_uuid: operation.domain_uuid,
+                                            operation_type: NmxmPartitionOperationType::Pending(
+                                                result.operation_id.clone(),
+                                            ),
+                                            original_operation_type: Some(
+                                                NmxmPartitionOperationType::Create,
+                                            ),
+                                            gpu_ids: operation.gpu_ids.clone(),
+                                            name: operation.name.clone(),
+                                            db_partition_id: operation.db_partition_id,
+                                        });
+                                    })
+                                    .or_insert(vec![NmxmPartitionOperation {
+                                        domain_uuid: operation.domain_uuid,
+                                        operation_type: NmxmPartitionOperationType::Pending(
+                                            result.operation_id.clone(),
+                                        ),
+                                        original_operation_type: Some(
+                                            NmxmPartitionOperationType::Create,
+                                        ),
+                                        gpu_ids: operation.gpu_ids.clone(),
+                                        name: operation.name.clone(),
+                                        db_partition_id: operation.db_partition_id,
+                                    }]);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    %logical_partition_id,
+                                    "Failed to issue create partition to NMX-M, continuing with other operations: {e}"
+                                );
+                            }
+                        }
                     }
                     NmxmPartitionOperationType::Remove(nmx_m_partition_id) => {
                         // Remove from the partition.
 
-                        let result = nmxm_client
+                        match nmxm_client
                             .delete_partition(nmx_m_partition_id.clone())
                             .await
-                            .map_err(|e| {
-                                CarbideError::internal(format!("Failed to create partition: {e}"))
-                            })?;
-                        pending_operations
-                            .entry(logical_partition_id)
-                            .and_modify(|ops| {
-                                ops.push(NmxmPartitionOperation {
-                                    domain_uuid: operation.domain_uuid,
-                                    operation_type: NmxmPartitionOperationType::Pending(
-                                        result.operation_id.clone(),
-                                    ),
-                                    original_operation_type: Some(
-                                        NmxmPartitionOperationType::Remove(
-                                            nmx_m_partition_id.clone(),
+                        {
+                            Ok(result) => {
+                                pending_operations
+                                    .entry(logical_partition_id)
+                                    .and_modify(|ops| {
+                                        ops.push(NmxmPartitionOperation {
+                                            domain_uuid: operation.domain_uuid,
+                                            operation_type: NmxmPartitionOperationType::Pending(
+                                                result.operation_id.clone(),
+                                            ),
+                                            original_operation_type: Some(
+                                                NmxmPartitionOperationType::Remove(
+                                                    nmx_m_partition_id.clone(),
+                                                ),
+                                            ),
+                                            gpu_ids: operation.gpu_ids.clone(),
+                                            name: operation.name.clone(),
+                                            db_partition_id: operation.db_partition_id,
+                                        });
+                                    })
+                                    .or_insert(vec![NmxmPartitionOperation {
+                                        domain_uuid: operation.domain_uuid,
+                                        operation_type: NmxmPartitionOperationType::Pending(
+                                            result.operation_id.clone(),
                                         ),
-                                    ),
-                                    gpu_ids: operation.gpu_ids.clone(),
-                                    name: operation.name.clone(),
-                                    db_partition_id: operation.db_partition_id,
-                                });
-                            })
-                            .or_insert(vec![NmxmPartitionOperation {
-                                domain_uuid: operation.domain_uuid,
-                                operation_type: NmxmPartitionOperationType::Pending(
-                                    result.operation_id.clone(),
-                                ),
-                                original_operation_type: Some(NmxmPartitionOperationType::Remove(
-                                    nmx_m_partition_id.clone(),
-                                )),
-                                gpu_ids: operation.gpu_ids.clone(),
-                                name: operation.name.clone(),
-                                db_partition_id: operation.db_partition_id,
-                            }]);
+                                        original_operation_type: Some(
+                                            NmxmPartitionOperationType::Remove(
+                                                nmx_m_partition_id.clone(),
+                                            ),
+                                        ),
+                                        gpu_ids: operation.gpu_ids.clone(),
+                                        name: operation.name.clone(),
+                                        db_partition_id: operation.db_partition_id,
+                                    }]);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    %logical_partition_id,
+                                    %nmx_m_partition_id,
+                                    "Failed to issue delete partition to NMX-M, continuing with other operations: {e}"
+                                );
+                            }
+                        }
                     }
                     NmxmPartitionOperationType::RemoveDefaultPartition(nmx_m_partition_id) => {
                         tracing::info!("NOT Removing default partition {nmx_m_partition_id}");
@@ -1476,42 +1479,52 @@ impl NvlPartitionMonitor {
                                 operation.gpu_ids.clone(),
                             )),
                         };
-                        let result = nmxm_client
+                        match nmxm_client
                             .update_partition(nmx_m_partition_id.clone(), request)
                             .await
-                            .map_err(|e| {
-                                CarbideError::internal(format!("Failed to update partition: {e}"))
-                            })?;
-                        pending_operations
-                            .entry(logical_partition_id)
-                            .and_modify(|ops| {
-                                ops.push(NmxmPartitionOperation {
-                                    domain_uuid: operation.domain_uuid,
-                                    operation_type: NmxmPartitionOperationType::Pending(
-                                        result.operation_id.clone(),
-                                    ),
-                                    original_operation_type: Some(
-                                        NmxmPartitionOperationType::Update(
-                                            nmx_m_partition_id.clone(),
+                        {
+                            Ok(result) => {
+                                pending_operations
+                                    .entry(logical_partition_id)
+                                    .and_modify(|ops| {
+                                        ops.push(NmxmPartitionOperation {
+                                            domain_uuid: operation.domain_uuid,
+                                            operation_type: NmxmPartitionOperationType::Pending(
+                                                result.operation_id.clone(),
+                                            ),
+                                            original_operation_type: Some(
+                                                NmxmPartitionOperationType::Update(
+                                                    nmx_m_partition_id.clone(),
+                                                ),
+                                            ),
+                                            gpu_ids: operation.gpu_ids.clone(),
+                                            name: operation.name.clone(),
+                                            db_partition_id: operation.db_partition_id,
+                                        });
+                                    })
+                                    .or_insert(vec![NmxmPartitionOperation {
+                                        domain_uuid: operation.domain_uuid,
+                                        operation_type: NmxmPartitionOperationType::Pending(
+                                            result.operation_id.clone(),
                                         ),
-                                    ),
-                                    gpu_ids: operation.gpu_ids.clone(),
-                                    name: operation.name.clone(),
-                                    db_partition_id: operation.db_partition_id,
-                                });
-                            })
-                            .or_insert(vec![NmxmPartitionOperation {
-                                domain_uuid: operation.domain_uuid,
-                                operation_type: NmxmPartitionOperationType::Pending(
-                                    result.operation_id.clone(),
-                                ),
-                                original_operation_type: Some(NmxmPartitionOperationType::Update(
-                                    nmx_m_partition_id.clone(),
-                                )),
-                                gpu_ids: operation.gpu_ids.clone(),
-                                name: operation.name.clone(),
-                                db_partition_id: operation.db_partition_id,
-                            }]);
+                                        original_operation_type: Some(
+                                            NmxmPartitionOperationType::Update(
+                                                nmx_m_partition_id.clone(),
+                                            ),
+                                        ),
+                                        gpu_ids: operation.gpu_ids.clone(),
+                                        name: operation.name.clone(),
+                                        db_partition_id: operation.db_partition_id,
+                                    }]);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    %logical_partition_id,
+                                    %nmx_m_partition_id,
+                                    "Failed to issue update partition to NMX-M, continuing with other operations: {e}"
+                                );
+                            }
+                        }
                     }
                     NmxmPartitionOperationType::Pending(_operation_id) => {
                         // This will be handled by the poll_nmx_m_operations_with_timeout function, there should not be any Pending operations in this step.
@@ -1561,7 +1574,7 @@ impl NvlPartitionMonitor {
                             continue;
                         }
                     };
-                    let result = nmxm_client
+                    let get_operation_result = nmxm_client
                         .get_operation(operation_id.to_string())
                         .await
                         .map_err(|e| {
@@ -1572,16 +1585,20 @@ impl NvlPartitionMonitor {
                             ))
                         })?;
 
-                    match result.status {
+                    match get_operation_result.status {
                         libnmxm::nmxm_model::OperationStatus::Completed => {
                             tracing::info!(
-                                "Operation {operation:?} for logical partition {logical_partition_id} completed successfully"
+                                "Operation {get_operation_result:?} for logical partition {logical_partition_id} completed successfully"
                             );
                             completed_operations_for_this_logical_partition.push(operation.clone());
                             operations_to_remove.push(*logical_partition_id);
 
                             let applied_change = AppliedChange {
-                                operation: operation.operation_type.clone().into(),
+                                operation: operation
+                                    .original_operation_type
+                                    .clone()
+                                    .unwrap_or_else(|| operation.operation_type.clone())
+                                    .into(),
                                 status: NmxmPartitionOperationStatus::Completed,
                             };
                             *metrics
@@ -1595,13 +1612,25 @@ impl NvlPartitionMonitor {
                                 .push(start_time.elapsed());
                         }
                         libnmxm::nmxm_model::OperationStatus::Failed => {
-                            tracing::error!(
-                                "Operation {operation:?} for logical partition {logical_partition_id} failed with error"
-                            );
+                            if let Some(result) = get_operation_result.result.as_ref() {
+                                let error = result.error.as_deref().unwrap_or_default();
+                                let error_details = result.details.as_deref().unwrap_or_default();
+                                tracing::error!(
+                                    "Operation {get_operation_result:?} for logical partition {logical_partition_id} failed with error: {error} {error_details}"
+                                );
+                            } else {
+                                tracing::error!(
+                                    "Operation {get_operation_result:?} for logical partition {logical_partition_id} failed with unknown error"
+                                );
+                            }
                             operations_to_remove.push(*logical_partition_id);
 
                             let applied_change = AppliedChange {
-                                operation: operation.operation_type.clone().into(),
+                                operation: operation
+                                    .original_operation_type
+                                    .clone()
+                                    .unwrap_or_else(|| operation.operation_type.clone())
+                                    .into(),
                                 status: NmxmPartitionOperationStatus::Failed,
                             };
                             *metrics
@@ -1625,7 +1654,11 @@ impl NvlPartitionMonitor {
                             operations_to_remove.push(*logical_partition_id);
 
                             let applied_change = AppliedChange {
-                                operation: operation.operation_type.clone().into(),
+                                operation: operation
+                                    .original_operation_type
+                                    .clone()
+                                    .unwrap_or_else(|| operation.operation_type.clone())
+                                    .into(),
                                 status: NmxmPartitionOperationStatus::Cancelled,
                             };
                             *metrics
@@ -1661,7 +1694,11 @@ impl NvlPartitionMonitor {
         for (logical_partition_id, operation) in pending_nmx_m_operations {
             for op in &operation {
                 let applied_change = AppliedChange {
-                    operation: op.operation_type.clone().into(),
+                    operation: op
+                        .original_operation_type
+                        .clone()
+                        .unwrap_or_else(|| op.operation_type.clone())
+                        .into(),
                     status: NmxmPartitionOperationStatus::Timedout,
                 };
                 *metrics

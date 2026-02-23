@@ -516,6 +516,25 @@ pub async fn final_delete(
     Ok(partition)
 }
 
+/// Counts the number of instances that reference a given IB partition in their ib_config.
+pub async fn count_instances_referencing_partition(
+    txn: impl DbReader<'_>,
+    partition_id: IBPartitionId,
+) -> Result<i64, DatabaseError> {
+    let query = "
+        SELECT count(*) FROM instances
+        WHERE (ib_config -> 'ib_interfaces')
+              @> jsonb_build_array(jsonb_build_object('ib_partition_id', $1::text))
+    ";
+    let (count,): (i64,) = sqlx::query_as(query)
+        .bind(partition_id.to_string())
+        .fetch_one(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(count)
+}
+
 pub async fn update(
     value: &IBPartition,
     txn: &mut PgConnection,

@@ -1,7 +1,9 @@
 # Help! My Instance/Subnet/VPC is stuck in a certain state
 
-A common issue that is observed in Forge sites is that objects do not move into
-the desired state - even after a Forge user waited for a long amount of time.
+A common issue that is observed in sites managed by NVIDIA Bare Metal Manager
+(BMM) is that objects do not move into the desired state - even after a user waits
+for a long amount of time.
+
 Examples of these problems are:
 - Instances are not getting provisioned (are stuck in `Provisioning` state)
 - Instances are not getting released (are stuck in `Terminating` state)

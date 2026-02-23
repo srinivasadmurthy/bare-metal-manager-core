@@ -36,6 +36,7 @@ use db::work_lock_manager::WorkLockManagerHandle;
 use db::{DatabaseError, DatabaseResult, WithTransaction};
 use forge_secrets::certificates::CertificateProvider;
 use forge_secrets::credentials::CredentialProvider;
+use librms::RmsApi;
 use model::machine::Machine;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::resource_pool::common::CommonPools;
@@ -50,7 +51,6 @@ use crate::ethernet_virtualization::EthVirtData;
 use crate::ib::IBFabricManager;
 use crate::logging::log_limiter::LogLimiter;
 use crate::nvlink::NmxmClientPool;
-use crate::rack::rms_client::RmsApi;
 use crate::redfish::RedfishClientPool;
 use crate::scout_stream::ConnectionRegistry;
 use crate::site_explorer::EndpointExplorer;
@@ -708,6 +708,13 @@ impl Forge for Api {
         Err(Status::unimplemented(
             "not implemented yet -- under construction",
         ))
+    }
+
+    async fn find_rack_state_histories(
+        &self,
+        request: tonic::Request<rpc::RackStateHistoriesRequest>,
+    ) -> Result<Response<rpc::RackStateHistories>, Status> {
+        crate::handlers::rack::find_rack_state_histories(self, request).await
     }
 
     async fn find_switch_state_histories(

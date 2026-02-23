@@ -19,7 +19,7 @@
 //!
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::ops::Deref;
 use std::str::FromStr;
 
@@ -92,8 +92,7 @@ pub async fn get_or_create(
 ) -> DatabaseResult<Machine> {
     let existing_machine =
         find_one(&mut *txn, stable_machine_id, MachineSearchConfig::default()).await?;
-    if interface.machine_id.is_some() {
-        let machine_id = interface.machine_id.as_ref().unwrap();
+    if let Some(machine_id) = interface.machine_id.as_ref() {
         if machine_id != stable_machine_id {
             return Err(DatabaseError::internal(format!(
                 "Database inconsistency: MachineId {} on interface {} does not match stable machine ID {} which now uses this interface",
@@ -298,7 +297,7 @@ pub async fn find(
 
 pub async fn find_by_ip(
     txn: &mut PgConnection,
-    ip: &Ipv4Addr,
+    ip: &IpAddr,
 ) -> Result<Option<Machine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
@@ -517,7 +516,7 @@ pub async fn find_by_query(
         return find_one(txn, &id, MachineSearchConfig::default()).await;
     }
 
-    if let Ok(ip) = Ipv4Addr::from_str(query) {
+    if let Ok(ip) = IpAddr::from_str(query) {
         return find_by_ip(txn, &ip).await;
     }
 
@@ -541,17 +540,18 @@ pub async fn update_reboot_time(
     Ok(())
 }
 
-pub async fn update_reboot_requested_time(
+pub async fn update_reboot_requested_explicit_time(
     machine_id: &MachineId,
     txn: &mut PgConnection,
     mode: MachineLastRebootRequestedMode,
+    time: DateTime<Utc>,
 ) -> Result<(), DatabaseError> {
     let mut restart_verified = None;
     if matches!(mode, MachineLastRebootRequestedMode::Reboot) {
         restart_verified = Some(false);
     }
     let data = MachineLastRebootRequested {
-        time: chrono::Utc::now(),
+        time,
         mode,
         restart_verified,
         verification_attempts: Some(0),
@@ -565,6 +565,14 @@ pub async fn update_reboot_requested_time(
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
     Ok(())
+}
+
+pub async fn update_reboot_requested_time(
+    machine_id: &MachineId,
+    txn: &mut PgConnection,
+    mode: MachineLastRebootRequestedMode,
+) -> Result<(), DatabaseError> {
+    update_reboot_requested_explicit_time(machine_id, txn, mode, Utc::now()).await
 }
 
 pub async fn update_restart_verification_status(
@@ -1350,12 +1358,20 @@ pub async fn trigger_dpu_reprovisioning_request(
     Ok(())
 }
 
-// Update reprovision start time.
+// Update reprovision start time to the current time
 pub async fn update_dpu_reprovision_start_time(
     machine_id: &MachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
-    let current_time = chrono::Utc::now();
+    update_dpu_reprovision_explicit_start_time(machine_id, chrono::Utc::now(), txn).await
+}
+
+// Update reprovision start time to a specific start time
+pub async fn update_dpu_reprovision_explicit_start_time(
+    machine_id: &MachineId,
+    time: DateTime<Utc>,
+    txn: &mut PgConnection,
+) -> Result<(), DatabaseError> {
     let query = r#"UPDATE machines
                         SET reprovisioning_requested=
                                     jsonb_set(reprovisioning_requested,
@@ -1363,7 +1379,7 @@ pub async fn update_dpu_reprovision_start_time(
                        WHERE id=$1 RETURNING id"#;
     let _id = sqlx::query_as::<_, MachineId>(query)
         .bind(machine_id)
-        .bind(sqlx::types::Json(current_time))
+        .bind(sqlx::types::Json(time))
         .fetch_one(txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
@@ -1371,11 +1387,19 @@ pub async fn update_dpu_reprovision_start_time(
     Ok(())
 }
 
+// Update reprovision start time to the current time
 pub async fn update_host_reprovision_start_time(
     machine_id: &MachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
-    let current_time = chrono::Utc::now();
+    update_host_reprovision_explicit_start_time(machine_id, chrono::Utc::now(), txn).await
+}
+
+pub async fn update_host_reprovision_explicit_start_time(
+    machine_id: &MachineId,
+    time: DateTime<Utc>,
+    txn: &mut PgConnection,
+) -> Result<(), DatabaseError> {
     let query = r#"UPDATE machines
                         SET host_reprovisioning_requested=
                                     jsonb_set(host_reprovisioning_requested,
@@ -1383,7 +1407,7 @@ pub async fn update_host_reprovision_start_time(
                        WHERE id=$1 RETURNING id"#;
     let _id = sqlx::query_as::<_, MachineId>(query)
         .bind(machine_id)
-        .bind(sqlx::types::Json(current_time))
+        .bind(sqlx::types::Json(time))
         .fetch_one(txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
@@ -1603,10 +1627,9 @@ pub async fn apply_agent_upgrade_policy(
         None => Ok(false),
         Some(obs) => {
             let carbide_api_version = carbide_version::v!(build_version);
-            if obs.agent_version.is_none() {
+            let Some(agent_version) = obs.agent_version.clone() else {
                 return Ok(false);
-            }
-            let agent_version = obs.agent_version.as_ref().cloned().unwrap();
+            };
             let should_upgrade = policy.should_upgrade(&agent_version, carbide_api_version);
             if should_upgrade != machine.needs_agent_upgrade() {
                 set_dpu_agent_upgrade_requested(

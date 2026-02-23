@@ -1,13 +1,13 @@
 # Codebase overview
 
 
-bluefield/ - `forge-dpu-agent` and other tools running on the DPU
+bluefield/ - `dpu-agent` and other tools running on the DPU
 
 book/ - architecture of forge book.  aka "the book"
 
 - admin/ - `carbide-admin-cli`: A command line client for the carbide API server
 - api/ - forge primary entrypoint for GRPC API calls. This component receives all the  GRPC calls
-- scout/ - `forge-scout`. A binary that runs on Forge managed hosts and DPUs and executes various parts workflows on behalf of the site controller
+- scout/ - `forge-scout`. A binary that runs on NVIDIA Bare Metal Manager (BMM) managed hosts and DPUs and executes various parts workflows on behalf of the site controller
 
 dev/ - a catch all directory for things that are not code related but are used to support forge.  e.g. Dockerfiles, kubernetes yaml, etc.
 

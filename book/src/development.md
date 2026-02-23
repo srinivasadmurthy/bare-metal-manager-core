@@ -1,9 +1,6 @@
 # Development
 
-We aim to keep the development environment as self-contained and automated as
-possible. Each time we onboard new staff, we want to enshrine more of each
-development cluster bring up into tooling instead of institutional knowledge.
-To that end, we are using docker-compose to instantiate a development
+NVIDIA Bare Metal Manager (BMM) uses docker-compose to instantiate a development
 environment.
 
 ## Local environment prep
@@ -79,7 +76,7 @@ environment.
 8. Install `direnv` using your package manager
 
    It would be best to install `direnv` on your host. `direnv` requires a shell hook to work.  See `man direnv` (after install) for
-   more information on setting it up.  Once you clone the `carbide` repo, you need to run `direnv allow` the first time you cd into your local copy.
+   more information on setting it up. Once you clone the `bare-metal-manager-core` repo, you need to run `direnv allow` the first time you cd into your local copy.
    Running `direnv allow` exports the necessary environmental variables while in the repo and cleans up when not in the repo.
 
    There are preset environment variables that are used throughout the repo. `${REPO_ROOT}` represents the top of the forge repo tree.
@@ -184,7 +181,7 @@ Cleanup, otherwise docker-compose won't work later:
 
 ## IDE
 
-Recommended IDE for Rust development in the Carbide project is CLion, IntelliJ works as well but includes a lot of extra components that you don't need. There are plenty
+Recommended IDE for Rust development in the BMM project is CLion, IntelliJ works as well but includes a lot of extra components that you don't need. There are plenty
 of options (VS Code, NeoVim etc), but CLion/IntelliJ is widely used.
 
 One thing to note regardless of what IDE you choose: if you're running on Linux DO NOT USE Snap or Flatpak versions of the software packages. These builds introduce a number

@@ -20,7 +20,6 @@ use model::switch::{Switch, SwitchControllerState};
 
 use crate::state_controller::state_handler::{
     StateHandler, StateHandlerContext, StateHandlerError, StateHandlerOutcome,
-    StateHandlerOutcomeWithTransaction,
 };
 use crate::state_controller::switch::context::SwitchStateHandlerContextObjects;
 
@@ -41,7 +40,7 @@ impl StateHandler for SwitchStateHandler {
         state: &mut Switch,
         controller_state: &Self::ControllerState,
         ctx: &mut StateHandlerContext<Self::ContextObjects>,
-    ) -> Result<StateHandlerOutcomeWithTransaction<SwitchControllerState>, StateHandlerError> {
+    ) -> Result<StateHandlerOutcome<SwitchControllerState>, StateHandlerError> {
         match controller_state {
             SwitchControllerState::Initializing => {
                 // TODO: Implement Switch initialization logic
@@ -50,7 +49,7 @@ impl StateHandler for SwitchStateHandler {
                 // 2. Allocating resources
                 tracing::info!("Initializing Switch");
                 let new_state = SwitchControllerState::FetchingData;
-                Ok(StateHandlerOutcome::transition(new_state).with_txn(None))
+                Ok(StateHandlerOutcome::transition(new_state))
             }
 
             SwitchControllerState::FetchingData => {
@@ -60,7 +59,7 @@ impl StateHandler for SwitchStateHandler {
                 // 1. Fetching data from the Switch
                 // 2. Updating the Switch status
                 let new_state = SwitchControllerState::Configuring;
-                Ok(StateHandlerOutcome::transition(new_state).with_txn(None))
+                Ok(StateHandlerOutcome::transition(new_state))
             }
 
             SwitchControllerState::Configuring => {
@@ -70,7 +69,7 @@ impl StateHandler for SwitchStateHandler {
                 // 1. Configuring the Switch
                 // 2. Updating the Switch status
                 let new_state = SwitchControllerState::Ready;
-                Ok(StateHandlerOutcome::transition(new_state).with_txn(None))
+                Ok(StateHandlerOutcome::transition(new_state))
             }
 
             SwitchControllerState::Deleting => {
@@ -84,16 +83,15 @@ impl StateHandler for SwitchStateHandler {
                 // For now, just delete the Switch from the database
                 let mut txn = ctx.services.db_pool.begin().await?;
                 db_switch::final_delete(*switch_id, &mut txn).await?;
-                Ok(StateHandlerOutcome::deleted().with_txn(Some(txn)))
+                Ok(StateHandlerOutcome::deleted().with_txn(txn))
             }
 
             SwitchControllerState::Ready => {
                 tracing::info!("Switch is ready");
                 if state.is_marked_as_deleted() {
-                    Ok(
-                        StateHandlerOutcome::transition(SwitchControllerState::Deleting)
-                            .with_txn(None),
-                    )
+                    Ok(StateHandlerOutcome::transition(
+                        SwitchControllerState::Deleting,
+                    ))
                 } else {
                     // TODO: Implement Switch monitoring logic
                     // This would typically involve:
@@ -101,20 +99,19 @@ impl StateHandler for SwitchStateHandler {
                     // 2. Updating Switch status
 
                     // For now, just do nothing
-                    Ok(StateHandlerOutcome::do_nothing().with_txn(None))
+                    Ok(StateHandlerOutcome::do_nothing())
                 }
             }
 
             SwitchControllerState::Error { .. } => {
                 tracing::info!("Switch is in error state");
                 if state.is_marked_as_deleted() {
-                    Ok(
-                        StateHandlerOutcome::transition(SwitchControllerState::Deleting)
-                            .with_txn(None),
-                    )
+                    Ok(StateHandlerOutcome::transition(
+                        SwitchControllerState::Deleting,
+                    ))
                 } else {
                     // If Switch is in error state, keep it there for manual intervention
-                    Ok(StateHandlerOutcome::do_nothing().with_txn(None))
+                    Ok(StateHandlerOutcome::do_nothing())
                 }
             }
         }

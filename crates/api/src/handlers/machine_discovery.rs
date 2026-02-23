@@ -24,15 +24,16 @@ pub use ::rpc::forge as rpc;
 use carbide_uuid::nvlink::NvLinkDomainId;
 use db::WithTransaction;
 use futures_util::FutureExt;
-use model::hardware_info::{HardwareInfo, MachineNvLinkInfo, NvLinkGpu};
+use model::hardware_info::{GpuPlatformInfo, HardwareInfo, MachineNvLinkInfo, NvLinkGpu};
 use model::machine::machine_id::{from_hardware_info, host_id_from_dpu_hardware_info};
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::{DpuInitState, DpuInitStates, ManagedHostState};
 use tonic::{Request, Response, Status};
 
 use crate::api::{Api, log_machine_id, log_request_data};
+use crate::cfg::file::NvLinkConfig;
 use crate::handlers::utils::convert_and_log_machine_id;
-use crate::{CarbideError, attestation as attest};
+use crate::{CarbideError, CarbideResult, attestation as attest};
 
 pub(crate) async fn discover_machine(
     api: &Api,
@@ -100,52 +101,13 @@ pub(crate) async fn discover_machine(
         && let Some(nvlink_config) = api.runtime_config.nvlink_config.as_ref()
         && nvlink_config.enabled
     {
-        let nmx_m_client = api
-            .nmxm_pool
-            .create_client(&nvlink_config.nmx_m_endpoint, None)
+        get_nvlink_info_from_nmx_m(api, nvlink_config, platform_info)
             .await
-            .map_err(|e| CarbideError::internal(format!("Failed to create NMX-M client: {e}")))?;
-
-        // Turns out this would also be a good place to get the NMX-M ID for the GPUs. So instead of getting the chassis list, we should get the GPUs list.
-        let nmx_m_gpu_list = nmx_m_client
-            .get_gpu(None)
-            .await
-            .map_err(|e| CarbideError::internal(format!("Failed to get compute nodes: {e}")))?;
-
-        // Get the list of GPUs which match the location info returned from scout.
-        let matching_gpus = nmx_m_gpu_list
-            .iter()
-            .filter(|gpu| {
-                // If NMX-M GPU location info tray index matches the tray index returned from scout.
-                gpu.location_info
-                    .as_ref()
-                    .map(|info| {
-                        info.tray_index.unwrap_or_default() as u32 == platform_info.tray_index
-                            && info.slot_id.unwrap_or_default() as u32 == platform_info.slot_number
-                            && info.chassis_serial_number.as_deref().unwrap_or_default()
-                                == platform_info.chassis_serial
-                    })
-                    .unwrap_or(false)
+            .map_err(|e| {
+                tracing::warn!("Failed to get NVLink info from NMX-M: {e}");
+                e
             })
-            .collect::<Vec<_>>();
-
-        let domain_uuid = matching_gpus
-            .first()
-            .and_then(|gpu| gpu.domain_uuid)
-            .ok_or_else(|| {
-                CarbideError::internal(format!(
-                    "Failed to find domain UUID for GPUs: {matching_gpus:?}"
-                ))
-            })?;
-
-        Some(MachineNvLinkInfo {
-            domain_uuid: NvLinkDomainId::from(domain_uuid),
-            gpus: matching_gpus
-                .into_iter()
-                .cloned()
-                .map(NvLinkGpu::from)
-                .collect(),
-        })
+            .ok()
     } else {
         None
     };
@@ -363,41 +325,25 @@ pub(crate) async fn discover_machine(
     // Whoever was able to decrypt it (activate credential), possesses
     // the TPM that the endorsement key (EK) and the attestation key (AK) that they came from.
     // if attestation is not enabled, or it is a DPU, then issue machine certificates immediately
-    #[cfg(feature = "linux-build")]
-    let mut attest_key_bind_challenge_opt: Option<rpc::AttestKeyBindChallenge> = None;
-    let mut make_machine_certificate = false;
-    #[cfg(not(feature = "linux-build"))]
-    let attest_key_bind_challenge_opt: Option<rpc::AttestKeyBindChallenge> = None;
-
-    if api.runtime_config.attestation_enabled && !hardware_info.is_dpu() {
-        #[cfg(feature = "linux-build")]
-        if let Some(attest_key_info) = attest_key_info_opt {
-            tracing::info!(
-                "It is not a DPU and attestation is enabled. Generating Attest Key Bind Challenge ..."
-            );
-
-            attest_key_bind_challenge_opt = Some(
-                crate::handlers::measured_boot::create_attest_key_bind_challenge(
-                    &mut txn,
-                    &attest_key_info,
-                    &stable_machine_id,
-                )
-                .await?,
-            );
-        } else {
+    let attest_key_challenge = if api.runtime_config.attestation_enabled && !hardware_info.is_dpu()
+    {
+        let Some(attest_key_info) = attest_key_info_opt else {
             return Err(Status::invalid_argument(
                 "Internal Error: This should have been handled above! AttestKeyInfo is not populated.",
             ));
-        }
+        };
 
-        #[cfg(not(feature = "linux-build"))]
-        {
-            tracing::warn!(
-                %stable_machine_id,
-                "Attestation enabled but linux-build feature disabled; vending certificate without attestation challenge"
-            );
-            make_machine_certificate = true;
-        }
+        tracing::info!(
+            "It is not a DPU and attestation is enabled. Generating Attest Key Bind Challenge ..."
+        );
+        Some(
+            crate::handlers::measured_boot::create_attest_key_bind_challenge(
+                &mut txn,
+                &attest_key_info,
+                &stable_machine_id,
+            )
+            .await?,
+        )
     } else {
         tracing::info!(
             "Attestation enabled is {}. Is_DPU is {}. Vending certs to machine with id {}",
@@ -406,12 +352,8 @@ pub(crate) async fn discover_machine(
             stable_machine_id,
         );
 
-        // Don't make the certificate here, wait until we commit the transaction
-        #[cfg(feature = "linux-build")]
-        {
-            make_machine_certificate = true;
-        }
-    }
+        None
+    };
 
     if let Some(nvlink_info) = nvlink_info {
         db::machine::update_nvlink_info(&mut txn, &machine_id, nvlink_info).await?;
@@ -419,15 +361,16 @@ pub(crate) async fn discover_machine(
 
     txn.commit().await?;
 
-    let machine_certificate = if make_machine_certificate {
+    let machine_certificate = if attest_key_challenge.is_none() {
         if std::env::var("UNSUPPORTED_CERTIFICATE_PROVIDER").is_ok() {
-            Some(forge_secrets::certificates::Certificate::default())
+            Some(rpc::MachineCertificate::default())
         } else {
             Some(
                 api.certificate_provider
                     .get_certificate(&stable_machine_id.to_string(), None, None)
                     .await
-                    .map_err(|err| CarbideError::ClientCertificateError(err.to_string()))?,
+                    .map_err(|err| CarbideError::ClientCertificateError(err.to_string()))?
+                    .into(),
             )
         }
     } else {
@@ -436,8 +379,8 @@ pub(crate) async fn discover_machine(
 
     let response = Ok(Response::new(rpc::MachineDiscoveryResult {
         machine_id: Some(stable_machine_id),
-        machine_certificate: machine_certificate.map(Into::into),
-        attest_key_challenge: attest_key_bind_challenge_opt,
+        machine_certificate,
+        attest_key_challenge,
         machine_interface_id: Some(interface.id),
     }));
 
@@ -489,4 +432,57 @@ pub(crate) async fn discovery_completed(
         discovery_result, "discovery_completed",
     );
     Ok(Response::new(rpc::MachineDiscoveryCompletedResponse {}))
+}
+
+// Match up the platform info from scout with the GPU data from NMX-M to get the domain UUID and NMX-M GPU IDs.
+async fn get_nvlink_info_from_nmx_m(
+    api: &Api,
+    nvlink_config: &NvLinkConfig,
+    platform_info: &GpuPlatformInfo,
+) -> CarbideResult<MachineNvLinkInfo> {
+    let nmx_m_client = api
+        .nmxm_pool
+        .create_client(&nvlink_config.nmx_m_endpoint, None)
+        .await
+        .map_err(|e| CarbideError::internal(format!("Failed to create NMX-M client: {e}")))?;
+
+    let nmx_m_gpu_list = nmx_m_client
+        .get_gpu(None)
+        .await
+        .map_err(|e| CarbideError::internal(format!("Failed to get compute nodes: {e}")))?;
+
+    // Get the list of GPUs which match the location info returned from scout.
+    let matching_gpus = nmx_m_gpu_list
+        .iter()
+        .filter(|gpu| {
+            // If NMX-M GPU location info tray index matches the tray index returned from scout.
+            gpu.location_info
+                .as_ref()
+                .map(|info| {
+                    info.tray_index.unwrap_or_default() as u32 == platform_info.tray_index
+                        && info.slot_id.unwrap_or_default() as u32 == platform_info.slot_number
+                        && info.chassis_serial_number.as_deref().unwrap_or_default()
+                            == platform_info.chassis_serial
+                })
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    let domain_uuid = matching_gpus
+        .first()
+        .and_then(|gpu| gpu.domain_uuid)
+        .ok_or_else(|| {
+            CarbideError::internal(format!(
+                "Failed to find domain UUID for GPUs: {matching_gpus:?}"
+            ))
+        })?;
+
+    Ok(MachineNvLinkInfo {
+        domain_uuid: NvLinkDomainId::from(domain_uuid),
+        gpus: matching_gpus
+            .into_iter()
+            .cloned()
+            .map(NvLinkGpu::from)
+            .collect(),
+    })
 }
