@@ -1303,6 +1303,7 @@ pub async fn create(
         .bind(sqlx::types::Json(Dpf {
             enabled: dpf_enabled,
             used_for_ingestion: false,
+            astra_enabled: false,
         }))
         .fetch_one(&mut *txn)
         .await
@@ -2248,6 +2249,20 @@ pub async fn mark_machine_ingestion_done_with_dpf(
     machine_id: &MachineId,
 ) -> Result<(), DatabaseError> {
     let query = "UPDATE machines set dpf = jsonb_set(dpf, '{used_for_ingestion}', to_jsonb(true)) WHERE id=$1";
+    sqlx::query(query)
+        .bind(machine_id)
+        .execute(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(())
+}
+
+pub async fn mark_machine_astra_enabled(
+    txn: &mut PgConnection,
+    machine_id: &MachineId,
+) -> Result<(), DatabaseError> {
+    let query = "UPDATE machines set dpf = jsonb_set(dpf, '{astra_enabled}', to_jsonb(true)) WHERE id=$1";
     sqlx::query(query)
         .bind(machine_id)
         .execute(txn)

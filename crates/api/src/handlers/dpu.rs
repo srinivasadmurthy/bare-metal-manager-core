@@ -35,7 +35,7 @@ use model::instance::config::extension_services::InstanceExtensionServiceConfig;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::network::MachineNetworkStatusObservation;
 use model::machine::upgrade_policy::{AgentUpgradePolicy, BuildVersion};
-use model::machine::{InstanceState, LoadSnapshotOptions, ManagedHostState};
+use model::machine::{Machine, InstanceState, LoadSnapshotOptions, ManagedHostState};
 use model::machine_update_module::HOST_UPDATE_HEALTH_PROBE_ID;
 use model::network_segment::NetworkSegmentSearchConfig;
 use tonic::{Request, Response, Status};
@@ -50,6 +50,14 @@ use crate::{CarbideError, ethernet_virtualization};
 /// vxlan48 is special HBN single vxlan device. It handles networking between machines on the
 /// same subnet. It handles the encapsulation into VXLAN and VNI for cross-host comms.
 const HBN_SINGLE_VLAN_DEVICE: &str = "vxlan48";
+
+async fn get_spx_config_for_astra(
+    _host_snapshot: &Machine,
+    _dpu_snapshot: &Machine,
+) -> Result<Option<rpc::AstraSpxNetworkConfig>, tonic::Status> {
+
+    Ok(None)
+}
 
 pub(crate) async fn get_managed_host_network_config_inner(
     api: &Api,
@@ -598,6 +606,8 @@ pub(crate) async fn get_managed_host_network_config_inner(
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
 
+    let spx_config = get_spx_config_for_astra(&snapshot.host_snapshot, dpu_snapshot).await?;
+
     let resp = rpc::ManagedHostNetworkConfigResponse {
         instance_id: snapshot.instance.as_ref().map(|instance| instance.id),
         asn,
@@ -727,6 +737,7 @@ pub(crate) async fn get_managed_host_network_config_inner(
             .unwrap_or_default(),
         instance: maybe_instance,
         dpu_extension_services: extension_services,
+        spx_config,
     };
 
     // If this all worked, we shouldn't emit a log line

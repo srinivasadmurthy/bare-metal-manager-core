@@ -747,6 +747,8 @@ pub struct Dpf {
     pub enabled: bool,
     // If dpf is used for ingestion.
     pub used_for_ingestion: bool,
+    #[serde(default)]
+    pub astra_enabled: bool,
 }
 
 impl From<Machine> for ::rpc::forge::dpf_state_response::DpfState {

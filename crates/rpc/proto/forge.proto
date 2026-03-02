@@ -3240,6 +3240,77 @@ message ManagedHostNetworkConfigResponse {
   // will still use the dynamically allocated VNI for deriving
   // route-targets.
   optional uint32 site_global_vpc_vni = 117;
+
+  // If this machine has Astra enabled and has CX NICs,
+  // and if the machine is moving in or out of a tenancy,
+  // we have to send the NIC configuration info to the DPU.
+  // The forge-dpu-agent will then use this information to
+  // make rpc calls to the Astra gRPC agent to configure
+  // the NICs.
+  optional AstraSpxNetworkConfig spx_config = 118;
+}
+
+// Example Usage of this structure
+// Let's say we have 8 CX9 cards, and we want
+// to assocaite the same VNI with all of them.
+// Then we will have one vnet_config req that
+// has the VNI. And we will have 8 nic_config_reqs
+// that associate that vnet (and hence that VNI)
+// with the NICs.
+message AstraSpxNetworkConfig {
+  // A list of Vnets we want created or removed.
+  repeated AstraVnetConfigReq vnet_config_req = 1;
+
+  // A list of NIC to Vnet associations we want
+  // created or removed.
+  repeated AstraNicConfigReq nic_config_req= 2;
+}
+
+// Vnet info: has VNI and overlay IP info
+message AstraVnetConfig {
+  uint32 vni = 1;
+  // Overlay algo subnetip cidr
+  string overlay_subnet_ipv4 = 2;
+  string overlay_subnet_ipv6 = 3;
+}
+
+// Create or delete a Vnet
+message AstraVnetConfigReq {
+  enum OpCode {
+    Unspecified = 0;
+    Create = 1;
+    Delete = 2;
+  }
+  OpCode op = 1;
+  AstraVnetConfig config = 2;
+}
+
+// Specifies whether the attachment is PF or VF
+enum AstraNicAttachmentType {
+  AttachUnspecified = 0;
+  AttachPF = 1;
+  AttachVF = 2;
+}
+
+// NicConfig specifies the MAC of the NIC, identifying it.
+// We then associate a VNI with the PF or a VF of the NIC.
+message AstraNicConfig {
+  AstraNicAttachmentType at_type = 1;
+  string mac_addr = 2;
+  uint32 vni = 3;
+  // If at_type is AttachVF, the vf index
+  optional uint32 vf_index = 4;
+}
+
+// Create or delete an association between a NIC and a Vnet/VNI
+message AstraNicConfigReq {
+  enum OpCode {
+    Unspecified = 0;
+    Create = 1;
+    Delete = 2;
+  }
+  OpCode op = 1;
+  AstraNicConfig config = 2;
 }
 
 message TrafficInterceptConfig {

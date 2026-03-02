@@ -237,6 +237,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[derive(serde::Serialize)]",
         )
         .type_attribute(
+            "forge.AstraSpxNetworkConfig",
+            "#[derive(serde::Serialize)]",
+        )
+        .type_attribute(
+            "forge.AstraVnetConfigReq",
+            "#[derive(serde::Serialize)]",
+        )
+        .type_attribute(
+            "forge.AstraNicConfigReq",
+            "#[derive(serde::Serialize)]",
+        )
+        .type_attribute(
+            "forge.AstraVnetConfig",
+            "#[derive(serde::Serialize)]",
+        )
+        .type_attribute(
+            "forge.AstraNicConfig",
+            "#[derive(serde::Serialize)]",
+        )
+        .type_attribute(
             "forge.ManagedHostNetworkConfigResponse",
             "#[derive(serde::Serialize)]",
         )
