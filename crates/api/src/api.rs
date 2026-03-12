@@ -452,7 +452,9 @@ impl Forge for Api {
         &self,
         request: Request<MachineId>,
     ) -> Result<Response<rpc::ListHealthReportOverrideResponse>, Status> {
-        crate::handlers::health::list_health_report_overrides(self, request).await
+        let res = crate::handlers::health::list_health_report_overrides(self, request).await;
+        println!("SDM res: {:?}", res);
+        res
     }
 
     async fn insert_health_report_override(
@@ -488,6 +490,13 @@ impl Forge for Api {
         request: Request<rpc::RemoveRackHealthReportOverrideRequest>,
     ) -> Result<Response<()>, Status> {
         crate::handlers::rack::remove_rack_health_report_override(self, request).await
+    }
+
+    async fn get_hardware_leaks_report(
+        &self,
+        request: Request<rpc::HardwareLeaksReportRequest>,
+    ) -> Result<Response<rpc::HardwareLeaksReportResponse>, Status> {
+        crate::handlers::health::get_hardware_leaks_report(self, request).await
     }
 
     async fn get_all_domain_metadata(

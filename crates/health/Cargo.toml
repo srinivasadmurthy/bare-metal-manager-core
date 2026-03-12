@@ -69,7 +69,10 @@ logfmt = { path = "../logfmt" }
 carbide-version = { path = "../version" }
 
 [features]
+default = []
 bench-hooks = []
+cpu2temp_alert = []
+leak_alert = []
 
 [dev-dependencies]
 criterion = { workspace = true }

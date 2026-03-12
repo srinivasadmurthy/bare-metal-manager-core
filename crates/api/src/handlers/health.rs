@@ -27,6 +27,46 @@ use crate::api::Api;
 use crate::auth::AuthContext;
 use crate::handlers::utils::convert_and_log_machine_id;
 
+const TRAY_LEAK_DETECTION_SOURCE: &str = "hardware-health.tray-leak-detection";
+
+// Return a list of machines that have leaks and their associated alerts.
+// If the machines list in the request is empty, return a report for all machines.
+// Otherwise, confine the leaks report to the machines in the request.
+pub async fn get_hardware_leaks_report(
+    api: &Api,
+    request: Request<rpc::HardwareLeaksReportRequest>,
+) -> Result<Response<rpc::HardwareLeaksReportResponse>, Status> {
+    let mut txn = api.txn_begin().await?;
+
+    let machine_ids = request.into_inner().machine_ids;
+
+    let machines_with_leaks =
+        db::machine::find_machines_with_leaks(&mut txn, &machine_ids).await?;
+
+    txn.commit().await?;
+
+    let leakt_reports = machines_with_leaks
+        .into_iter()
+        .filter_map(|(machine_id, overrides)| {
+            let report = overrides?
+                .merges
+                .get(TRAY_LEAK_DETECTION_SOURCE)
+                .cloned()?;
+            Some(rpc::HardwareMachineLeaks {
+                machine_id: Some(machine_id),
+                overrides: Some(rpc::HealthReportOverride {
+                    report: Some(report.into()),
+                    mode: rpc::OverrideMode::Merge as i32,
+                }),
+            })
+        })
+        .collect();
+
+    Ok(Response::new(rpc::HardwareLeaksReportResponse {
+        leakt_reports,
+    }))
+}
+
 pub async fn list_health_report_overrides(
     api: &Api,
     machine_id: Request<MachineId>,
@@ -44,8 +84,7 @@ pub async fn list_health_report_overrides(
 
     txn.commit().await?;
 
-    Ok(Response::new(rpc::ListHealthReportOverrideResponse {
-        overrides: host_machine
+    let ovr = host_machine
             .health_report_overrides
             .clone()
             .into_iter()
@@ -53,7 +92,12 @@ pub async fn list_health_report_overrides(
                 report: Some(o.0.into()),
                 mode: o.1 as i32,
             })
-            .collect(),
+            .collect();
+
+    println!("SDM ovr: {:?}", ovr);
+
+    Ok(Response::new(rpc::ListHealthReportOverrideResponse {
+        overrides: ovr
     }))
 }
 
@@ -136,6 +180,9 @@ pub async fn insert_health_report_override(
         )
         .into());
     }
+
+    println!("SDM machine_id: {:?} report: {:?}", machine_id, report);
+
     let mut txn = api.txn_begin().await?;
 
     let mut report = health_report::HealthReport::try_from(report.clone())

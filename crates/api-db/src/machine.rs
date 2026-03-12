@@ -45,6 +45,7 @@ use model::machine::{
     Dpf, FailureDetails, Machine, MachineInterfaceSnapshot, MachineLastRebootRequested,
     MachineLastRebootRequestedMode, ManagedHostState, ReprovisionRequest, UpgradeDecision,
 };
+use model::machine::health_override::HealthReportOverrides;
 use model::machine_interface_address::MachineInterfaceAssociation;
 use model::metadata::Metadata;
 use model::resource_pool;
@@ -158,6 +159,7 @@ pub async fn find_one(
         .await?
         .pop())
 }
+
 
 pub async fn find_existing_machine(
     txn: &mut PgConnection,
@@ -1028,6 +1030,66 @@ pub async fn remove_health_report_override(
         .map_err(|e| DatabaseError::new("remove health report override", e))?;
 
     Ok(())
+}
+
+const LEAK_DETECTION_QUERY_BASE: &str = r#"
+    SELECT id, health_report_overrides FROM machines m
+    WHERE m.health_report_overrides->'merges' ? 'hardware-health.tray-leak-detection'
+    AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(
+            m.health_report_overrides->'merges'->'hardware-health.tray-leak-detection'->'alerts'
+        ) AS alert
+        WHERE alert->'classifications' ? 'Leak'
+    )
+"#;
+
+/// Finds machines that have leak alerts in their health report overrides.
+///
+/// * `txn` - A reference to an active DB transaction
+/// * `machine_ids` - If empty, returns all machines with leaks. Otherwise, confines the search
+///   to the given machine IDs.
+pub async fn find_machines_with_leaks<DB>(
+    txn: &mut DB,
+    machine_ids: &[MachineId],
+) -> Result<Vec<(MachineId, Option<HealthReportOverrides>)>, DatabaseError>
+where
+    for<'c> &'c mut DB: DbReader<'c>,
+{
+    let rows = if machine_ids.is_empty() {
+        sqlx::query(LEAK_DETECTION_QUERY_BASE)
+            .fetch_all(&mut *txn)
+            .await
+    } else {
+        let machine_id_strings: Vec<String> = machine_ids.iter().map(|id| id.to_string()).collect();
+        let query = format!(
+            r#"
+            SELECT id, health_report_overrides FROM machines m
+            WHERE m.id = ANY($1::varchar[])
+            AND m.health_report_overrides->'merges' ? 'hardware-health.tray-leak-detection'
+            AND EXISTS (
+                SELECT 1 FROM jsonb_array_elements(
+                    m.health_report_overrides->'merges'->'hardware-health.tray-leak-detection'->'alerts'
+                ) AS alert
+                WHERE alert->'classifications' ? 'Leak'
+            )
+            "#
+        );
+        sqlx::query(&query)
+            .bind(machine_id_strings)
+            .fetch_all(&mut *txn)
+            .await
+    }
+    .map_err(|e| DatabaseError::query(LEAK_DETECTION_QUERY_BASE, e))?;
+
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        let machine_id: MachineId = row.try_get(0).map_err(|e| DatabaseError::query(LEAK_DETECTION_QUERY_BASE, e))?;
+        let health_report_overrides: Option<sqlx::types::Json<HealthReportOverrides>> =
+            row.try_get(1).map_err(|e| DatabaseError::query(LEAK_DETECTION_QUERY_BASE, e))?;
+        result.push((machine_id, health_report_overrides.map(|json| json.0)));
+    }
+
+    Ok(result)
 }
 
 pub async fn update_agent_reported_inventory(

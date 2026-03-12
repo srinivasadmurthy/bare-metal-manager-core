@@ -80,6 +80,11 @@ impl HealthReportProcessor {
     }
 
     fn classify(health: &SensorHealthContext, reading: f64) -> SensorHealth {
+        #[cfg(feature = "cpu2temp_alert")]
+        if health.sensor_id == "CPU2TEMP" {
+            return SensorHealth::Critical;
+        }
+
         if let Some(max) = health.range_max
             && reading > max
         {

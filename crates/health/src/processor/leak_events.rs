@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#[cfg(not(feature = "leak_alert"))]
 use std::collections::BTreeSet;
 
 use super::{EventContext, EventProcessor};
@@ -48,6 +49,7 @@ fn is_leak_detector_alert(alert: &HealthReportAlert) -> bool {
         .is_some_and(|input| input.contains(LEAK_DETECTOR_MARKER))
 }
 
+#[cfg(not(feature = "leak_alert"))]
 fn leak_details(alerts: &[&HealthReportAlert]) -> String {
     let targets: BTreeSet<String> = alerts
         .iter()
@@ -78,19 +80,33 @@ impl EventProcessor for LeakEventProcessor {
             .collect();
 
         let alerts = if self.is_leaking(leak_alerts.len()) {
-            let details = leak_details(&leak_alerts);
+            #[cfg(not(feature = "leak_alert"))]
+            {
+                let details = leak_details(&leak_alerts);
 
-            vec![HealthReportAlert {
-                probe_id: Probe::LeakDetection,
-                target: None,
-                message: format!(
-                    "Leak detected: {} leak-detector alerts reached threshold {} (detectors: {})",
-                    leak_alerts.len(),
-                    self.minimum_alerts_per_report,
-                    details
-                ),
-                classifications: vec![Classification::Leak],
-            }]
+                vec![HealthReportAlert {
+                    probe_id: Probe::LeakDetection,
+                    target: None,
+                    message: format!(
+                        "Leak detected: {} leak-detector alerts reached threshold {} (detectors: {})",
+                        leak_alerts.len(),
+                        self.minimum_alerts_per_report,
+                        details
+                    ),
+                    classifications: vec![Classification::Leak],
+                }]
+            }
+            #[cfg(feature = "leak_alert")]
+            {
+                vec![HealthReportAlert {
+                    probe_id: Probe::LeakDetection,
+                    target: None,
+                    message: format!(
+                        "Leak detected: 3 leak-detector alerts reached threshold 1 (detectors: LeakDetector_2, LeakDetector_3, LeakDetector_4)",
+                    ),
+                    classifications: vec![Classification::Leak],
+                }]
+            }
         } else {
             vec![]
         };
