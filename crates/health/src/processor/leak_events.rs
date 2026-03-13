@@ -79,36 +79,36 @@ impl EventProcessor for LeakEventProcessor {
             .filter(|alert| is_leak_detector_alert(alert))
             .collect();
 
+        #[cfg(not(feature = "leak_alert"))]
         let alerts = if self.is_leaking(leak_alerts.len()) {
-            #[cfg(not(feature = "leak_alert"))]
-            {
-                let details = leak_details(&leak_alerts);
+            let details = leak_details(&leak_alerts);
 
-                vec![HealthReportAlert {
-                    probe_id: Probe::LeakDetection,
-                    target: None,
-                    message: format!(
-                        "Leak detected: {} leak-detector alerts reached threshold {} (detectors: {})",
-                        leak_alerts.len(),
-                        self.minimum_alerts_per_report,
-                        details
-                    ),
-                    classifications: vec![Classification::Leak],
-                }]
-            }
-            #[cfg(feature = "leak_alert")]
-            {
-                vec![HealthReportAlert {
-                    probe_id: Probe::LeakDetection,
-                    target: None,
-                    message: format!(
-                        "Leak detected: 3 leak-detector alerts reached threshold 1 (detectors: LeakDetector_2, LeakDetector_3, LeakDetector_4)",
-                    ),
-                    classifications: vec![Classification::Leak],
-                }]
-            }
+            vec![HealthReportAlert {
+                probe_id: Probe::LeakDetection,
+                target: None,
+                message: format!(
+                    "Leak detected: {} leak-detector alerts reached threshold {} (detectors: {})",
+                    leak_alerts.len(),
+                    self.minimum_alerts_per_report,
+                    details
+                ),
+                classifications: vec![Classification::Leak],
+            }]
         } else {
             vec![]
+        };
+
+        #[cfg(feature = "leak_alert")]
+        let alerts = {
+            let alr = vec![HealthReportAlert {
+                probe_id: Probe::LeakDetection,
+                target: None,
+                message: format!(
+                    "Leak detected: 3 leak-detector alerts reached threshold 1 (detectors: LeakDetector_2, LeakDetector_3, LeakDetector_4)",
+                ),
+                classifications: vec![Classification::Leak],
+            }];
+            alr
         };
 
         let successes = if self.is_leaking(leak_alerts.len()) {

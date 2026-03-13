@@ -149,6 +149,8 @@ impl HealthReportProcessor {
                         calculated_status = ?state,
                         "Threshold check indicates issue but BMC reports sensor as OK - likely incorrect thresholds, reporting OK"
                     );
+
+                    #[cfg(not(feature = "cpu2temp_alert"))]
                     return SensorHealthResult::Success(HealthReportSuccess {
                         probe_id: Probe::Sensor,
                         target: Some(health.sensor_id.clone()),
