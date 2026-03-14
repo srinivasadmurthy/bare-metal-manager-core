@@ -6727,9 +6727,16 @@ message HardwareLeaksReportRequest {
   repeated common.MachineId machine_ids = 1;
 }
 
+
+
 message HardwareMachineLeaks {
+  enum PowerStatus {
+    On = 0;
+    Off = 1;
+  }
   common.MachineId machine_id = 1;
-  HealthReportOverride overrides = 2;
+  optional PowerStatus power_status = 2;
+  HealthReportOverride overrides = 3;
 }
 
 // Returns a list of leak_reports with leak type of alert in them

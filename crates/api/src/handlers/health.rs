@@ -16,6 +16,7 @@
  */
 
 use ::rpc::forge::{self as rpc, HealthReportOverride};
+use ::rpc::forge::hardware_machine_leaks::PowerStatus;
 use carbide_uuid::machine::MachineId;
 use health_report::OverrideMode;
 use model::machine::machine_search_config::MachineSearchConfig;
@@ -47,13 +48,23 @@ pub async fn get_hardware_leaks_report(
 
     let leakt_reports = machines_with_leaks
         .into_iter()
-        .filter_map(|(machine_id, overrides)| {
+        .filter_map(|(machine_id, power_state, overrides)| {
             let report = overrides?
                 .merges
                 .get(TRAY_LEAK_DETECTION_SOURCE)
                 .cloned()?;
+            let power_status = power_state.and_then(|s| match s {
+                model::power_manager::PowerState::On => {
+                    Some(PowerStatus::On as i32)
+                }
+                model::power_manager::PowerState::Off => {
+                    Some(PowerStatus::Off as i32)
+                }
+                model::power_manager::PowerState::PowerManagerDisabled => None,
+            });
             Some(rpc::HardwareMachineLeaks {
                 machine_id: Some(machine_id),
+                power_status,
                 overrides: Some(rpc::HealthReportOverride {
                     report: Some(report.into()),
                     mode: rpc::OverrideMode::Merge as i32,

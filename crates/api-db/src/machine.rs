@@ -46,6 +46,7 @@ use model::machine::{
     MachineLastRebootRequestedMode, ManagedHostState, ReprovisionRequest, UpgradeDecision,
 };
 use model::machine::health_override::HealthReportOverrides;
+use model::power_manager::PowerState;
 use model::machine_interface_address::MachineInterfaceAssociation;
 use model::metadata::Metadata;
 use model::resource_pool;
@@ -1033,7 +1034,9 @@ pub async fn remove_health_report_override(
 }
 
 const LEAK_DETECTION_QUERY_BASE: &str = r#"
-    SELECT id, health_report_overrides FROM machines m
+    SELECT m.id, m.health_report_overrides, po.last_fetched_power_state
+    FROM machines m
+    LEFT JOIN power_options po ON m.id = po.host_id
     WHERE m.health_report_overrides->'merges' ? 'hardware-health.tray-leak-detection'
     AND EXISTS (
         SELECT 1 FROM jsonb_array_elements(
@@ -1045,13 +1048,16 @@ const LEAK_DETECTION_QUERY_BASE: &str = r#"
 
 /// Finds machines that have leak alerts in their health report overrides.
 ///
+/// Returns a vector of (MachineId, Option&lt;PowerState&gt;, Option&lt;HealthReportOverrides&gt;).
+/// PowerState is from power_options.last_fetched_power_state when a matching row exists.
+///
 /// * `txn` - A reference to an active DB transaction
 /// * `machine_ids` - If empty, returns all machines with leaks. Otherwise, confines the search
 ///   to the given machine IDs.
 pub async fn find_machines_with_leaks<DB>(
     txn: &mut DB,
     machine_ids: &[MachineId],
-) -> Result<Vec<(MachineId, Option<HealthReportOverrides>)>, DatabaseError>
+) -> Result<Vec<(MachineId, Option<PowerState>, Option<HealthReportOverrides>)>, DatabaseError>
 where
     for<'c> &'c mut DB: DbReader<'c>,
 {
@@ -1063,7 +1069,9 @@ where
         let machine_id_strings: Vec<String> = machine_ids.iter().map(|id| id.to_string()).collect();
         let query = format!(
             r#"
-            SELECT id, health_report_overrides FROM machines m
+            SELECT m.id, m.health_report_overrides, po.last_fetched_power_state
+            FROM machines m
+            LEFT JOIN power_options po ON m.id = po.host_id
             WHERE m.id = ANY($1::varchar[])
             AND m.health_report_overrides->'merges' ? 'hardware-health.tray-leak-detection'
             AND EXISTS (
@@ -1086,7 +1094,13 @@ where
         let machine_id: MachineId = row.try_get(0).map_err(|e| DatabaseError::query(LEAK_DETECTION_QUERY_BASE, e))?;
         let health_report_overrides: Option<sqlx::types::Json<HealthReportOverrides>> =
             row.try_get(1).map_err(|e| DatabaseError::query(LEAK_DETECTION_QUERY_BASE, e))?;
-        result.push((machine_id, health_report_overrides.map(|json| json.0)));
+        let last_fetched_power_state: Option<PowerState> =
+            row.try_get(2).map_err(|e| DatabaseError::query(LEAK_DETECTION_QUERY_BASE, e))?;
+        result.push((
+            machine_id,
+            last_fetched_power_state,
+            health_report_overrides.map(|json| json.0),
+        ));
     }
 
     Ok(result)
