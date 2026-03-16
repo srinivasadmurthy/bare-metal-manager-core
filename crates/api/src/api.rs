@@ -452,9 +452,7 @@ impl Forge for Api {
         &self,
         request: Request<MachineId>,
     ) -> Result<Response<rpc::ListHealthReportOverrideResponse>, Status> {
-        let res = crate::handlers::health::list_health_report_overrides(self, request).await;
-        println!("SDM res: {:?}", res);
-        res
+        crate::handlers::health::list_health_report_overrides(self, request).await
     }
 
     async fn insert_health_report_override(

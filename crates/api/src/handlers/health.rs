@@ -105,8 +105,6 @@ pub async fn list_health_report_overrides(
             })
             .collect();
 
-    println!("SDM ovr: {:?}", ovr);
-
     Ok(Response::new(rpc::ListHealthReportOverrideResponse {
         overrides: ovr
     }))
@@ -191,8 +189,6 @@ pub async fn insert_health_report_override(
         )
         .into());
     }
-
-    println!("SDM machine_id: {:?} report: {:?}", machine_id, report);
 
     let mut txn = api.txn_begin().await?;
 

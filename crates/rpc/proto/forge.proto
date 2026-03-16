@@ -6727,8 +6727,9 @@ message HardwareLeaksReportRequest {
   repeated common.MachineId machine_ids = 1;
 }
 
-
-
+// Each Leak record returned contains the machine id,
+// the health overrides with classification LEAK, and
+// the last fetched powerstate of the machine
 message HardwareMachineLeaks {
   enum PowerStatus {
     On = 0;
