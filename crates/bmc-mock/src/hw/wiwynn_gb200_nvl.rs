@@ -108,6 +108,8 @@ impl WiwynnGB200Nvl<'_> {
                             .build(),
                     ),
                     log_services: None,
+                    storage: None,
+                    secure_boot_available: true,
                 },
                 redfish::computer_system::SingleSystemConfig {
                     id: "HGX_Baseboard_0".into(),
@@ -123,6 +125,8 @@ impl WiwynnGB200Nvl<'_> {
                     bios_mode: redfish::computer_system::BiosMode::Generic,
                     base_bios: None,
                     log_services: None,
+                    storage: None,
+                    secure_boot_available: false,
                 },
             ],
         }

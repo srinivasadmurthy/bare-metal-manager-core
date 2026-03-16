@@ -17,6 +17,7 @@
 
 #[cfg(not(feature = "leak_alert"))]
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use super::{EventContext, EventProcessor};
 use crate::sink::{
@@ -127,7 +128,7 @@ impl EventProcessor for LeakEventProcessor {
             alerts,
         };
 
-        vec![CollectorEvent::HealthReport(leak_report)]
+        vec![CollectorEvent::HealthReport(Arc::new(leak_report))]
     }
 }
 
@@ -173,7 +174,8 @@ mod tests {
             alerts: vec![leak_alert("LeakDetector_Probe")],
         };
 
-        let emitted = processor.process_event(&context(), &CollectorEvent::HealthReport(report));
+        let emitted =
+            processor.process_event(&context(), &CollectorEvent::HealthReport(Arc::new(report)));
         assert_eq!(emitted.len(), 1);
 
         let CollectorEvent::HealthReport(derived) = &emitted[0] else {
@@ -195,7 +197,8 @@ mod tests {
             alerts: vec![leak_alert("LeakDetector_Probe")],
         };
 
-        let emitted = processor.process_event(&context(), &CollectorEvent::HealthReport(report));
+        let emitted =
+            processor.process_event(&context(), &CollectorEvent::HealthReport(Arc::new(report)));
         assert_eq!(emitted.len(), 1);
 
         let CollectorEvent::HealthReport(derived) = &emitted[0] else {
