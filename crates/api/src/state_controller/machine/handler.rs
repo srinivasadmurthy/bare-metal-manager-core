@@ -5675,6 +5675,18 @@ impl StateHandler for InstanceStateHandler {
                     // Otherwise, follow the normal termination/reprovision flow through
                     // BootingWithDiscoveryImage.
                     if instance.custom_pxe_reboot_requested {
+                        if !instance
+                            .config
+                            .os
+                            .run_provisioning_instructions_on_every_boot
+                        {
+                            ctx.pending_db_writes
+                                .push(MachineWriteOp::UseCustomIpxeOnNextBoot {
+                                    machine_id: mh_snapshot.host_snapshot.id,
+                                    boot_with_custom_ipxe: true,
+                                });
+                        }
+
                         let next_state = ManagedHostState::Assigned {
                             instance_state: InstanceState::WaitingForRebootToReady,
                         };
@@ -9357,17 +9369,17 @@ async fn handle_instance_host_platform_config(
                     })?)
                 {
                     tracing::warn!(
-                        "Tenant has released {} but the {} does not have its boot order configured properly",
-                        mh_snapshot.host_snapshot.id,
-                        vendor.to_string()
+                        machine_id = %mh_snapshot.host_snapshot.id,
+                        bmc_vendor = %vendor,
+                        "Host boot order is not configured properly"
                     );
 
                     true
                 } else {
                     tracing::info!(
-                        "Tenant has released {} and the {} has its boot order configured properly",
-                        mh_snapshot.host_snapshot.id,
-                        vendor.to_string()
+                        machine_id = %mh_snapshot.host_snapshot.id,
+                        bmc_vendor = %vendor,
+                        "Host boot order is configured properly"
                     );
 
                     false
