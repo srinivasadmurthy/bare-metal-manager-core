@@ -302,6 +302,7 @@ async fn fetch_logical_partitions(
                 only_quarantine: false,
                 instance_type_id: None,
                 mnnvl_only: true,
+                only_leaking_on_hosts: false,
             });
 
             let machine_ids = api

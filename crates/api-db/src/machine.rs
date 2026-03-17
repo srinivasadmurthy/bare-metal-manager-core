@@ -34,7 +34,6 @@ use lazy_static::lazy_static;
 use mac_address::MacAddress;
 use model::controller_outcome::PersistentStateHandlerOutcome;
 use model::hardware_info::{MachineInventory, MachineNvLinkInfo};
-use model::machine::health_override::HealthReportOverrides;
 use model::machine::infiniband::MachineInfinibandStatusObservation;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::network::{
@@ -48,7 +47,6 @@ use model::machine::{
 };
 use model::machine_interface_address::MachineInterfaceAssociation;
 use model::metadata::Metadata;
-use model::power_manager::PowerState;
 use model::resource_pool;
 use model::resource_pool::ResourcePoolError;
 use model::resource_pool::common::CommonPools;
@@ -1032,76 +1030,6 @@ pub async fn remove_health_report_override(
     Ok(())
 }
 
-const LEAK_DETECTION_QUERY_BASE: &str = r#"
-    SELECT m.id, m.health_report_overrides, po.last_fetched_power_state
-    FROM machines m
-    LEFT JOIN power_options po ON m.id = po.host_id
-    WHERE m.health_report_overrides->'merges' ? 'hardware-health.tray-leak-detection'
-    AND EXISTS (
-        SELECT 1 FROM jsonb_array_elements(
-            m.health_report_overrides->'merges'->'hardware-health.tray-leak-detection'->'alerts'
-        ) AS alert
-        WHERE alert->'classifications' ? 'Leak'
-    )
-"#;
-
-/// Finds machines that have leak alerts in their health report overrides.
-///
-/// Returns a vector of (MachineId, Option&lt;PowerState&gt;, Option&lt;HealthReportOverrides&gt;).
-/// PowerState is from power_options.last_fetched_power_state when a matching row exists.
-///
-/// * `txn` - A reference to an active DB transaction
-/// * `machine_ids` - If empty, returns all machines with leaks. Otherwise, confines the search
-///   to the given machine IDs.
-pub async fn find_machines_with_leaks<DB>(
-    txn: &mut DB,
-    machine_ids: &[MachineId],
-) -> Result<Vec<(MachineId, Option<PowerState>, Option<HealthReportOverrides>)>, DatabaseError>
-where
-    for<'c> &'c mut DB: DbReader<'c>,
-{
-    let rows = if machine_ids.is_empty() {
-        sqlx::query(LEAK_DETECTION_QUERY_BASE)
-            .fetch_all(&mut *txn)
-            .await
-    } else {
-        let machine_id_strings: Vec<String> = machine_ids.iter().map(|id| id.to_string()).collect();
-
-        lazy_static! {
-            static ref query: String = format!(
-                "{} AND m.id = ANY($1::varchar[])",
-                LEAK_DETECTION_QUERY_BASE,
-            );
-        }
-
-        sqlx::query(&query)
-            .bind(machine_id_strings)
-            .fetch_all(&mut *txn)
-            .await
-    }
-    .map_err(|e| DatabaseError::query(LEAK_DETECTION_QUERY_BASE, e))?;
-
-    let mut result = Vec::with_capacity(rows.len());
-    for row in rows {
-        let machine_id: MachineId = row
-            .try_get(0)
-            .map_err(|e| DatabaseError::query(LEAK_DETECTION_QUERY_BASE, e))?;
-        let health_report_overrides: Option<sqlx::types::Json<HealthReportOverrides>> = row
-            .try_get(1)
-            .map_err(|e| DatabaseError::query(LEAK_DETECTION_QUERY_BASE, e))?;
-        let last_fetched_power_state: Option<PowerState> = row
-            .try_get(2)
-            .map_err(|e| DatabaseError::query(LEAK_DETECTION_QUERY_BASE, e))?;
-        result.push((
-            machine_id,
-            last_fetched_power_state,
-            health_report_overrides.map(|json| json.0),
-        ));
-    }
-
-    Ok(result)
-}
-
 pub async fn update_agent_reported_inventory(
     txn: &mut PgConnection,
     machine_id: &MachineId,
@@ -1730,6 +1658,11 @@ pub async fn find_machine_ids(
         qb.push(" INNER JOIN machine_topologies mt ON machines.id = mt.machine_id");
     }
 
+    // Return only machines that are powered on and have a health override with leak classification
+    if search_config.only_leaking_on_hosts {
+        qb.push(" INNER JOIN power_options po ON po.host_id = machines.id AND po.last_fetched_power_state = 'on'");
+    }
+
     qb.push(" WHERE TRUE");
 
     if search_config.only_maintenance {
@@ -1778,6 +1711,17 @@ pub async fn find_machine_ids(
         );
     }
 
+    if search_config.only_leaking_on_hosts {
+        qb.push(
+            " AND machines.health_report_overrides->'merges' ? 'hardware-health.tray-leak-detection'
+            AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(
+            machines.health_report_overrides->'merges'->'hardware-health.tray-leak-detection'->'alerts'
+        ) AS alert
+        WHERE alert->'classifications' ? 'Leak')",
+        );
+    }
+
     if let Some(id) = search_config.instance_type_id {
         qb.push(" AND instance_type_id = ");
         qb.push_bind(id);
@@ -1788,6 +1732,7 @@ pub async fn find_machine_ids(
     }
 
     let q = qb.build_query_as();
+
     let machine_ids: Vec<MachineId> = q
         .fetch_all(txn)
         .await

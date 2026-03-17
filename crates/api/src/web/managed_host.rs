@@ -658,6 +658,7 @@ async fn fetch_managed_hosts_with_metadata(
             only_quarantine: false,
             instance_type_id: None,
             mnnvl_only: false,
+            only_leaking_on_hosts: false,
         }))
         .await?
         .into_inner()
