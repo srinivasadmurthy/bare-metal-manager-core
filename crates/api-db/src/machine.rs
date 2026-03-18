@@ -1659,11 +1659,10 @@ pub async fn find_machine_ids(
 
     // Return only machines that are powered on and have a health override with leak classification
     if let Some(pstate) = &search_config.only_with_power_state {
-        let qstr = format!(
-            " INNER JOIN power_options po ON po.host_id = machines.id AND po.last_fetched_power_state = '{}'",
-            pstate
-        );
-        qb.push(qstr);
+        let pstate_normalized = pstate.to_lowercase();
+        qb.push(" INNER JOIN power_options po ON po.host_id = machines.id AND po.last_fetched_power_state = ");
+        qb.push_bind(pstate_normalized);
+        qb.push("::host_power_state_t");
     }
 
     qb.push(" WHERE TRUE");
@@ -1709,11 +1708,11 @@ pub async fn find_machine_ids(
     }
 
     if let Some(ovrrd_str) = &search_config.only_with_health_alert {
-        let qstr = format!(
-            "AND health_report_overrides->'merges' ? '{}' AND jsonb_array_length( health_report_overrides->'merges'->'{}'->'alerts') > 0",
-            ovrrd_str, ovrrd_str
-        );
-        qb.push(qstr);
+        qb.push(" AND health_report_overrides->'merges' ? ");
+        qb.push_bind(ovrrd_str.clone());
+        qb.push(" AND jsonb_array_length(health_report_overrides->'merges'->");
+        qb.push_bind(ovrrd_str);
+        qb.push("->'alerts') > 0");
     }
 
     if let Some(id) = search_config.instance_type_id {
