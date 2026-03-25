@@ -30,9 +30,9 @@ use ::rpc::forge::{
     self as rpc, FlatInterfaceConfig, ManagedHostNetworkConfigResponse,
     NetworkSecurityGroupRuleAction, NetworkSecurityGroupRuleProtocol,
 };
+use carbide_network::ip::prefix::Ipv4Net;
+use carbide_network::virtualization::VpcVirtualizationType;
 use eyre::WrapErr;
-use forge_network::ip::prefix::Ipv4Net;
-use forge_network::virtualization::VpcVirtualizationType;
 use mac_address::MacAddress;
 use serde::Deserialize;
 use tokio::process::Command as TokioCommand;
@@ -54,13 +54,6 @@ const NVUED_BLOCK_RULE: &str = r"
 -A INPUT -p tcp --dport 8765 -j DROP
 ";
 
-struct EthernetVirtualizerPaths {
-    interfaces: FPath,
-    frr: FPath,
-    daemons: FPath,
-    acl_rules: FPath,
-}
-
 #[derive(PartialEq, Debug, Clone)]
 pub enum InterfaceState {
     Up,
@@ -79,51 +72,61 @@ impl FromStr for InterfaceState {
 }
 
 impl InterfaceState {
-    pub fn command(&self, hbn_device_names: &HBNDeviceNames) -> String {
+    const HOST_INTERFACE_NAME: &str = "pf0hpf";
+    pub fn command(&self) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("ip");
+        cmd.arg("link")
+            .arg("set")
+            .arg(InterfaceState::HOST_INTERFACE_NAME);
         if InterfaceState::Up == *self {
-            format!("ifup {}", hbn_device_names.reps[0])
+            cmd.arg("up");
         } else {
-            format!("ifdown {}", hbn_device_names.reps[0])
+            cmd.arg("down");
         }
+        cmd
     }
 
-    pub async fn update_state(
-        needed_state: &Self,
-        hbn_device_names: &HBNDeviceNames,
-        current_state: &Option<InterfaceState>,
-    ) -> eyre::Result<Option<InterfaceState>> {
-        let current_state = if let Some(current_state) = current_state {
-            current_state
-        } else {
-            // Let's try to find out.
-            &get_interface_state(hbn_device_names).await?
-        };
+    pub async fn update_state(needed_state: &Self) -> eyre::Result<()> {
+        let current_state = get_interface_state(InterfaceState::HOST_INTERFACE_NAME).await?;
 
-        if current_state != needed_state {
+        if current_state != *needed_state {
             // Execute command only if interface state is changed.
-            let cmd = needed_state.command(hbn_device_names);
+            let mut cmd = needed_state.command();
             tracing::info!(
-                "Updating interface state from {:?} to {:?} with command: {}",
+                "Updating interface state from {:?} to {:?} with command: {:?}",
                 current_state,
                 needed_state,
                 cmd
             );
-            hbn::run_in_container_shell(&cmd).await?;
+            let result = cmd.output().await?;
+            if !result.status.success() {
+                return Err(eyre::eyre!(
+                    "Failed to update interface state: {}",
+                    result.status
+                ));
+            }
 
             // Let's check if interface state is updated or not.
-            let new_state = get_interface_state(hbn_device_names).await?;
+            let new_state = get_interface_state(InterfaceState::HOST_INTERFACE_NAME).await?;
             if &new_state != needed_state {
                 return Err(eyre::eyre!(
                     r#"State is not updated after command execution. Will try in next iteration. 
                 Needed {needed_state:?}, After updating {new_state:?}, Interface: {}"#,
-                    hbn_device_names.reps[0]
+                    InterfaceState::HOST_INTERFACE_NAME
                 ));
             }
         }
 
         // Return new state.
-        Ok(Some(needed_state.clone()))
+        Ok(())
     }
+}
+
+struct EthernetVirtualizerPaths {
+    interfaces: FPath,
+    frr: FPath,
+    daemons: FPath,
+    acl_rules: FPath,
 }
 
 impl EthernetVirtualizerPaths {
@@ -144,12 +147,12 @@ struct DhcpServerPaths {
 }
 
 /// Stores addresses of dependent services that the DHCP module announces.
-/// Note that these can apply to both IPv4 and IPv6; pxe_ip is actually
+/// Note that these can apply to both IPv4 and IPv6; pxe_ips is actually
 /// UEFI HTTP boot in this case, and NTP is still NTP. We should be able
 /// to leverage this struct even in DHCPv6 land (whereas other things don't
 /// really carry through to DHCPv6).
 pub struct ServiceAddresses {
-    pub pxe_ip: IpAddr,
+    pub pxe_ips: Vec<IpAddr>,
     pub ntpservers: Vec<IpAddr>,
     pub nameservers: Vec<IpAddr>,
 }
@@ -223,41 +226,47 @@ pub async fn update_nvue(
 
     let physical_name = hbn_device_names.reps[0].to_string();
     let networks = if nc.use_admin_network {
-        let admin_interface = nc
-            .admin_interface
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("Missing admin_interface"))?;
-        vec![nvue::PortConfig {
-            interface_name: physical_name,
-            is_phy: true,
-            vlan: admin_interface.vlan_id as u16,
-            vni: if nc.network_virtualization_type() == ::rpc::forge::VpcVirtualizationType::Fnn {
-                Some(admin_interface.vni)
-            } else {
-                None
-            },
-            l3_vni: if nc.network_virtualization_type() == ::rpc::forge::VpcVirtualizationType::Fnn
-            {
-                Some(admin_interface.vpc_vni)
-            } else {
-                None
-            },
-            gateway_cidr: admin_interface.gateway.clone(),
-            vpc_prefixes: admin_interface.vpc_prefixes.clone(),
-            vpc_peer_prefixes: admin_interface.vpc_peer_prefixes.clone(),
-            vpc_peer_vnis: admin_interface.vpc_peer_vnis.clone(),
-            svi_ip: admin_interface.svi_ip.clone(),
-            tenant_vrf_loopback_ip: admin_interface.tenant_vrf_loopback_ip.clone(),
-            network_security_group_id: None, // NSGs are not applied on the admin network.
-            is_l2_segment: if nc.network_virtualization_type()
-                == ::rpc::forge::VpcVirtualizationType::Fnn
-            {
-                admin_interface.is_l2_segment
-            } else {
-                // Why false in legacy case? ¯\_(ツ)_/¯
-                false
-            },
-        }]
+        if nc.is_primary_dpu {
+            let admin_interface = nc
+                .admin_interface
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("Missing admin_interface"))?;
+            vec![nvue::PortConfig {
+                interface_name: physical_name,
+                is_phy: true,
+                vlan: admin_interface.vlan_id as u16,
+                vni: if nc.network_virtualization_type() == ::rpc::forge::VpcVirtualizationType::Fnn
+                {
+                    Some(admin_interface.vni)
+                } else {
+                    None
+                },
+                l3_vni: if nc.network_virtualization_type()
+                    == ::rpc::forge::VpcVirtualizationType::Fnn
+                {
+                    Some(admin_interface.vpc_vni)
+                } else {
+                    None
+                },
+                gateway_cidr: admin_interface.gateway.clone(),
+                vpc_prefixes: admin_interface.vpc_prefixes.clone(),
+                vpc_peer_prefixes: admin_interface.vpc_peer_prefixes.clone(),
+                vpc_peer_vnis: admin_interface.vpc_peer_vnis.clone(),
+                svi_ip: admin_interface.svi_ip.clone(),
+                tenant_vrf_loopback_ip: admin_interface.tenant_vrf_loopback_ip.clone(),
+                network_security_group_id: None, // NSGs are not applied on the admin network.
+                is_l2_segment: if nc.network_virtualization_type()
+                    == ::rpc::forge::VpcVirtualizationType::Fnn
+                {
+                    admin_interface.is_l2_segment
+                } else {
+                    // Why false in legacy case? ¯\_(ツ)_/¯
+                    false
+                },
+            }]
+        } else {
+            vec![]
+        }
     } else {
         let mut ifs = Vec::with_capacity(nc.tenant_interfaces.len());
         for net in &nc.tenant_interfaces {
@@ -768,15 +777,19 @@ async fn do_post(
     Ok(has_changes)
 }
 
-async fn get_interface_state(hbn_device_names: &HBNDeviceNames) -> eyre::Result<InterfaceState> {
-    let cmd = format!("ip link show {}", hbn_device_names.reps[0]);
-    let output = hbn::run_in_container(
-        &hbn::get_hbn_container_id().await?,
-        &["bash", "-c", &cmd],
-        true,
-    )
-    .await?;
+async fn get_interface_state(interface_name: &str) -> eyre::Result<InterfaceState> {
+    let mut cmd = tokio::process::Command::new("ip");
+    cmd.arg("link").arg("show").arg(interface_name);
+    let output = cmd.output().await?;
 
+    if !output.status.success() {
+        return Err(eyre::eyre!(
+            "Failed to get interface state: {}",
+            output.status
+        ));
+    }
+
+    let output = String::from_utf8_lossy(&output.stdout);
     InterfaceState::from_str(&output)
 }
 
@@ -795,21 +808,100 @@ fn needed_interface_state(is_primary_dpu: bool, use_admin_network: bool) -> Inte
     InterfaceState::Down
 }
 
-pub async fn update_interface_state(
-    nc: &ManagedHostNetworkConfigResponse,
-    skip_reload: bool,
-    hbn_device_names: &HBNDeviceNames,
-    current_state: &Option<InterfaceState>,
-) -> eyre::Result<Option<InterfaceState>> {
-    if skip_reload {
-        return Ok(current_state.clone());
-    }
-
+pub async fn update_interface_state(nc: &ManagedHostNetworkConfigResponse) -> eyre::Result<()> {
     let needed_state = needed_interface_state(nc.is_primary_dpu, nc.use_admin_network);
 
-    InterfaceState::update_state(&needed_state, hbn_device_names, current_state).await
+    InterfaceState::update_state(&needed_state).await
 }
 
+/// Sends the current DHCP server config to the dhcp-server process via gRPC.
+///
+/// Builds YAML representations of [`DhcpConfig`] and [`HostConfig`] from the
+/// supplied network config and service addresses, then calls `UpdateConfig`
+/// followed by `ReloadConfig` on the remote control service.  The server only
+/// restarts when the content has actually changed (see server-side diffing in
+/// `grpc_server.rs`), so this is safe to call on every agent tick.
+///
+/// Returns `Ok(true)` on success (matching the convention of the file-write
+/// path) so callers can treat both paths uniformly.
+async fn update_dhcp_via_grpc(
+    grpc_addr: &str,
+    network_config: &rpc::ManagedHostNetworkConfigResponse,
+    service_addrs: &ServiceAddresses,
+    hbn_device_names: HBNDeviceNames,
+) -> eyre::Result<bool> {
+    let Some(mh_nc) = &network_config.managed_host_config else {
+        eyre::bail!("Loopback IP is missing. Can't write dhcp-server config.");
+    };
+    let loopback_ip: Ipv4Addr = mh_nc.loopback_ip.parse()?;
+
+    let nameservers_v4 = service_addrs
+        .nameservers
+        .iter()
+        .filter_map(|x| match x {
+            IpAddr::V4(x) => Some(*x),
+            _ => None,
+        })
+        .collect::<Vec<Ipv4Addr>>();
+
+    let ntpservers_v4 = service_addrs
+        .ntpservers
+        .iter()
+        .filter_map(|x| match x {
+            IpAddr::V4(x) => Some(*x),
+            _ => None,
+        })
+        .collect::<Vec<Ipv4Addr>>();
+
+    let pxe_ip_v4 = service_addrs
+        .pxe_ips
+        .iter()
+        .find_map(|x| match x {
+            IpAddr::V4(x) => Some(*x),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "DHCPv4 server config requires an IPv4 PXE/UEFI HTTP boot address, but none found in {:?}",
+                service_addrs.pxe_ips
+            )
+        })?;
+
+    let dhcp_config = utils::models::dhcp::DhcpConfig::from_forge_dhcp_config(
+        pxe_ip_v4,
+        ntpservers_v4,
+        nameservers_v4,
+        loopback_ip,
+    )?;
+    let host_config = utils::models::dhcp::HostConfig::try_from(
+        network_config.clone(),
+        hbn_device_names.reps[0],
+        hbn_device_names.virt_rep_begin,
+        hbn_device_names.sf_id,
+    )?;
+    let interfaces: Vec<String> = host_config.host_ip_addresses.keys().cloned().collect();
+
+    crate::dhcp_server_grpc_client::update_and_reload(
+        grpc_addr,
+        dhcp_config,
+        Some(host_config),
+        interfaces,
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Updates DHCP server configuration using either the gRPC or file-write path.
+///
+/// When `dhcp_grpc_server` is `Some`, delegates to [`update_dhcp_via_grpc`]
+/// which pushes YAML configs to the dhcp-server control service directly.
+///
+/// When `dhcp_grpc_server` is `None`, falls back to the original behaviour:
+/// writes config files into the HBN container and triggers a supervisord
+/// restart via [`do_post`] if any file changed.
+///
+/// Returns `Ok(true)` if a reload was triggered, `Ok(false)` if configs were
+/// already up-to-date.
 pub async fn update_dhcp(
     hbn_root: &Path,
     network_config: &rpc::ManagedHostNetworkConfigResponse,
@@ -817,7 +909,12 @@ pub async fn update_dhcp(
     skip_post: bool,
     service_addrs: &ServiceAddresses,
     hbn_device_names: HBNDeviceNames,
+    dhcp_grpc_server: Option<String>,
 ) -> eyre::Result<bool> {
+    if let Some(ref addr) = dhcp_grpc_server {
+        return update_dhcp_via_grpc(addr, network_config, service_addrs, hbn_device_names).await;
+    }
+
     let path_dhcp_relay = FPath(hbn_root.join(dhcp::RELAY_PATH));
     let path_dhcp_relay_nvue = FPath(hbn_root.join(dhcp::RELAY_PATH_NVUE));
     let paths_dhcp_server = DhcpServerPaths {
@@ -831,14 +928,19 @@ pub async fn update_dhcp(
     // Delete NVUE relay config in case we used that previously
     let _ = fs::remove_file(path_dhcp_relay_nvue);
 
+    let stop_server = network_config.use_admin_network && !network_config.is_primary_dpu;
     // Start DHCP Server in HBN.
-    let post_action = match write_dhcp_server_config(
+    let post_action = match write_dhcp_v4_server_config(
         &path_dhcp_relay,
         &paths_dhcp_server,
         network_config,
         service_addrs,
         &hbn_device_names,
     ) {
+        Ok(true) if stop_server => PostAction {
+            path: paths_dhcp_server.server,
+            cmd: dhcp::STOP_DHCP_SERVER,
+        },
         Ok(true) => PostAction {
             path: paths_dhcp_server.server,
             cmd: dhcp::RELOAD_DHCP_SERVER,
@@ -1040,7 +1142,7 @@ pub async fn reset(
 // This is currently scoped to IPv4 only, and there are
 // a few IPv4-specific checks for things like NTP servers,
 // UEFI HTTP/PXE IP, and nameservers below.
-fn write_dhcp_server_config(
+fn write_dhcp_v4_server_config(
     dhcp_relay_path: &FPath,
     dhcp_server_path: &DhcpServerPaths,
     nc: &rpc::ManagedHostNetworkConfigResponse,
@@ -1104,10 +1206,10 @@ fn write_dhcp_server_config(
 
     let loopback_ip = mh_nc.loopback_ip.parse()?;
 
-    // Filter nameservers, NTP servers, and our UEFI HTTP server
-    // addresses to IPv4 for the DHCPv4 server config. Now that
-    // ServiceAddresses holds both families, we need to ensure
-    // DHCPv4 options only carry IPv4 addresses.
+    // Filter to IPv4, since this is specifically for the DHCPv4 server
+    // config, and the input ServiceAddresses holds both families.
+    // Again, we'll eventually have a specific builder for a DHCPv6
+    // that does similar things with ServiceAddresses, but for IPv6.
     let nameservers_v4 = service_addrs
         .nameservers
         .iter()
@@ -1126,20 +1228,23 @@ fn write_dhcp_server_config(
         })
         .collect::<Vec<Ipv4Addr>>();
 
-    let pxe_ip_v4 = match service_addrs.pxe_ip {
-        IpAddr::V4(v4) => v4,
-        IpAddr::V6(_) => {
-            return Err(eyre::eyre!(
-                "DHCPv4 server config requires an IPv4 PXE/UEFI HTTP boot address, got {}",
-                service_addrs.pxe_ip
-            ));
-        }
-    };
+    let pxe_ip_v4 = service_addrs
+        .pxe_ips
+        .iter()
+        .find_map(|x| match x {
+            IpAddr::V4(x) => Some(*x),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            eyre::eyre!("DHCPv4 server config requires an IPv4 PXE/UEFI HTTP boot address, but none found in {:?}", service_addrs.pxe_ips)
+        })?;
 
     let mut has_changes = false;
 
-    let next_contents =
-        dhcp::build_server_supervisord_config(dhcp::DhcpServerSupervisordConfig { interfaces })?;
+    let next_contents = dhcp::build_server_supervisord_config(dhcp::DhcpServerSupervisordConfig {
+        interfaces,
+        autostart: (!nc.use_admin_network || nc.is_primary_dpu),
+    })?;
     match write(
         next_contents,
         &dhcp_server_path.server,
@@ -1703,8 +1808,8 @@ mod tests {
     use std::str::FromStr;
 
     use ::rpc::{common as rpc_common, forge as rpc};
+    use carbide_network::virtualization::{VpcVirtualizationType, get_svi_ip};
     use eyre::WrapErr;
-    use forge_network::virtualization::{VpcVirtualizationType, get_svi_ip};
     use ipnetwork::IpNetwork;
     use utils::models::dhcp::{DhcpConfig, HostConfig};
 
@@ -1740,6 +1845,7 @@ mod tests {
             24,
             true,
             None,
+            false,
         );
 
         let f = tempfile::NamedTempFile::new()?;
@@ -1797,7 +1903,7 @@ mod tests {
 
         // Test without an NSG to make sure there are no changes for pre-FNN users
         // if they don't opt-in to a network security group.
-        let network_config = netconf(virtualization_type, 32, 24, false, None);
+        let network_config = netconf(virtualization_type, 32, 24, false, None, true);
 
         let td = tempfile::tempdir()?;
         let hbn_root = td.path();
@@ -1829,11 +1935,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_with_tenant_nvue_with_bridge() -> Result<(), Box<dyn std::error::Error>> {
+        let virtualization_type = VpcVirtualizationType::EthernetVirtualizerWithNvue;
+
+        // Both interfaces are L2 segments, so IncludeBridge is true and the bridge block is emitted.
+        let network_config = netconf(virtualization_type, 32, 24, false, None, true);
+
+        let td = tempfile::tempdir()?;
+        let hbn_root = td.path();
+        fs::create_dir_all(hbn_root.join("var/support"))?;
+        fs::create_dir_all(hbn_root.join("etc/cumulus/acl/policy.d"))?;
+
+        let has_changes = super::update_nvue(
+            virtualization_type,
+            hbn_root,
+            &network_config,
+            true,
+            HBNDeviceNames::hbn_23(),
+        )
+        .await?;
+        assert!(
+            has_changes,
+            "update_nvue should have written the file, there should be changes"
+        );
+
+        // check ACLs
+        let expected = include_str!("../templates/tests/70-forge_nvue.rules.expected");
+        compare_diffed(hbn_root.join(nvue::PATH_ACL), expected)?;
+
+        // check startup.yaml (includes bridge block)
+        let expected = include_str!("../templates/tests/nvue_startup_with_bridge.yaml.expected");
+        compare_diffed(hbn_root.join(nvue::PATH), expected)?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_with_tenant_nvue_quarantined() -> Result<(), Box<dyn std::error::Error>> {
         let virtualization_type = VpcVirtualizationType::EthernetVirtualizerWithNvue;
 
         let network_config = {
-            let mut cfg = netconf(virtualization_type, 32, 24, true, None);
+            let mut cfg = netconf(virtualization_type, 32, 24, true, None, false);
             match cfg.managed_host_config.as_mut() {
                 Some(c) => {
                     c.quarantine_state = Some(rpc::ManagedHostQuarantineState {
@@ -1880,7 +2022,7 @@ mod tests {
         let virtualization_type = VpcVirtualizationType::Fnn;
 
         let network_config = {
-            let mut cfg = netconf(virtualization_type, 32, 24, true, None);
+            let mut cfg = netconf(virtualization_type, 32, 24, true, None, false);
             match cfg.managed_host_config.as_mut() {
                 Some(c) => {
                     c.quarantine_state = Some(rpc::ManagedHostQuarantineState {
@@ -1928,7 +2070,7 @@ mod tests {
         // Test WITH an NSG
         let virtualization_type = VpcVirtualizationType::EthernetVirtualizerWithNvue;
 
-        let network_config = netconf(virtualization_type, 32, 24, true, None);
+        let network_config = netconf(virtualization_type, 32, 24, true, None, false);
 
         let td = tempfile::tempdir()?;
         let hbn_root = td.path();
@@ -1963,7 +2105,7 @@ mod tests {
     async fn test_with_tenant_nvue_with_empty_nsg_default_deny()
     -> Result<(), Box<dyn std::error::Error>> {
         let virtualization_type = VpcVirtualizationType::EthernetVirtualizerWithNvue;
-        let mut network_config = netconf(virtualization_type, 32, 24, true, None);
+        let mut network_config = netconf(virtualization_type, 32, 24, true, None, false);
 
         // Empty out all NSG rules.  This should result in config that
         // just has a single default deny.
@@ -2017,7 +2159,7 @@ mod tests {
     async fn test_with_tenant_nvue_fnn_classic_with_nsg() -> Result<(), Box<dyn std::error::Error>>
     {
         let virtualization_type = VpcVirtualizationType::Fnn;
-        let network_config = netconf(virtualization_type, 32, 24, true, None);
+        let network_config = netconf(virtualization_type, 32, 24, true, None, false);
 
         let td = tempfile::tempdir()?;
         let hbn_root = td.path();
@@ -2063,7 +2205,7 @@ mod tests {
     async fn test_with_tenant_nvue_fnn_classic_with_empty_nsg_default_deny()
     -> Result<(), Box<dyn std::error::Error>> {
         let virtualization_type = VpcVirtualizationType::Fnn;
-        let mut network_config = netconf(virtualization_type, 32, 24, true, Some(3109));
+        let mut network_config = netconf(virtualization_type, 32, 24, true, Some(3109), false);
 
         // Empty out all NSG rules.  This should result in config that
         // just has a single default deny.
@@ -2116,7 +2258,7 @@ mod tests {
     #[tokio::test]
     async fn test_with_tenant_nvue_fnn_classic() -> Result<(), Box<dyn std::error::Error>> {
         let virtualization_type = VpcVirtualizationType::Fnn;
-        let network_config = netconf(virtualization_type, 32, 24, false, None);
+        let network_config = netconf(virtualization_type, 32, 24, false, None, false);
 
         let td = tempfile::tempdir()?;
         let hbn_root = td.path();
@@ -2161,6 +2303,7 @@ mod tests {
         network_prefix_length: u8,
         include_network_security_group: bool,
         site_global_vpc_vni: Option<u32>,
+        second_interface_l2: bool,
     ) -> rpc::ManagedHostNetworkConfigResponse {
         // The config we received from API server
         // Admin won't be used
@@ -2256,13 +2399,13 @@ mod tests {
                 svi_ip: get_svi_ip(
                     &Some(svi_ip2),
                     virtualization_type,
-                    false,
+                    second_interface_l2,
                     network_prefix_length,
                 )
                 .unwrap()
                 .map(|ip| ip.to_string()),
                 tenant_vrf_loopback_ip: Some("10.217.5.125".to_string()),
-                is_l2_segment: false,
+                is_l2_segment: second_interface_l2,
                 network_security_group: if !include_network_security_group {
                     None
                 } else {
@@ -3007,7 +3150,7 @@ mod tests {
         let ip = FPath(PathBuf::from(i.path()));
 
         let service_addrs = ServiceAddresses {
-            pxe_ip: IpAddr::from([10, 0, 0, 1]),
+            pxe_ips: vec![IpAddr::from([10, 0, 0, 1])],
             ntpservers: vec![
                 IpAddr::from([127, 0, 0, 1]),
                 IpAddr::from([127, 0, 0, 2]),
@@ -3026,7 +3169,7 @@ mod tests {
         host_config_str =
             dhcp::build_server_host_config(network_config2.clone(), &HBNDeviceNames::pre_23())?;
         assert!(host_config_str.contains("mtu: 1500"));
-        match super::write_dhcp_server_config(
+        match super::write_dhcp_v4_server_config(
             &fp,
             &super::DhcpServerPaths {
                 server: gp.clone(),
@@ -3075,11 +3218,11 @@ mod tests {
         assert!(host_config_str.contains("mtu: 1500"));
 
         let service_addrs = ServiceAddresses {
-            pxe_ip: IpAddr::from([10, 0, 0, 1]),
+            pxe_ips: vec![IpAddr::from([10, 0, 0, 1])],
             ntpservers: vec![],
             nameservers: vec![IpAddr::from([10, 1, 1, 1])],
         };
-        match super::write_dhcp_server_config(
+        match super::write_dhcp_v4_server_config(
             &fp,
             &super::DhcpServerPaths {
                 server: gp,
@@ -3122,6 +3265,97 @@ mod tests {
         validate_host_config(
             dhcp_host_config,
             HostConfig::try_from(network_config, "pf0hpf_sf", "pf0vf", "_sf")?,
+        );
+
+        Ok(())
+    }
+
+    // test_dhcp_server_config_errors_without_ipv4_pxe is more or less
+    // a copypasta of other testing above, and its purpose in life is
+    // to make sure we get the [expected] error when passing a list of
+    // IPs to the DHCPv4 config builder, and no IPv4 addresses exist
+    // to build config against. This should really only happen in an
+    // IPv6-only environment, which would be really impressive.
+    #[test]
+    fn test_dhcp_server_config_errors_without_ipv4_pxe() -> Result<(), Box<dyn std::error::Error>> {
+        let netconf = rpc::ManagedHostNetworkConfig {
+            loopback_ip: "10.217.5.39".to_string(),
+            quarantine_state: None,
+        };
+        let network_config = rpc::ManagedHostNetworkConfigResponse {
+            site_global_vpc_vni: None,
+            asn: 4259912557,
+            datacenter_asn: 11414,
+            common_internal_route_target: None,
+            additional_route_target_imports: vec![],
+            anycast_site_prefixes: vec![],
+            tenant_host_asn: None,
+            routing_profile: None,
+            traffic_intercept_config: None,
+            dhcp_servers: vec![],
+            vni_device: "vxlan48".to_string(),
+            managed_host_config: Some(netconf),
+            managed_host_config_version: "V1-T1".to_string(),
+            use_admin_network: false,
+            admin_interface: None,
+            tenant_interfaces: vec![],
+            instance_network_config_version: "V1-T1".to_string(),
+            network_security_policy_overrides: vec![],
+            instance_id: None,
+            remote_id: "test".to_string(),
+            dpu_network_pinger_type: None,
+            network_virtualization_type: None,
+            vpc_vni: None,
+            route_servers: vec![],
+            deny_prefixes: vec![],
+            site_fabric_prefixes: vec![],
+            vpc_isolation_behavior: rpc::VpcIsolationBehaviorType::VpcIsolationMutual.into(),
+            deprecated_deny_prefixes: vec![],
+            enable_dhcp: true,
+            host_interface_id: None,
+            min_dpu_functioning_links: None,
+            is_primary_dpu: true,
+            internet_l3_vni: None,
+            stateful_acls_enabled: false,
+            instance: None,
+            dpu_extension_services: vec![],
+        };
+
+        let f = tempfile::NamedTempFile::new()?;
+        let fp = FPath(PathBuf::from(f.path()));
+
+        let g = tempfile::NamedTempFile::new()?;
+        let gp = FPath(PathBuf::from(g.path()));
+
+        let h = tempfile::NamedTempFile::new()?;
+        let hp = FPath(PathBuf::from(h.path()));
+
+        let i = tempfile::NamedTempFile::new()?;
+        let ip = FPath(PathBuf::from(i.path()));
+
+        let service_addrs = ServiceAddresses {
+            pxe_ips: vec!["fd00::1".parse().unwrap()],
+            ntpservers: vec![],
+            nameservers: vec![IpAddr::from([10, 1, 1, 1])],
+        };
+
+        let result = super::write_dhcp_v4_server_config(
+            &fp,
+            &super::DhcpServerPaths {
+                server: gp,
+                config: hp,
+                host_config: ip,
+            },
+            &network_config,
+            &service_addrs,
+            &HBNDeviceNames::pre_23(),
+        );
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("IPv4 PXE/UEFI HTTP boot address"),
+            "Expected error about missing IPv4, got: {err_msg}"
         );
 
         Ok(())

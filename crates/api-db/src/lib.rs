@@ -22,6 +22,7 @@
 pub mod attestation;
 pub mod bmc_metadata;
 pub mod carbide_version;
+pub mod compute_allocation;
 pub mod db_read;
 pub mod desired_firmware;
 pub mod dhcp_entry;
@@ -34,6 +35,7 @@ pub mod dpu_machine_update;
 pub mod dpu_remediation;
 pub mod expected_machine;
 pub mod expected_power_shelf;
+pub mod expected_rack;
 pub mod expected_switch;
 pub mod explored_endpoints;
 pub mod explored_managed_host;
@@ -83,6 +85,7 @@ pub mod sku;
 pub mod switch;
 pub mod switch_state_history;
 pub mod tenant;
+pub mod tenant_identity_config;
 pub mod tenant_keyset;
 pub mod trim_table;
 pub mod vpc;
@@ -104,7 +107,6 @@ use mac_address::MacAddress;
 use model::ConfigValidationError;
 use model::hardware_info::HardwareInfoError;
 use model::tenant::TenantError;
-use rpc::errors::RpcDataConversionError;
 use sqlx::{Acquire, PgPool, PgTransaction, Postgres};
 use tonic::Status;
 
@@ -287,7 +289,6 @@ pub trait ColumnInfo<'a>: Clone + Copy {
 
 ///
 /// Wraps a sqlx::Error and records location and query
-///
 #[derive(Debug)]
 pub struct AnnotatedSqlxError {
     file: &'static str,
@@ -337,8 +338,6 @@ pub enum DatabaseError {
     },
     #[error("Argument is invalid: {0}")]
     InvalidArgument(String),
-    #[error("Can not convert between RPC data model and internal data model - {0}")]
-    RpcDataConversionError(#[from] RpcDataConversionError),
     #[error("Duplicate MAC address for expected host BMC interface: {0}")]
     ExpectedHostDuplicateMacAddress(MacAddress),
     #[error("Argument is missing in input: {0}")]
@@ -383,6 +382,8 @@ pub enum DatabaseError {
     DhcpError(#[from] DhcpError),
     #[error("Maximum one association per interface")]
     MaxOneInterfaceAssociation,
+    #[error("Fast-path allocation failed and can be retried")]
+    TryAgain,
 }
 
 impl DatabaseError {
@@ -399,6 +400,18 @@ impl DatabaseError {
         match self {
             DatabaseError::Sqlx(e) => DatabaseError::new(op_name, e.source),
             _ => self,
+        }
+    }
+
+    pub fn is_fqdn_conflict(&self) -> bool {
+        match self {
+            DatabaseError::Sqlx(sqlx_error) => match &sqlx_error.source {
+                sqlx::Error::Database(database_error) => {
+                    database_error.constraint() == Some("fqdn_must_be_unique")
+                }
+                _ => false,
+            },
+            _ => false,
         }
     }
 }
@@ -537,6 +550,7 @@ impl From<DatabaseError> for tonic::Status {
             error @ DatabaseError::Internal { .. } => Status::internal(error.to_string()),
             DatabaseError::InvalidArgument(msg) => Status::invalid_argument(msg),
             DatabaseError::InvalidConfiguration(e) => Status::invalid_argument(e.to_string()),
+            error @ DatabaseError::DhcpError(_) => Status::resource_exhausted(error.to_string()),
             DatabaseError::MissingArgument(msg) => Status::invalid_argument(*msg),
             DatabaseError::NetworkParseError(e) => Status::invalid_argument(e.to_string()),
             DatabaseError::NetworkSegmentDelete(msg) => Status::invalid_argument(msg),
@@ -544,7 +558,6 @@ impl From<DatabaseError> for tonic::Status {
                 Status::not_found(format!("{kind} not found: {id}"))
             }
             DatabaseError::ResourceExhausted(kind) => Status::resource_exhausted(kind),
-            DatabaseError::RpcDataConversionError(e) => Status::invalid_argument(e.to_string()),
             error @ DatabaseError::RpcUuidConversionError(_) => {
                 Status::invalid_argument(error.to_string())
             }
@@ -768,6 +781,7 @@ fn setup_test_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ip_allocator::DhcpError;
 
     #[test]
     fn test_database_error_new() {
@@ -793,5 +807,14 @@ mod tests {
         assert_eq!(err.line, line!() - 4);
         assert_eq!(err.file, file!());
         assert!(format!("{err}").contains(DB_QUERY));
+    }
+
+    #[test]
+    fn test_dhcp_error_maps_to_resource_exhausted_status() {
+        let err = DatabaseError::DhcpError(DhcpError::PrefixExhausted(
+            "10.217.5.160".parse().expect("valid IP"),
+        ));
+        let status: tonic::Status = err.into();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 }

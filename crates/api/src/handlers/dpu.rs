@@ -21,12 +21,12 @@ use std::str::FromStr;
 
 use ::rpc::errors::RpcDataConversionError;
 use ::rpc::{common as rpc_common, forge as rpc};
+use carbide_network::virtualization::VpcVirtualizationType;
 use carbide_uuid::machine::MachineId;
 use db::{
     DatabaseError, ObjectColumnFilter, dpu_agent_upgrade_policy, network_security_group,
     network_segment,
 };
-use forge_network::virtualization::VpcVirtualizationType;
 use futures_util::future::join_all;
 use itertools::Itertools;
 use model::extension_service::{ExtensionService, ExtensionServiceVersionInfo};
@@ -83,9 +83,10 @@ pub(crate) async fn get_managed_host_network_config_inner(
     {
         Some(dpu_snapshot) => dpu_snapshot,
         None => {
-            return Err(Status::failed_precondition(format!(
+            return Err(CarbideError::FailedPrecondition(format!(
                 "DPU {dpu_machine_id} needs discovery.  DPU snapshot not found for managed host"
-            )));
+            ))
+            .into());
         }
     };
 
@@ -108,9 +109,10 @@ pub(crate) async fn get_managed_host_network_config_inner(
     let loopback_ip = match dpu_snapshot.loopback_ip() {
         Some(ip) => ip,
         None => {
-            return Err(Status::failed_precondition(format!(
+            return Err(CarbideError::FailedPrecondition(format!(
                 "DPU {dpu_machine_id} needs discovery. Does not have a loopback IP yet."
-            )));
+            ))
+            .into());
         }
     };
 
@@ -125,9 +127,10 @@ pub(crate) async fn get_managed_host_network_config_inner(
             .secondary_overlay_vtep_ip
             .is_none()
     {
-        return Err(Status::failed_precondition(format!(
+        return Err(CarbideError::FailedPrecondition(format!(
             "DPU {dpu_machine_id} needs discovery. Does not have a secondary VTEP IP yet."
-        )));
+        ))
+        .into());
     };
 
     // its ok if there is no locator here.  if there isn't one, then only the primary dpu is allowed to be configred (checked below)
@@ -371,14 +374,14 @@ pub(crate) async fn get_managed_host_network_config_inner(
             let segment_details = segment_details.iter().map(|x|(x.id, x)).collect::<HashMap<_,_>>();
 
             let Some(segment) = segment_details.get(&network_segment_id) else {
-                return Err(Status::internal(format!(
+                return Err(CarbideError::Internal { message: format!(
                     "Tenant segment id {network_segment_id} is not found in db."
-                )));
+                ) }.into());
             };
 
             let domain = match segment.subdomain_id {
                 Some(domain_id) => {
-                    db::dns::domain::find_by_uuid(&mut txn, domain_id)
+                    db::dns::domain::find_by_uuid(txn.as_pgconn(), domain_id)
                         .await
                         .map_err(CarbideError::from)?
                         .ok_or_else(|| CarbideError::NotFoundError {
@@ -425,15 +428,15 @@ pub(crate) async fn get_managed_host_network_config_inner(
             ) {
                 // This can not happen as validated during instance creation.
                 let Some(iface_segment) = iface.network_segment_id else {
-                    return Err(Status::internal(format!(
+                    return Err(CarbideError::Internal { message: format!(
                         "Tenant segment is not assigned for iface: {iface:?}."
-                    )));
+                    ) }.into());
                 };
 
                 let Some(segment) = segment_details.get(&iface_segment) else {
-                    return Err(Status::internal(format!(
+                    return Err(CarbideError::Internal { message: format!(
                         "Tenant segment id {iface_segment} is not found in db. Can not fetch the details."
-                    )));
+                    ) }.into());
                 };
 
                 let tenant_interface =
@@ -583,7 +586,7 @@ pub(crate) async fn get_managed_host_network_config_inner(
                 info.version.version,
             );
             Some(
-                extension_service::get_extension_service_credential(&api.credential_provider, key)
+                extension_service::get_extension_service_credential(&api.credential_manager, key)
                     .await?,
             )
         } else {
@@ -778,7 +781,9 @@ pub(crate) async fn update_agent_reported_inventory(
 
         txn.commit().await?;
     } else {
-        return Err(Status::invalid_argument("inventory missing from request"));
+        return Err(
+            CarbideError::InvalidArgument("inventory missing from request".to_string()).into(),
+        );
     }
 
     tracing::debug!(
@@ -888,7 +893,7 @@ pub(crate) async fn record_dpu_network_status(
             &mut txn,
             *host_interface_id,
             Some(timestamp.parse().map_err(|e| {
-                Status::invalid_argument(format!("Failed parsing dhcp timestamp: {e}"))
+                CarbideError::InvalidArgument(format!("Failed parsing dhcp timestamp: {e}"))
             })?),
         )
         .await?;
@@ -996,16 +1001,18 @@ pub(crate) async fn dpu_agent_upgrade_check(
     })?;
     log_machine_id(&machine_id);
     if !machine_id.machine_type().is_dpu() {
-        return Err(Status::invalid_argument(
-            "Upgrade check can only be performed on DPUs",
-        ));
+        return Err(CarbideError::InvalidArgument(
+            "Upgrade check can only be performed on DPUs".into(),
+        )
+        .into());
     }
 
     // We usually want these two to match
     let agent_version = req.current_agent_version;
     let server_version = carbide_version::v!(build_version);
-    BuildVersion::try_from(server_version)
-        .map_err(|_| Status::internal("Invalid server version, cannot check for upgrade"))?;
+    BuildVersion::try_from(server_version).map_err(|_| CarbideError::Internal {
+        message: "Invalid server version, cannot check for upgrade".into(),
+    })?;
 
     let mut txn = api.txn_begin().await?;
 
@@ -1058,7 +1065,11 @@ pub(crate) async fn dpu_agent_upgrade_policy_action(
     }
 
     let Some(active_policy) = dpu_agent_upgrade_policy::get(&mut txn).await? else {
-        return Err(tonic::Status::not_found("No agent upgrade policy"));
+        return Err(CarbideError::NotFoundError {
+            kind: "agent_upgrade_policy",
+            id: "active".to_string(),
+        }
+        .into());
     };
     txn.commit().await?;
 
@@ -1111,9 +1122,9 @@ pub(crate) async fn trigger_dpu_reprovisioning(
             .classifications
             .contains(&health_report::HealthAlertClassification::prevent_allocations())
     }) {
-        return Err(Status::invalid_argument(
-            "Machine must have a 'HostUpdateInProgress' Health Alert with 'PreventAllocations' classification.",
-        ));
+        return Err(CarbideError::InvalidArgument(
+            "Machine must have a 'HostUpdateInProgress' Health Alert with 'PreventAllocations' classification.".into(),
+        ).into());
     }
 
     if snapshot.dpu_snapshots.iter().any(|ms| {

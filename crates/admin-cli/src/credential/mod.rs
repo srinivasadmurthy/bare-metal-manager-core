@@ -30,14 +30,11 @@ mod generate_ufm_cert;
 #[cfg(test)]
 mod tests;
 
-use ::rpc::admin_cli::CarbideCliResult;
 use clap::Parser;
 
 use crate::cfg::dispatch::Dispatch;
-use crate::cfg::run::Run;
-use crate::cfg::runtime::RuntimeContext;
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Dispatch)]
 #[clap(rename_all = "kebab_case")]
 pub enum Cmd {
     #[clap(about = "Add UFM credential")]
@@ -62,21 +59,4 @@ pub enum Cmd {
     AddNmxM(add_nmxm::Args),
     #[clap(about = "Delete NmxM credentials")]
     DeleteNmxM(delete_nmxm::Args),
-}
-
-impl Dispatch for Cmd {
-    async fn dispatch(self, mut ctx: RuntimeContext) -> CarbideCliResult<()> {
-        match self {
-            Cmd::AddUFM(args) => args.run(&mut ctx).await,
-            Cmd::DeleteUFM(args) => args.run(&mut ctx).await,
-            Cmd::GenerateUFMCert(args) => args.run(&mut ctx).await,
-            Cmd::AddBMC(args) => args.run(&mut ctx).await,
-            Cmd::DeleteBMC(args) => args.run(&mut ctx).await,
-            Cmd::AddUefi(args) => args.run(&mut ctx).await,
-            Cmd::AddHostFactoryDefault(args) => args.run(&mut ctx).await,
-            Cmd::AddDpuFactoryDefault(args) => args.run(&mut ctx).await,
-            Cmd::AddNmxM(args) => args.run(&mut ctx).await,
-            Cmd::DeleteNmxM(args) => args.run(&mut ctx).await,
-        }
-    }
 }

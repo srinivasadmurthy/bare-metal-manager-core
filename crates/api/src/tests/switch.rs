@@ -46,7 +46,7 @@ async fn test_find_switch_by_id(pool: sqlx::PgPool) -> Result<(), Box<dyn std::e
     let found_switch = &switch_list.switches[0];
     assert_eq!(
         found_switch.id.as_ref().unwrap().to_string(),
-        switch_id.clone().to_string()
+        switch_id.to_string()
     );
     assert_eq!(
         found_switch.config.as_ref().unwrap().name,
@@ -315,8 +315,16 @@ async fn test_switch_controller_state_transitions(
     let new_state = SwitchControllerState::Ready;
     let current_version = switch.controller_state.version;
 
-    db_switch::try_update_controller_state(&mut txn, switch_id, current_version, &new_state)
-        .await?;
+    let next_version = current_version.increment();
+    let updated = db_switch::try_update_controller_state(
+        &mut txn,
+        switch_id,
+        current_version,
+        next_version,
+        &new_state,
+    )
+    .await?;
+    assert!(updated, "update with correct version should succeed");
 
     // Verify the state was updated
     let updated_switches = db_switch::find_by(
@@ -332,6 +340,39 @@ async fn test_switch_controller_state_transitions(
         updated_switch.controller_state.value,
         SwitchControllerState::Ready
     ));
+
+    // Version should have been incremented
+    assert_eq!(
+        updated_switch.controller_state.version.version_nr(),
+        current_version.version_nr() + 1,
+        "version should be incremented after update"
+    );
+
+    // Trying to update with the old version should fail (optimistic lock)
+    let stale_update = db_switch::try_update_controller_state(
+        &mut txn,
+        switch_id,
+        current_version,
+        current_version.increment(),
+        &SwitchControllerState::Initializing,
+    )
+    .await?;
+    assert!(
+        !stale_update,
+        "update with stale version should be rejected"
+    );
+
+    // Updating with the new version should succeed
+    let new_version = updated_switch.controller_state.version;
+    let updated_again = db_switch::try_update_controller_state(
+        &mut txn,
+        switch_id,
+        new_version,
+        new_version.increment(),
+        &SwitchControllerState::Initializing,
+    )
+    .await?;
+    assert!(updated_again, "update with current version should succeed");
 
     txn.rollback().await?;
 
@@ -558,6 +599,7 @@ async fn test_find_switch_with_bmc_info(
     };
     use mac_address::MacAddress;
     use model::address_selection_strategy::AddressSelectionStrategy;
+    use model::expected_switch::ExpectedSwitch;
     use model::metadata::Metadata;
     use model::network_segment::NetworkSegmentType;
 
@@ -570,18 +612,21 @@ async fn test_find_switch_with_bmc_info(
 
     db_expected_switch::create(
         &mut txn,
-        bmc_mac,
-        "admin".to_string(),
-        "password".to_string(),
-        switch_serial.to_string(),
-        Metadata {
-            name: "Test Expected Switch".to_string(),
-            description: "Test switch for BMC info lookup".to_string(),
-            labels: HashMap::new(),
+        ExpectedSwitch {
+            expected_switch_id: None,
+            bmc_mac_address: bmc_mac,
+            bmc_username: "admin".to_string(),
+            bmc_password: "password".to_string(),
+            serial_number: switch_serial.to_string(),
+            metadata: Metadata {
+                name: "Test Expected Switch".to_string(),
+                description: "Test switch for BMC info lookup".to_string(),
+                labels: HashMap::new(),
+            },
+            rack_id: None,
+            nvos_username: Some("nvos_user".to_string()),
+            nvos_password: Some("nvos_pass".to_string()),
         },
-        None,
-        Some("nvos_user".to_string()),
-        Some("nvos_pass".to_string()),
     )
     .await?;
 

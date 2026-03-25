@@ -15,8 +15,10 @@
  * limitations under the License.
  */
 pub(crate) mod common;
+mod compute_allocation;
 mod connected_device;
 mod create_domain;
+mod credential;
 mod desired_firmware_versions;
 mod dns;
 mod dpa_interfaces;
@@ -31,6 +33,8 @@ mod dpu_reprovisioning;
 mod dynamic_config;
 mod expected_machine;
 mod expected_power_shelf;
+mod expected_rack;
+mod expected_switch;
 mod explored_endpoint_find;
 mod explored_managed_host_find;
 mod extension_service;
@@ -87,6 +91,7 @@ mod power_shelf;
 mod power_shelf_state_controller;
 mod prevent_duplicate_mac_addresses;
 mod rack_firmware;
+mod rack_health;
 mod rack_state_controller;
 mod redfish_actions;
 mod resource_pool;

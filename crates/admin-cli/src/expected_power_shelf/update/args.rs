@@ -1,0 +1,157 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+use ::rpc::admin_cli::CarbideCliError;
+use carbide_uuid::rack::RackId;
+use clap::{ArgGroup, Parser};
+use mac_address::MacAddress;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Parser, Debug, Serialize, Deserialize)]
+#[clap(group(ArgGroup::new("group").required(true).multiple(true).args(&[
+"bmc_username",
+"bmc_password",
+"shelf_serial_number",
+])))]
+pub struct Args {
+    #[clap(
+        short = 'a',
+        long,
+        help = "BMC MAC Address of the expected power shelf"
+    )]
+    pub bmc_mac_address: Option<MacAddress>,
+
+    #[clap(long = "id", help = "ID (UUID) of the expected power shelf to update.")]
+    #[serde(skip)]
+    pub id: Option<Uuid>,
+    #[clap(
+        short = 'u',
+        long,
+        group = "group",
+        requires("bmc_password"),
+        help = "BMC username of the expected power shelf"
+    )]
+    pub bmc_username: Option<String>,
+    #[clap(
+        short = 'p',
+        long,
+        group = "group",
+        requires("bmc_username"),
+        help = "BMC password of the expected power shelf"
+    )]
+    pub bmc_password: Option<String>,
+    #[clap(
+        short = 's',
+        long,
+        group = "group",
+        help = "Chassis serial number of the expected power shelf"
+    )]
+    pub shelf_serial_number: Option<String>,
+
+    #[clap(
+        long = "meta-name",
+        value_name = "META_NAME",
+        help = "The name that should be used as part of the Metadata for newly created Power Shelves. If empty, the Power Shelf Id will be used"
+    )]
+    pub meta_name: Option<String>,
+
+    #[clap(
+        long = "meta-description",
+        value_name = "META_DESCRIPTION",
+        help = "The description that should be used as part of the Metadata for newly created Power Shelves"
+    )]
+    pub meta_description: Option<String>,
+
+    #[clap(
+        long = "label",
+        value_name = "LABEL",
+        help = "A label that will be added as metadata for the newly created Machine. The labels key and value must be separated by a : character",
+        action = clap::ArgAction::Append
+    )]
+    pub labels: Option<Vec<String>>,
+
+    #[clap(
+        long = "host_name",
+        value_name = "HOST_NAME",
+        help = "Host name of the power shelf",
+        action = clap::ArgAction::Append
+    )]
+    pub host_name: Option<String>,
+
+    #[clap(
+        long = "rack_id",
+        value_name = "RACK_ID",
+        help = "Rack ID for this power shelf",
+        action = clap::ArgAction::Append
+    )]
+    pub rack_id: Option<RackId>,
+
+    #[clap(
+        long = "ip_address",
+        value_name = "IP_ADDRESS",
+        help = "IP address of the power shelf",
+        action = clap::ArgAction::Append
+    )]
+    pub ip_address: Option<String>,
+}
+
+impl TryFrom<Args> for rpc::forge::ExpectedPowerShelf {
+    type Error = CarbideCliError;
+
+    fn try_from(args: Args) -> Result<Self, Self::Error> {
+        match (&args.bmc_mac_address, &args.id) {
+            (Some(_), Some(_)) => {
+                return Err(CarbideCliError::ChooseOneError("--bmc-mac-address", "--id"));
+            }
+            (None, None) => {
+                return Err(CarbideCliError::RequireOneError(
+                    "--bmc-mac-address",
+                    "--id",
+                ));
+            }
+            _ => {}
+        }
+        if args.bmc_username.is_none()
+            && args.bmc_password.is_none()
+            && args.shelf_serial_number.is_none()
+        {
+            return Err(CarbideCliError::GenericError(
+                "One of the following options must be specified: bmc-user-name and bmc-password or shelf-serial-number".to_string(),
+            ));
+        }
+        Ok(rpc::forge::ExpectedPowerShelf {
+            expected_power_shelf_id: args.id.map(|id| ::rpc::common::Uuid {
+                value: id.to_string(),
+            }),
+            bmc_mac_address: args
+                .bmc_mac_address
+                .map(|m| m.to_string())
+                .unwrap_or_default(),
+            bmc_username: args.bmc_username.unwrap_or_default(),
+            bmc_password: args.bmc_password.unwrap_or_default(),
+            shelf_serial_number: args.shelf_serial_number.unwrap_or_default(),
+            ip_address: args.ip_address.unwrap_or_default(),
+            metadata: Some(rpc::forge::Metadata {
+                name: args.meta_name.unwrap_or_default(),
+                description: args.meta_description.unwrap_or_default(),
+                labels: crate::metadata::parse_rpc_labels(args.labels.unwrap_or_default()),
+            }),
+            rack_id: args.rack_id,
+        })
+    }
+}

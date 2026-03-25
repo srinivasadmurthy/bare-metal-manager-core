@@ -15,6 +15,7 @@
 		<tr>
 			<th>Source</th>
 			<th>Mode</th>
+			<th>Triggered By</th>
 			<th>Alerts</th>
 			<th>Classifications</th>
 			<th>Details</th>
@@ -25,6 +26,7 @@
 		<tr>
 			<td>{{ override.health_report.source }}</td>
 			<td>{{ override.mode }}</td>
+			<td>{% match override.health_report.triggered_by %}{% when Some with (v) %}{{ v }}{% when None %}—{% endmatch %}</td>
 			<td>{{ override.health_report.alerts|health_alerts_fmt(false, false)|safe }}</td>
 			<td>{{ override.health_report.alerts|health_alert_classifications_fmt|safe }}</td>
 			<td>
@@ -58,6 +60,7 @@
 				<button onclick="setOverrideTextBoxToTemplate(templateMergeInternalMaintenance)">Internal Maintenance</button>
 				<button onclick="setOverrideTextBoxToTemplate(templateStopRebootForRecovery)">Prevent Reboot</button>
 				<button onclick="setOverrideTextBoxToTemplate(templateMergeOfrMaintenance)">Out for Repair</button>
+				<button onclick="setOverrideTextBoxToTemplate(templateMergeBreakfix)">Break Fix</button>
 				<button onclick="setOverrideTextBoxToTemplate(templateMergeDegradedMaintenance)">Degraded</button>
 				<button onclick="setOverrideTextBoxToTemplate(templateMergeValidationMaintenance)">Validation</button>
 				<button onclick="setOverrideTextBoxToTemplate(templateMergeSuppressExternalAlerting)">Suppress Alerts</button>
@@ -133,7 +136,7 @@ const templateMergeInternalMaintenance = {
 	health_report: {
 		source: "maintenance",
 		successes: [],
-		alerts: [{id: "Maintenance", target: null, message: "", tenant_message: null, classifications: ["PreventAllocations", "SuppressExternalAlerting"]}]
+		alerts: [{id: "Maintenance", target: null, message: "", tenant_message: null, classifications: ["PreventAllocations", "SuppressExternalAlerting", "ExcludeFromStateMachineSla"]}]
 	}
 };
 
@@ -142,7 +145,17 @@ const templateMergeOfrMaintenance = {
 	health_report: {
 		source: "manual-maintenance",
 		successes: [],
-		alerts: [{id: "Maintenance", target: "OutForRepair", message: "", tenant_message: null, classifications: ["PreventAllocations", "SuppressExternalAlerting"]}]
+		alerts: [{id: "Maintenance", target: "OutForRepair", message: "", tenant_message: null, classifications: ["PreventAllocations", "SuppressExternalAlerting", "ExcludeFromStateMachineSla"]}]
+	}
+};
+
+const templateMergeBreakfix = {
+	mode: "Merge",
+	health_report: {
+		source: "manual-maintenance",
+		successes: [],
+		alerts: [{id: "Maintenance", target: "Break-Fix", message: "Machine is broken, setting Break-Fix tag for automated repair",
+			tenant_message: null, classifications: ["PreventAllocations", "SuppressExternalAlerting"]}]
 	}
 };
 
