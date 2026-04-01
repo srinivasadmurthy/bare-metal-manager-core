@@ -73,5 +73,10 @@ x509-parser = { workspace = true }
 [build-dependencies]
 carbide-version = { path = "../version" }
 
+[features]
+default = []
+#default = ["mockdpa"]
+mockdpa = []
+
 [lints]
 workspace = true
