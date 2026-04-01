@@ -218,8 +218,6 @@ impl StateControllerIO for MachineStateControllerIO {
                 InstanceState::NetworkConfigUpdate { .. } => "networkconfigupdate",
                 InstanceState::WaitingForDpusToUp => "waitingfordpustoup",
                 InstanceState::HostPlatformConfiguration { .. } => "hostplatformconfiguration",
-                InstanceState::DpaProvisioning => "dpaprovisioning",
-                InstanceState::WaitingForDpaToBeReady => "waitingfordpatobeready",
             }
         }
 

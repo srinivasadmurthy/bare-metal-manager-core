@@ -341,19 +341,11 @@ pub async fn advance_created_instance_into_state(
     .await;
 
     // Check whether we went through expected states
-    // - DpaProvisioning
-    // - WaitingForDpaToBeReady
     // - WaitingForNetworkSegmentToBeReady
     // - WaitingForNetworkConfig
     assert_eq!(
-        mh.host().parsed_history(Some(4)).await,
+        mh.host().parsed_history(Some(2)).await,
         vec![
-            ManagedHostState::Assigned {
-                instance_state: model::machine::InstanceState::DpaProvisioning,
-            },
-            ManagedHostState::Assigned {
-                instance_state: model::machine::InstanceState::WaitingForDpaToBeReady,
-            },
             ManagedHostState::Assigned {
                 instance_state: model::machine::InstanceState::WaitingForNetworkSegmentToBeReady,
             },

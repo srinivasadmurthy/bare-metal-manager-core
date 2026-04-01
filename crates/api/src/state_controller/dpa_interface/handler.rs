@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use carbide_uuid::dpa_interface::DpaInterfaceId;
-use chrono::{Duration, TimeDelta};
+use chrono::TimeDelta;
 use db::dpa_interface::get_dpa_vni;
 use eyre::eyre;
 use model::dpa_interface::DpaLockMode::{Locked, Unlocked};
@@ -73,7 +73,7 @@ impl StateHandler for DpaInterfaceStateHandler {
             .services
             .site_config
             .get_hb_interval()
-            .unwrap_or_else(|| Duration::minutes(2));
+            .unwrap_or_else(|| TimeDelta::minutes(2));
 
         let dpa_info = ctx.services.dpa_info.clone().unwrap();
 

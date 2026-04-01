@@ -72,6 +72,7 @@ mod credentials;
 mod db_init;
 mod dhcp;
 mod dpa;
+mod dpa_monitor;
 mod dpf;
 mod dynamic_settings;
 mod errors;

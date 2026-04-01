@@ -51,6 +51,7 @@ use crate::api::Api;
 use crate::api::metrics::ApiMetricsEmitter;
 use crate::cfg::file::{CarbideConfig, ListenMode};
 use crate::dpa::handler::{DpaInfo, start_dpa_handler};
+use crate::dpa_monitor::DpaMonitor;
 use crate::dynamic_settings::DynamicSettings;
 use crate::errors::CarbideError;
 use crate::firmware_downloader::FirmwareDownloader;
@@ -734,7 +735,6 @@ pub async fn initialize_and_start_controllers(
 
         emitter_builder.build()
     };
-
     let handler_services = Arc::new(CommonStateHandlerServices {
         db_pool: db_pool.clone(),
         db_reader: db_pool.clone().into(),
@@ -940,6 +940,21 @@ pub async fn initialize_and_start_controllers(
         work_lock_manager_handle.clone(),
     )
     .start(join_set, cancel_token.clone())?;
+
+    if carbide_config.is_dpa_enabled() {
+        let mqtt_client =
+            Some(start_dpa_handler(join_set, api_service.clone(), cancel_token.clone()).await?);
+
+        DpaMonitor::new(
+            db_pool.clone(),
+            mqtt_client,
+            meter.clone(),
+            carbide_config.dpa_config.clone().unwrap_or_default(),
+            carbide_config.host_health,
+            work_lock_manager_handle.clone(),
+        )
+        .start(join_set, cancel_token.clone())?;
+    }
 
     SiteExplorer::new(
         db_pool.clone(),

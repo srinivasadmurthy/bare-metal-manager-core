@@ -1545,9 +1545,7 @@ async fn test_scout_heartbeat_timeout_alert_cleared_on_instance_creation_transit
         if matches!(
             host.current_state(),
             ManagedHostState::Assigned {
-                instance_state: InstanceState::DpaProvisioning
-            } | ManagedHostState::Assigned {
-                instance_state: InstanceState::WaitingForDpaToBeReady
+                instance_state: InstanceState::Ready
             }
         ) {
             reached_assigned = true;
