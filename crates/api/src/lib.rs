@@ -74,6 +74,7 @@ mod dhcp;
 mod dpa;
 mod dpa_monitor;
 mod dpf;
+mod dpf_services;
 mod dynamic_settings;
 mod errors;
 mod ethernet_virtualization;
