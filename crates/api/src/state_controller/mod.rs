@@ -19,7 +19,6 @@ pub mod common_services;
 pub mod config;
 pub mod controller;
 pub mod db_write_batch;
-pub mod dpa_interface;
 pub mod ib_partition;
 pub mod io;
 pub mod machine;

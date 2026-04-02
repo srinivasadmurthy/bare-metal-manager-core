@@ -115,12 +115,10 @@ impl DpaMonitor {
 
         println!("{} SDM dpa monitor start enabled: {}", Utc::now(), self.config.enabled);
 
-        if self.config.enabled {
-            join_set
-                .build_task()
-                .name("dpa-monitor")
-                .spawn(async move { self.run(cancel_token).await })?;
-        }
+        join_set
+            .build_task()
+            .name("dpa-monitor")
+            .spawn(async move { self.run(cancel_token).await })?;
 
         Ok(())
     }

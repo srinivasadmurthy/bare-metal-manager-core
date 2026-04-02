@@ -77,8 +77,6 @@ use crate::scout_stream::ConnectionRegistry;
 use crate::site_explorer::{BmcEndpointExplorer, SiteExplorer};
 use crate::state_controller::common_services::CommonStateHandlerServices;
 use crate::state_controller::controller::{Enqueuer, StateController};
-use crate::state_controller::dpa_interface::handler::DpaInterfaceStateHandler;
-use crate::state_controller::dpa_interface::io::DpaInterfaceStateControllerIO;
 use crate::state_controller::ib_partition::handler::IBPartitionStateHandler;
 use crate::state_controller::ib_partition::io::IBPartitionStateControllerIO;
 use crate::state_controller::machine::handler::MachineStateHandlerBuilder;
@@ -663,24 +661,6 @@ pub async fn initialize_and_start_controllers(
     let downloader = FirmwareDownloader::new();
     let upload_limiter = Arc::new(Semaphore::new(carbide_config.firmware_global.max_uploads));
 
-    let mut dpa_info: Option<Arc<DpaInfo>> = None;
-
-    if carbide_config.is_dpa_enabled() {
-        let mqtt_client =
-            Some(start_dpa_handler(join_set, api_service.clone(), cancel_token.clone()).await?);
-        let subnet_ip = carbide_config.get_dpa_subnet_ip()?;
-
-        let subnet_mask = carbide_config.get_dpa_subnet_mask()?;
-
-        let info: DpaInfo = DpaInfo {
-            subnet_ip,
-            subnet_mask,
-            mqtt_client,
-        };
-
-        dpa_info = Some(Arc::new(info));
-    }
-
     // Create state change emitter with DSX Exchange Event Bus hook if enabled
     let state_change_emitter = {
         let mut emitter_builder = StateChangeEmitterBuilder::default();
@@ -746,7 +726,6 @@ pub async fn initialize_and_start_controllers(
         ib_pools: common_pools.infiniband.clone(),
         ipmi_tool: ipmi_tool.clone(),
         site_config: carbide_config.clone(),
-        dpa_info: dpa_info.clone(),
         rms_client: rms_client.clone(),
     });
 
@@ -845,19 +824,6 @@ pub async fn initialize_and_start_controllers(
         .build_and_spawn(join_set, cancel_token.clone())
         .expect("Unable to build NetworkSegmentController");
 
-    if carbide_config.is_dpa_enabled() {
-        tracing::info!("Starting DpaInterfaceStateController as dpa is enabled");
-        StateController::<DpaInterfaceStateControllerIO>::builder()
-            .database(db_pool.clone(), work_lock_manager_handle.clone())
-            .meter("carbide_dpa_interfaces", meter.clone())
-            .processor_id(state_controller_id.clone())
-            .services(handler_services.clone())
-            .iteration_config((&carbide_config.dpa_interface_state_controller.controller).into())
-            .state_handler(Arc::new(DpaInterfaceStateHandler::new()))
-            .build_and_spawn(join_set, cancel_token.clone())
-            .expect("Unable to build DpaInterfaceStateController");
-    }
-
     if carbide_config.spdm.enabled {
         let Some(nras_config) = carbide_config.spdm.nras_config.clone() else {
             return Err(eyre::eyre!(
@@ -945,6 +911,23 @@ pub async fn initialize_and_start_controllers(
     .start(join_set, cancel_token.clone())?;
 
     if carbide_config.is_dpa_enabled() {
+        let mqtt_client =
+            Some(start_dpa_handler(join_set, api_service.clone(), cancel_token.clone()).await?);
+
+        let subnet_ip = carbide_config.get_dpa_subnet_ip()?;
+
+        let subnet_mask = carbide_config.get_dpa_subnet_mask()?;
+
+        let info: DpaInfo = DpaInfo {
+            subnet_ip,
+            subnet_mask,
+            mqtt_client,
+        };
+
+        let dpa_info = Some(Arc::new(info));
+    
+        println!(" SDM DPA enabled. Starting DpaMonitor");
+
         DpaMonitor::new(
             db_pool.clone(),
             db_pool.clone().into(),

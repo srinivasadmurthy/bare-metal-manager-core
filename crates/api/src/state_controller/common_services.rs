@@ -25,7 +25,6 @@ use model::resource_pool::common::IbPools;
 use sqlx::PgPool;
 
 use crate::cfg::file::CarbideConfig;
-use crate::dpa::handler::DpaInfo;
 use crate::ib::IBFabricManager;
 use crate::ipmitool::IPMITool;
 use crate::redfish::RedfishClientPool;
@@ -55,8 +54,6 @@ pub struct CommonStateHandlerServices {
 
     /// Access to the site config
     pub site_config: Arc<CarbideConfig>,
-
-    pub dpa_info: Option<Arc<DpaInfo>>,
 
     /// Rack Manager Service client
     pub rms_client: Option<Arc<dyn RmsApi>>,
