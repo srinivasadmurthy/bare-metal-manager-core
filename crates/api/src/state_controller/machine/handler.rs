@@ -607,6 +607,8 @@ impl MachineStateHandler {
     ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
         let mh_state = mh_snapshot.managed_state.clone();
 
+        println!("{} SDM attempt_state_transition: mh_state: {:#?}", Utc::now(), mh_state);
+
         // If it's been more than 5 minutes since DPU reported status, consider it unhealthy
         for dpu_snapshot in &mh_snapshot.dpu_snapshots {
             if let Some(dpu_health) = dpu_snapshot.dpu_agent_health_report.as_ref() {
@@ -2275,6 +2277,7 @@ impl StateHandler for MachineStateHandler {
         _mh_state: &Self::ControllerState, // mh_snapshot above already contains it
         ctx: &mut StateHandlerContext<Self::ContextObjects>,
     ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
+        println!("{} SDM handle_object_state: host_machine_id: {:?}", Utc::now(), host_machine_id);
         if !mh_snapshot
             .host_snapshot
             .associated_dpu_machine_ids()
@@ -2350,6 +2353,8 @@ impl StateHandler for MachineStateHandler {
             db::power_options::persist(&power_options, &mut txn).await?;
             txn.commit().await?;
         }
+
+        println!("SDM handle_object_state: done");
 
         result
     }

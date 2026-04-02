@@ -20,6 +20,8 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use chrono::Utc;
+
 use arc_swap::ArcSwap;
 use db::machine::update_dpu_asns;
 use db::resource_pool::DefineResourcePoolError;
@@ -994,6 +996,8 @@ pub async fn initialize_and_start_controllers(
         &carbide_config.machine_validation_config.clone(),
     )
     .await?;
+
+    println!("{} SDM setup: all controllers started", Utc::now());
 
     Ok(())
 }
