@@ -23,6 +23,7 @@ use carbide_uuid::machine::MachineId;
 
 use db::dpa_interface::get_dpa_vni;
 use chrono::TimeDelta;
+use model::dpa_interface::DpaLockMode::{Locked, Unlocked};
 use crate::dpa::handler::DpaInfo;
 use db::db_read::PgPoolReader;
 use crate::periodic_timer::PeriodicTimer;
@@ -338,6 +339,118 @@ impl DpaMonitor {
                 }
             }
 
+            DpaInterfaceControllerState::Unlocking => {
+                // Once we reach Unlocking state, we would have replied to
+                // ForgeAgentControl requests from scout with a reply indicating
+                // that it should unlock the card. The scout does the action, and
+                // publishes an observation indicating the lock status. That causes
+                // us to update the card state in the DB. If card_state is none, that
+                // means this sequence has not yet taken place. So we just wait.
+                if dpa_interface.card_state.is_none() {
+                    tracing::info!("card_state none for dpa: {:#?}", dpa_interface.id);
+                    return Ok(HandlerResult {
+                        new_state: None,
+                        txn: None,
+                    });
+                }
+                if let Some(ref mut cs) = dpa_interface.card_state
+                    && cs.lockmode == Some(Unlocked)
+                {
+                    let new_state = DpaInterfaceControllerState::ApplyFirmware;
+                    tracing::info!(state = ?new_state, "Interface unlocked. Transitioning to next state");
+                    return Ok(HandlerResult {
+                        new_state: Some(new_state),
+                        txn: None,
+                    });
+                }
+                return Ok(HandlerResult {
+                    new_state: None,
+                    txn: None,
+                });
+            }
+
+            DpaInterfaceControllerState::ApplyFirmware => {
+                // At this point, we're in the ApplyFirmware state, which means we
+                // have sent a firmware flash instruction to scout (via a configured
+                // FirmwareFlasherProfile). Now, we wait for an observation report
+                // from scout indicating firmware has been applied (or skipped if no
+                // config was available).
+                let Some(ref card_state) = dpa_interface.card_state else {
+                    tracing::info!(
+                        "no firmware report, because card_state none for dpa: {:#?}, waiting for retry",
+                        dpa_interface.id
+                    );
+                    return Ok(HandlerResult {
+                        new_state: None,
+                        txn: None,
+                    });
+                };
+                if let Some(ref firmware_report) = card_state.firmware_report {
+                    // Transition on to the next state if the flash succeeded and reset
+                    // either wasn't requested (None) or succeeded (Some(true)).
+                    //
+                    // To explain this a bit better, if no reset was requested, then
+                    // we'll get None back here. Since no reset was requested at all,
+                    // then we can continue, so we just "default" to true, to let
+                    // things continue. If a reset WAS requested, then we'll unwrap
+                    // whatever the result was (either success/true, or failed/false).
+                    let reset_ok = firmware_report.reset.unwrap_or(true);
+                    if firmware_report.flashed && reset_ok {
+                        let new_state = DpaInterfaceControllerState::ApplyProfile;
+                        tracing::info!(
+                            state = ?new_state,
+                            observed_version = firmware_report.observed_version.as_deref().unwrap_or("none"),
+                            "firmware report received and successfully applied, transitioning"
+                        );
+                        return Ok(HandlerResult {
+                            new_state: Some(new_state),
+                            txn: None,
+                        });
+                    }
+                    tracing::warn!(
+                        flashed = firmware_report.flashed,
+                        reset = ?firmware_report.reset,
+                        observed_version = firmware_report.observed_version.as_deref().unwrap_or("none"),
+                        "firmware report received but not successful, waiting for retry"
+                    );
+                }
+
+                // ..if we get here, it's because the firmware_report in the CardState
+                // wasn't set yet. ...or it was, and this round wasn't successful, so we're
+                // just going to keep hanging out in this state until it is (letting the
+                // apply workflow happen again).
+                return Ok(HandlerResult {
+                    new_state: None,
+                    txn: None,
+                });
+            }
+
+            DpaInterfaceControllerState::ApplyProfile => {
+                return handle_apply_profile(dpa_interface);
+            }
+
+            DpaInterfaceControllerState::Locking => {
+                let Some(ref cs) = dpa_interface.card_state else {
+                    tracing::error!("Unexpected - card_state none for dpa: {:#?}", dpa_interface.id);
+                    return Ok(HandlerResult {
+                        new_state: None,
+                        txn: None,
+                    });
+                };
+                if cs.lockmode == Some(Locked) {
+                    let new_state = DpaInterfaceControllerState::WaitingForSetVNI;
+                    tracing::info!(state = ?new_state, "Dpa Interface state transition");
+                    return Ok(HandlerResult {
+                        new_state: Some(new_state),
+                        txn: None,
+                    });
+                }
+                return Ok(HandlerResult {
+                    new_state: None,
+                    txn: None,
+                });
+            }
+
             _ => {}
         }
         Ok(HandlerResult {
@@ -490,3 +603,51 @@ async fn send_set_vni_command<'a>(
         Err(_e) => Ok(None),
     }
 }
+
+/// handle_apply_profile handles the ApplyProfile state for a
+/// SuperNIC/DPA interface, which means we sent an mlxconfig
+/// profile config down to scout (which takes care of resetting
+/// mlxconfig parameters back to defaults, and then potentially
+/// overlaying a profile of parameters over top of it).
+///
+/// And just so it's clear, there are two "success" cases that
+/// we check for here.
+/// 1. A profile was configured and successfully synced — scout
+///    reports a profile_name and profile_synced is true.
+/// 2. NO profile was configured (indicating reset only) — scout
+///    reports profile_name=None and profile_synced true. This is
+///    successful because the reset itself succeeded and there was
+///    nothing else to apply.
+///
+/// In both cases, profile_synced=Some(true) is the signal that
+/// the workflow completed successfully, and it's safe to transition
+/// to the next state.
+fn handle_apply_profile(
+    state: &DpaInterface,
+) -> CarbideResult<HandlerResult> {
+    let Some(ref cs) = state.card_state else {
+        tracing::info!(
+            "no profile report, because card_state none for dpa: {:#?}, waiting for retry",
+            state.id
+        );
+        return Ok(HandlerResult {
+            new_state: None,
+            txn: None,
+        });
+    };
+    if cs.profile_synced == Some(true) {
+        let new_state = DpaInterfaceControllerState::Locking;
+        tracing::info!(
+            state = ?new_state,
+            profile = cs.profile.as_deref().unwrap_or("none"),
+            "profile applied successfully, transitioning"
+        );
+        return Ok(HandlerResult {
+            new_state: Some(new_state),
+            txn: None,
+        });
+    }
+    Ok(HandlerResult {
+        new_state: None,
+        txn: None,
+    })}
