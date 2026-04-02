@@ -451,12 +451,121 @@ impl DpaMonitor {
                 });
             }
 
-            _ => {}
+            DpaInterfaceControllerState::WaitingForSetVNI => {
+                // When we are in the WaitingForSetVNI state, we are have sent a SetVNI command
+                // to the DPA Interface Card. We are waiting for an ACK for that command.
+                // When the ack shows up, the network_config_version and the network_status_observation
+                // will match.
+
+                if !dpa_interface.managed_host_network_config_version_synced() {
+                    tracing::debug!("DPA interface found in WaitingForSetVNI state");
+
+                    let client = dpa_info.mqtt_client.clone().ok_or_else(|| {
+                        eyre::eyre!("Missing mqtt_client")
+                    })?;
+
+                    let txn = send_set_vni_command(
+                        dpa_interface,
+                        &mut self.db_services,
+                        client,
+                        &dpa_info,
+                        true,  /* needs_vni */
+                        false, /* not a heartbeat */
+                        true,  /* send revision */
+                    )
+                    .await?;
+                    return Ok(HandlerResult {
+                        new_state: None,
+                        txn: txn,
+                    });
+                } else {
+                    let new_state = DpaInterfaceControllerState::Assigned;
+                    tracing::info!(state = ?new_state, "Dpa Interface state transition");
+                    return Ok(HandlerResult {
+                        new_state: Some(new_state),
+                        txn: None,
+                    });
+                }
+            }
+
+            DpaInterfaceControllerState::Assigned => {
+                // We will stay in the Assigned state as long as use_admin_network is off, which
+                // means we are in the tenant network. Once use_admin_network is turned on, we
+                // will send a SetVNI command to the DPA Interface card to set the VNI to 0
+                // and will transition to WaitingForResetVNI state.
+
+                let client = dpa_info
+                    .mqtt_client
+                    .clone()
+                    .ok_or_else(|| eyre::eyre!("Missing mqtt_client"))?;
+
+                if !in_instance {
+                    let new_state = DpaInterfaceControllerState::WaitingForResetVNI;
+                    tracing::info!(state = ?new_state, "Dpa Interface state transition");
+                    let txn = send_set_vni_command(
+                        dpa_interface,
+                        &mut self.db_services,
+                        client,
+                        &dpa_info,
+                        false,
+                        false,
+                        true,
+                    )
+                    .await?;
+
+                    return Ok(HandlerResult {
+                        new_state: Some(new_state),
+                        txn: txn,
+                    });
+                } else {
+                    let txn =
+                        do_heartbeat(dpa_interface, &mut self.db_services, client, &dpa_info, hb_interval, true)
+                            .await?;
+
+                    // Send a heartbeat command, indicated by the revision string being "NIL".
+                    return Ok(HandlerResult {
+                        new_state: None,
+                        txn: txn,
+                    });
+                }
+            }
+
+            DpaInterfaceControllerState::WaitingForResetVNI => {
+                // When we are in the WaitingForResetVNI state, we are have sent a SetVNI command
+                // to the DPA Interface Card. We are waiting for an ACK for that command.
+                // When the ack shows up, the network_config_version and the network_status_observation
+                // will match.
+
+                if !dpa_interface.managed_host_network_config_version_synced() {
+                    tracing::debug!("DPA interface found in WaitingForResetVNI state");
+                    let client = dpa_info.mqtt_client.clone().ok_or_else(|| {
+                        eyre::eyre!("Missing mqtt_client")
+                    })?;
+
+                    let txn = send_set_vni_command(
+                        dpa_interface,
+                        &mut self.db_services,
+                        client,
+                        &dpa_info,
+                        false,
+                        false,
+                        true,
+                    )
+                    .await?;
+                    return Ok(HandlerResult {
+                        new_state: None,
+                        txn: txn,
+                    });
+                } else {
+                    let new_state = DpaInterfaceControllerState::Ready;
+                    tracing::info!(state = ?new_state, "Dpa Interface state transition");
+                    return Ok(HandlerResult {
+                        new_state: Some(new_state),
+                        txn: None,
+                    });
+                }
+            }
         }
-        Ok(HandlerResult {
-            new_state: None,
-            txn: None,
-        })
     }
 
     async fn get_all_snapshots(
