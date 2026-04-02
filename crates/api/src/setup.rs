@@ -746,7 +746,7 @@ pub async fn initialize_and_start_controllers(
         ib_pools: common_pools.infiniband.clone(),
         ipmi_tool: ipmi_tool.clone(),
         site_config: carbide_config.clone(),
-        dpa_info,
+        dpa_info: dpa_info.clone(),
         rms_client: rms_client.clone(),
     });
 
@@ -945,12 +945,10 @@ pub async fn initialize_and_start_controllers(
     .start(join_set, cancel_token.clone())?;
 
     if carbide_config.is_dpa_enabled() {
-        let mqtt_client =
-            Some(start_dpa_handler(join_set, api_service.clone(), cancel_token.clone()).await?);
-
         DpaMonitor::new(
             db_pool.clone(),
-            mqtt_client,
+            db_pool.clone().into(),
+            dpa_info.clone(),
             meter.clone(),
             carbide_config.dpa_config.clone().unwrap_or_default(),
             carbide_config.host_health,
