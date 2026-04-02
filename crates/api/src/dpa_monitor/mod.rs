@@ -166,6 +166,7 @@ impl DpaMonitor {
             .await;
         check_dpa_span.record("metrics", metrics.to_string());
         self.metric_holder.update_metrics(metrics);
+        println!("{} SDM dpa monitor run_single_iteration_inner: result: {:?}", Utc::now(), result);
         result
     }
 
@@ -223,6 +224,8 @@ impl DpaMonitor {
 
                 let controller_state = mh.dpa_interface_snapshots[idx].controller_state.clone();
 
+                println!("{} SDM dpa monitor run_single_iteration_inner: id: {:?}", Utc::now(), mh.dpa_interface_snapshots[idx].id);
+
                 // Look at this DPA interface and see if we need to transition it to a new state.
                 // This will return a new state if we need to transition to a new state, or None if we can stay in the current state.
                 // We build an array of dpa interfaces and new state.
@@ -231,6 +234,8 @@ impl DpaMonitor {
 
                 let new_state = handler_result.new_state;
                 let txn = handler_result.txn;
+
+                println!("{} SDM dpa monitor run_single_iteration_inner: id: {:?} new_state: {:#?}", Utc::now(), mh.dpa_interface_snapshots[idx].id, new_state);
 
                 if let Some(new_state) = new_state {
                     let new_version = controller_state.version.increment();

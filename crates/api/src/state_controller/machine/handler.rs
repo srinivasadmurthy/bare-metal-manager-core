@@ -980,7 +980,6 @@ impl MachineStateHandler {
                     Self::clear_host_update_alert_and_reprov(mh_snapshot, &mut txn).await?;
 
                     // Switch to using the network we just created for the tenant
-                    let mut txn = ctx.services.db_pool.begin().await?;
                     for dpu_snapshot in &mh_snapshot.dpu_snapshots {
                         let (mut netconf, version) = dpu_snapshot.network_config.clone().take();
                         netconf.use_admin_network = Some(false);
@@ -5899,23 +5898,6 @@ impl StateHandler for InstanceStateHandler {
                         db::machine::try_update_network_config(
                             &mut txn,
                             &dpu_snapshot.id,
-                            version,
-                            &netconf,
-                        )
-                        .await?;
-                    }
-
-                    // Machine is currently an instance, but the instance is being released and we
-                    // are switching the NICs to the admin network. Set use_admin_network to true
-                    // and update the network config version in the DPA interfaces. This will cause
-                    // the DPA State Controller to send SetVNI commands with the VNI being zero.
-                    for dpa_interface in &mh_snapshot.dpa_interface_snapshots {
-                        let (mut netconf, version) = dpa_interface.network_config.clone().take();
-                        netconf.use_admin_network = Some(true);
-                        let dpa_interface_id = dpa_interface.id;
-                        db::dpa_interface::try_update_network_config(
-                            &mut txn,
-                            &dpa_interface_id,
                             version,
                             &netconf,
                         )
