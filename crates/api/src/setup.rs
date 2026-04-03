@@ -955,7 +955,7 @@ pub async fn initialize_and_start_controllers(
         };
 
         let dpa_info = Some(Arc::new(info));
-    
+
         println!(" SDM DPA enabled. Starting DpaMonitor");
 
         DpaMonitor::new(

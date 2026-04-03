@@ -21,28 +21,28 @@ use std::collections::HashMap;
 
 use carbide_uuid::machine::MachineId;
 
-use db::dpa_interface::get_dpa_vni;
-use chrono::TimeDelta;
-use model::dpa_interface::DpaLockMode::{Locked, Unlocked};
 use crate::dpa::handler::DpaInfo;
-use db::db_read::PgPoolReader;
 use crate::periodic_timer::PeriodicTimer;
+use chrono::TimeDelta;
+use db::db_read::PgPoolReader;
+use db::dpa_interface::get_dpa_vni;
 use db::work_lock_manager::WorkLockManagerHandle;
 use db::{self};
+use model::dpa_interface::DpaLockMode::{Locked, Unlocked};
+use model::dpa_interface::{DpaInterface, DpaInterfaceControllerState};
 use sqlx::{PgConnection, PgPool, PgTransaction};
 use std::time::Duration;
-use model::dpa_interface::{DpaInterface, DpaInterfaceControllerState};
 
-use crate::{CarbideResult, CarbideError};
 use crate::api::TransactionVending;
 use crate::cfg::file::DpaConfig;
+use crate::{CarbideError, CarbideResult};
+use model::machine::machine_search_config::MachineSearchConfig;
+use model::machine::{HostHealthConfig, LoadSnapshotOptions, ManagedHostStateSnapshot};
 use mqttea::client::MqtteaClient;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use model::machine::{HostHealthConfig, LoadSnapshotOptions, ManagedHostStateSnapshot};
-use model::machine::machine_search_config::MachineSearchConfig;
 
-use metrics::{DpaMonitorMetrics};
+use metrics::DpaMonitorMetrics;
 
 use chrono::Utc;
 use tracing::Instrument;
@@ -75,8 +75,6 @@ pub struct HandlerResult {
 
 impl DpaMonitor {
     const ITERATION_WORK_KEY: &'static str = "DpaMonitor::run_single_iteration";
-
-   
 
     pub fn new(
         db_pool: PgPool,
@@ -112,8 +110,11 @@ impl DpaMonitor {
         join_set: &mut JoinSet<()>,
         cancel_token: CancellationToken,
     ) -> io::Result<()> {
-
-        println!("{} SDM dpa monitor start enabled: {}", Utc::now(), self.config.enabled);
+        println!(
+            "{} SDM dpa monitor start enabled: {}",
+            Utc::now(),
+            self.config.enabled
+        );
 
         join_set
             .build_task()
@@ -166,11 +167,18 @@ impl DpaMonitor {
             .await;
         check_dpa_span.record("metrics", metrics.to_string());
         self.metric_holder.update_metrics(metrics);
-        println!("{} SDM dpa monitor run_single_iteration_inner: result: {:?}", Utc::now(), result);
+        println!(
+            "{} SDM dpa monitor run_single_iteration_inner: result: {:?}",
+            Utc::now(),
+            result
+        );
         result
     }
 
-    async fn run_single_iteration_inner(&mut self, metrics: &mut DpaMonitorMetrics) -> CarbideResult<usize> {
+    async fn run_single_iteration_inner(
+        &mut self,
+        metrics: &mut DpaMonitorMetrics,
+    ) -> CarbideResult<usize> {
         println!("{} SDM dpa monitor run_single_iteration_inner", Utc::now());
         let _lock = match self
             .work_lock_manager_handle
@@ -203,14 +211,21 @@ impl DpaMonitor {
 
         txn.commit().await?;
 
-        println!("{} SDM dpa monitor run_single_iteration_inner: got {} snapshots", Utc::now(), snapshots.len());
+        println!(
+            "{} SDM dpa monitor run_single_iteration_inner: got {} snapshots",
+            Utc::now(),
+            snapshots.len()
+        );
 
         for mh in snapshots.values_mut() {
             metrics.num_machines_scanned += 1;
 
             // If the machine does not have any dpa interfaces, we can skip it.
             if mh.dpa_interface_snapshots.is_empty() {
-                println!("{} SDM dpa monitor run_single_iteration_inner: skipping, no dpa interfaces", Utc::now());
+                println!(
+                    "{} SDM dpa monitor run_single_iteration_inner: skipping, no dpa interfaces",
+                    Utc::now()
+                );
                 continue;
             }
 
@@ -224,7 +239,11 @@ impl DpaMonitor {
 
                 let controller_state = mh.dpa_interface_snapshots[idx].controller_state.clone();
 
-                println!("{} SDM dpa monitor run_single_iteration_inner: id: {:?}", Utc::now(), mh.dpa_interface_snapshots[idx].id);
+                println!(
+                    "{} SDM dpa monitor run_single_iteration_inner: id: {:?}",
+                    Utc::now(),
+                    mh.dpa_interface_snapshots[idx].id
+                );
 
                 // Look at this DPA interface and see if we need to transition it to a new state.
                 // This will return a new state if we need to transition to a new state, or None if we can stay in the current state.
@@ -235,15 +254,23 @@ impl DpaMonitor {
                 let new_state = handler_result.new_state;
                 let txn = handler_result.txn;
 
-                println!("{} SDM dpa monitor run_single_iteration_inner: id: {:?} new_state: {:#?}", Utc::now(), mh.dpa_interface_snapshots[idx].id, new_state);
+                println!(
+                    "{} SDM dpa monitor run_single_iteration_inner: id: {:?} new_state: {:#?}",
+                    Utc::now(),
+                    mh.dpa_interface_snapshots[idx].id,
+                    new_state
+                );
 
                 if let Some(new_state) = new_state {
                     let new_version = controller_state.version.increment();
 
-                    let mut txn = match txn {
-                        Some(t) => t,
-                        None => self.db_services.db_pool.begin().await.map_err(|e| db::AnnotatedSqlxError::new("dpa_monitor begin txn", e))?,
-                    };
+                    let mut txn =
+                        match txn {
+                            Some(t) => t,
+                            None => self.db_services.db_pool.begin().await.map_err(|e| {
+                                db::AnnotatedSqlxError::new("dpa_monitor begin txn", e)
+                            })?,
+                        };
 
                     db::dpa_interface::try_update_controller_state(
                         &mut txn,
@@ -254,9 +281,13 @@ impl DpaMonitor {
                     )
                     .await?;
 
-                    txn.commit().await.map_err(|e| db::AnnotatedSqlxError::new("dpa_monitor commit txn", e))?;
+                    txn.commit()
+                        .await
+                        .map_err(|e| db::AnnotatedSqlxError::new("dpa_monitor commit txn", e))?;
                 } else if let Some(txn) = txn {
-                    txn.commit().await.map_err(|e| db::AnnotatedSqlxError::new("dpa_monitor commit txn", e))?;
+                    txn.commit()
+                        .await
+                        .map_err(|e| db::AnnotatedSqlxError::new("dpa_monitor commit txn", e))?;
                 }
             }
         }
@@ -286,13 +317,21 @@ impl DpaMonitor {
 
         let dpa_info = self.dpa_info.clone().unwrap();
 
-        println!("{} SDM dpa monitor handle_dpa_interface: {}, in_instance: {}", Utc::now(), dpa_interface.id, in_instance);
+        println!(
+            "{} SDM dpa monitor handle_dpa_interface: {}, in_instance: {}",
+            Utc::now(),
+            dpa_interface.id,
+            in_instance
+        );
 
         let controller_state = dpa_interface.controller_state.value.clone();
         match controller_state {
             DpaInterfaceControllerState::Provisioning => {
-                if !in_instance {
-                    println!("{} SDM dpa monitor handle_dpa_interface: skipping, not in instance", Utc::now());
+                if !in_instance || dpa_interface.use_admin_network() {
+                    println!(
+                        "{} SDM dpa monitor handle_dpa_interface: skipping, not in instance",
+                        Utc::now()
+                    );
                     return Ok(HandlerResult {
                         new_state: None,
                         txn: None,
@@ -318,7 +357,7 @@ impl DpaMonitor {
                     .clone()
                     .ok_or_else(|| eyre::eyre!("Missing mqtt_client"))?;
 
-                if in_instance {
+                if in_instance && dpa_interface.use_admin_network() {
                     // We are in the process of transitioning to an instance.
                     // So go through the unlock/apply firmware/lock sequence
                     let new_state = DpaInterfaceControllerState::Unlocking;
@@ -331,9 +370,15 @@ impl DpaMonitor {
                 } else {
                     // We are in the Ready state, and we are not an instane.
                     // So just do hearbeats
-                    let txn =
-                        do_heartbeat(dpa_interface, &mut self.db_services, client, &dpa_info, hb_interval, false)
-                            .await?;
+                    let txn = do_heartbeat(
+                        dpa_interface,
+                        &mut self.db_services,
+                        client,
+                        &dpa_info,
+                        hb_interval,
+                        false,
+                    )
+                    .await?;
 
                     return Ok(HandlerResult {
                         new_state: None,
@@ -434,7 +479,10 @@ impl DpaMonitor {
 
             DpaInterfaceControllerState::Locking => {
                 let Some(ref cs) = dpa_interface.card_state else {
-                    tracing::error!("Unexpected - card_state none for dpa: {:#?}", dpa_interface.id);
+                    tracing::error!(
+                        "Unexpected - card_state none for dpa: {:#?}",
+                        dpa_interface.id
+                    );
                     return Ok(HandlerResult {
                         new_state: None,
                         txn: None,
@@ -463,9 +511,10 @@ impl DpaMonitor {
                 if !dpa_interface.managed_host_network_config_version_synced() {
                     tracing::debug!("DPA interface found in WaitingForSetVNI state");
 
-                    let client = dpa_info.mqtt_client.clone().ok_or_else(|| {
-                        eyre::eyre!("Missing mqtt_client")
-                    })?;
+                    let client = dpa_info
+                        .mqtt_client
+                        .clone()
+                        .ok_or_else(|| eyre::eyre!("Missing mqtt_client"))?;
 
                     let txn = send_set_vni_command(
                         dpa_interface,
@@ -521,9 +570,15 @@ impl DpaMonitor {
                         txn: txn,
                     });
                 } else {
-                    let txn =
-                        do_heartbeat(dpa_interface, &mut self.db_services, client, &dpa_info, hb_interval, true)
-                            .await?;
+                    let txn = do_heartbeat(
+                        dpa_interface,
+                        &mut self.db_services,
+                        client,
+                        &dpa_info,
+                        hb_interval,
+                        true,
+                    )
+                    .await?;
 
                     // Send a heartbeat command, indicated by the revision string being "NIL".
                     return Ok(HandlerResult {
@@ -541,9 +596,10 @@ impl DpaMonitor {
 
                 if !dpa_interface.managed_host_network_config_version_synced() {
                     tracing::debug!("DPA interface found in WaitingForResetVNI state");
-                    let client = dpa_info.mqtt_client.clone().ok_or_else(|| {
-                        eyre::eyre!("Missing mqtt_client")
-                    })?;
+                    let client = dpa_info
+                        .mqtt_client
+                        .clone()
+                        .ok_or_else(|| eyre::eyre!("Missing mqtt_client"))?;
 
                     let txn = send_set_vni_command(
                         dpa_interface,
@@ -698,7 +754,11 @@ async fn send_set_vni_command<'a>(
     {
         Ok(()) => {
             if heart_beat {
-                let mut txn = services.db_pool.begin().await.map_err(|e| db::AnnotatedSqlxError::new("dpa_monitor hb begin txn", e))?;
+                let mut txn = services
+                    .db_pool
+                    .begin()
+                    .await
+                    .map_err(|e| db::AnnotatedSqlxError::new("dpa_monitor hb begin txn", e))?;
                 let res = db::dpa_interface::update_last_hb_time(state, &mut txn).await;
                 if res.is_err() {
                     tracing::error!(
@@ -734,9 +794,7 @@ async fn send_set_vni_command<'a>(
 /// In both cases, profile_synced=Some(true) is the signal that
 /// the workflow completed successfully, and it's safe to transition
 /// to the next state.
-fn handle_apply_profile(
-    state: &DpaInterface,
-) -> CarbideResult<HandlerResult> {
+fn handle_apply_profile(state: &DpaInterface) -> CarbideResult<HandlerResult> {
     let Some(ref cs) = state.card_state else {
         tracing::info!(
             "no profile report, because card_state none for dpa: {:#?}, waiting for retry",
@@ -762,4 +820,5 @@ fn handle_apply_profile(
     Ok(HandlerResult {
         new_state: None,
         txn: None,
-    })}
+    })
+}

@@ -187,7 +187,7 @@ pub fn discover_device(device: &str) -> Result<MlxDeviceInfo, String> {
 
     for dev in devices {
         if dev.pci_name == device {
-            return Ok(dev)
+            return Ok(dev);
         }
     }
 

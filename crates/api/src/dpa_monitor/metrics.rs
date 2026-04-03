@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
+use crate::logging::metrics_utils::SharedMetricsHolder;
+use opentelemetry::metrics::{Histogram, Meter};
 use std::fmt;
 use std::fmt::Display;
-use crate::logging::metrics_utils::SharedMetricsHolder;
-use opentelemetry::metrics::{Meter, Histogram};
 use std::time::Duration;
 
 /// Metrics that are gathered in a single dpa monitor run
@@ -111,8 +111,7 @@ impl DpaMonitorInstruments {
         }
     }
 
-    fn init_counters_and_histograms(&self) {
-    }
+    fn init_counters_and_histograms(&self) {}
 
     fn emit_counters_and_histograms(&self, metrics: &DpaMonitorMetrics) {
         self.iteration_latency.record(

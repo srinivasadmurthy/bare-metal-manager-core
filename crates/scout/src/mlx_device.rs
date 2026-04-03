@@ -1171,7 +1171,7 @@ pub(crate) fn apply_profile(
 
 #[cfg(feature = "mockdpa")]
 pub(crate) fn apply_profile(
-   _device: &str,
+    _device: &str,
     profile: Option<SerializableProfile>,
 ) -> (Option<String>, Option<bool>) {
     // If a profile was provided, sync it after the reset.

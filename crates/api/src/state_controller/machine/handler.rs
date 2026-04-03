@@ -607,7 +607,11 @@ impl MachineStateHandler {
     ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
         let mh_state = mh_snapshot.managed_state.clone();
 
-        println!("{} SDM attempt_state_transition: mh_state: {:#?}", Utc::now(), mh_state);
+        println!(
+            "{} SDM attempt_state_transition: mh_state: {:#?}",
+            Utc::now(),
+            mh_state
+        );
 
         // If it's been more than 5 minutes since DPU reported status, consider it unhealthy
         for dpu_snapshot in &mh_snapshot.dpu_snapshots {
@@ -992,6 +996,26 @@ impl MachineStateHandler {
                             &netconf,
                         )
                         .await?;
+                    }
+
+                    // Machine is currently unassigned, but an instance is being created and we
+                    // are switching the NICs from the admin network. Set use_admin_network to false
+                    // and update the network config version in the DPA interfaces. This will cause
+                    // the DPA State Controller to send SetVNI commands with the appropriate VNI.
+                    if ctx.services.site_config.is_dpa_enabled() {
+                        for dpa_interface in &mh_snapshot.dpa_interface_snapshots {
+                            let (mut netconf, version) =
+                                dpa_interface.network_config.clone().take();
+                            netconf.use_admin_network = Some(false);
+                            let dpa_interface_id = dpa_interface.id;
+                            db::dpa_interface::try_update_network_config(
+                                &mut txn,
+                                &dpa_interface_id,
+                                version,
+                                &netconf,
+                            )
+                            .await?;
+                        }
                     }
 
                     let next_state = ManagedHostState::Assigned {
@@ -2291,7 +2315,11 @@ impl StateHandler for MachineStateHandler {
         _mh_state: &Self::ControllerState, // mh_snapshot above already contains it
         ctx: &mut StateHandlerContext<Self::ContextObjects>,
     ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
-        println!("{} SDM handle_object_state: host_machine_id: {:?}", Utc::now(), host_machine_id);
+        println!(
+            "{} SDM handle_object_state: host_machine_id: {:?}",
+            Utc::now(),
+            host_machine_id
+        );
         if !mh_snapshot
             .host_snapshot
             .associated_dpu_machine_ids()
@@ -5419,6 +5447,21 @@ impl StateHandler for InstanceStateHandler {
                                 ));
                     }
 
+                    // Check each DPA interface to see if it has acted on updating the network config.
+                    // This involves the DPA State Machine sending SetVNI commands to the NICs, and getting
+                    // an ACK. If any of the interfaces has not yet heard back the ACk, we will continue to
+                    // be in the current state.
+                    if ctx.services.site_config.is_dpa_enabled() {
+                        for dpa_interface in &mh_snapshot.dpa_interface_snapshots {
+                            if !dpa_interface.managed_host_network_config_version_synced() {
+                                return Ok(StateHandlerOutcome::wait(
+                                            "Waiting for DPA agent(s) to apply network config and report healthy network"
+                                                .to_string()
+                                        ));
+                            }
+                        }
+                    }
+
                     let next_state = ManagedHostState::Assigned {
                         instance_state: InstanceState::WaitingForRebootToReady,
                     };
@@ -5927,6 +5970,23 @@ impl StateHandler for InstanceStateHandler {
                         db::machine::try_update_network_config(
                             &mut txn,
                             &dpu_snapshot.id,
+                            version,
+                            &netconf,
+                        )
+                        .await?;
+                    }
+
+                    // Machine is currently an instance, but the instance is being released and we
+                    // are switching the NICs to the admin network. Set use_admin_network to true
+                    // and update the network config version in the DPA interfaces. This will cause
+                    // the DPA State Controller to send SetVNI commands with the VNI being zero.
+                    for dpa_interface in &mh_snapshot.dpa_interface_snapshots {
+                        let (mut netconf, version) = dpa_interface.network_config.clone().take();
+                        netconf.use_admin_network = Some(true);
+                        let dpa_interface_id = dpa_interface.id;
+                        db::dpa_interface::try_update_network_config(
+                            &mut txn,
+                            &dpa_interface_id,
                             version,
                             &netconf,
                         )
