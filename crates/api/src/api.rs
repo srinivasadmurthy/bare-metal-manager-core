@@ -308,6 +308,20 @@ impl Forge for Api {
         crate::handlers::power_shelf::find_power_shelf(self, request).await
     }
 
+    async fn find_power_shelf_ids(
+        &self,
+        request: Request<rpc::PowerShelfSearchFilter>,
+    ) -> Result<Response<rpc::PowerShelfIdList>, Status> {
+        crate::handlers::power_shelf::find_ids(self, request).await
+    }
+
+    async fn find_power_shelves_by_ids(
+        &self,
+        request: Request<rpc::PowerShelvesByIdsRequest>,
+    ) -> Result<Response<rpc::PowerShelfList>, Status> {
+        crate::handlers::power_shelf::find_by_ids(self, request).await
+    }
+
     async fn delete_power_shelf(
         &self,
         request: Request<rpc::PowerShelfDeletionRequest>,
@@ -320,6 +334,20 @@ impl Forge for Api {
         request: Request<rpc::SwitchQuery>,
     ) -> Result<Response<rpc::SwitchList>, Status> {
         crate::handlers::switch::find_switch(self, request).await
+    }
+
+    async fn find_switch_ids(
+        &self,
+        request: Request<rpc::SwitchSearchFilter>,
+    ) -> Result<Response<rpc::SwitchIdList>, Status> {
+        crate::handlers::switch::find_ids(self, request).await
+    }
+
+    async fn find_switches_by_ids(
+        &self,
+        request: Request<rpc::SwitchesByIdsRequest>,
+    ) -> Result<Response<rpc::SwitchList>, Status> {
+        crate::handlers::switch::find_by_ids(self, request).await
     }
 
     async fn delete_switch(
@@ -725,7 +753,7 @@ impl Forge for Api {
     async fn find_machine_health_histories(
         &self,
         request: Request<rpc::MachineHealthHistoriesRequest>,
-    ) -> std::result::Result<Response<rpc::MachineHealthHistories>, Status> {
+    ) -> std::result::Result<Response<rpc::HealthHistories>, Status> {
         crate::handlers::machine::find_machine_health_histories(self, request).await
     }
 
@@ -931,6 +959,27 @@ impl Forge for Api {
         request: Request<rpc::MachineMetadataUpdateRequest>,
     ) -> std::result::Result<Response<()>, Status> {
         crate::handlers::machine::update_machine_metadata(self, request).await
+    }
+
+    async fn update_rack_metadata(
+        &self,
+        request: Request<rpc::RackMetadataUpdateRequest>,
+    ) -> std::result::Result<Response<()>, Status> {
+        crate::handlers::rack::update_rack_metadata(self, request).await
+    }
+
+    async fn update_switch_metadata(
+        &self,
+        request: Request<rpc::SwitchMetadataUpdateRequest>,
+    ) -> std::result::Result<Response<()>, Status> {
+        crate::handlers::switch::update_switch_metadata(self, request).await
+    }
+
+    async fn update_power_shelf_metadata(
+        &self,
+        request: Request<rpc::PowerShelfMetadataUpdateRequest>,
+    ) -> std::result::Result<Response<()>, Status> {
+        crate::handlers::power_shelf::update_power_shelf_metadata(self, request).await
     }
 
     async fn update_machine_nv_link_info(

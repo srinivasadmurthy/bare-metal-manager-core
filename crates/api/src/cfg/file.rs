@@ -346,6 +346,12 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub machine_validation_config: MachineValidationConfig,
 
+    /// Rack-level validation configuration. Runs
+    /// multi-node partition tests after firmware upgrade
+    /// and maintenance to verify rack health.
+    #[serde(default)]
+    pub rack_validation_config: RackValidationConfig,
+
     /// Machine identity (SPIFFE JWT-SVID) settings,
     /// used by `SignMachineIdentity` to issue short-lived
     /// identity tokens to tenant workloads.
@@ -597,6 +603,10 @@ pub struct DpfConfig {
     /// Whether to create the bf.cfg ConfigMap during initialization.
     #[serde(default = "default_to_true")]
     pub bfcfg_enabled: bool,
+    /// Are we testing v2 version??
+    /// This is just temporary flag and will be removed once v2 becomes only option.
+    #[serde(default)]
+    pub v2: bool,
 }
 
 impl Default for DpfConfig {
@@ -609,6 +619,7 @@ impl Default for DpfConfig {
             bfb_url: String::new(),
             services: None,
             bfcfg_enabled: true,
+            v2: false,
         }
     }
 }
@@ -2680,6 +2691,35 @@ impl MachineValidationConfig {
     }
 }
 
+/// Configuration for rack-level validation (partition-based
+/// multi-node tests run after firmware upgrade / maintenance).
+///
+/// Example:
+/// ```toml
+/// [rack_validation_config]
+/// enabled = true
+/// run_interval = "60s"
+/// ```
+#[derive(Default, Clone, Debug, Deserialize, Serialize)]
+pub struct RackValidationConfig {
+    /// Enables rack validation testing.
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(
+        default = "RackValidationConfig::default_run_interval",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "as_std_duration"
+    )]
+    pub run_interval: std::time::Duration,
+}
+
+impl RackValidationConfig {
+    const fn default_run_interval() -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+}
+
 /// The VPC isolation behavior enforced within a site.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2780,6 +2820,7 @@ impl From<CarbideConfig> for rpc::forge::RuntimeConfig {
             max_find_by_ids: value.max_find_by_ids,
             dpu_network_pinger_type: value.dpu_network_monitor_pinger_type,
             machine_validation_enabled: value.machine_validation_config.enabled,
+            rack_validation_enabled: value.rack_validation_config.enabled,
             bom_validation_enabled: value.bom_validation.enabled,
             bom_validation_ignore_unassigned_machines: value
                 .bom_validation

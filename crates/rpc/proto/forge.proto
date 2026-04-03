@@ -87,9 +87,13 @@ service Forge {
   rpc IBPartitionsForTenant(TenantSearchQuery) returns (IBPartitionList);
 
   rpc FindPowerShelves(PowerShelfQuery) returns (PowerShelfList);
+  rpc FindPowerShelfIds(PowerShelfSearchFilter) returns (PowerShelfIdList);
+  rpc FindPowerShelvesByIds(PowerShelvesByIdsRequest) returns (PowerShelfList);
   rpc DeletePowerShelf(PowerShelfDeletionRequest) returns (PowerShelfDeletionResult);
 
   rpc FindSwitches(SwitchQuery) returns (SwitchList);
+  rpc FindSwitchIds(SwitchSearchFilter) returns (SwitchIdList);
+  rpc FindSwitchesByIds(SwitchesByIdsRequest) returns (SwitchList);
   rpc DeleteSwitch(SwitchDeletionRequest) returns (SwitchDeletionResult);
 
   // InfiniBand Fabrics
@@ -179,7 +183,7 @@ service Forge {
   rpc FindMachineIds(MachineSearchConfig) returns (common.MachineIdList);
   rpc FindMachinesByIds(MachinesByIdsRequest) returns (MachineList);
   rpc FindMachineStateHistories(MachineStateHistoriesRequest) returns (MachineStateHistories);
-  rpc FindMachineHealthHistories(MachineHealthHistoriesRequest) returns (MachineHealthHistories);
+  rpc FindMachineHealthHistories(MachineHealthHistoriesRequest) returns (HealthHistories);
   rpc FindPowerShelfStateHistories(PowerShelfStateHistoriesRequest) returns (PowerShelfStateHistories);
   rpc FindRackStateHistories(RackStateHistoriesRequest) returns (RackStateHistories);
   rpc FindSwitchStateHistories(SwitchStateHistoriesRequest) returns (SwitchStateHistories);
@@ -272,6 +276,15 @@ service Forge {
 
   // Update the Metadata of a Machine
   rpc UpdateMachineMetadata(MachineMetadataUpdateRequest) returns (google.protobuf.Empty);
+
+  // Update the Metadata of a Rack
+  rpc UpdateRackMetadata(RackMetadataUpdateRequest) returns (google.protobuf.Empty);
+
+  // Update the Metadata of a Switch
+  rpc UpdateSwitchMetadata(SwitchMetadataUpdateRequest) returns (google.protobuf.Empty);
+
+  // Update the Metadata of a PowerShelf
+  rpc UpdatePowerShelfMetadata(PowerShelfMetadataUpdateRequest) returns (google.protobuf.Empty);
 
   // Update the NVLink Info of a Machine
   rpc UpdateMachineNvLinkInfo(UpdateMachineNvLinkInfoRequest) returns (google.protobuf.Empty);
@@ -1166,6 +1179,8 @@ message RuntimeConfig {
   int32 dpa_subnet_mask = 48;
 
   bool dpf_enabled = 49;
+
+  bool rack_validation_enabled = 50;
 }
 
 message EchoRequest {
@@ -1706,6 +1721,8 @@ message PowerShelfStatus {
   optional string power_state = 4;
   // Health status: "ok", "warning", "critical"
   optional string health_status = 5;
+  // The controller state machine state (e.g. "initializing", "ready", "error")
+  optional string controller_state = 6;
 }
 
 // Describe a PowerShelf configuration and status
@@ -1719,7 +1736,16 @@ message PowerShelf {
   // Timestamp when the power shelf was marked as deleted
   optional google.protobuf.Timestamp deleted = 4;
 
+  // Deprecated: use status.controller_state instead
   string controller_state = 5;
+
+  Metadata metadata = 6;
+  string version = 7;
+
+  BmcInfo bmc_info = 8;
+
+  // Version string for the current controller state (e.g. "V3-T1774905143273055").
+  string state_version = 9;
 }
 
 message PowerShelfList {
@@ -1762,6 +1788,30 @@ message PowerShelfStateHistoryRecords {
 message PowerShelfQuery {
   optional string name = 1;
   common.PowerShelfId power_shelf_id = 2;
+}
+
+// Filter for controlling whether deleted resources are included in search results.
+enum DeletedFilter {
+  // Exclude deleted resources (default behavior)
+  DELETED_FILTER_EXCLUDE = 0;
+  // Return only deleted resources
+  DELETED_FILTER_ONLY = 1;
+  // Include both deleted and non-deleted resources
+  DELETED_FILTER_INCLUDE = 2;
+}
+
+message PowerShelfSearchFilter {
+  optional common.RackId rack_id = 1;
+  // Controls whether deleted power shelves are included. Defaults to EXCLUDE.
+  DeletedFilter deleted = 2;
+  // Filter by controller state (e.g. "ready", "initializing", "error")
+  optional string controller_state = 3;
+  // Filter by BMC MAC address via machine_interfaces
+  optional string bmc_mac = 4;
+}
+
+message PowerShelvesByIdsRequest {
+  repeated common.PowerShelfId power_shelf_ids = 1;
 }
 
 message ExpectedPowerShelf {
@@ -1829,6 +1879,8 @@ message SwitchStatus {
   optional string power_state = 4;
   // Health status: "ok", "warning", "critical"
   optional string health_status = 5;
+  // The controller state machine state (e.g. "initializing", "ready", "error")
+  optional string controller_state = 6;
 }
 
 // Describe a Switch configuration and status
@@ -1842,12 +1894,16 @@ message Switch {
   // Timestamp when the switch was marked as deleted
   optional google.protobuf.Timestamp deleted = 4;
 
+  // Deprecated: use status.controller_state instead
   string controller_state = 5;
 
   BmcInfo bmc_info = 6;
 
   // Version string for the current controller state (e.g. "V3-T1774905143273055").
   string state_version = 7;
+
+  Metadata metadata = 8;
+  string version = 9;
 }
 
 message SwitchList {
@@ -1892,6 +1948,20 @@ message SwitchStateHistoryRecords {
 message SwitchQuery {
   optional string name = 1;
   common.SwitchId switch_id = 2;
+}
+
+message SwitchSearchFilter {
+  optional common.RackId rack_id = 1;
+  // Controls whether deleted switches are included. Defaults to EXCLUDE.
+  DeletedFilter deleted = 2;
+  // Filter by controller state (e.g. "ready", "initializing", "error")
+  optional string controller_state = 3;
+  // Filter by BMC MAC address via machine_interfaces
+  optional string bmc_mac = 4;
+}
+
+message SwitchesByIdsRequest {
+  repeated common.SwitchId switch_ids = 1;
 }
 
 message ExpectedSwitch {
@@ -2765,18 +2835,18 @@ message MachineHealthHistoriesRequest {
   google.protobuf.Timestamp end_time = 3;
 }
 
-message MachineHealthHistories {
+message HealthHistories {
   // The Health History for each Machine
-  map<string, MachineHealthHistoryRecords> histories = 1;
+  map<string, HealthHistoryRecords> histories = 1;
 }
 
-// A list of Machine health history records, starting by the oldest
-message MachineHealthHistoryRecords {
-  repeated MachineHealthHistoryRecord records = 1;
+// A list of health history records, starting by the oldest
+message HealthHistoryRecords {
+  repeated HealthHistoryRecord records = 1;
 }
 
-// The observed health for a Machine at a certain point in time
-message MachineHealthHistoryRecord {
+// The observed health for a resource at a certain point in time
+message HealthHistoryRecord {
   // The observed health
   health.HealthReport health = 1;
   // The time when the health was observed
@@ -2966,6 +3036,48 @@ message MachineMetadataUpdateRequest {
   optional string if_version_match = 2;
 
   // New Metadata to be utilized by the Machine
+  Metadata metadata = 3;
+}
+
+message RackMetadataUpdateRequest {
+  // The ID of the Rack for which the Metadata update will apply
+  common.RackId rack_id = 1;
+
+  // If the field here is set, the update will only be applied if the version
+  // is equivalent to the current Rack `version` on the Forge Site.
+  // If a concurrent update changed the site configuration, the API will return
+  // a `ConcurrentModificationError`.
+  optional string if_version_match = 2;
+
+  // New Metadata to be utilized by the Rack
+  Metadata metadata = 3;
+}
+
+message SwitchMetadataUpdateRequest {
+  // The ID of the Switch for which the Metadata update will apply
+  common.SwitchId switch_id = 1;
+
+  // If the field here is set, the update will only be applied if the version
+  // is equivalent to the current Switch `version` on the Forge Site.
+  // If a concurrent update changed the site configuration, the API will return
+  // a `ConcurrentModificationError`.
+  optional string if_version_match = 2;
+
+  // New Metadata to be utilized by the Switch
+  Metadata metadata = 3;
+}
+
+message PowerShelfMetadataUpdateRequest {
+  // The ID of the PowerShelf for which the Metadata update will apply
+  common.PowerShelfId power_shelf_id = 1;
+
+  // If the field here is set, the update will only be applied if the version
+  // is equivalent to the current PowerShelf `version` on the Forge Site.
+  // If a concurrent update changed the site configuration, the API will return
+  // a `ConcurrentModificationError`.
+  optional string if_version_match = 2;
+
+  // New Metadata to be utilized by the PowerShelf
   Metadata metadata = 3;
 }
 
@@ -6051,12 +6163,14 @@ message Rack {
   repeated string expected_nvlink_switches = 5;
   repeated common.MachineId compute_trays = 6;
   repeated common.PowerShelfId power_shelves = 7;
-  // repeated common.NvlinkSwitchId nvlink_switches = 8;
+  repeated common.SwitchId switches = 8;
   google.protobuf.Timestamp created = 9;
   google.protobuf.Timestamp updated = 10;
   google.protobuf.Timestamp deleted = 11;
   health.HealthReport health = 12;
   repeated HealthOverrideOrigin health_overrides = 13;
+  Metadata metadata = 14;
+  string version = 15;
 }
 
 message RackStateHistoryRecord {
