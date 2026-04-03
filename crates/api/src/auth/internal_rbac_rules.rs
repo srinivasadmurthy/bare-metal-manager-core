@@ -137,11 +137,11 @@ impl InternalRBACRules {
         );
         x.perm(
             "InsertHealthReportOverride",
-            vec![ForgeAdminCLI, Health, Ssh, SshRs],
+            vec![ForgeAdminCLI, Health, Ssh, SshRs, Rla],
         );
         x.perm(
             "RemoveHealthReportOverride",
-            vec![ForgeAdminCLI, Health, Ssh, SshRs],
+            vec![ForgeAdminCLI, Health, Ssh, SshRs, Rla],
         );
         x.perm(
             "ListRackHealthReportOverrides",
@@ -238,7 +238,7 @@ impl InternalRBACRules {
         x.perm("AdminForceDeleteMachine", vec![ForgeAdminCLI, Machineatron]);
         x.perm("AdminListResourcePools", vec![ForgeAdminCLI]);
         x.perm("AdminGrowResourcePool", vec![ForgeAdminCLI]);
-        x.perm("SetMaintenance", vec![ForgeAdminCLI, SiteAgent]);
+        x.perm("SetMaintenance", vec![ForgeAdminCLI, SiteAgent, Rla]);
         x.perm("SetDynamicConfig", vec![ForgeAdminCLI, Machineatron]);
         x.perm("TriggerDpuReprovisioning", vec![ForgeAdminCLI]);
         x.perm("TriggerHostReprovisioning", vec![ForgeAdminCLI, Rla]);
@@ -988,6 +988,25 @@ mod rbac_rule_tests {
             "TrimTable",
             &[Principal::SpiffeServiceIdentifier(
                 "carbide-maintenance-jobs".to_string()
+            )]
+        ));
+
+        assert!(InternalRBACRules::allowed_from_static(
+            "SetMaintenance",
+            &[Principal::SpiffeServiceIdentifier(
+                "carbide-rla".to_string()
+            )]
+        ));
+        assert!(InternalRBACRules::allowed_from_static(
+            "InsertHealthReportOverride",
+            &[Principal::SpiffeServiceIdentifier(
+                "carbide-rla".to_string()
+            )]
+        ));
+        assert!(InternalRBACRules::allowed_from_static(
+            "RemoveHealthReportOverride",
+            &[Principal::SpiffeServiceIdentifier(
+                "carbide-rla".to_string()
             )]
         ));
 
