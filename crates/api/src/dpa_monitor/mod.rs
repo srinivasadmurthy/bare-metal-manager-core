@@ -696,6 +696,8 @@ async fn do_heartbeat<'a>(
         send_revision = true; // DPA config not in sync with us. So resend the config
     }
 
+    println!("SDM do_heartbeat send_hb: {send_hb} send_revision: {send_revision}");
+
     if send_hb || send_revision {
         let txn = send_set_vni_command(
             state,
@@ -735,12 +737,15 @@ async fn send_set_vni_command<'a>(
         match get_dpa_vni(state, &mut services.db_reader).await {
             Ok(dv) => dv,
             Err(e) => {
+                println!("SDM get_dpa_vni error: {:#?}", e);
                 return Err(eyre::eyre!("get_dpa_vni error: {:#?}", e).into());
             }
         }
     } else {
         0
     };
+
+    println!("SDM sending set vni command: revision: {revision_str} vni: {vni}");
 
     // Send a heartbeat command, indicated by the revision string being "NIL".
     match crate::dpa::handler::send_dpa_command(

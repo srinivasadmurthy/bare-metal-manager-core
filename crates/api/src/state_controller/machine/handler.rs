@@ -6039,6 +6039,7 @@ impl StateHandler for InstanceStateHandler {
                     if ctx.services.site_config.is_dpa_enabled() {
                         for dpa_interface in &mh_snapshot.dpa_interface_snapshots {
                             if !dpa_interface.managed_host_network_config_version_synced() {
+                                println!("SDM DPA interface {} is not synced", dpa_interface.id);
                                 return Ok(StateHandlerOutcome::wait(
                                             "Waiting for DPA agent(s) to apply network config and report healthy network"
                                                 .to_string()
