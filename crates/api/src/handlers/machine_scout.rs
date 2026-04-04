@@ -284,7 +284,7 @@ pub(crate) async fn forge_agent_control(
                 }
             }
             ManagedHostState::Assigned {
-                instance_state: InstanceState::WaitingForNetworkConfig,
+                instance_state: InstanceState::WaitingForDpaToBeReady,
             } => {
                 // Commit the transaction now, to avoid holding across an unrelated await point
                 txn.commit().await?;
