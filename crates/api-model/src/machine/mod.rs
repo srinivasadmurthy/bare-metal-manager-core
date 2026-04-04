@@ -1945,6 +1945,8 @@ pub enum InstanceState {
     WaitingForNetworkSegmentToBeReady,
     WaitingForNetworkConfig,
     WaitingForStorageConfig,
+    DpaProvisioning,
+    WaitingForDpaToBeReady,
     WaitingForExtensionServicesConfig,
     WaitingForRebootToReady,
     Ready,

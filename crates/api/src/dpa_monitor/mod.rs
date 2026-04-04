@@ -327,9 +327,9 @@ impl DpaMonitor {
         let controller_state = dpa_interface.controller_state.value.clone();
         match controller_state {
             DpaInterfaceControllerState::Provisioning => {
-                if !in_instance || dpa_interface.use_admin_network() {
+                if dpa_interface.use_admin_network() {
                     println!(
-                        "{} SDM dpa monitor handle_dpa_interface: skipping, not in instance",
+                        "{} SDM dpa monitor handle_dpa_interface: skipping, use_admin_network is true",
                         Utc::now()
                     );
                     return Ok(HandlerResult {
@@ -357,7 +357,7 @@ impl DpaMonitor {
                     .clone()
                     .ok_or_else(|| eyre::eyre!("Missing mqtt_client"))?;
 
-                if in_instance && dpa_interface.use_admin_network() {
+                if !dpa_interface.use_admin_network() {
                     // We are in the process of transitioning to an instance.
                     // So go through the unlock/apply firmware/lock sequence
                     let new_state = DpaInterfaceControllerState::Unlocking;
@@ -551,7 +551,7 @@ impl DpaMonitor {
                     .clone()
                     .ok_or_else(|| eyre::eyre!("Missing mqtt_client"))?;
 
-                if !in_instance {
+                if dpa_interface.use_admin_network() {
                     let new_state = DpaInterfaceControllerState::WaitingForResetVNI;
                     tracing::info!(state = ?new_state, "Dpa Interface state transition");
                     let txn = send_set_vni_command(

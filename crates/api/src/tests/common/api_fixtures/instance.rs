@@ -347,6 +347,12 @@ pub async fn advance_created_instance_into_state(
         mh.host().parsed_history(Some(2)).await,
         vec![
             ManagedHostState::Assigned {
+                instance_state: model::machine::InstanceState::DpaProvisioning,
+            },
+            ManagedHostState::Assigned {
+                instance_state: model::machine::InstanceState::WaitingForDpaToBeReady,
+            },
+            ManagedHostState::Assigned {
                 instance_state: model::machine::InstanceState::WaitingForNetworkSegmentToBeReady,
             },
             ManagedHostState::Assigned {
