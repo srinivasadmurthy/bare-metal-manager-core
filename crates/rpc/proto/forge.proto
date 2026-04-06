@@ -176,6 +176,10 @@ service Forge {
   rpc DiscoverDhcp(DhcpDiscovery) returns (DhcpRecord);
   rpc ExpireDhcpLease(ExpireDhcpLeaseRequest) returns (ExpireDhcpLeaseResponse);
 
+  rpc AssignStaticAddress(AssignStaticAddressRequest) returns (AssignStaticAddressResponse);
+  rpc RemoveStaticAddress(RemoveStaticAddressRequest) returns (RemoveStaticAddressResponse);
+  rpc FindInterfaceAddresses(FindInterfaceAddressesRequest) returns (FindInterfaceAddressesResponse);
+
   // PRIVILEGED: Find things
   rpc FindInterfaces(InterfaceSearchQuery) returns (InterfaceList);
   rpc DeleteInterface(InterfaceDeleteQuery) returns (google.protobuf.Empty);
@@ -1821,7 +1825,7 @@ message ExpectedPowerShelf {
   string bmc_username = 2;
   string bmc_password = 3;
   string shelf_serial_number = 4;
-  string ip_address = 5;
+  string bmc_ip_address = 5;
   // Metadata that will automatically get associated with a newly created PowerShelf
   Metadata metadata = 6;
   optional common.RackId rack_id = 7;
@@ -1979,6 +1983,7 @@ message ExpectedSwitch {
   // Unique identifier for the expected switch. When omitted, server generates one.
   optional common.UUID expected_switch_id = 9;
   repeated string nvos_mac_addresses = 10;
+  string bmc_ip_address = 11;
 }
 
 message ExpectedSwitchRequest {
@@ -2888,6 +2893,53 @@ message InterfaceSearchQuery {
   optional string ip = 2;
 }
 
+message AssignStaticAddressRequest {
+  common.MachineInterfaceId interface_id = 1;
+  string ip_address = 2;
+}
+
+enum AssignStaticAddressStatus {
+  ASSIGN_STATIC_ADDRESS_STATUS_ASSIGNED = 0;
+  ASSIGN_STATIC_ADDRESS_STATUS_REPLACED_STATIC = 1;
+  ASSIGN_STATIC_ADDRESS_STATUS_REPLACED_DHCP = 2;
+}
+
+message AssignStaticAddressResponse {
+  common.MachineInterfaceId interface_id = 1;
+  string ip_address = 2;
+  AssignStaticAddressStatus status = 3;
+}
+
+message RemoveStaticAddressRequest {
+  common.MachineInterfaceId interface_id = 1;
+  string ip_address = 2;
+}
+
+enum RemoveStaticAddressStatus {
+  REMOVE_STATIC_ADDRESS_STATUS_REMOVED = 0;
+  REMOVE_STATIC_ADDRESS_STATUS_NOT_FOUND = 1;
+}
+
+message RemoveStaticAddressResponse {
+  common.MachineInterfaceId interface_id = 1;
+  string ip_address = 2;
+  RemoveStaticAddressStatus status = 3;
+}
+
+message FindInterfaceAddressesRequest {
+  common.MachineInterfaceId interface_id = 1;
+}
+
+message InterfaceAddress {
+  string address = 1;
+  string allocation_type = 2;
+}
+
+message FindInterfaceAddressesResponse {
+  common.MachineInterfaceId interface_id = 1;
+  repeated InterfaceAddress addresses = 2;
+}
+
 enum MachineType {
   UNKNOWN = 0;
   DPU = 1;
@@ -3392,6 +3444,9 @@ message SshRequest {
 message CopyBfbToDpuRshimRequest {
   SshRequest ssh_request = 1;
   reserved 2;
+  // Optional host BMC IP; if provided, the host will be power-cycled
+  // before BFB copy to ensure the DPU has rshim control.
+  optional string host_bmc_ip = 3;
 }
 
 message UpdateMachineHardwareInfoRequest {

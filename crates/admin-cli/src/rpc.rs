@@ -679,7 +679,7 @@ impl ApiClient {
                     bmc_username: power_shelf.bmc_username,
                     bmc_password: power_shelf.bmc_password,
                     shelf_serial_number: power_shelf.shelf_serial_number,
-                    ip_address: power_shelf.ip_address.unwrap_or_default(),
+                    bmc_ip_address: power_shelf.bmc_ip_address.unwrap_or_default(),
                     metadata: power_shelf.metadata,
                     rack_id: power_shelf.rack_id,
                 })
@@ -711,6 +711,10 @@ impl ApiClient {
                         .collect(),
                     nvos_username: switch.nvos_username,
                     nvos_password: switch.nvos_password,
+                    bmc_ip_address: switch
+                        .bmc_ip_address
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_default(),
                     metadata: switch.metadata,
                     rack_id: switch.rack_id,
                 })
