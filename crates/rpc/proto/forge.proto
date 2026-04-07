@@ -53,6 +53,11 @@ service Forge {
   rpc FindVpcIds(VpcSearchFilter) returns (VpcIdList);
   rpc FindVpcsByIds(VpcsByIdsRequest) returns (VpcList);
 
+  rpc CreateSpxPartition(SpxPartitionCreationRequest) returns (SpxPartition);
+  rpc DeleteSpxPartition(SpxPartitionDeletionRequest) returns (SpxPartitionDeletionResult);
+  rpc FindSpxPartitionIds(SpxPartitionSearchFilter) returns (SpxPartitionIdList);
+  rpc FindSpxPartitionsByIds(SpxPartitionsByIdsRequest) returns (SpxPartitionList);
+
   // VPC prefixes
   rpc CreateVpcPrefix(VpcPrefixCreationRequest) returns (VpcPrefix);
   rpc SearchVpcPrefixes(VpcPrefixSearchQuery) returns (VpcPrefixIdList);
@@ -7266,4 +7271,43 @@ message DeviceFirmwareVersions {
 
 message ListComponentFirmwareVersionsResponse {
   repeated DeviceFirmwareVersions devices = 1;
+}
+
+message SpxPartitionCreationRequest {
+  Metadata metadata = 1;
+  optional common.SpxPartitionId id = 2;
+  optional uint32 vni = 3;
+  string tenantOrganizationId = 4;
+}
+
+message SpxPartition {
+  Metadata metadata = 1;
+  common.SpxPartitionId id = 2;
+  uint32 vni = 3;
+  string tenantOrganizationId = 4;
+}
+
+message SpxPartitionIdList {
+  repeated common.SpxPartitionId spx_partition_ids = 1;
+}
+
+message SpxPartitionDeletionRequest {
+  common.SpxPartitionId id = 1;
+}
+
+message SpxPartitionDeletionResult {
+}
+
+message SpxPartitionSearchFilter {
+  optional string name = 1;
+  optional string tenant_org_id = 2;
+  optional Label label = 3;
+}
+
+message SpxPartitionList {
+  repeated SpxPartition spx_partitions = 1;
+}
+
+message SpxPartitionsByIdsRequest {
+  repeated common.SpxPartitionId spx_partition_ids = 1;
 }

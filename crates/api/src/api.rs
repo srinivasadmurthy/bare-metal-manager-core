@@ -259,6 +259,34 @@ impl Forge for Api {
         crate::handlers::vpc_peering::delete(self, request).await
     }
 
+    async fn create_spx_partition(
+        &self,
+        request: Request<rpc::SpxPartitionCreationRequest>,
+    ) -> Result<Response<rpc::SpxPartition>, Status> {
+        crate::handlers::spx_partition::create(self, request).await
+    }
+
+    async fn delete_spx_partition(
+        &self,
+        request: Request<rpc::SpxPartitionDeletionRequest>,
+    ) -> Result<Response<rpc::SpxPartitionDeletionResult>, Status> {
+        crate::handlers::spx_partition::delete(self, request).await
+    }
+
+    async fn find_spx_partition_ids(
+        &self,
+        request: Request<rpc::SpxPartitionSearchFilter>,
+    ) -> Result<Response<rpc::SpxPartitionIdList>, Status> {
+        crate::handlers::spx_partition::find_ids(self, request).await
+    }
+
+    async fn find_spx_partitions_by_ids(
+        &self,
+        request: Request<rpc::SpxPartitionsByIdsRequest>,
+    ) -> Result<Response<rpc::SpxPartitionList>, Status> {
+        crate::handlers::spx_partition::find_by_ids(self, request).await
+    }
+
     async fn find_ib_partition_ids(
         &self,
         request: Request<rpc::IbPartitionSearchFilter>,
