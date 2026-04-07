@@ -2353,6 +2353,7 @@ message InstanceConfig {
   // Configures instance nvlink partitions
   InstanceNVLinkConfig nvlink = 24;
 
+  optional InstanceSpxConfig spxconfig = 25;
 }
 
 // Desired network configuration for an instance
@@ -2380,6 +2381,17 @@ message InstanceDpuExtensionServicesConfig {
 message InstanceNVLinkConfig {
   // Configures how instance nvlink gpus are set up
   repeated InstanceNVLinkGpuConfig gpu_configs = 1;
+}
+
+message InstanceSpxConfig {
+  repeated InstanceSpxAttachment spx_attachments = 1;
+}
+
+message InstanceSpxAttachment {
+  string dpa_mac_addr = 1;
+  common.SpxPartitionId spx_partition_id = 2;
+  InterfaceFunctionType attachment_type = 3;
+  optional uint32 virtual_function_id = 4;
 }
 
 // New configuration for the instances network interfaces

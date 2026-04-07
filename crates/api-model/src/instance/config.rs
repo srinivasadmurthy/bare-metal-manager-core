@@ -66,6 +66,9 @@ pub struct InstanceConfig {
 
     /// configure instance nvlink
     pub nvlink: InstanceNvLinkConfig,
+
+    /// Configures instance spx
+    pub spxconfig: Option<InstanceSpxConfig>,
 }
 
 impl TryFrom<rpc::InstanceConfig> for InstanceConfig {
@@ -143,7 +146,11 @@ impl TryFrom<InstanceConfig> for rpc::InstanceConfig {
             true => None,
             false => Some(nvlink),
         };
-
+        let spxconfig = rpc::forge::InstanceSpxConfig::try_from(config.spxconfig)?;
+        let spxconfig = match spxconfig.spx_attachments.is_empty() {
+            true => None,
+            false => Some(spxconfig),
+        };
         // We only show user active extension services, and track terminating services internally.
         let active_extension_services: Vec<InstanceExtensionServiceConfig> = config
             .extension_services
@@ -168,6 +175,7 @@ impl TryFrom<InstanceConfig> for rpc::InstanceConfig {
             network_security_group_id: config.network_security_group_id.map(|i| i.to_string()),
             dpu_extension_services: extension_services,
             nvlink,
+            spxconfig,
         })
     }
 }
