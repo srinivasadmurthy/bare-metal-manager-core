@@ -2353,7 +2353,7 @@ message InstanceConfig {
   // Configures instance nvlink partitions
   InstanceNVLinkConfig nvlink = 24;
 
-  optional InstanceSpxConfig spxconfig = 25;
+  InstanceSpxConfig spxconfig = 25;
 }
 
 // Desired network configuration for an instance
@@ -2387,11 +2387,17 @@ message InstanceSpxConfig {
   repeated InstanceSpxAttachment spx_attachments = 1;
 }
 
+enum SpxAttachmentType {
+  Physical = 0;
+  Virtual = 1;
+  Ovn = 2; // This is WIP. Specification for this not yet finalized in Astra Spec
+}
+
 message InstanceSpxAttachment {
   string dpa_mac_addr = 1;
   common.SpxPartitionId spx_partition_id = 2;
-  InterfaceFunctionType attachment_type = 3;
-  optional uint32 virtual_function_id = 4;
+  SpxAttachmentType attachment_type = 3;
+  optional uint32 virtual_function_id = 4; // Needed only if AttachmentType is Virtual
 }
 
 // New configuration for the instances network interfaces

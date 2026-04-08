@@ -33,6 +33,7 @@ use crate::instance::config::InstanceConfig;
 use crate::instance::config::extension_services::InstanceExtensionServicesConfig;
 use crate::instance::config::infiniband::InstanceInfinibandConfig;
 use crate::instance::config::nvlink::InstanceNvLinkConfig;
+use crate::instance::config::spx::InstanceSpxConfig;
 use crate::instance::config::tenant_config::TenantConfig;
 use crate::instance::status::{InstanceStatus, InstanceStatusObservations};
 use crate::machine::infiniband::MachineInfinibandStatusObservation;
@@ -159,6 +160,8 @@ pub struct InstanceSnapshotPgJson {
     storage_config_version: String,
     nvlink_config: InstanceNvLinkConfig,
     nvlink_config_version: String,
+    spx_config: InstanceSpxConfig,
+    spx_config_version: String,
     config_version: String,
     phone_home_last_contact: Option<DateTime<Utc>>,
     use_custom_pxe_on_boot: bool,
@@ -230,6 +233,7 @@ impl TryFrom<InstanceSnapshotPgJson> for InstanceSnapshot {
             nvlink: value.nvlink_config,
             network_security_group_id: value.network_security_group_id,
             extension_services: value.extension_services_config,
+            spxconfig: value.spx_config,
         };
 
         Ok(InstanceSnapshot {

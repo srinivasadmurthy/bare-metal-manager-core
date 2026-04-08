@@ -19,6 +19,7 @@ pub mod extension_services;
 pub mod infiniband;
 pub mod network;
 pub mod nvlink;
+pub mod spx;
 pub mod tenant_config;
 
 use carbide_uuid::network_security_group::{
@@ -34,6 +35,7 @@ use crate::instance::config::extension_services::{
 use crate::instance::config::infiniband::InstanceInfinibandConfig;
 use crate::instance::config::network::InstanceNetworkConfig;
 use crate::instance::config::nvlink::InstanceNvLinkConfig;
+use crate::instance::config::spx::InstanceSpxConfig;
 use crate::instance::config::tenant_config::TenantConfig;
 use crate::os::OperatingSystem;
 
@@ -68,7 +70,7 @@ pub struct InstanceConfig {
     pub nvlink: InstanceNvLinkConfig,
 
     /// Configures instance spx
-    pub spxconfig: Option<InstanceSpxConfig>,
+    pub spxconfig: InstanceSpxConfig,
 }
 
 impl TryFrom<rpc::InstanceConfig> for InstanceConfig {
@@ -111,6 +113,13 @@ impl TryFrom<rpc::InstanceConfig> for InstanceConfig {
             .transpose()?
             .unwrap_or(InstanceNvLinkConfig::default());
 
+        // Spx config is optional
+        let spxconfig = config
+            .spxconfig
+            .map(InstanceSpxConfig::try_from)
+            .transpose()?
+            .unwrap_or(InstanceSpxConfig::default());
+
         Ok(InstanceConfig {
             tenant,
             os,
@@ -125,6 +134,7 @@ impl TryFrom<rpc::InstanceConfig> for InstanceConfig {
                 })?,
             extension_services,
             nvlink,
+            spxconfig,
         })
     }
 }
