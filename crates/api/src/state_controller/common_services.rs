@@ -57,7 +57,6 @@ pub struct CommonStateHandlerServices {
     pub site_config: Arc<CarbideConfig>,
 
     /// Rack Manager Service client
-    #[allow(dead_code)]
     pub rms_client: Option<Arc<dyn RmsApi>>,
 
     /// Credential manager (Vault) for fetching BMC credentials

@@ -55,7 +55,7 @@ impl TryFrom<rpc::InstanceSpxConfig> for InstanceSpxConfig {
         let mut spx_attachments = Vec::with_capacity(config.spx_attachments.len());
         for attachment in config.spx_attachments.into_iter() {
             spx_attachments.push(InstanceSpxAttachment {
-                mac_addr: attachment.mac_addr,
+                mac_addr: attachment.dpa_mac_addr,
                 spx_partition_id: attachment.spx_partition_id,
                 attachment_type: SpxAttachmentType::try_from(attachment.attachment_type)?,
                 virtual_function_id: attachment.virtual_function_id,
@@ -72,7 +72,7 @@ impl TryFrom<InstanceSpxConfig> for rpc::InstanceSpxConfig {
         let mut spx_attachments = Vec::with_capacity(config.spx_attachments.len());
         for attachment in config.spx_attachments.into_iter() {
             spx_attachments.push(rpc::InstanceSpxAttachment {
-                mac_addr: attachment.mac_addr,
+                dpa_mac_addr: attachment.mac_addr,
                 spx_partition_id: attachment.spx_partition_id,
                 attachment_type: attachment.attachment_type as i32,
                 virtual_function_id: attachment.virtual_function_id,

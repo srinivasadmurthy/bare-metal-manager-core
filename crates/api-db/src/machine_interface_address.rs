@@ -16,7 +16,7 @@
  */
 use std::net::IpAddr;
 
-use carbide_network::ip::IpAddressFamily;
+use carbide_network::ip::{IdentifyAddressFamily, IpAddressFamily};
 use carbide_uuid::machine::{MachineId, MachineInterfaceId};
 use model::allocation_type::{AllocationType, AssignStaticResult};
 use model::network_segment::NetworkSegmentType;
@@ -49,11 +49,16 @@ pub async fn find_ipv4_for_interface(
         .map_err(|e| DatabaseError::query(query, e))
 }
 
+/// Looks up which machine interface owns an IP, with segment metadata and **allocation type**.
+///
+/// `allocation_type` is used by the IP finder to classify operator static assignments
+/// (`AllocationType::Static` or addresses on the `static-assignments` segment) as
+/// `IpTypeStaticBmcIp` where appropriate.
 pub async fn find_by_address(
     txn: impl DbReader<'_>,
     address: IpAddr,
 ) -> Result<Option<MachineInterfaceSearchResult>, DatabaseError> {
-    let query = "SELECT mi.id, mi.machine_id, ns.name, ns.network_segment_type
+    let query = "SELECT mi.id, mi.machine_id, ns.name, ns.network_segment_type, mia.allocation_type
             FROM machine_interface_addresses mia
             INNER JOIN machine_interfaces mi ON mi.id = mia.interface_id
             INNER JOIN network_segments ns ON ns.id = mi.segment_id
@@ -160,11 +165,7 @@ pub async fn assign_static(
     interface_id: MachineInterfaceId,
     address: IpAddr,
 ) -> Result<AssignStaticResult, DatabaseError> {
-    let family = if address.is_ipv4() {
-        IpAddressFamily::Ipv4
-    } else {
-        IpAddressFamily::Ipv6
-    };
+    let family = address.address_family();
 
     let existing = find_allocation_type_for_family(&mut *txn, interface_id, family).await?;
 
@@ -192,7 +193,7 @@ pub async fn assign_static(
 pub async fn delete_by_address(
     txn: &mut PgConnection,
     address: IpAddr,
-    allocation_type: model::allocation_type::AllocationType,
+    allocation_type: AllocationType,
 ) -> Result<bool, DatabaseError> {
     let query =
         "DELETE FROM machine_interface_addresses WHERE address = $1::inet AND allocation_type = $2";
@@ -226,10 +227,13 @@ pub async fn has_address_for_family(
         .map_err(|e| DatabaseError::query(query, e))
 }
 
+/// Row shape for [`find_by_address`]: interface identity, owning segment, and how the address was
+/// assigned (DHCP vs static / operator-configured).
 #[derive(Debug, FromRow)]
 pub struct MachineInterfaceSearchResult {
     pub id: MachineInterfaceId,
     pub machine_id: Option<MachineId>,
     pub name: String,
     pub network_segment_type: NetworkSegmentType,
+    pub allocation_type: AllocationType,
 }

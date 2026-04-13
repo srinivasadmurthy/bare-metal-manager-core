@@ -399,6 +399,7 @@ pub async fn update_nvue(
             nc.routing_profile.as_ref().map(|rp| nvue::RoutingProfile {
                 leak_default_route_from_underlay: rp.leak_default_route_from_underlay,
                 leak_tenant_host_routes_to_underlay: rp.leak_tenant_host_routes_to_underlay,
+                tenant_leak_communities_accepted: rp.tenant_leak_communities_accepted,
                 route_target_imports: rp
                     .route_target_imports
                     .iter()
@@ -417,6 +418,7 @@ pub async fn update_nvue(
                     .collect(),
             })
         },
+        bgp_leaf_session_password: nc.bgp_leaf_session_password.clone(),
     };
 
     // next_contents is a YAML-serialized NVUE config.
@@ -777,6 +779,7 @@ async fn update_dhcp_via_grpc(
     network_config: &rpc::ManagedHostNetworkConfigResponse,
     service_addrs: &ServiceAddresses,
     hbn_device_names: HBNDeviceNames,
+    interface_translation_mode: Option<&InterfaceTranslationMode>,
 ) -> eyre::Result<bool> {
     let Some(mh_nc) = &network_config.managed_host_config else {
         eyre::bail!("Loopback IP is missing. Can't write dhcp-server config.");
@@ -829,6 +832,12 @@ async fn update_dhcp_via_grpc(
     )?;
     let interfaces: Vec<String> = host_config.host_ip_addresses.keys().cloned().collect();
 
+    let interfaces = if let Some(translation_mode) = interface_translation_mode {
+        translation_mode.translate_list(&interfaces)
+    } else {
+        interfaces
+    };
+
     crate::dhcp_server_grpc_client::update_and_reload(
         grpc_addr,
         dhcp_config,
@@ -858,13 +867,21 @@ pub async fn update_dhcp(
     service_addrs: &ServiceAddresses,
     hbn_device_names: HBNDeviceNames,
     dhcp_grpc_server: Option<String>,
+    interface_translation_mode: Option<&InterfaceTranslationMode>,
 ) -> eyre::Result<bool> {
     let stop_server = network_config.use_admin_network && !network_config.is_primary_dpu;
     if let Some(ref addr) = dhcp_grpc_server {
         if stop_server {
             return stop_dhcp_via_grpc(addr).await;
         }
-        return update_dhcp_via_grpc(addr, network_config, service_addrs, hbn_device_names).await;
+        return update_dhcp_via_grpc(
+            addr,
+            network_config,
+            service_addrs,
+            hbn_device_names,
+            interface_translation_mode,
+        )
+        .await;
     }
 
     let path_dhcp_relay = FPath(hbn_root.join(dhcp::RELAY_PATH));
@@ -917,6 +934,7 @@ pub async fn update_dhcp(
 pub async fn interfaces(
     network_config: &rpc::ManagedHostNetworkConfigResponse,
     factory_mac_address: MacAddress,
+    nvue_client: Option<&NvueClient>,
 ) -> eyre::Result<Vec<rpc::InstanceInterfaceStatusObservation>> {
     let mut interfaces = vec![];
     if network_config.use_admin_network {
@@ -940,13 +958,21 @@ pub async fn interfaces(
             .iter()
             .any(|iface| iface.function_type == rpc::InterfaceFunctionType::Virtual as i32)
         {
-            let fdb_json = hbn::run_in_container(
-                &hbn::get_hbn_container_id().await?,
-                &["bridge", "-j", "fdb", "show"],
-                true,
-            )
-            .await?;
-            parse_fdb(&fdb_json)?
+            match nvue_client {
+                Some(nvue_client) => {
+                    let mac_table = nvue_client.bridge_mac_table("br_default").await?;
+                    vlan_fdb_map_from_nvue_mac_table(mac_table)
+                }
+                None => {
+                    let fdb_json = hbn::run_in_container(
+                        &hbn::get_hbn_container_id().await?,
+                        &["bridge", "-j", "fdb", "show"],
+                        true,
+                    )
+                    .await?;
+                    parse_fdb(&fdb_json)?
+                }
+            }
         } else {
             HashMap::new()
         };
@@ -1280,6 +1306,59 @@ struct Fdb {
     vlan: Option<u32>,
 }
 
+impl Fdb {
+    pub fn is_permanent(&self) -> bool {
+        self.state == "permanent"
+    }
+}
+
+impl From<nvue_client::types::MacTableEntry> for Fdb {
+    fn from(mac_table_entry: nvue_client::types::MacTableEntry) -> Self {
+        let nvue_client::types::MacTableEntry {
+            mac,
+            interface,
+            entry_type,
+            vlan,
+        } = mac_table_entry;
+        let vlan = vlan.map(u32::from);
+        Self {
+            mac,
+            ifname: interface,
+            state: entry_type,
+            vlan,
+        }
+    }
+}
+
+fn vlan_fdb_map_from_nvue_mac_table(
+    mac_table: Vec<nvue_client::types::MacTableEntry>,
+) -> HashMap<u32, Vec<Fdb>> {
+    let entries_by_vlan = mac_table.into_iter().filter_map(|table_entry| {
+        let fdb = Fdb::from(table_entry);
+        if let Some(vlan_id) = fdb.vlan
+            && !fdb.is_permanent()
+        {
+            Some((vlan_id, fdb))
+        } else {
+            None
+        }
+    });
+
+    use std::collections::hash_map::Entry;
+    let mut fdb_table: HashMap<_, Vec<_>> = HashMap::new();
+    for (vlan_id, fdb_entry) in entries_by_vlan {
+        match fdb_table.entry(vlan_id) {
+            Entry::Occupied(mut occupied_entry) => {
+                occupied_entry.get_mut().push(fdb_entry);
+            }
+            Entry::Vacant(vacant_entry) => {
+                vacant_entry.insert(vec![fdb_entry]);
+            }
+        }
+    }
+    fdb_table
+}
+
 #[derive(Deserialize, Debug)]
 // This has many more fields, only parse the one we check
 struct IpShow {
@@ -1511,6 +1590,39 @@ fn cleanup_old_acls(hbn_root: &Path) {
                 }
             }
         }
+    }
+}
+
+// In some cases (e.g. different container namespaces), the other services we
+// send configuration data to might see different interface names from the ones
+// HBN sees. This allows us to translate them.
+pub enum InterfaceTranslationMode {
+    // The translated interface is just the input interface with a string prepended.
+    Prepend(String),
+}
+
+impl InterfaceTranslationMode {
+    pub fn translate(&self, input_interface_name: &str) -> String {
+        use InterfaceTranslationMode::*;
+        match self {
+            Prepend(prefix) => {
+                format!("{prefix}{input_interface_name}")
+            }
+        }
+    }
+
+    pub fn translate_list<S, I>(&self, input_interface_names: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        input_interface_names
+            .into_iter()
+            .map(|name| {
+                let name = name.as_ref();
+                self.translate(name)
+            })
+            .collect()
     }
 }
 
@@ -2334,6 +2446,7 @@ mod tests {
             asn: 4259912557,
             datacenter_asn: 11414,
             site_global_vpc_vni,
+            bgp_leaf_session_password: None,
             anycast_site_prefixes: vec!["5.255.255.0/24".to_string()],
             tenant_host_asn: Some(65100),
             common_internal_route_target: Some(rpc_common::RouteTarget {
@@ -2347,6 +2460,7 @@ mod tests {
             routing_profile: Some(rpc::RoutingProfile {
                 leak_default_route_from_underlay: include_network_host_route_and_default_leaking,
                 leak_tenant_host_routes_to_underlay: include_network_host_route_and_default_leaking,
+                tenant_leak_communities_accepted: include_network_host_route_and_default_leaking,
                 route_target_imports: vec![rpc_common::RouteTarget {
                     asn: 44444,
                     vni: 55555,
@@ -2548,6 +2662,7 @@ mod tests {
         let hostname = super::hostname().wrap_err("gethostname error")?;
         let vpc_vni = 7777;
         let conf = nvue::NvueConfig {
+            bgp_leaf_session_password: None,
             is_fnn,
             vpc_virtualization_type,
             use_admin_network: true,
@@ -2593,6 +2708,7 @@ mod tests {
                 ip: "10.217.4.70".to_string(),
             }],
             ct_routing_profile: Some(nvue::RoutingProfile {
+                tenant_leak_communities_accepted: false,
                 leak_default_route_from_underlay: false,
                 leak_tenant_host_routes_to_underlay: false,
                 route_target_imports: vec![nvue::RouteTargetConfig {
@@ -2805,6 +2921,7 @@ mod tests {
         };
 
         let mut network_config = rpc::ManagedHostNetworkConfigResponse {
+            bgp_leaf_session_password: None,
             site_global_vpc_vni: None,
             asn: 4259912557,
             datacenter_asn: 11414,
@@ -2820,6 +2937,7 @@ mod tests {
             anycast_site_prefixes: vec!["5.255.255.0/24".to_string()],
             tenant_host_asn: Some(65100),
             routing_profile: Some(rpc::RoutingProfile {
+                tenant_leak_communities_accepted: false,
                 leak_default_route_from_underlay: false,
                 leak_tenant_host_routes_to_underlay: false,
                 route_target_imports: vec![rpc_common::RouteTarget {
@@ -3019,6 +3137,7 @@ mod tests {
             quarantine_state: None,
         };
         let network_config = rpc::ManagedHostNetworkConfigResponse {
+            bgp_leaf_session_password: None,
             site_global_vpc_vni: None,
             asn: 4259912557,
             datacenter_asn: 11414,
@@ -3113,5 +3232,13 @@ mod tests {
 
         // Secondary dpu tenant network
         assert_eq!(needed_interface_state(false, false), InterfaceState::Up);
+    }
+
+    #[test]
+    fn test_interface_translation() {
+        let translation = InterfaceTranslationMode::Prepend("pre_".into());
+        let interface_name = "i0";
+        let translated_interface_name = translation.translate(interface_name);
+        assert_eq!(translated_interface_name.as_str(), "pre_i0");
     }
 }

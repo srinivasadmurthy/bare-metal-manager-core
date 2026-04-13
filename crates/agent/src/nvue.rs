@@ -126,6 +126,7 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         .ct_routing_profile
         .as_ref()
         .map(|rt| TmplRoutingProfile {
+            TenantLeakCommunitiesAccepted: rt.tenant_leak_communities_accepted,
             LeakDefaultRouteFromUnderlay: rt.leak_default_route_from_underlay,
             LeakTenantHostRoutesToUnderlay: rt.leak_tenant_host_routes_to_underlay,
             RouteTargetImports: rt
@@ -408,6 +409,8 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         split_prefixes_by_family(&conf.deny_prefixes, 1000 + deny_prefix_index_offset);
 
     let params = TmplNvue {
+        HasBgpLeafSessionPassword: conf.bgp_leaf_session_password.is_some(),
+        BgpLeafSessionPassword: conf.bgp_leaf_session_password.unwrap_or_default(),
         UseAdminNetwork: conf.use_admin_network,
         LoopbackIP: conf.loopback_ip,
         HasSiteGlobalVpcVni: conf.site_global_vpc_vni.is_some(),
@@ -873,6 +876,7 @@ pub struct NvueConfig {
     pub site_global_vpc_vni: Option<u32>,
     pub common_internal_route_target: Option<RouteTargetConfig>,
     pub additional_route_target_imports: Vec<RouteTargetConfig>,
+    pub bgp_leaf_session_password: Option<String>,
 
     pub secondary_overlay_vtep_ip: Option<String>,
     pub vf_intercept_bridge_port_name: Option<String>,
@@ -922,6 +926,7 @@ pub struct RoutingProfile {
     pub leak_tenant_host_routes_to_underlay: bool,
     pub route_target_imports: Vec<RouteTargetConfig>,
     pub route_targets_on_exports: Vec<RouteTargetConfig>,
+    pub tenant_leak_communities_accepted: bool,
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -1138,6 +1143,11 @@ struct TmplNvue {
     StorageLoopback: String,  // XXX (Classic, L3)
     DPUstorageprefix: String, // XXX (Classic, L3)
     IncludeBridge: bool,
+
+    HasBgpLeafSessionPassword: bool,
+    /// A password to use for the BGP session with the
+    /// leaf TOR.
+    BgpLeafSessionPassword: String,
 }
 
 #[allow(non_snake_case)]
@@ -1179,6 +1189,7 @@ struct TmplRoutingProfile {
     LeakDefaultRouteFromUnderlay: bool,
     RouteTargetImports: Vec<TmplRouteTargetConfig>,
     RouteTargetsOnExports: Vec<TmplRouteTargetConfig>,
+    TenantLeakCommunitiesAccepted: bool,
 }
 
 #[allow(non_snake_case)]
@@ -1459,6 +1470,7 @@ mod tests {
     /// Uses EthernetVirtualizer (ETV) by default.
     fn minimal_nvue_config() -> NvueConfig {
         NvueConfig {
+            bgp_leaf_session_password: None,
             is_fnn: false,
             vpc_virtualization_type: VpcVirtualizationType::EthernetVirtualizer,
             use_admin_network: false,
@@ -1576,6 +1588,7 @@ mod tests {
         conf.deny_prefixes = vec!["192.0.2.0/24".into(), "2001:db8:bad::/48".into()];
         conf.site_fabric_prefixes = vec!["10.0.0.0/16".into(), "fd00:abcd::/32".into()];
         conf.ct_routing_profile = Some(RoutingProfile {
+            tenant_leak_communities_accepted: false,
             leak_default_route_from_underlay: false,
             leak_tenant_host_routes_to_underlay: false,
             route_target_imports: vec![],
@@ -1650,6 +1663,7 @@ mod tests {
         conf.deny_prefixes = vec!["192.0.2.0/24".into()];
         conf.site_fabric_prefixes = vec!["10.0.0.0/16".into(), "fd00::/48".into()];
         conf.ct_routing_profile = Some(RoutingProfile {
+            tenant_leak_communities_accepted: false,
             leak_default_route_from_underlay: false,
             leak_tenant_host_routes_to_underlay: false,
 
@@ -1729,6 +1743,7 @@ mod tests {
         conf.use_vpc_isolation = true;
         conf.site_fabric_prefixes = vec!["10.0.0.0/16".into(), "fd00::/32".into()];
         conf.ct_routing_profile = Some(RoutingProfile {
+            tenant_leak_communities_accepted: false,
             leak_default_route_from_underlay: false,
             leak_tenant_host_routes_to_underlay: false,
             route_target_imports: vec![],

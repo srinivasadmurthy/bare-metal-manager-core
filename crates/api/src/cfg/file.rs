@@ -47,6 +47,7 @@ use model::network_security_group::NetworkSecurityGroupRule;
 use model::network_segment::NetworkDefinition;
 use model::resource_pool::define::ResourcePoolDef;
 use model::site_explorer::{EndpointExplorationReport, ExploredEndpoint};
+use model::tenant::TENANT_IDENTITY_SIGNING_JWT_ALG;
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utils::HostPortPair;
@@ -55,14 +56,14 @@ use crate::state_controller::config::IterationConfig;
 
 const MAX_IB_PARTITION_PER_TENANT: i32 = 31;
 
-static BF2_NIC: &str = "24.47.1026";
-static BF2_BMC: &str = "BF-25.10-9";
+static BF2_NIC: &str = "24.47.2682";
+static BF2_BMC: &str = "BF-25.10-20";
 static BF2_CEC: &str = "4-15";
-static BF2_UEFI: &str = "4.13.0-26-g337fea6bfd";
-static BF3_NIC: &str = "32.47.1026";
-static BF3_BMC: &str = "BF-25.10-9";
+static BF2_UEFI: &str = "4.13.2-12-g943a91640d";
+static BF3_NIC: &str = "32.47.2682";
+static BF3_BMC: &str = "BF-25.10-20";
 static BF3_CEC: &str = "00.02.0195.0000_n02";
-static BF3_UEFI: &str = "4.13.0-26-g337fea6bfd";
+static BF3_UEFI: &str = "4.13.2-12-g943a91640d";
 
 /// nico-api configuration file content
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -483,8 +484,10 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub rack_management_enabled: bool,
 
-    /// URL of the Rack Manager Service API for rack-level firmware upgrades and power sequencing.
-    pub rms_api_url: Option<String>,
+    /// Rack Manager Service configuration for rack-level firmware upgrades,
+    /// power sequencing, and mTLS connectivity.
+    #[serde(default)]
+    pub rms: RmsConfig,
 
     /// rack_types contains the rack type definitions. When expected racks
     /// are created, they are given a rack_type name to reference. This maps
@@ -529,6 +532,30 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub arm_pxe_boot_url_override: Option<String>,
 
+    /// Alternate API URL for external hosts that cannot resolve
+    /// https://carbide-pxe.forge. This be an IP (e.g., "https://10.0.0.1:1079"),
+    /// or an externally resolvable hostname (e.g.,
+    /// "https://carbide-stack-api.corp.example.com"). This is the URL
+    /// that gets handed back to interfaces assigned ot the static-assignments
+    /// subnet. If not set, external hosts will just get the "internal"
+    /// variant of api_url.
+    #[serde(default)]
+    pub external_api_url: Option<String>,
+
+    /// Alternate PXE URL for external hosts (e.g., "http://10.0.0.1:8080"
+    /// or "http://carbide-stack-pxe.corp.example.com"). Used for cloud-init and
+    /// root CA retrieval for interfaces on the static-assignments segment,
+    /// and follows the same rules as external_api_url above.
+    #[serde(default)]
+    pub external_pxe_url: Option<String>,
+
+    /// Alternate static PXE URL for external hosts (e.g.,
+    /// "http://10.0.0.1:8081" or "http://carbide-stack-static.corp.example.com").
+    /// Used for kernel/blob downloads on the static-assignments segment.
+    /// If not set, falls back to `external_pxe_url`.
+    #[serde(default)]
+    pub external_static_pxe_url: Option<String>,
+
     /// Controls enforcement of compute allocations when a new instance is
     /// requested.
     #[serde(default)]
@@ -562,6 +589,20 @@ pub struct CarbideConfig {
     /// manager integration.
     #[serde(default)]
     pub component_manager: Option<component_manager::config::ComponentManagerConfig>,
+
+    /// The password source to use for sites where the LEAF TOR
+    /// requires session passwords.
+    #[serde(default)]
+    pub bgp_leaf_session_password: Option<BgpLeafSessionPassword>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub enum BgpLeafSessionPassword {
+    /// Use a defined site-wide password.
+    /// The password should already exist in the credentials
+    /// store.
+    #[default]
+    SiteWide,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -671,13 +712,24 @@ pub struct MachineIdentityConfig {
     /// Optional HTTP proxy for token endpoint calls (SSRF mitigation).
     #[serde(default)]
     pub token_endpoint_http_proxy: Option<String>,
+    /// Key-id for encryption/decryption of signing keys (selects from secrets `machine_identity.encryption_keys`).
+    #[serde(default)]
+    pub current_encryption_key_id: Option<String>,
+    /// Trust domains allowed for tenant JWT `iss` (normalized host). Empty = allow any.
+    /// Patterns: exact hostname, `*.suffix` (one label under suffix), `**.suffix` (suffix or any subdomain).
+    #[serde(default)]
+    pub trust_domain_allowlist: Vec<String>,
+    /// Allowed DNS names for the `token_endpoint` URL host (`http://` / `https://` only). Empty = allow any.
+    /// Same pattern syntax as [`Self::trust_domain_allowlist`].
+    #[serde(default)]
+    pub token_endpoint_domain_allowlist: Vec<String>,
 }
 
 fn machine_identity_default_enabled() -> bool {
-    true
+    false
 }
 fn machine_identity_default_algorithm() -> String {
-    "ES256".to_string()
+    TENANT_IDENTITY_SIGNING_JWT_ALG.to_string()
 }
 fn machine_identity_default_token_ttl_min_sec() -> u32 {
     60
@@ -694,6 +746,9 @@ impl Default for MachineIdentityConfig {
             token_ttl_min_sec: machine_identity_default_token_ttl_min_sec(),
             token_ttl_max_sec: machine_identity_default_token_ttl_max_sec(),
             token_endpoint_http_proxy: None,
+            current_encryption_key_id: None,
+            trust_domain_allowlist: Vec::new(),
+            token_endpoint_domain_allowlist: Vec::new(),
         }
     }
 }
@@ -704,7 +759,19 @@ impl From<MachineIdentityConfig> for model::tenant::IdentityConfigValidationBoun
             token_ttl_min_sec: mi.token_ttl_min_sec,
             token_ttl_max_sec: mi.token_ttl_max_sec,
             algorithm: mi.algorithm,
-            encryption_key_id: "placeholder-encryption-key".to_string(),
+            encryption_key_id: mi.current_encryption_key_id.expect(
+                "current_encryption_key_id is required when machine identity is enabled; \
+                 statup validation in parse_carbide_config failed",
+            ),
+            trust_domain_allowlist: mi.trust_domain_allowlist,
+        }
+    }
+}
+
+impl From<MachineIdentityConfig> for model::tenant::TokenDelegationValidationBounds {
+    fn from(mi: MachineIdentityConfig) -> Self {
+        Self {
+            token_endpoint_domain_allowlist: mi.token_endpoint_domain_allowlist,
         }
     }
 }
@@ -818,6 +885,11 @@ pub struct FnnRoutingProfileConfig {
     /// into the underlay?
     #[serde(default)]
     pub leak_tenant_host_routes_to_underlay: bool,
+
+    /// Are route-leak communities sent by the host OS honored by the DPU for allowing
+    /// routes advertised by the host OS to be leaked into the underlay?
+    #[serde(default)]
+    pub tenant_leak_communities_accepted: bool,
 }
 
 /// FNN configuration specific to the admin network.
@@ -1953,6 +2025,30 @@ fn default_listen() -> SocketAddr {
 
 fn default_max_database_connections() -> u32 {
     1000
+}
+
+fn default_rms_enforce_tls() -> bool {
+    true
+}
+
+/// Rack Manager Service (RMS) configuration for API connectivity and mTLS.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RmsConfig {
+    /// URL of the RMS API for rack-level firmware upgrades and power sequencing.
+    pub api_url: Option<String>,
+
+    /// Path to the root CA certificate for TLS verification when connecting to RMS.
+    pub root_ca_path: Option<String>,
+
+    /// Path to the client certificate PEM for mTLS with RMS.
+    pub client_cert: Option<String>,
+
+    /// Path to the client private key PEM for mTLS with RMS.
+    pub client_key: Option<String>,
+
+    /// Enforce TLS when connecting to RMS. Defaults to true.
+    #[serde(default = "default_rms_enforce_tls")]
+    pub enforce_tls: bool,
 }
 
 /// DpuConfig related internal configuration

@@ -978,6 +978,7 @@ dependencies = [
 name = "bmc-explorer"
 version = "0.1.0"
 dependencies = [
+ "axum 0.8.6",
  "bmc-mock",
  "bmc-vendor",
  "carbide-api-model",
@@ -1353,6 +1354,7 @@ dependencies = [
  "carbide-dpf",
  "carbide-health-report",
  "carbide-host-support",
+ "carbide-ipxe-renderer",
  "carbide-libmlx",
  "carbide-macros",
  "carbide-measured-boot",
@@ -1417,6 +1419,7 @@ dependencies = [
  "opentelemetry-prometheus",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "p256",
  "pkcs1",
  "prometheus",
  "prometheus-text-parser",
@@ -1469,13 +1472,16 @@ name = "carbide-api-db"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "carbide-api-model",
  "carbide-health-report",
  "carbide-host-support",
+ "carbide-ipxe-renderer",
  "carbide-libmlx",
  "carbide-macros",
  "carbide-measured-boot",
  "carbide-network",
+ "carbide-secrets",
  "carbide-sqlx-testing",
  "carbide-utils",
  "carbide-uuid",
@@ -1544,6 +1550,7 @@ dependencies = [
  "carbide-dpf",
  "carbide-health-report",
  "carbide-host-support",
+ "carbide-ipxe-renderer",
  "carbide-libmlx",
  "carbide-network",
  "carbide-rpc",
@@ -1581,6 +1588,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tss-esapi",
+ "url",
  "uuid",
  "version-compare 0.2.1",
 ]
@@ -1981,6 +1989,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "carbide-ipxe-renderer"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "carbide-libmlx"
 version = "0.0.1"
 dependencies = [
@@ -2290,22 +2308,29 @@ dependencies = [
 name = "carbide-secrets"
 version = "0.0.0"
 dependencies = [
+ "aes-gcm",
  "arc-swap",
  "async-trait",
+ "base64 0.22.1",
  "bmc-vendor",
  "carbide-rpc",
  "carbide-uuid",
  "eyre",
  "figment",
+ "hex",
  "mac_address",
  "notify",
  "opentelemetry",
+ "p256",
  "rand 0.9.2",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "serde_yaml",
  "serial_test",
+ "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.17",
  "tokio",
  "tracing",
  "vaultrs",
@@ -5646,7 +5671,7 @@ dependencies = [
 [[package]]
 name = "libredfish"
 version = "0.0.0"
-source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.43.5#add240967b48f7781fead48b8e3b223acbbc96d3"
+source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.43.9#a2f873edee9a49494a05b737e49c9c4e6378761b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5677,8 +5702,8 @@ dependencies = [
 
 [[package]]
 name = "librms"
-version = "0.0.5"
-source = "git+https://github.com/NVIDIA/nv-rms-client.git?tag=v0.0.5#d516c7838fa4185ee6e7de426f3c759081624b0a"
+version = "0.0.11"
+source = "git+https://github.com/NVIDIA/nv-rms-client.git?tag=v0.0.9.beta-rc2#52c7d4a0a1cda0c11bfbd544afb3acf13b328dab"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6509,9 +6534,9 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26c9cc7e5fc69e068dbea45368f18494ee6dbba0f324a741622cf84d02957c03"
+checksum = "b66689536dc565b539a8636894449215b1b694784628c2928d0609e53cbf5fbc"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -6525,9 +6550,9 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish-bmc-http"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a1d599f8b7c1d913a62ef51183255a0f42e24b4770901bd853f5cad5d043e62"
+checksum = "6510d7a2155ff4d7054c89afa7700972fb27e32f1138ea988c2025f3c8756edc"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -6545,9 +6570,9 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish-core"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3f28ca2cfecf4e0a6cf5865d84feb22e8ff3fcbc0f021a98486baa1f0fc542f"
+checksum = "37bfa3c6ab939e8be20ebd5feeb51b01cf475f67faf07d31db1d28951ffd34cb"
 dependencies = [
  "futures-core",
  "rust_decimal",
@@ -6559,9 +6584,9 @@ dependencies = [
 
 [[package]]
 name = "nv-redfish-csdl-compiler"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "511b072f3cc1b419b294fc1e40e6a36c889f94bf2c52967d03aebe3c3483bcdf"
+checksum = "45ab80d9109120adcd29beac75c0162333c85fca5054730271c05028bd62b52f"
 dependencies = [
  "clap",
  "clap_derive",
@@ -10229,7 +10254,7 @@ dependencies = [
 [[package]]
 name = "tonic-client-wrapper"
 version = "1.0.0"
-source = "git+https://github.com/NVIDIA/nv-rms-client.git?tag=v0.0.5#d516c7838fa4185ee6e7de426f3c759081624b0a"
+source = "git+https://github.com/NVIDIA/nv-rms-client.git?tag=v0.0.9.beta-rc2#52c7d4a0a1cda0c11bfbd544afb3acf13b328dab"
 dependencies = [
  "async-trait",
  "heck 0.5.0",
