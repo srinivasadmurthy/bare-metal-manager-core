@@ -83,6 +83,7 @@ pub mod resource_pool;
 pub mod route_servers;
 pub mod site_exploration_report;
 pub mod sku;
+pub mod spx_partition;
 pub mod switch;
 pub mod switch_state_history;
 pub mod tenant;

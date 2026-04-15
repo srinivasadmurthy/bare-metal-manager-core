@@ -15,50 +15,124 @@
  * limitations under the License.
  */
 use ::rpc::forge as rpc;
+use db::{ObjectColumnFilter, WithTransaction, spx_partition};
+use futures_util::FutureExt;
+use model::spx_partition::NewSpxPartition;
 use tonic::{Request, Response, Status};
 
-use crate::api::{Api, log_request_data};
+use crate::CarbideError;
+use crate::api::{Api, log_request_data, log_tenant_organization_id};
 
 pub(crate) async fn create(
-    _api: &Api,
+    api: &Api,
     request: Request<rpc::SpxPartitionCreationRequest>,
 ) -> Result<Response<rpc::SpxPartition>, Status> {
     log_request_data(&request);
 
-    let _spx_partition_creation_request = request.into_inner();
+    let request_inner = request.into_inner();
+    log_tenant_organization_id(&request_inner.tenant_organization_id);
 
-    Ok(Response::new(rpc::SpxPartition::default()))
+    let req = NewSpxPartition::try_from(request_inner)?;
+
+    let mut txn = api.txn_begin().await?;
+    let partition = db::spx_partition::create(&req, &mut txn)
+        .await
+        .map_err(CarbideError::from)?;
+    let resp = rpc::SpxPartition::try_from(partition).map(Response::new)?;
+    txn.commit().await?;
+
+    Ok(resp)
 }
 
 pub(crate) async fn delete(
-    _api: &Api,
+    api: &Api,
     request: Request<rpc::SpxPartitionDeletionRequest>,
 ) -> Result<Response<rpc::SpxPartitionDeletionResult>, Status> {
     log_request_data(&request);
 
-    let _spx_partition_deletion_request = request.into_inner();
+    let id = request
+        .into_inner()
+        .id
+        .ok_or_else(|| CarbideError::MissingArgument("id"))?;
 
-    Ok(Response::new(rpc::SpxPartitionDeletionResult::default()))
+    let mut partitions = db::spx_partition::find_by(
+        &api.database_connection,
+        ObjectColumnFilter::One(spx_partition::IdColumn, &id),
+    )
+    .await
+    .map_err(CarbideError::from)?;
+
+    let partition = match partitions.len() {
+        1 => partitions.remove(0),
+        _ => {
+            return Err(CarbideError::NotFoundError {
+                kind: "spx_partition",
+                id: id.to_string(),
+            }
+            .into());
+        }
+    };
+
+    let resp = api
+        .with_txn(|txn| db::spx_partition::mark_as_deleted(&partition, txn).boxed())
+        .await?
+        .map(|_| rpc::SpxPartitionDeletionResult {})
+        .map(Response::new)?;
+
+    Ok(resp)
 }
 
 pub(crate) async fn find_ids(
-    _api: &Api,
+    api: &Api,
     request: Request<rpc::SpxPartitionSearchFilter>,
 ) -> Result<Response<rpc::SpxPartitionIdList>, Status> {
     log_request_data(&request);
 
-    let _spx_partition_search_filter = request.into_inner();
+    let rpc_filter = request.into_inner();
+    if let Some(ref tenant_org_id) = rpc_filter.tenant_org_id {
+        log_tenant_organization_id(tenant_org_id);
+    }
 
-    Ok(Response::new(rpc::SpxPartitionIdList::default()))
+    let filter: model::spx_partition::SpxPartitionSearchFilter = rpc_filter.into();
+    let spx_partition_ids =
+        db::spx_partition::find_ids(&api.database_connection, filter).await?;
+
+    Ok(Response::new(rpc::SpxPartitionIdList { spx_partition_ids }))
 }
 
 pub(crate) async fn find_by_ids(
-    _api: &Api,
+    api: &Api,
     request: Request<rpc::SpxPartitionsByIdsRequest>,
 ) -> Result<Response<rpc::SpxPartitionList>, Status> {
     log_request_data(&request);
 
-    let _spx_partitions_by_ids_request = request.into_inner();
+    let rpc::SpxPartitionsByIdsRequest {
+        spx_partition_ids, ..
+    } = request.into_inner();
 
-    Ok(Response::new(rpc::SpxPartitionList::default()))
+    let max_find_by_ids = api.runtime_config.max_find_by_ids as usize;
+    if spx_partition_ids.len() > max_find_by_ids {
+        return Err(CarbideError::InvalidArgument(format!(
+            "no more than {max_find_by_ids} IDs can be accepted"
+        ))
+        .into());
+    } else if spx_partition_ids.is_empty() {
+        return Err(
+            CarbideError::InvalidArgument("at least one ID must be provided".to_string()).into(),
+        );
+    }
+
+    let partitions = db::spx_partition::find_by(
+        &api.database_connection,
+        ObjectColumnFilter::List(spx_partition::IdColumn, &spx_partition_ids),
+    )
+    .await
+    .map_err(CarbideError::from)?;
+
+    let mut spx_partitions = Vec::with_capacity(partitions.len());
+    for p in partitions {
+        spx_partitions.push(p.try_into()?);
+    }
+
+    Ok(Response::new(rpc::SpxPartitionList { spx_partitions }))
 }
