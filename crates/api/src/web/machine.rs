@@ -27,7 +27,7 @@ use hyper::http::StatusCode;
 use itertools::Itertools;
 use model::machine::network::ManagedHostQuarantineState;
 use rpc::forge::forge_server::Forge;
-use rpc::forge::{self as forgerpc, MachineInventorySoftwareComponent, OverrideMode};
+use rpc::forge::{self as forgerpc, HealthReportApplyMode, MachineInventorySoftwareComponent};
 use serde::Deserialize;
 use utils::managed_host_display::to_time;
 
@@ -111,14 +111,14 @@ impl MachineRowDisplay {
             num_nvlink_gpus = nvlink_info.gpus.len();
         }
         let replace_count = m
-            .health_overrides
+            .health_sources
             .iter()
-            .filter(|o| o.mode() == OverrideMode::Replace)
+            .filter(|o| o.mode() == HealthReportApplyMode::Replace)
             .count();
         let merge_count = m
-            .health_overrides
+            .health_sources
             .iter()
-            .filter(|o| o.mode() == OverrideMode::Merge)
+            .filter(|o| o.mode() == HealthReportApplyMode::Merge)
             .count();
 
         let health = m
@@ -703,11 +703,7 @@ impl From<forgerpc::Machine> for MachineDetail<'_> {
                         .unwrap_or_else(health_report::HealthReport::malformed_report)
                 })
                 .unwrap_or_else(health_report::HealthReport::missing_report),
-            health_overrides: m
-                .health_overrides
-                .iter()
-                .map(|o| o.source.clone())
-                .collect(),
+            health_overrides: m.health_sources.iter().map(|o| o.source.clone()).collect(),
             discovery_info_json,
             capabilities_json: m
                 .capabilities

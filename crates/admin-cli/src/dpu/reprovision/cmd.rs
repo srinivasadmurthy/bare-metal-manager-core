@@ -21,7 +21,7 @@ use carbide_uuid::machine::MachineType;
 use prettytable::{Table, row};
 
 use super::args::Args;
-use crate::machine::{HealthOverrideTemplates, get_health_report};
+use crate::machine::{HealthReportTemplates, get_health_report};
 use crate::rpc::ApiClient;
 
 pub async fn reprovision(api_client: &ApiClient, reprov: Args) -> CarbideCliResult<()> {
@@ -90,7 +90,7 @@ async fn apply_health_override(
 
         if let Some(host_machine) = host_machine
             && host_machine
-                .health_overrides
+                .health_sources
                 .iter()
                 .any(|or| or.source == "host-update")
         {
@@ -100,7 +100,7 @@ async fn apply_health_override(
             )));
         }
 
-        let report = get_health_report(HealthOverrideTemplates::HostUpdate, Some(update_message));
+        let report = get_health_report(HealthReportTemplates::HostUpdate, Some(update_message));
 
         api_client
             .machine_insert_health_report_override(*host_machine_id, report.into(), false)

@@ -21,7 +21,7 @@ use carbide_uuid::machine::MachineId;
 use prettytable::{Table, row};
 
 use super::args::{ReprovisionClear, ReprovisionSet};
-use crate::machine::{HealthOverrideTemplates, get_health_report};
+use crate::machine::{HealthReportTemplates, get_health_report};
 use crate::rpc::ApiClient;
 
 pub async fn trigger_reprovisioning_set(
@@ -40,7 +40,7 @@ pub async fn trigger_reprovisioning_set(
 
         if let Some(host_machine) = host_machine
             && host_machine
-                .health_overrides
+                .health_sources
                 .iter()
                 .any(|or| or.source == "host-update")
         {
@@ -50,7 +50,7 @@ pub async fn trigger_reprovisioning_set(
             )));
         }
 
-        let report = get_health_report(HealthOverrideTemplates::HostUpdate, Some(update_message));
+        let report = get_health_report(HealthReportTemplates::HostUpdate, Some(update_message));
 
         api_client
             .machine_insert_health_report_override(data.id, report.into(), false)

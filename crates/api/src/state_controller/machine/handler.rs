@@ -34,7 +34,7 @@ use forge_secrets::credentials::{BmcCredentialType, CredentialKey, CredentialRea
 use futures::TryFutureExt;
 use futures_util::FutureExt;
 use health_report::{
-    HealthAlertClassification, HealthProbeAlert, HealthProbeId, HealthReport, OverrideMode,
+    HealthAlertClassification, HealthProbeAlert, HealthProbeId, HealthReport, HealthReportApplyMode,
 };
 use itertools::Itertools;
 use libredfish::model::oem::nvidia_dpu::HostPrivilegeLevel;
@@ -518,12 +518,8 @@ impl MachineStateHandler {
             }
         }
 
-        ctx.metrics.num_merge_overrides = state.host_snapshot.health_report_overrides.merges.len();
-        ctx.metrics.replace_override_enabled = state
-            .host_snapshot
-            .health_report_overrides
-            .replace
-            .is_some();
+        ctx.metrics.num_merge_overrides = state.host_snapshot.health_reports.merges.len();
+        ctx.metrics.replace_override_enabled = state.host_snapshot.health_reports.replace.is_some();
     }
 
     fn record_health_history(
@@ -545,7 +541,7 @@ impl MachineStateHandler {
         db::machine::remove_health_report_override(
             txn,
             &mh_snaphost.host_snapshot.id,
-            health_report::OverrideMode::Merge,
+            health_report::HealthReportApplyMode::Merge,
             model::machine_update_module::HOST_UPDATE_HEALTH_REPORT_SOURCE,
         )
         .await?;
@@ -564,7 +560,7 @@ impl MachineStateHandler {
         db::machine::remove_health_report_override(
             txn,
             host_machine_id,
-            health_report::OverrideMode::Merge,
+            health_report::HealthReportApplyMode::Merge,
             "scout",
         )
         .await?;
@@ -846,7 +842,7 @@ impl MachineStateHandler {
                                     db::machine::insert_health_report_override(
                                         txn,
                                         &host_machine_id,
-                                        health_report::OverrideMode::Merge,
+                                        health_report::HealthReportApplyMode::Merge,
                                         &health_report,
                                         false,
                                     )
@@ -911,7 +907,7 @@ impl MachineStateHandler {
                     db::machine::insert_health_report_override(
                         &mut txn,
                         host_machine_id,
-                        health_report::OverrideMode::Merge,
+                        health_report::HealthReportApplyMode::Merge,
                         &health_override,
                         false,
                     )
@@ -1557,7 +1553,7 @@ impl MachineStateHandler {
         let timeout_threshold = self.reachability_params.scout_reporting_timeout;
         let scout_timeout_alert_exists = mh_snapshot
             .host_snapshot
-            .health_report_overrides
+            .health_reports
             .merges
             .contains_key("scout");
 
@@ -1580,7 +1576,7 @@ impl MachineStateHandler {
             db::machine::insert_health_report_override(
                 &mut txn,
                 host_machine_id,
-                OverrideMode::Merge,
+                HealthReportApplyMode::Merge,
                 &health_report,
                 false,
             )
@@ -4766,7 +4762,7 @@ impl StateHandler for HostMachineStateHandler {
                         .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
                         .await?;
 
-                    let boot_interface_mac = if !mh_snapshot.dpu_snapshots.is_empty() {
+                    let boot_interface_mac = if !mh_snapshot.is_zero_dpu() {
                         let primary_interface = mh_snapshot
                             .host_snapshot
                             .interfaces
@@ -5300,6 +5296,16 @@ impl StateHandler for InstanceStateHandler {
                     Ok(StateHandlerOutcome::transition(next_state))
                 }
                 InstanceState::WaitingForExtensionServicesConfig => {
+                    // Extension services run on DPUs. A zero-DPU host has no
+                    // DPUs to run them on, so there is nothing to wait for;
+                    // skip straight to the next state.
+                    if mh_snapshot.is_zero_dpu() {
+                        let next_state = ManagedHostState::Assigned {
+                            instance_state: InstanceState::WaitingForRebootToReady,
+                        };
+                        return Ok(StateHandlerOutcome::transition(next_state));
+                    }
+
                     // If no extension services are configured, skip the wait and proceed
                     if instance
                         .config
@@ -5545,7 +5551,7 @@ impl StateHandler for InstanceStateHandler {
                             db::machine::insert_health_report_override(
                                 &mut txn,
                                 &machine_id,
-                                OverrideMode::Merge,
+                                HealthReportApplyMode::Merge,
                                 &health_override,
                                 false,
                             )
@@ -5559,7 +5565,7 @@ impl StateHandler for InstanceStateHandler {
                             db::machine::insert_health_report_override(
                                 &mut txn,
                                 &machine_id,
-                                OverrideMode::Merge,
+                                HealthReportApplyMode::Merge,
                                 &health_override,
                                 false,
                             )
@@ -5585,12 +5591,16 @@ impl StateHandler for InstanceStateHandler {
                     .await
                 }
                 InstanceState::WaitingForDpusToUp => {
-                    if !are_dpus_up_trigger_reboot_if_needed(
-                        mh_snapshot,
-                        &self.reachability_params,
-                        ctx,
-                    )
-                    .await
+                    // A zero-DPU host has no DPUs to wait for. Skip the
+                    // readiness check and proceed with the rest of the
+                    // handler (custom-PXE reboot, termination flow, etc).
+                    if !mh_snapshot.is_zero_dpu()
+                        && !are_dpus_up_trigger_reboot_if_needed(
+                            mh_snapshot,
+                            &self.reachability_params,
+                            ctx,
+                        )
+                        .await
                     {
                         return Ok(StateHandlerOutcome::wait(
                             "Waiting for DPUs to come up.".to_string(),
@@ -5880,7 +5890,7 @@ impl StateHandler for InstanceStateHandler {
                             ctx.pending_db_writes.push(
                                 MachineWriteOp::InsertHealthReportOverride {
                                     machine_id: *host_machine_id,
-                                    mode: health_report::OverrideMode::Merge,
+                                    mode: health_report::HealthReportApplyMode::Merge,
                                     health_report,
                                 },
                             );
@@ -5941,6 +5951,17 @@ impl StateHandler for InstanceStateHandler {
                     Ok(StateHandlerOutcome::transition(next_state).with_txn(txn))
                 }
                 InstanceState::DPUReprovision { .. } => {
+                    // Reaching DPUReprovision with no DPUs is technically a
+                    // bug/violation; the reprovision branch should have been
+                    // skipped upstream. But, without this guard, the empty loop
+                    // below falls through to `do_nothing()` and the host
+                    // would/could sit in `DPUReprovision` forever.
+                    if mh_snapshot.is_zero_dpu() {
+                        return Err(StateHandlerError::GenericError(eyre!(
+                            "DPUReprovision state entered on zero-DPU host {host_machine_id}; reprovision requires DPUs"
+                        )));
+                    }
+
                     for dpu_snapshot in &mh_snapshot.dpu_snapshots {
                         if let outcome @ StateHandlerOutcome::Transition { .. } =
                             handle_dpu_reprovision(
@@ -6681,6 +6702,10 @@ impl HostUpgradeState {
             details @ HostReprovisionState::NewFirmwareReportedWait { .. } => {
                 self.host_new_firmware_reported_wait(state, ctx, details, machine_id, scenario)
                     .await
+            }
+            HostReprovisionState::WaitingForScoutUpgrade { .. } => {
+                // TODO: will be implemented in a follow-up (@jrakhmonov)
+                Ok(StateHandlerOutcome::do_nothing())
             }
             HostReprovisionState::FailedFirmwareUpgrade { report_time, .. } => {
                 let can_retry = retry_count < MAX_FIRMWARE_UPGRADE_RETRIES;
@@ -9002,7 +9027,8 @@ async fn call_machine_setup_and_handle_no_dpu_error(
             );
             Ok(())
         }
-        (Ok(()), _, _) => Ok(()),
+        // TODO: handle the job id returned from machine setup
+        (Ok(_), _, _) => Ok(()),
         (Err(e), _, _) => Err(e),
     }
 }
@@ -9354,7 +9380,7 @@ async fn handle_instance_host_platform_config(
             }
         }
         HostPlatformConfigurationState::CheckHostConfig => {
-            let configure_host_boot_order = if !mh_snapshot.dpu_snapshots.is_empty() {
+            let configure_host_boot_order = if !mh_snapshot.is_zero_dpu() {
                 // Given that we are checking the boot order of a server immediately after a power cycle, we
                 // should do some waiting to ensure that the host is not reporting stale redfish information from
                 // before Carbide powered it off.
@@ -9461,7 +9487,7 @@ async fn handle_instance_host_platform_config(
                 },
             };
 
-            let boot_interface_mac = if !mh_snapshot.dpu_snapshots.is_empty() {
+            let boot_interface_mac = if !mh_snapshot.is_zero_dpu() {
                 let primary_interface = mh_snapshot
                     .host_snapshot
                     .interfaces
@@ -9558,7 +9584,7 @@ async fn configure_host_bios(
     redfish_client: &dyn Redfish,
     mh_snapshot: &ManagedHostStateSnapshot,
 ) -> Result<BiosConfigOutcome, StateHandlerError> {
-    let boot_interface_mac = if !mh_snapshot.dpu_snapshots.is_empty() {
+    let boot_interface_mac = if !mh_snapshot.is_zero_dpu() {
         let primary_interface = mh_snapshot
             .host_snapshot
             .interfaces
@@ -9637,7 +9663,7 @@ async fn set_host_boot_order(
 ) -> Result<SetBootOrderOutcome, StateHandlerError> {
     match set_boot_order_info.set_boot_order_state {
         SetBootOrderState::SetBootOrder => {
-            if mh_snapshot.dpu_snapshots.is_empty() {
+            if mh_snapshot.is_zero_dpu() {
                 // MachineState::SetBootOrder is a NO-OP for the Zero-DPU case
                 Ok(SetBootOrderOutcome::Done)
             } else {
@@ -10018,11 +10044,10 @@ mod tests {
     /// This test catches regressions where the argument gets dropped or replaced with an empty map.
     #[tokio::test]
     async fn test_oem_manager_profiles_passed_to_machine_setup() {
+        use carbide_redfish::libredfish::RedfishClientPool;
+        use carbide_redfish::libredfish::test_support::{RedfishSim, RedfishSimAction};
         use libredfish::BiosProfileType;
         use libredfish::model::service_root::RedfishVendor;
-
-        use crate::redfish::RedfishClientPool;
-        use crate::redfish::test_support::{RedfishSim, RedfishSimAction};
 
         let mut config = crate::tests::common::api_fixtures::get_config();
         // Build an oem_manager_profiles map with a Dell R760 PSU Hot Spare setting.
@@ -10041,9 +10066,8 @@ mod tests {
             )]),
         )]);
 
+        use carbide_redfish::libredfish::RedfishAuth;
         use forge_secrets::credentials::{CredentialKey, CredentialType};
-
-        use crate::redfish::RedfishAuth;
 
         let sim = RedfishSim::default();
         let timepoint = sim.timepoint();

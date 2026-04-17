@@ -28,7 +28,7 @@ use carbide_uuid::machine::MachineId;
 use chrono::Utc;
 use db::work_lock_manager::WorkLockManagerHandle;
 use db::{self, DatabaseError};
-use health_report::OverrideMode;
+use health_report::HealthReportApplyMode;
 use metrics::{
     AppliedChange, FabricMetrics, IbFabricMonitorMetrics, UfmOperation, UfmOperationStatus,
 };
@@ -43,10 +43,10 @@ use sqlx::{PgConnection, PgPool};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+use utils::periodic_timer::PeriodicTimer;
 
 use crate::cfg::file::{CarbideConfig, IbFabricDefinition};
 use crate::ib::{GetPartitionOptions, IBFabricManager, IBFabricManagerType};
-use crate::periodic_timer::PeriodicTimer;
 use crate::{CarbideError, CarbideResult};
 
 /// `IbFabricMonitor` monitors the health of all connected InfiniBand fabrics in periodic intervals
@@ -995,7 +995,7 @@ async fn clear_ib_cleanup_alert(
     db::machine::remove_health_report_override(
         &mut conn,
         machine_id,
-        OverrideMode::Merge,
+        HealthReportApplyMode::Merge,
         "ib-cleanup-validation",
     )
     .await

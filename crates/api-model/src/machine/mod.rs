@@ -36,7 +36,7 @@ use health_report::HealthReport;
 use json::MachineSnapshotPgJson;
 use libredfish::{PowerState, SystemPowerControl};
 use mac_address::MacAddress;
-use rpc::forge::HealthOverrideOrigin;
+use rpc::forge::HealthSourceOrigin;
 use rpc::forge_agent_control_response::{Action, ForgeAgentControlExtraInfo};
 use serde::{Deserialize, Serialize, Serializer};
 use sqlx::postgres::PgRow;
@@ -62,7 +62,7 @@ use crate::hardware_info::{HardwareInfo, MachineNvLinkInfo};
 use crate::instance::config::network::DeviceLocator;
 use crate::instance::snapshot::InstanceSnapshotPgJson;
 use crate::machine::capabilities::MachineCapabilitiesSet;
-use crate::machine::health_override::HealthReportOverrides;
+use crate::machine::health_override::HealthReportSources;
 use crate::machine_interface_address::InterfaceAssociationType;
 use crate::network_segment::NetworkSegmentType;
 use crate::power_manager::PowerOptions;
@@ -123,14 +123,14 @@ pub struct ManagedHostStateSnapshot {
     pub aggregate_health: health_report::HealthReport,
     /// Health overrides inherited from the rack this host belongs to (if any).
     /// Populated at read time; not stored on the machines table.
-    pub rack_health_overrides: Option<HealthReportOverrides>,
+    pub rack_health_overrides: Option<HealthReportSources>,
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ManagedHostStateSnapshot {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         #[derive(Deserialize)]
         struct RackHealthOverrides {
-            json: HealthReportOverrides,
+            json: HealthReportSources,
         }
 
         let host_snapshot: sqlx::types::Json<MachineSnapshotPgJson> =
@@ -239,6 +239,38 @@ impl From<ManagedHostStateSnapshotError> for sqlx::Error {
 }
 
 impl ManagedHostStateSnapshot {
+    /// Returns `true` if this managed host has no DPU snapshots attached.
+    ///
+    /// Most call sites in the state controller use this to follow a "zero-DPU"
+    /// branch -- skip DPU-specific work, use the host's primary interface MAC
+    /// directly, reject DPU-only operations, etc.
+    ///
+    /// Note: Currently, a handful of call sites combine this with
+    /// `host_snapshot.associated_dpu_machine_ids().is_empty()` to distinguish
+    /// "truly zero-DPU" from "DPU expected per topology but the snapshot
+    /// failed to load". Those sites intentionally inspect both fields and
+    /// should NOT be rewritten to use this helper alone. Maybe we can enhance
+    /// that later, but for now this keeps it simple.
+    ///
+    /// NOTE(chet): When called from state-controller handlers (anything reached
+    /// via `MachineStateHandler::handle_object_state`), there is an upstream
+    /// guard that short-circuits with an error if topology reports DPUs but
+    /// `dpu_snapshots` is empty -- i.e. the DPU snapshots failed to load.
+    /// That guard runs before the `ManagedHostState` dispatch, so by the time
+    /// a state handler asks `is_zero_dpu()`, the potential bug of "topology
+    /// has DPUs, but snapshots are empty, so we think it's zero DPU" has
+    /// already been filtered out. A `true` return in that context means
+    /// genuinely zero-DPU (both topology and snapshots agree).
+    ///
+    /// Now, callers OUTSIDE the state-controller path DON'T get that upstream
+    /// guard; if you need the stronger guarantee there, you'll need to
+    /// check both:
+    /// `self.dpu_snapshots.is_empty()` and
+    /// `self.host_snapshot.associated_dpu_machine_ids().is_empty()`.
+    pub fn is_zero_dpu(&self) -> bool {
+        self.dpu_snapshots.is_empty()
+    }
+
     /// Returns `true` if override report is hw_health, `false` otherwise
     fn merge_override_report_with_hw_health(
         output: &mut HealthReport,
@@ -246,7 +278,7 @@ impl ManagedHostStateSnapshot {
         report: &mut HealthReport,
         hardware_health_config: HardwareHealthReportsConfig,
     ) -> bool {
-        if HealthReportOverrides::is_hardware_health_override_source(source) {
+        if HealthReportSources::is_hardware_health_override_source(source) {
             match hardware_health_config {
                 HardwareHealthReportsConfig::Disabled => {}
                 HardwareHealthReportsConfig::MonitorOnly => {
@@ -311,10 +343,10 @@ impl ManagedHostStateSnapshot {
         let source = "aggregate-host-health".to_string();
         let observed_at = Some(chrono::Utc::now());
 
-        // If there is an [`OverrideMode::Replace`] health report override on
+        // If there is an [`HealthReportApplyMode::Replace`] health report override on
         // the host, then use that. A host-level Replace takes full precedence,
         // including over any rack-level overrides.
-        if let Some(mut over) = self.host_snapshot.health_report_overrides.replace.clone() {
+        if let Some(mut over) = self.host_snapshot.health_reports.replace.clone() {
             over.source = source;
             over.observed_at = observed_at;
             self.aggregate_health = over;
@@ -384,7 +416,7 @@ impl ManagedHostStateSnapshot {
                 output.merge(report);
             }
 
-            for (source, over) in snapshot.health_report_overrides.merges.iter_mut() {
+            for (source, over) in snapshot.health_reports.merges.iter_mut() {
                 let merged_hardware = Self::merge_override_report_with_hw_health(
                     &mut output,
                     source,
@@ -395,7 +427,7 @@ impl ManagedHostStateSnapshot {
             }
         }
 
-        for (source, over) in self.host_snapshot.health_report_overrides.merges.iter_mut() {
+        for (source, over) in self.host_snapshot.health_reports.merges.iter_mut() {
             let merged_hardware = Self::merge_override_report_with_hw_health(
                 &mut output,
                 source,
@@ -549,7 +581,7 @@ impl ManagedHostStateSnapshot {
                 let snapshot = self.dpu_snapshots.remove(index);
                 self.dpu_snapshots.insert(0, snapshot);
             }
-        } else if !self.dpu_snapshots.is_empty() {
+        } else if !self.is_zero_dpu() {
             // If it is not Zero-DPU case, return failure.
             return Err(ManagedHostStateSnapshotError::AttachedDpuIdMissing(
                 self.host_snapshot.id,
@@ -736,8 +768,8 @@ pub struct Machine {
     /// Latest health report submitted by site-explorer
     pub site_explorer_health_report: Option<HealthReport>,
 
-    /// All health report overrides
-    pub health_report_overrides: HealthReportOverrides,
+    /// All health report sources
+    pub health_reports: HealthReportSources,
 
     // Inventory related to a DPU machine as reported by the agent there.
     // Software and versions installed on the machine.
@@ -1091,10 +1123,10 @@ impl From<Machine> for rpc::forge::Machine {
                 if let Some(hr) = machine.site_explorer_health_report.as_ref() {
                     health.merge(hr);
                 }
-                match machine.health_report_overrides.replace.as_ref() {
+                match machine.health_reports.replace.as_ref() {
                     Some(over) => over.clone(),
                     None => {
-                        for over in machine.health_report_overrides.merges.values() {
+                        for over in machine.health_reports.merges.values() {
                             health.merge(over);
                         }
                         health
@@ -1106,7 +1138,7 @@ impl From<Machine> for rpc::forge::Machine {
 
         let (maintenance_reference, maintenance_start_time) = if !machine.is_dpu() {
             machine
-                .health_report_overrides
+                .health_reports
                 .maintenance_override()
                 .map(|o| (Some(o.maintenance_reference), o.maintenance_start_time))
                 .unwrap_or_default()
@@ -1188,10 +1220,10 @@ impl From<Machine> for rpc::forge::Machine {
             state_reason: machine.controller_state_outcome.map(|r| r.into()),
             health: Some(health.into()),
             firmware_autoupdate: machine.firmware_autoupdate,
-            health_overrides: machine
-                .health_report_overrides
+            health_sources: machine
+                .health_reports
                 .into_iter()
-                .map(|(hr, m)| HealthOverrideOrigin {
+                .map(|(hr, m)| HealthSourceOrigin {
                     mode: m as i32,
                     source: hr.source,
                 })
@@ -1576,6 +1608,22 @@ pub enum HostReprovisionState {
         reason: Option<String>,
     },
     WaitingForRackFirmwareUpgrade,
+    WaitingForScoutUpgrade {
+        component_type: FirmwareComponentType,
+        target_version: String,
+        started_at: DateTime<Utc>,
+        #[serde(default)]
+        result: Option<ScoutUpgradeResult>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ScoutUpgradeResult {
+    pub success: bool,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

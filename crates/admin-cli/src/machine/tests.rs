@@ -25,7 +25,7 @@
 // ValueEnum Parsing - Test string parsing for types deriving claps ValueEnum.
 
 use clap::{CommandFactory, Parser};
-use health_override::args::{Args as OverrideCommand, HealthOverrideTemplates};
+use health_override::args::{Args as OverrideCommand, HealthReportTemplates};
 use metadata::args::Args as MachineMetadataCommand;
 use network::args::Args as NetworkCommand;
 
@@ -138,7 +138,7 @@ fn parse_health_override_show() {
         .expect("should parse health-override show");
 
     match cmd {
-        Cmd::HealthOverride(OverrideCommand::Show { machine_id }) => {
+        Cmd::HealthReport(OverrideCommand::Show { machine_id }) => {
             assert_eq!(machine_id.to_string(), TEST_MACHINE_ID);
         }
         _ => panic!("expected HealthOverride Show variant"),
@@ -160,7 +160,7 @@ fn parse_health_override_add_with_template() {
     .expect("should parse health-override add with template");
 
     match cmd {
-        Cmd::HealthOverride(OverrideCommand::Add(args)) => {
+        Cmd::HealthReport(OverrideCommand::Add(args)) => {
             assert!(args.template.is_some());
             assert!(args.health_report.is_none());
         }
@@ -282,31 +282,31 @@ fn parse_positions() {
 // values correctly convert back into their expected variant,
 // or fail otherwise.
 
-// health_override_templates_value_enum ensures HealthOverrideTemplates
+// health_override_templates_value_enum ensures HealthReportTemplates
 // parses from strings.
 #[test]
 fn health_override_templates_value_enum() {
     use clap::ValueEnum;
 
     assert!(matches!(
-        HealthOverrideTemplates::from_str("host-update", false),
-        Ok(HealthOverrideTemplates::HostUpdate)
+        HealthReportTemplates::from_str("host-update", false),
+        Ok(HealthReportTemplates::HostUpdate)
     ));
     assert!(matches!(
-        HealthOverrideTemplates::from_str("internal-maintenance", false),
-        Ok(HealthOverrideTemplates::InternalMaintenance)
+        HealthReportTemplates::from_str("internal-maintenance", false),
+        Ok(HealthReportTemplates::InternalMaintenance)
     ));
     assert!(matches!(
-        HealthOverrideTemplates::from_str("out-for-repair", false),
-        Ok(HealthOverrideTemplates::OutForRepair)
+        HealthReportTemplates::from_str("out-for-repair", false),
+        Ok(HealthReportTemplates::OutForRepair)
     ));
     assert!(matches!(
-        HealthOverrideTemplates::from_str("degraded", false),
-        Ok(HealthOverrideTemplates::Degraded)
+        HealthReportTemplates::from_str("degraded", false),
+        Ok(HealthReportTemplates::Degraded)
     ));
     assert!(matches!(
-        HealthOverrideTemplates::from_str("validation", false),
-        Ok(HealthOverrideTemplates::Validation)
+        HealthReportTemplates::from_str("validation", false),
+        Ok(HealthReportTemplates::Validation)
     ));
-    assert!(HealthOverrideTemplates::from_str("invalid", false).is_err());
+    assert!(HealthReportTemplates::from_str("invalid", false).is_err());
 }
