@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 use ::rpc::forge as rpc;
+use chrono::Utc;
 use db::{ObjectColumnFilter, WithTransaction, spx_partition};
 use futures_util::FutureExt;
 use model::spx_partition::NewSpxPartition;
@@ -40,7 +41,13 @@ pub(crate) async fn create(
         .map_err(CarbideError::from)?;
     let resp = rpc::SpxPartition::try_from(partition).map(Response::new)?;
     txn.commit().await?;
-
+    println!(
+        "{} {}:{} SDM create_spx_partition resp: {:?}",
+        Utc::now(),
+        file!(),
+        line!(),
+        resp
+    );
     Ok(resp)
 }
 

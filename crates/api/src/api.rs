@@ -20,6 +20,7 @@ pub mod metrics;
 use std::panic::Location;
 use std::pin::Pin;
 use std::sync::Arc;
+use chrono::Utc;
 
 pub use ::rpc::forge as rpc;
 use ::rpc::forge::{RemoveSkuRequest, SkuIdList};
@@ -263,7 +264,15 @@ impl Forge for Api {
         &self,
         request: Request<rpc::SpxPartitionCreationRequest>,
     ) -> Result<Response<rpc::SpxPartition>, Status> {
-        crate::handlers::spx_partition::create(self, request).await
+        let res = crate::handlers::spx_partition::create(self, request).await;
+        println!(
+            "{} {}:{} SDM create_spx_partition response: {:?}",
+            Utc::now(),
+            file!(),
+            line!(),
+            res
+        );
+        res
     }
 
     async fn delete_spx_partition(

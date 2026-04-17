@@ -136,6 +136,15 @@ pub async fn insert_health_report_override(
         )
         .into());
     }
+
+    println!(
+        "[{} {}:{}] SDM insert_health_report_override: {:?}",
+        chrono::Utc::now().to_rfc3339(),
+        file!(),
+        line!(),
+        report
+    );
+
     let mut txn = api.txn_begin().await?;
 
     let mut report = health_report::HealthReport::try_from(report.clone())
@@ -168,6 +177,15 @@ pub async fn remove_health_report_override(
 
     let rpc::RemoveHealthReportOverrideRequest { machine_id, source } = request.into_inner();
     let machine_id = convert_and_log_machine_id(machine_id.as_ref())?;
+
+    println!(
+        "[{} {}:{}] SDM remove_health_report_override: {:?}",
+        chrono::Utc::now().to_rfc3339(),
+        file!(),
+        line!(),
+        source
+    );
+
     remove_by_source(&mut txn, machine_id, source).await?;
     txn.commit().await?;
 

@@ -534,6 +534,9 @@ impl Default for MetricsConfig {
 impl Config {
     /// Load configuration from optional path
     pub fn load(config_path: Option<&Path>) -> Result<Self, String> {
+
+        println!("SDM load configuration from path: {:?}", config_path);
+
         let mut figment = Figment::new().merge(Serialized::defaults(Config::default()));
 
         if let Some(path) = config_path {

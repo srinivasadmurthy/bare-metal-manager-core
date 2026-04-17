@@ -37,7 +37,10 @@ pub fn block_sqlx_filter() -> tracing_subscriber::filter::Targets {
         .with_target("sqlx::extract_query_data", LevelFilter::WARN)
 }
 
-pub const SQLX_STATEMENTS_LOG_LEVEL: Level = Level::INFO;
+// XXX TODO XXX
+// SDM delete before merge
+// XXX TODO XXX
+pub const SQLX_STATEMENTS_LOG_LEVEL: Level = Level::ERROR;
 
 /// Creates a tracing `Layer` which intercepts `sqlx::query` calls only and aggregates their data
 pub fn create_sqlx_query_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
