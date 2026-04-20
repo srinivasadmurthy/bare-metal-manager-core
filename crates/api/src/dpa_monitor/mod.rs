@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use carbide_uuid::machine::MachineId;
 
 use crate::dpa::handler::DpaInfo;
-use crate::periodic_timer::PeriodicTimer;
+use utils::periodic_timer::PeriodicTimer;
 use chrono::TimeDelta;
 use db::db_read::PgPoolReader;
 use db::dpa_interface::get_dpa_vni;

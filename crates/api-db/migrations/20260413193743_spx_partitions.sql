@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS spx_partitions
     description VARCHAR(1024) NOT NULL DEFAULT (''),
     tenant_organization_id VARCHAR(64) NOT NULL,
     config_version VARCHAR(64) NOT NULL,
+    vni integer NULL UNIQUE;
 
     created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
