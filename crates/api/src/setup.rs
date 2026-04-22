@@ -23,6 +23,7 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use arc_swap::ArcSwap;
+use carbide_firmware::FirmwareDownloader;
 use carbide_ipmi::IPMITool;
 use carbide_redfish::libredfish::RedfishClientPool;
 use carbide_redfish::nv_redfish::NvRedfishClientPool;
@@ -60,7 +61,6 @@ use crate::dpa::handler::{DpaInfo, start_dpa_handler};
 use crate::dpa_monitor::DpaMonitor;
 use crate::dynamic_settings::DynamicSettings;
 use crate::errors::CarbideError;
-use crate::firmware_downloader::FirmwareDownloader;
 use crate::handlers::machine_validation::apply_config_on_startup;
 use crate::ib::{self, IBFabricManager};
 use crate::ib_fabric_monitor::IbFabricMonitor;
@@ -419,6 +419,7 @@ pub async fn start_api(
             crate::dpf_services::dhcp_server_service(&reg),
             crate::dpf_services::doca_hbn_service(&reg),
             crate::dpf_services::dpu_agent_service(&reg),
+            crate::dpf_services::fmds_service(&reg),
         ];
 
         let bfcfg_template = if carbide_config.dpf.bfcfg_enabled {
@@ -1047,7 +1048,7 @@ pub async fn initialize_and_start_controllers(
 
     PreingestionManager::new(
         db_pool.clone(),
-        carbide_config.clone(),
+        carbide_config.preingestion_manager(),
         shared_redfish_pool.clone(),
         meter.clone(),
         Some(downloader.clone()),

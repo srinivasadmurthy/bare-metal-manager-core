@@ -15,32 +15,25 @@
  * limitations under the License.
  */
 
-mod delete;
-mod list;
-mod maintenance;
-pub mod metadata;
-pub mod profile;
-mod show;
+use db::DatabaseError;
 
-#[cfg(test)]
-mod tests;
-
-use clap::Parser;
-
-use crate::cfg::dispatch::Dispatch;
-
-#[derive(Parser, Debug, Dispatch)]
-pub enum Cmd {
-    #[clap(about = "Show rack information")]
-    Show(show::Args),
-    #[clap(about = "List all racks")]
-    List(list::Args),
-    #[clap(about = "Delete the rack")]
-    Delete(delete::Args),
-    #[clap(subcommand, about = "Edit Metadata associated with a Rack")]
-    Metadata(metadata::Args),
-    #[clap(subcommand, about = "Rack profile")]
-    Profile(profile::Args),
-    #[clap(subcommand, about = "On-demand rack maintenance")]
-    Maintenance(maintenance::Args),
+#[derive(thiserror::Error, Debug)]
+pub enum PreingestionManagerError {
+    #[error("Database error: {0}")]
+    DatabaseError(#[from] DatabaseError),
+    #[error("Error in libredfish: {0}")]
+    RedfishError(#[from] libredfish::RedfishError),
+    #[error("Argument is invalid: {0}")]
+    InvalidArgument(String),
+    #[error("Internal error: {message}")]
+    Internal { message: String },
 }
+
+impl PreingestionManagerError {
+    /// Creates a `Internal` error with the given error message
+    pub fn internal(message: String) -> Self {
+        Self::Internal { message }
+    }
+}
+
+pub type PreingestionManagerResult<T> = Result<T, PreingestionManagerError>;
