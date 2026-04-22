@@ -24,6 +24,7 @@ use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use carbide_firmware::{FirmwareConfig, FirmwareConfigSnapshot};
 use carbide_uuid::machine::MachineId;
 use chrono::{DateTime, Duration, Utc};
 use config_version::{ConfigVersion, Versioned};
@@ -84,8 +85,7 @@ use version_compare::Cmp;
 
 use crate::CarbideError;
 use crate::cfg::file::{
-    BomValidationConfig, CarbideConfig, FirmwareConfig, MachineValidationConfig,
-    PowerManagerOptions, TimePeriod,
+    BomValidationConfig, CarbideConfig, MachineValidationConfig, PowerManagerOptions, TimePeriod,
 };
 use crate::dpf::DpfOperations;
 use crate::firmware_downloader::FirmwareDownloader;
@@ -1456,6 +1456,20 @@ impl MachineStateHandler {
                 }
             }
             ManagedHostState::DPUReprovision { .. } => {
+                // Reaching host-level DPUReprovision with no DPUs is an
+                // invariant violation -- the caller (Ready handler) only
+                // enters this state when `dpu_reprovisioning_needed()` is
+                // true, which requires non-empty DPUs. Without this guard
+                // the empty loop below falls through to `do_nothing()` and
+                // the host would sit in DPUReprovision forever.
+                if mh_snapshot.is_zero_dpu() {
+                    return Err(StateHandlerError::GenericError(eyre!(
+                        "DPUReprovision state entered on zero-DPU host {host_machine_id}; \
+                         reprovision requires DPUs"
+                    )));
+                }
+
+                let fw_config_snapshot = self.dpu_handler.hardware_models.create_snapshot();
                 for dpu_snapshot in &mh_snapshot.dpu_snapshots {
                     // TODO: Optimization Possible: We can have another outcome something like
                     // TransitionNotPossible. This will be valid for the sync states (States where
@@ -1470,7 +1484,7 @@ impl MachineStateHandler {
                             &MachineNextStateResolver,
                             dpu_snapshot,
                             ctx,
-                            &self.dpu_handler.hardware_models,
+                            &fw_config_snapshot,
                             self.dpu_handler.dpf_sdk.as_deref(),
                         )
                         .await?
@@ -2545,7 +2559,7 @@ async fn handle_dpu_reprovision(
     next_state_resolver: &impl NextState,
     dpu_snapshot: &Machine,
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
-    hardware_models: &FirmwareConfig,
+    hardware_models: &FirmwareConfigSnapshot,
     dpf_sdk: Option<&dyn DpfOperations>,
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
     let dpu_machine_id = &dpu_snapshot.id;
@@ -2923,7 +2937,7 @@ pub async fn try_wait_for_dpu_discovery(
 async fn check_fw_component_version(
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     dpu_snapshot: &Machine,
-    hardware_models: &FirmwareConfig,
+    hardware_models: &FirmwareConfigSnapshot,
 ) -> Result<Option<StateHandlerOutcome<ManagedHostState>>, StateHandlerError> {
     let redfish_client = ctx
         .services
@@ -3496,8 +3510,12 @@ impl DpuMachineStateHandler {
                     }
                 };
 
-                if let Some(outcome) =
-                    check_fw_component_version(ctx, dpu_snapshot, &self.hardware_models).await?
+                if let Some(outcome) = check_fw_component_version(
+                    ctx,
+                    dpu_snapshot,
+                    &self.hardware_models.create_snapshot(),
+                )
+                .await?
                 {
                     return Ok(outcome);
                 }
@@ -3526,6 +3544,9 @@ impl DpuMachineStateHandler {
                 )
                 .await
                 {
+                    // TODO(chet): I don't know if this is still a thing, but I'm pretty sure
+                    // it hasn't been fixed/addressed yet, and it appears to be logged all over
+                    // the place now.
                     let msg = format!(
                         "redfish machine_setup failed for DPU {}, potentially due to known race condition between UEFI POST and BMC. issuing a force-restart. err: {}",
                         dpu_snapshot.id, e
@@ -4762,22 +4783,8 @@ impl StateHandler for HostMachineStateHandler {
                         .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
                         .await?;
 
-                    let boot_interface_mac = if !mh_snapshot.is_zero_dpu() {
-                        let primary_interface = mh_snapshot
-                            .host_snapshot
-                            .interfaces
-                            .iter()
-                            .find(|x| x.primary_interface)
-                            .ok_or_else(|| {
-                                StateHandlerError::GenericError(eyre::eyre!(
-                                    "Missing primary interface from host: {}",
-                                    mh_snapshot.host_snapshot.id
-                                ))
-                            })?;
-                        Some(primary_interface.mac_address.to_string())
-                    } else {
-                        None
-                    };
+                    let boot_interface_mac =
+                        mh_snapshot.boot_interface_mac().map(|m| m.to_string());
 
                     match redfish_client
                         .is_bios_setup(boot_interface_mac.as_deref())
@@ -5962,6 +5969,7 @@ impl StateHandler for InstanceStateHandler {
                         )));
                     }
 
+                    let fw_config_snapshot = self.hardware_models.create_snapshot();
                     for dpu_snapshot in &mh_snapshot.dpu_snapshots {
                         if let outcome @ StateHandlerOutcome::Transition { .. } =
                             handle_dpu_reprovision(
@@ -5970,7 +5978,7 @@ impl StateHandler for InstanceStateHandler {
                                 &InstanceNextStateResolver,
                                 dpu_snapshot,
                                 ctx,
-                                &self.hardware_models,
+                                &fw_config_snapshot,
                                 self.dpf_sdk.as_deref(),
                             )
                             .await?
@@ -6922,7 +6930,11 @@ impl HostUpgradeState {
             )));
         };
 
-        let Some(fw_info) = self.parsed_hosts.find_fw_info_for_host(&explored_endpoint) else {
+        let Some(fw_info) = self
+            .parsed_hosts
+            .create_snapshot()
+            .find_fw_info_for_host(&explored_endpoint)
+        else {
             return Ok(StateHandlerOutcome::transition(scenario.complete_state()));
         };
 
@@ -7603,8 +7615,10 @@ impl HostUpgradeState {
                         // If we have multiple firmware files to be uploaded, do the next one.
                         if let Some(endpoint) =
                             find_explored_refreshed_endpoint(state, machine_id, ctx).await?
-                            && let Some(fw_info) =
-                                self.parsed_hosts.find_fw_info_for_host(&endpoint)
+                            && let Some(fw_info) = self
+                                .parsed_hosts
+                                .create_snapshot()
+                                .find_fw_info_for_host(&endpoint)
                             && let Some(component_info) = fw_info.components.get(firmware_type)
                             && let Some(selected_firmware) =
                                 component_info.known_firmware.iter().find(|&x| x.default)
@@ -7715,7 +7729,10 @@ impl HostUpgradeState {
                             return Ok(StateHandlerOutcome::do_nothing());
                         };
 
-                        if let Some(fw_info) = self.parsed_hosts.find_fw_info_for_host(&endpoint)
+                        if let Some(fw_info) = self
+                            .parsed_hosts
+                            .create_snapshot()
+                            .find_fw_info_for_host(&endpoint)
                             && let Some(current_version) =
                                 endpoint.find_version(&fw_info, *firmware_type)
                             && current_version == final_version
@@ -7989,7 +8006,11 @@ impl HostUpgradeState {
             return Ok(StateHandlerOutcome::do_nothing());
         };
 
-        let Some(fw_info) = self.parsed_hosts.find_fw_info_for_host(&endpoint) else {
+        let Some(fw_info) = self
+            .parsed_hosts
+            .create_snapshot()
+            .find_fw_info_for_host(&endpoint)
+        else {
             tracing::error!("Could no longer find firmware info for {machine_id}");
             return Ok(StateHandlerOutcome::transition(scenario.actual_new_state(
                 HostReprovisionState::CheckingFirmwareRepeatV2 {
@@ -8996,12 +9017,15 @@ fn can_restart_reprovision(dpu_snapshots: &[Machine], version: ConfigVersion) ->
     dpu_reprovision_restart_requested_after_state_transition(version, *latest_requested_at)
 }
 
-/// Call [`Redfish::machine_setup`], but ignore any [`RedfishError::NoDpu`] if we expect there to be no DPUs.
+/// Call machine_setup, but ignore any RedfishError::NoDpu if we expect there
+/// to be no DPUs.
 ///
-/// TODO(ken): This is a temporary workaround for work-in-progress on zero-DPU support (August 2024)
-/// The way we should do this going forward is to plumb the actual non-DPU MAC address we want to
-/// boot from, but that information is not in scope at this time. Once it is, and we pass it to
-/// machine_setup, we should no longer expect a NoDpu error and can thus call vanilla machine_setup again.
+/// So, callers can *now* plumb a "dumb" host-NIC MAC for zero-DPU hosts via
+/// boot_interface_mac(), meaning the ::NoDpu handling below is expected to
+/// fire only when `machine_setup` has DPU-specific assumptions beyond the MAC
+/// (e.g. Attribute-path checks that still require a DPU to be present). When
+/// that dependency is fully removed, this wrapper can collapse into a plain
+/// `machine_setup` call.
 async fn call_machine_setup_and_handle_no_dpu_error(
     redfish_client: &dyn Redfish,
     boot_interface_mac: Option<&str>,
@@ -9380,63 +9404,57 @@ async fn handle_instance_host_platform_config(
             }
         }
         HostPlatformConfigurationState::CheckHostConfig => {
-            let configure_host_boot_order = if !mh_snapshot.is_zero_dpu() {
-                // Given that we are checking the boot order of a server immediately after a power cycle, we
-                // should do some waiting to ensure that the host is not reporting stale redfish information from
-                // before Carbide powered it off.
-                // This check guarantees that the host has finished loading the BIOS after the DPUs have come up.
-                // If Carbide is still reading an incorrect boot order at this point, something is wrong, and
-                // we should configure this host properly.
-                if !are_dpus_up_trigger_reboot_if_needed(mh_snapshot, reachability_params, ctx)
+            // For hosts with DPU(s), wait for DPU(s) to come up before reading
+            // BIOS state -- the host can report stale Redfish info from before the
+            // power cycle until the DPUs have finished initializing. Zero-DPU
+            // hosts skip this wait, because there are no DPUs to come up.
+            if !mh_snapshot.is_zero_dpu()
+                && !are_dpus_up_trigger_reboot_if_needed(mh_snapshot, reachability_params, ctx)
                     .await
-                {
-                    return Ok(StateHandlerOutcome::wait(
-                        "Waiting for DPUs to come up.".to_string(),
-                    ));
-                }
+            {
+                return Ok(StateHandlerOutcome::wait(
+                    "Waiting for DPUs to come up.".to_string(),
+                ));
+            }
 
-                let primary_interface = mh_snapshot
-                    .host_snapshot
-                    .interfaces
-                    .iter()
-                    .find(|x| x.primary_interface)
-                    .ok_or_else(|| {
-                        StateHandlerError::GenericError(eyre::eyre!(
-                            "Missing primary interface from host: {}",
-                            mh_snapshot.host_snapshot.id
-                        ))
-                    })?;
+            // Resolve the MAC whose interface should be first in the boot
+            // order. For hosts with DPUs, this is the DPU-facing PF (set as
+            // the primary_interface by site-explorer during DPU attach).
+            //
+            // For zero-DPU hosts, it's the operator-declared primary host
+            // NIC (which comes from `ExpectedHostNic.primary`) *or* the
+            // "lowest" deterministic-fallback host NIC.
+            let boot_interface_mac = mh_snapshot.boot_interface_mac().ok_or_else(|| {
+                StateHandlerError::GenericError(eyre::eyre!(
+                    "Missing boot interface MAC for host: {}",
+                    mh_snapshot.host_snapshot.id
+                ))
+            })?;
 
-                let vendor = mh_snapshot.host_snapshot.bmc_vendor();
+            let vendor = mh_snapshot.host_snapshot.bmc_vendor();
 
-                log_host_config(redfish_client.as_ref(), mh_snapshot).await;
+            log_host_config(redfish_client.as_ref(), mh_snapshot).await;
 
-                if !(redfish_client
-                    .is_boot_order_setup(&primary_interface.mac_address.to_string())
-                    .await
-                    .map_err(|e| StateHandlerError::RedfishError {
-                        operation: "is_boot_order_setup",
-                        error: e,
-                    })?)
-                {
-                    tracing::warn!(
-                        machine_id = %mh_snapshot.host_snapshot.id,
-                        bmc_vendor = %vendor,
-                        "Host boot order is not configured properly"
-                    );
-
-                    true
-                } else {
-                    tracing::info!(
-                        machine_id = %mh_snapshot.host_snapshot.id,
-                        bmc_vendor = %vendor,
-                        "Host boot order is configured properly"
-                    );
-
-                    false
-                }
-            } else {
+            let configure_host_boot_order = if redfish_client
+                .is_boot_order_setup(&boot_interface_mac.to_string())
+                .await
+                .map_err(|e| StateHandlerError::RedfishError {
+                    operation: "is_boot_order_setup",
+                    error: e,
+                })? {
+                tracing::info!(
+                    machine_id = %mh_snapshot.host_snapshot.id,
+                    bmc_vendor = %vendor,
+                    "Host boot order is configured properly"
+                );
                 false
+            } else {
+                tracing::warn!(
+                    machine_id = %mh_snapshot.host_snapshot.id,
+                    bmc_vendor = %vendor,
+                    "Host boot order is not configured properly"
+                );
+                true
             };
 
             if configure_host_boot_order {
@@ -9487,22 +9505,7 @@ async fn handle_instance_host_platform_config(
                 },
             };
 
-            let boot_interface_mac = if !mh_snapshot.is_zero_dpu() {
-                let primary_interface = mh_snapshot
-                    .host_snapshot
-                    .interfaces
-                    .iter()
-                    .find(|x| x.primary_interface)
-                    .ok_or_else(|| {
-                        StateHandlerError::GenericError(eyre::eyre!(
-                            "Missing primary interface from host: {}",
-                            mh_snapshot.host_snapshot.id
-                        ))
-                    })?;
-                Some(primary_interface.mac_address.to_string())
-            } else {
-                None
-            };
+            let boot_interface_mac = mh_snapshot.boot_interface_mac().map(|m| m.to_string());
 
             match redfish_client
                 .is_bios_setup(boot_interface_mac.as_deref())
@@ -9584,23 +9587,7 @@ async fn configure_host_bios(
     redfish_client: &dyn Redfish,
     mh_snapshot: &ManagedHostStateSnapshot,
 ) -> Result<BiosConfigOutcome, StateHandlerError> {
-    let boot_interface_mac = if !mh_snapshot.is_zero_dpu() {
-        let primary_interface = mh_snapshot
-            .host_snapshot
-            .interfaces
-            .iter()
-            .find(|x| x.primary_interface)
-            .ok_or_else(|| {
-                StateHandlerError::GenericError(eyre::eyre!(
-                    "Missing primary interface from host: {}",
-                    mh_snapshot.host_snapshot.id
-                ))
-            })?;
-        Some(primary_interface.mac_address.to_string())
-    } else {
-        // This is the Zero-DPU case
-        None
-    };
+    let boot_interface_mac = mh_snapshot.boot_interface_mac().map(|m| m.to_string());
 
     if let Err(e) = call_machine_setup_and_handle_no_dpu_error(
         redfish_client,
@@ -9610,6 +9597,9 @@ async fn configure_host_bios(
     )
     .await
     {
+        // TODO(chet): I don't know if this is still a thing, but I'm pretty sure
+        // it hasn't been fixed/addressed yet, and it appears to be logged all over
+        // the place now.
         tracing::warn!(
             "redfish machine_setup failed for {}, potentially due to known race condition between UEFI POST and BMC. triggering force-restart if needed. err: {}",
             mh_snapshot.host_snapshot.id,
@@ -9641,15 +9631,16 @@ async fn configure_host_bios(
             )
             .await?
         };
-        // Return WaitingForReboot instead of Err to ensure the transaction is committed
-        // and last_reboot_requested is persisted. Returning Err would cause a transaction
-        // rollback, leading to a tight reboot loop since the reboot timestamp is lost.
+        // Return WaitingForReboot instead of Err to ensure the transaction is
+        // committed, and last_reboot_requested is persisted. Returning Err would
+        // cause a transaction rollback, leading to a tight reboot loop (since the
+        // reboot timestamp would be lost).
         return Ok(BiosConfigOutcome::WaitingForReboot(format!(
             "redfish machine_setup failed: {e}; triggered host reboot: {reboot_status:#?}"
         )));
     };
 
-    // Host needs to be rebooted to pick up the changes after calling machine_setup
+    // Host needs to be rebooted to pick up the changes after calling machine_setup.
     handler_host_power_control(mh_snapshot, ctx, SystemPowerControl::ForceRestart).await?;
     Ok(BiosConfigOutcome::Done)
 }
@@ -9663,85 +9654,81 @@ async fn set_host_boot_order(
 ) -> Result<SetBootOrderOutcome, StateHandlerError> {
     match set_boot_order_info.set_boot_order_state {
         SetBootOrderState::SetBootOrder => {
-            if mh_snapshot.is_zero_dpu() {
-                // MachineState::SetBootOrder is a NO-OP for the Zero-DPU case
-                Ok(SetBootOrderOutcome::Done)
-            } else {
-                let primary_interface = mh_snapshot
-                    .host_snapshot
-                    .interfaces
-                    .iter()
-                    .find(|x| x.primary_interface)
-                    .ok_or_else(|| {
-                        StateHandlerError::GenericError(eyre::eyre!(
-                            "Missing primary interface from host: {}",
-                            mh_snapshot.host_snapshot.id
-                        ))
-                    })?;
+            // Resolve the boot NIC MAC the same way `CheckHostConfig` does,
+            // supporting hosts with DPU(s) and zero DPUs alike.
+            let boot_interface_mac = mh_snapshot.boot_interface_mac().ok_or_else(|| {
+                StateHandlerError::GenericError(eyre::eyre!(
+                    "Missing boot interface MAC for host: {}",
+                    mh_snapshot.host_snapshot.id
+                ))
+            })?;
 
-                let jid = match set_boot_order_dpu_first_and_handle_no_dpu_error(
-                    redfish_client,
-                    &primary_interface.mac_address.to_string(),
-                    mh_snapshot.host_snapshot.associated_dpu_machine_ids().len(),
-                    &ctx.services.site_config,
-                )
-                .await
-                {
-                    Ok(jid) => jid,
-                    Err(e) => {
-                        tracing::warn!(
-                            "redfish set_boot_order_dpu_first failed for {}, potentially due to known race condition between UEFI POST and BMC. triggering force-restart if needed. err: {}",
-                            mh_snapshot.host_snapshot.id,
-                            e
-                        );
+            let jid = match set_boot_order_dpu_first_and_handle_no_dpu_error(
+                redfish_client,
+                &boot_interface_mac.to_string(),
+                mh_snapshot.host_snapshot.associated_dpu_machine_ids().len(),
+                &ctx.services.site_config,
+            )
+            .await
+            {
+                Ok(jid) => jid,
+                Err(e) => {
+                    // TODO(chet): I don't know if this is still a thing, but I'm pretty sure
+                    // it hasn't been fixed/addressed yet, and it appears to be logged all over
+                    // the place now.
+                    tracing::warn!(
+                        "redfish set_boot_order_dpu_first failed for {}, potentially due to known race condition between UEFI POST and BMC. triggering force-restart if needed. err: {}",
+                        mh_snapshot.host_snapshot.id,
+                        e
+                    );
 
-                        let reboot_status =
-                            if mh_snapshot.host_snapshot.last_reboot_requested.is_none() {
-                                handler_host_power_control(
-                                    mh_snapshot,
-                                    ctx,
-                                    SystemPowerControl::ForceRestart,
-                                )
-                                .await?;
+                    let reboot_status = if mh_snapshot.host_snapshot.last_reboot_requested.is_none()
+                    {
+                        handler_host_power_control(
+                            mh_snapshot,
+                            ctx,
+                            SystemPowerControl::ForceRestart,
+                        )
+                        .await?;
 
-                                RebootStatus {
-                                    increase_retry_count: true,
-                                    status: "Restarted host".to_string(),
-                                }
-                            } else {
-                                trigger_reboot_if_needed(
-                                    &mh_snapshot.host_snapshot,
-                                    mh_snapshot,
-                                    None,
-                                    reachability_params,
-                                    ctx,
-                                )
-                                .await?
-                            };
-
-                        // Log boot options and PCIe device list whenever a fresh reboot is
-                        // triggered so we capture full diagnostic context (UEFI device paths +
-                        // PCIe inventory) before state resets. Skipped when waiting on an
-                        // already-in-progress reboot to avoid redundant Redfish calls.
-                        if reboot_status.increase_retry_count {
-                            log_host_config(redfish_client, mh_snapshot).await;
+                        RebootStatus {
+                            increase_retry_count: true,
+                            status: "Restarted host".to_string(),
                         }
+                    } else {
+                        trigger_reboot_if_needed(
+                            &mh_snapshot.host_snapshot,
+                            mh_snapshot,
+                            None,
+                            reachability_params,
+                            ctx,
+                        )
+                        .await?
+                    };
 
-                        // Return wait instead of Err to ensure the transaction is committed
-                        // and last_reboot_requested is persisted. Returning Err would cause a transaction
-                        // rollback, leading to a tight reboot loop since the reboot timestamp is lost.
-                        return Ok(SetBootOrderOutcome::WaitingForReboot(format!(
-                            "redfish set_boot_order_dpu_first failed: {e}; triggered host reboot: {reboot_status:#?}"
-                        )));
+                    // Log boot options and PCIe device list whenever a fresh reboot is
+                    // triggered so we capture full diagnostic context (UEFI device paths +
+                    // PCIe inventory) before state resets. Skipped when waiting on an
+                    // already-in-progress reboot to avoid redundant Redfish calls.
+                    if reboot_status.increase_retry_count {
+                        log_host_config(redfish_client, mh_snapshot).await;
                     }
-                };
 
-                Ok(SetBootOrderOutcome::Continue(SetBootOrderInfo {
-                    set_boot_order_jid: jid,
-                    set_boot_order_state: SetBootOrderState::WaitForSetBootOrderJobScheduled,
-                    retry_count: set_boot_order_info.retry_count,
-                }))
-            }
+                    // Return WaitingForReboot instead of Err to ensure the transaction is
+                    // committed, and last_reboot_requested is persisted. Returning Err would
+                    // cause a transaction rollback, leading to a tight reboot loop (since the
+                    // reboot timestamp would be lost).
+                    return Ok(SetBootOrderOutcome::WaitingForReboot(format!(
+                        "redfish set_boot_order_dpu_first failed: {e}; triggered host reboot: {reboot_status:#?}"
+                    )));
+                }
+            };
+
+            Ok(SetBootOrderOutcome::Continue(SetBootOrderInfo {
+                set_boot_order_jid: jid,
+                set_boot_order_state: SetBootOrderState::WaitForSetBootOrderJobScheduled,
+                retry_count: set_boot_order_info.retry_count,
+            }))
         }
         SetBootOrderState::WaitForSetBootOrderJobScheduled => {
             if let Some(job_id) = &set_boot_order_info.set_boot_order_jid {
@@ -9964,20 +9951,15 @@ async fn set_host_boot_order(
 
             let retry_count = set_boot_order_info.retry_count;
 
-            let primary_interface = mh_snapshot
-                .host_snapshot
-                .interfaces
-                .iter()
-                .find(|x| x.primary_interface)
-                .ok_or_else(|| {
-                    StateHandlerError::GenericError(eyre::eyre!(
-                        "Missing primary interface from host: {}",
-                        mh_snapshot.host_snapshot.id
-                    ))
-                })?;
+            let boot_interface_mac = mh_snapshot.boot_interface_mac().ok_or_else(|| {
+                StateHandlerError::GenericError(eyre::eyre!(
+                    "Missing boot interface MAC for host: {}",
+                    mh_snapshot.host_snapshot.id
+                ))
+            })?;
 
             let boot_order_configured = redfish_client
-                .is_boot_order_setup(&primary_interface.mac_address.to_string())
+                .is_boot_order_setup(&boot_interface_mac.to_string())
                 .await
                 .map_err(|e| StateHandlerError::RedfishError {
                     operation: "is_boot_order_setup",

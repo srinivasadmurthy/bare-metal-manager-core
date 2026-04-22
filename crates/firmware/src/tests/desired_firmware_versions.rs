@@ -16,14 +16,14 @@
  */
 use sqlx::FromRow;
 
-use crate::cfg::file::FirmwareConfig;
+use crate::FirmwareConfig;
 
 #[derive(FromRow)]
 struct AsStrings {
     pub versions: String,
 }
 
-#[crate::sqlx_test]
+#[super::sqlx_test]
 pub async fn test_build_versions(pool: sqlx::PgPool) -> Result<(), eyre::Error> {
     use std::ops::DerefMut;
 
@@ -93,7 +93,11 @@ current_version_reported_as = "^2$"
     let mut txn = pool.begin().await?;
     desired_firmware::snapshot_desired_firmware(
         &mut txn,
-        config.map().into_values().collect::<Vec<_>>().as_slice(),
+        config
+            .create_snapshot()
+            .into_values()
+            .collect::<Vec<_>>()
+            .as_slice(),
     )
     .await?;
     txn.commit().await?;
@@ -116,6 +120,7 @@ current_version_reported_as = "^2$"
     let query = r#"SELECT explicit_update_start_needed FROM desired_firmware;"#;
     let explicit_update_needed: (bool,) = sqlx::query_as(query).fetch_one(txn.deref_mut()).await?;
     assert_eq!(explicit_update_needed, (true,));
+    txn.commit().await?;
 
     Ok(())
 }

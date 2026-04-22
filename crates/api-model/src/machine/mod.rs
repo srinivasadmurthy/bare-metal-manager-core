@@ -67,7 +67,7 @@ use crate::machine_interface_address::InterfaceAssociationType;
 use crate::network_segment::NetworkSegmentType;
 use crate::power_manager::PowerOptions;
 
-mod slas;
+pub mod slas;
 
 pub mod capabilities;
 pub mod health_override;
@@ -108,6 +108,9 @@ pub fn get_display_ids(machines: &[Machine]) -> String {
 fn default_true() -> bool {
     true
 }
+
+// This should be updated on each new model introduction
+pub const CURRENT_STATE_MODEL_VERSION: i16 = 2;
 
 /// Represents the current state of `Machine`
 #[derive(Debug, Clone)]
@@ -238,6 +241,58 @@ impl From<ManagedHostStateSnapshotError> for sqlx::Error {
     }
 }
 
+/// Pick the MAC address the host should boot from, given its interfaces.
+///
+/// See `ManagedHostStateSnapshot::boot_interface_mac` for the caller-facing
+/// details. I split this out as a function so it can be unit-tested directly
+/// without constructing a full `ManagedHostStateSnapshot`.
+///
+/// Ordering:
+/// 1. Any interface with `primary_interface == true` wins. This is the
+///    path operators can drive explicitly via `ExpectedHostNic.primary`,
+///    in the case of zero DPU hosts, and is also how hosts with DPU(s)
+///    end up with a boot MAC automatically during site-explorer ingestion.
+/// 2. If there's no primary interface, the interface outside the management
+///    segment with the "smallest" MAC address wins -- mainly so we can
+///    have some sense of a stable MAC for zero-DPU hosts where no operator
+///    explicitly declared a primary NIC (and ingestion didn't assign one either).
+/// 3. `None` -- This is the "I don't have any candidate interfaces yet" case,
+///    so it's on the caller to figure out. What this usually means is the
+///    caller passes `boot_interface_mac: None` to machine_setup, and then
+///    subsequent logic flows from there (e.g. ::NoDpu handling).
+fn pick_boot_interface_mac(
+    interfaces: &[MachineInterfaceSnapshot],
+) -> Option<mac_address::MacAddress> {
+    // The primary wins!
+    if let Some(primary) = interfaces.iter().find(|x| x.primary_interface) {
+        return Some(primary.mac_address);
+    }
+    // ..no primary, so lets try to find *some* interface.
+    interfaces
+        .iter()
+        .filter(|x| x.network_segment_type != Some(NetworkSegmentType::Underlay))
+        .min_by_key(|x| x.mac_address)
+        .map(|x| x.mac_address)
+}
+
+/// Derive a host-level `use_admin_network` from the per-DPU values for
+/// the host.
+///
+/// Split out from `ManagedHostStateSnapshot::use_admin_network` so it's
+/// more easily testable without building a full snapshot. The way this works is:
+/// - True when an empty slice (e.g. zero-DPU host or snapshots failed to load),
+///   because zero DPU hosts have no DPU to handle tenant overlay (and
+///   are always admin). In the snapshot failure case, it seemed more
+///   conservative to treat it as such.
+/// - Otherwise, walk across all of the use_admin_network values from the
+///   hosts DPU(s) and collect their values, defaulting to true otherwise.
+fn derive_use_admin_network(dpu_use_admin_network: &[Option<bool>]) -> bool {
+    dpu_use_admin_network.is_empty()
+        || dpu_use_admin_network
+            .iter()
+            .any(|flag| flag.unwrap_or(true))
+}
+
 impl ManagedHostStateSnapshot {
     /// Returns `true` if this managed host has no DPU snapshots attached.
     ///
@@ -271,7 +326,55 @@ impl ManagedHostStateSnapshot {
         self.dpu_snapshots.is_empty()
     }
 
-    /// Returns `true` if override report is hw_health, `false` otherwise
+    /// Returns `true` if this managed host is currently operating on the
+    /// admin network (rather than a tenant overlay).
+    ///
+    /// The underlying `use_admin_network` flag is persisted per-DPU on
+    /// `ManagedHostNetworkConfig` (fwiw, the config is generic, but
+    /// site-explorer and the machine state controller only populate this
+    /// for DPUs. Default is true.
+    ///
+    /// Zero-DPU hosts always return `true`, because there's no DPU to
+    /// handle tenant overlay networking. This allows consumers like the
+    /// IB and NVLink partition monitors to treat the host as admin-only
+    /// and detach.
+    ///
+    /// Now, this helper doesn't change where the *flag* is stored. I'm
+    /// planning on doing that in a future PR, but it will be a bit more
+    /// disruptive. It may end up going into the host's network_config,
+    /// allowing us to drop the per-DPU copies, and then this helper can
+    /// just read the host's config value directly.
+    pub fn use_admin_network(&self) -> bool {
+        let dpu_use_admin_network: Vec<_> = self
+            .dpu_snapshots
+            .iter()
+            .map(|dpu| dpu.network_config.use_admin_network)
+            .collect();
+        derive_use_admin_network(&dpu_use_admin_network)
+    }
+
+    /// Returns the MAC address the host should boot from, if one can be
+    /// determined from this snapshot.
+    ///
+    /// For hosts with DPUs, this is the DPU-facing "primary" `machine_interface`,
+    /// flagged as `primary_interface: true` during site-explorer ingestion.
+    ///
+    /// For zero-DPU hosts, the `primary_interface` flag is not (yet) set at
+    /// ingestion time, so this method "falls back" to the first non-underlay
+    /// `machine_interface` (i.e. not the BMC) sorted deterministically by MAC.
+    ///
+    /// Returns `None` if the host has no non-underlay interfaces yet -- e.g.
+    /// only the BMC has been discovered, or the host's primary NIC hasn't
+    /// DHCP'd yet.
+    ///
+    /// This helper exists to centralize the boot MAC selection logic that used
+    /// to be duplicated at every state controller callsite needing to pass a MAC
+    /// into things like machine_setup, is_bios_setup, etc.
+    pub fn boot_interface_mac(&self) -> Option<mac_address::MacAddress> {
+        pick_boot_interface_mac(&self.host_snapshot.interfaces)
+    }
+
+    /// Returns `true` if override report is hw_health, `false` otherwise.
     fn merge_override_report_with_hw_health(
         output: &mut HealthReport,
         source: &str,
@@ -461,6 +564,7 @@ impl ManagedHostStateSnapshot {
     pub fn rpc_machine_state(
         &self,
         dpu_machine_id: Option<&MachineId>,
+        sla_config: &slas::MachineSlaConfig,
     ) -> Option<rpc::forge::Machine> {
         match dpu_machine_id {
             None => {
@@ -474,6 +578,7 @@ impl ManagedHostStateSnapshot {
                         state,
                         version,
                         &self.aggregate_health,
+                        sla_config,
                     )
                     .into(),
                 );
@@ -487,6 +592,16 @@ impl ManagedHostStateSnapshot {
                 let mut rpc_machine: rpc::forge::Machine = dpu_snapshot.clone().into();
                 // In case the DPU does not know the associated Host - we can backfill the data here
                 rpc_machine.associated_host_machine_id = Some(self.host_snapshot.id);
+                rpc_machine.state_sla = Some(
+                    state_sla(
+                        &dpu_snapshot.id,
+                        &dpu_snapshot.state.value,
+                        &dpu_snapshot.state.version,
+                        &self.aggregate_health,
+                        sla_config,
+                    )
+                    .into(),
+                );
                 Some(rpc_machine)
             }
         }
@@ -1163,15 +1278,8 @@ impl From<Machine> for rpc::forge::Machine {
             }),
             instance_type_id: machine.instance_type_id.map(|i| i.to_string()),
             state_version: machine.state.version.version_string(),
-            state_sla: Some(
-                state_sla(
-                    &machine.id,
-                    &machine.state.value,
-                    &machine.state.version,
-                    &health,
-                )
-                .into(),
-            ),
+            // calculated at RPC handler, see ManagedHostStateSnapshot::rpc_machine_state
+            state_sla: None,
             machine_type: *RpcMachineTypeWrapper::from(machine.id.machine_type()) as _,
             metadata: Some(machine.metadata.into()),
             version: machine.version.version_string(),
@@ -2518,6 +2626,7 @@ pub fn state_sla(
     state: &ManagedHostState,
     state_version: &ConfigVersion,
     aggregate_health: &health_report::HealthReport,
+    sla_config: &slas::MachineSlaConfig,
 ) -> StateSla {
     let exclude = health_report::HealthAlertClassification::exclude_from_state_machine_sla();
     if aggregate_health
@@ -2579,9 +2688,15 @@ pub fn state_sla(
         ManagedHostState::Ready => StateSla::no_sla(),
         ManagedHostState::Assigned { instance_state } => match instance_state {
             InstanceState::Ready => StateSla::no_sla(),
-            InstanceState::BootingWithDiscoveryImage { retry } if retry.count > 0 => {
-                // Since retries happen after 30min, the occurence of any retry means we exhausted the SLA
-                StateSla::with_sla(std::time::Duration::ZERO, time_in_state)
+            InstanceState::BootingWithDiscoveryImage { retry } => {
+                if retry.count > 1 {
+                    StateSla::with_sla(std::time::Duration::ZERO, time_in_state)
+                } else {
+                    StateSla::with_sla(
+                        sla_config.assigned_booting_with_discovery_image,
+                        time_in_state,
+                    )
+                }
             }
             InstanceState::HostPlatformConfiguration { .. } => {
                 StateSla::with_sla(slas::ASSIGNED_HOST_PLATFORM_CONFIGURATION, time_in_state)
@@ -2990,7 +3105,13 @@ mod tests {
             health_report::HealthAlertClassification::exclude_from_state_machine_sla(),
         ])]);
 
-        let sla = state_sla(&machine_id, &state, &state_version, &health);
+        let sla = state_sla(
+            &machine_id,
+            &state,
+            &state_version,
+            &health,
+            &slas::MachineSlaConfig::default(),
+        );
 
         assert!(sla.sla.is_none(), "SLA should be absent when excluded");
         assert!(
@@ -3019,7 +3140,13 @@ mod tests {
             ]),
         ]);
 
-        let sla = state_sla(&machine_id, &state, &state_version, &health);
+        let sla = state_sla(
+            &machine_id,
+            &state,
+            &state_version,
+            &health,
+            &slas::MachineSlaConfig::default(),
+        );
 
         assert!(
             sla.sla.is_none(),
@@ -3041,7 +3168,13 @@ mod tests {
             health_report::HealthAlertClassification::prevent_allocations(),
         ])]);
 
-        let sla = state_sla(&machine_id, &state, &state_version, &health);
+        let sla = state_sla(
+            &machine_id,
+            &state,
+            &state_version,
+            &health,
+            &slas::MachineSlaConfig::default(),
+        );
 
         assert!(
             sla.sla.is_some(),
@@ -3060,7 +3193,13 @@ mod tests {
         let state_version = ConfigVersion::initial();
         let health = health_report_with_alerts(vec![]);
 
-        let sla = state_sla(&machine_id, &state, &state_version, &health);
+        let sla = state_sla(
+            &machine_id,
+            &state,
+            &state_version,
+            &health,
+            &slas::MachineSlaConfig::default(),
+        );
 
         assert!(
             sla.sla.is_some(),
@@ -3089,7 +3228,13 @@ mod tests {
             health_report::HealthAlertClassification::exclude_from_state_machine_sla(),
         ])]);
 
-        let sla = state_sla(&machine_id, &state, &state_version, &health);
+        let sla = state_sla(
+            &machine_id,
+            &state,
+            &state_version,
+            &health,
+            &slas::MachineSlaConfig::default(),
+        );
 
         assert!(
             sla.sla.is_none(),
@@ -3117,7 +3262,13 @@ mod tests {
         let state_version = ConfigVersion::initial();
         let health = health_report_with_alerts(vec![]);
 
-        let sla = state_sla(&machine_id, &state, &state_version, &health);
+        let sla = state_sla(
+            &machine_id,
+            &state,
+            &state_version,
+            &health,
+            &slas::MachineSlaConfig::default(),
+        );
 
         assert_eq!(
             sla.sla,
@@ -3139,6 +3290,107 @@ mod tests {
         let rpc_info: rpc::forge::DpuInfo = info.into();
         assert_eq!(rpc_info.id, "dpu-123");
         assert_eq!(rpc_info.loopback_ip, "10.0.0.1");
+    }
+
+    /// Build a mock `MachineInterfaceSnapshot` with the fields
+    /// `pick_boot_interface_mac` actually inspects (MAC, primary flag,
+    /// segment type) set, and everything else left at the mock default.
+    fn build_mock_interface(
+        mac: &str,
+        primary: bool,
+        segment_type: Option<NetworkSegmentType>,
+    ) -> MachineInterfaceSnapshot {
+        MachineInterfaceSnapshot {
+            primary_interface: primary,
+            network_segment_type: segment_type,
+            ..MachineInterfaceSnapshot::mock_with_mac(mac.parse().unwrap())
+        }
+    }
+
+    // Whichever interface is flagged `primary_interface` wins, regardless
+    // of MAC ordering or segment type of the other interfaces. This covers
+    // both paths that can set the flag, whether it be site-explorer w/ DPU
+    // ingestion, or operator-driven `ExpectedHostNic.primary` for zero-DPU
+    // hosts.
+    #[test]
+    fn pick_boot_interface_mac_returns_primary_interface_when_set() {
+        let primary_mac = "10:00:00:00:00:01";
+        let other_mac = "05:00:00:00:00:01"; // numerically lower but not primary
+        let interfaces = vec![
+            build_mock_interface(other_mac, false, Some(NetworkSegmentType::HostInband)),
+            build_mock_interface(primary_mac, true, Some(NetworkSegmentType::Admin)),
+        ];
+
+        assert_eq!(
+            pick_boot_interface_mac(&interfaces),
+            Some(primary_mac.parse().unwrap())
+        );
+    }
+
+    // This is our zero DPU fallback case -- no interface is flagged primary,
+    // so pick the lowest-MAC non-underlay interface. Verifies (a) the underlay
+    // BMC interface is excluded, and (b) ordering is deterministic across
+    // multiple non-underlay candidates.
+    #[test]
+    fn pick_boot_interface_mac_falls_back_to_lowest_non_underlay_mac_when_no_primary() {
+        let bmc_mac = "01:00:00:00:00:01"; // numerically lowest, but BMC!
+        let onboard_mac_lo = "10:00:00:00:00:01";
+        let onboard_mac_hi = "20:00:00:00:00:01";
+        let interfaces = vec![
+            build_mock_interface(bmc_mac, false, Some(NetworkSegmentType::Underlay)),
+            build_mock_interface(onboard_mac_hi, false, Some(NetworkSegmentType::HostInband)),
+            build_mock_interface(onboard_mac_lo, false, Some(NetworkSegmentType::HostInband)),
+        ];
+
+        assert_eq!(
+            pick_boot_interface_mac(&interfaces),
+            Some(onboard_mac_lo.parse().unwrap())
+        );
+    }
+
+    // Check the case  where only the BMC has been discovered so far (which
+    // is common during early ingestion). In this case, there's no valid boot MAC
+    // yet; callers fall back to the `::NoDpu` handling downstream.
+    #[test]
+    fn pick_boot_interface_mac_returns_none_when_only_underlay_interfaces() {
+        let bmc_mac = "01:00:00:00:00:01";
+        let interfaces = vec![build_mock_interface(
+            bmc_mac,
+            false,
+            Some(NetworkSegmentType::Underlay),
+        )];
+
+        assert_eq!(pick_boot_interface_mac(&interfaces), None);
+    }
+
+    // Zero-DPU hosts have no DPU snapshots at all. The helper must return
+    // `true` -- consumers (IB partition monitor, NVLink partition monitor)
+    // use this to decide whether to detach tenant partitions, and zero-DPU
+    // hosts never have a tenant overlay to protect.
+    #[test]
+    fn derive_use_admin_network_returns_true_for_empty_dpu_snapshots() {
+        assert!(derive_use_admin_network(&[]));
+    }
+
+    // Make sure the legacy default still works; when a DPU snapshot has no
+    // explicit value, treat it as admin-network. All or any "None" should
+    // therefore resolve to true.
+    #[test]
+    fn derive_use_admin_network_treats_none_as_true() {
+        assert!(derive_use_admin_network(&[None]));
+        assert!(derive_use_admin_network(&[None, None]));
+    }
+
+    // ...aand check OR semantics across DPUs: if any single DPU says admin,
+    // the whole host is treated as admin. Only "all DPUs explicitly say false"
+    // flips the host to tenant-network mode.
+    #[test]
+    fn derive_use_admin_network_ors_across_dpus() {
+        assert!(derive_use_admin_network(&[Some(false), Some(true)]));
+        assert!(derive_use_admin_network(&[Some(true), Some(true)]));
+        assert!(derive_use_admin_network(&[Some(false), None]));
+        assert!(!derive_use_admin_network(&[Some(false)]));
+        assert!(!derive_use_admin_network(&[Some(false), Some(false)]));
     }
 }
 

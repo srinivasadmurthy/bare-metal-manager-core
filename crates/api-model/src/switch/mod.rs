@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use ::rpc::errors::RpcDataConversionError;
-use ::rpc::forge as rpc;
+use ::rpc::forge::{self as rpc, LifecycleStatus};
 use carbide_uuid::rack::RackId;
 use carbide_uuid::switch::SwitchId;
 use chrono::prelude::*;
@@ -228,25 +228,47 @@ impl TryFrom<Switch> for rpc::Switch {
     type Error = RpcDataConversionError;
 
     fn try_from(src: Switch) -> Result<Self, Self::Error> {
-        let state_reason = src.controller_state_outcome.map(|r| r.into());
-        let sla = state_sla(&src.controller_state.value, &src.controller_state.version).into();
-        let controller_state = serde_json::to_string(&src.controller_state.value).unwrap();
+        let health = derive_switch_aggregate_health(&src.health_reports);
+        let health_sources = src
+            .health_reports
+            .iter()
+            .map(|(hr, m)| rpc::HealthSourceOrigin {
+                mode: m as i32,
+                source: hr.source.clone(),
+            })
+            .collect();
+
+        let sla = state_sla(&src.controller_state.value, &src.controller_state.version);
+        let lifecycle = LifecycleStatus {
+            state: serde_json::to_string(&src.controller_state.value).unwrap_or_default(),
+            version: src.controller_state.version.version_string(),
+            state_reason: src.controller_state_outcome.map(Into::into),
+            sla: Some(sla.clone().into()),
+        };
+        let controller_state = lifecycle.state.clone();
+
         let status = Some(match src.status {
             Some(s) => rpc::SwitchStatus {
-                state_reason,
-                state_sla: Some(sla),
+                state_reason: lifecycle.state_reason.clone(),
+                state_sla: Some(sla.into()),
                 switch_name: Some(s.switch_name),
                 power_state: Some(s.power_state),
                 health_status: Some(s.health_status),
-                controller_state: Some(controller_state.clone()),
+                controller_state: Some(lifecycle.state.clone()),
+                health: Some(health.into()),
+                health_sources,
+                lifecycle: Some(lifecycle),
             },
             None => rpc::SwitchStatus {
-                state_reason,
-                state_sla: Some(sla),
+                state_reason: lifecycle.state_reason.clone(),
+                state_sla: Some(sla.into()),
                 switch_name: None,
                 power_state: None,
                 health_status: None,
-                controller_state: Some(controller_state.clone()),
+                controller_state: Some(lifecycle.state.clone()),
+                health: Some(health.into()),
+                health_sources,
+                lifecycle: Some(lifecycle),
             },
         });
 
@@ -266,16 +288,6 @@ impl TryFrom<Switch> for rpc::Switch {
             enable_nmxc: src.config.enable_nmxc,
         };
 
-        let health = derive_switch_aggregate_health(&src.health_reports);
-        let health_sources = src
-            .health_reports
-            .clone()
-            .into_iter()
-            .map(|(hr, m)| rpc::HealthSourceOrigin {
-                mode: m as i32,
-                source: hr.source,
-            })
-            .collect();
         let deleted = if src.deleted.is_some() {
             Some(src.deleted.unwrap().into())
         } else {
@@ -294,8 +306,6 @@ impl TryFrom<Switch> for rpc::Switch {
             version: src.version.version_string(),
             rack_id: src.rack_id,
             placement_in_rack,
-            health: Some(health.into()),
-            health_sources,
         })
     }
 }
