@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-use crate::logging::metrics_utils::SharedMetricsHolder;
+use ::utils::metrics::SharedMetricsHolder;
 use opentelemetry::metrics::{Histogram, Meter};
 use std::fmt;
 use std::fmt::Display;
