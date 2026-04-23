@@ -89,6 +89,13 @@ impl TryFrom<rpc_forge::SpxPartitionCreationRequest> for NewSpxPartition {
 impl TryFrom<SpxPartition> for rpc_forge::SpxPartition {
     type Error = RpcDataConversionError;
     fn try_from(src: SpxPartition) -> Result<Self, Self::Error> {
+        if src.vni.is_none() {
+            return Err(RpcDataConversionError::InvalidValue(
+                "VNI is required".to_string(),
+                "VNI is required".to_string(),
+            ));
+        }
+        let vni = src.vni.unwrap();
         Ok(rpc_forge::SpxPartition {
             id: Some(src.id),
             metadata: Some(rpc_forge::Metadata {
@@ -97,7 +104,7 @@ impl TryFrom<SpxPartition> for rpc_forge::SpxPartition {
                 ..Default::default()
             }),
             tenant_organization_id: src.tenant_organization_id,
-            vni: 0,
+            vni: vni as u32,
         })
     }
 }
@@ -109,6 +116,7 @@ pub struct SpxPartition {
     pub description: String,
     pub tenant_organization_id: String,
     pub config_version: ConfigVersion,
+    pub vni: Option<i32>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
     pub deleted: Option<DateTime<Utc>>,
@@ -126,6 +134,7 @@ pub struct SpxPartitionSnapshotPgJson {
     pub description: String,
     pub tenant_organization_id: String,
     pub config_version: ConfigVersion,
+    pub vni: Option<i32>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
     pub deleted: Option<DateTime<Utc>>,
@@ -140,6 +149,7 @@ impl TryFrom<SpxPartitionSnapshotPgJson> for SpxPartition {
             description: value.description,
             tenant_organization_id: value.tenant_organization_id,
             config_version: value.config_version,
+            vni: value.vni,
             created: value.created,
             updated: value.updated,
             deleted: value.deleted,
