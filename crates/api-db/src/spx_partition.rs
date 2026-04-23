@@ -88,11 +88,11 @@ pub async fn find_ids(
     txn: impl DbReader<'_>,
     filter: model::spx_partition::SpxPartitionSearchFilter,
 ) -> Result<Vec<SpxPartitionId>, DatabaseError> {
-    let mut builder = sqlx::QueryBuilder::new("SELECT id FROM spx_partitions");
+    let mut builder = sqlx::QueryBuilder::new("SELECT id FROM spx_partitions WHERE");
     let mut has_filter = false;
 
     if let Some(tenant_org_id) = &filter.tenant_org_id {
-        builder.push(" WHERE tenant_organization_id = ");
+        builder.push(" tenant_organization_id = ");
         builder.push_bind(tenant_org_id);
         has_filter = true;
     }
@@ -100,10 +100,16 @@ pub async fn find_ids(
         if has_filter {
             builder.push(" AND name = ");
         } else {
-            builder.push(" WHERE name = ");
+            builder.push(" name = ");
         }
         builder.push_bind(name);
     }
+
+    if has_filter {
+        builder.push(" AND ");
+    }
+
+    builder.push(" deleted IS NULL");
 
     let query = builder.build_query_as();
     let ids: Vec<SpxPartitionId> = query
