@@ -45,6 +45,7 @@ pub struct NewSpxPartition {
     pub name: String,
     pub description: String,
     pub tenant_organization_id: String,
+    pub vni: Option<i32>,
 }
 
 impl TryFrom<rpc_forge::SpxPartitionCreationRequest> for NewSpxPartition {
@@ -70,6 +71,17 @@ impl TryFrom<rpc_forge::SpxPartitionCreationRequest> for NewSpxPartition {
             name,
             description,
             tenant_organization_id: req.tenant_organization_id,
+            vni: req.vni.map(|v| v.try_into()).transpose().map_err(
+                |e: std::num::TryFromIntError| {
+                    RpcDataConversionError::InvalidValue(
+                        format!(
+                            "`{}` cannot be converted to VNI",
+                            req.vni.unwrap_or_default()
+                        ),
+                        e.to_string(),
+                    )
+                },
+            )?,
         })
     }
 }

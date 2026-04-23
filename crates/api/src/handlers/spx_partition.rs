@@ -20,9 +20,64 @@ use db::{ObjectColumnFilter, WithTransaction, spx_partition};
 use futures_util::FutureExt;
 use model::spx_partition::NewSpxPartition;
 use tonic::{Request, Response, Status};
+use model::resource_pool;
+use sqlx::PgConnection;
+use db::resource_pool::ResourcePoolDatabaseError;
+
 
 use crate::CarbideError;
 use crate::api::{Api, log_request_data, log_tenant_organization_id};
+
+async fn allocate_dpa_vni(
+    api: &Api,
+    txn: &mut PgConnection,
+    owner_id: &str,
+    requested_vni: Option<i32>,
+) -> Result<i32, CarbideError> {
+    let source_pool = &api.common_pools.ethernet.pool_dpa_vni;
+
+    match db::resource_pool::allocate(
+        source_pool,
+        txn,
+        resource_pool::OwnerType::SpxPartition,
+        owner_id,
+        requested_vni,
+    )
+    .await
+    {
+        Ok(val) => Ok(val),
+        Err(ResourcePoolDatabaseError::ResourcePool(resource_pool::ResourcePoolError::Empty)) => {
+            tracing::error!(
+                owner_id,
+                pool = source_pool.name(),
+                "Pool exhausted, cannot allocate"
+            );
+            Err(CarbideError::ResourceExhausted(format!(
+                "pool {}",
+                source_pool.name
+            )))
+        }
+        Err(ResourcePoolDatabaseError::Database(e)) if requested_vni.is_some() => Err(match *e {
+            db::DatabaseError::FailedPrecondition(_s) => {
+                tracing::error!(
+                    owner_id,
+                    pool = source_pool.name(),
+                    value = requested_vni,
+                    "invalid pool value requested, cannot allocate"
+                );
+                CarbideError::FailedPrecondition(format!(
+                    "VNI `{}` cannot be requested or is already allocated",
+                    requested_vni.unwrap_or_default()
+                ))
+            }
+            e => e.into(),
+        }),
+        Err(err) => {
+            tracing::error!(owner_id, error = %err, pool = source_pool.name, "Error allocating from resource pool");
+            Err(err.into())
+        }
+    }
+}
 
 pub(crate) async fn create(
     api: &Api,
@@ -36,7 +91,10 @@ pub(crate) async fn create(
     let req = NewSpxPartition::try_from(request_inner)?;
 
     let mut txn = api.txn_begin().await?;
-    let partition = db::spx_partition::create(&req, &mut txn)
+
+    let vni = allocate_dpa_vni(api, &mut txn, &req.id.to_string(), req.vni).await?;
+
+    let partition = db::spx_partition::create(&req, vni, &mut txn)
         .await
         .map_err(CarbideError::from)?;
     let resp = rpc::SpxPartition::try_from(partition).map(Response::new)?;

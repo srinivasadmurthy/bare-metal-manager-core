@@ -36,6 +36,7 @@ impl ColumnInfo<'_> for IdColumn {
 
 pub async fn create(
     value: &NewSpxPartition,
+    vni: i32,
     txn: &mut PgConnection,
 ) -> Result<SpxPartition, DatabaseError> {
     let config_version = ConfigVersion::initial();
@@ -45,8 +46,9 @@ pub async fn create(
                 name,
                 description,
                 tenant_organization_id,
+                vni,
                 config_version)
-            VALUES ($1, $2, $3, $4, $5)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING row_to_json(spx_partitions.*)";
 
     let partition: SpxPartitionSnapshotPgJson = sqlx::query_as(query)
@@ -54,6 +56,7 @@ pub async fn create(
         .bind(&value.name)
         .bind(&value.description)
         .bind(&value.tenant_organization_id)
+        .bind(vni)
         .bind(config_version)
         .fetch_one(txn)
         .await
