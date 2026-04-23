@@ -120,31 +120,22 @@ pub(crate) async fn delete(
         .id
         .ok_or_else(|| CarbideError::MissingArgument("id"))?;
 
-    let mut partitions = db::spx_partition::find_by(
-        &api.database_connection,
-        ObjectColumnFilter::One(spx_partition::IdColumn, &id),
-    )
-    .await
-    .map_err(CarbideError::from)?;
-
-    let partition = match partitions.len() {
-        1 => partitions.remove(0),
-        _ => {
-            return Err(CarbideError::NotFoundError {
-                kind: "spx_partition",
-                id: id.to_string(),
-            }
-            .into());
-        }
-    };
+    let mut txn = api.txn_begin().await?;
 
     let resp = api
-        .with_txn(|txn| db::spx_partition::mark_as_deleted(&partition, txn).boxed())
+        .with_txn(|txn| db::spx_partition::mark_as_deleted(id, txn).boxed())
         .await?
-        .map(|_| rpc::SpxPartitionDeletionResult {})
-        .map(Response::new)?;
+        .map_err(CarbideError::from)?;
 
-    Ok(resp)
+    if let Some(vni) = resp.vni {
+        db::resource_pool::release(&api.common_pools.ethernet.pool_dpa_vni, &mut txn, vni)
+            .await
+            .map_err(CarbideError::from)?;
+    }
+
+    txn.commit().await?;
+
+    Ok(Response::new(rpc::SpxPartitionDeletionResult {}))
 }
 
 pub(crate) async fn find_ids(

@@ -137,12 +137,12 @@ pub async fn find_by<'a, C: ColumnInfo<'a, TableType = SpxPartition>>(
 }
 
 pub async fn mark_as_deleted(
-    partition: &SpxPartition,
+    pid: SpxPartitionId,
     txn: &mut PgConnection,
 ) -> DatabaseResult<SpxPartition> {
     let query = "UPDATE spx_partitions SET updated=NOW(), deleted=NOW() WHERE id=$1 RETURNING row_to_json(spx_partitions.*)";
     let partition: SpxPartitionSnapshotPgJson = sqlx::query_as(query)
-        .bind(partition.id)
+        .bind(pid)
         .fetch_one(txn)
         .await
         .map_err(|e| DatabaseError::new(query, e))?;
