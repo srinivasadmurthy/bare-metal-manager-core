@@ -2572,10 +2572,11 @@ enum SpxAttachmentType {
 }
 
 message InstanceSpxAttachment {
-  string dpa_mac_addr = 1;
-  common.SpxPartitionId spx_partition_id = 2;
-  SpxAttachmentType attachment_type = 3;
-  optional uint32 virtual_function_id = 4; // Needed only if AttachmentType is Virtual
+  string device = 1;
+  uint32 device_instance = 2;
+  common.SpxPartitionId spx_partition_id = 3;
+  SpxAttachmentType attachment_type = 4;
+  optional uint32 virtual_function_id = 5; // Needed only if AttachmentType is Virtual
 }
 
 // New configuration for the instances network interfaces

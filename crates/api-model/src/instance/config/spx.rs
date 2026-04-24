@@ -55,7 +55,8 @@ impl TryFrom<rpc::InstanceSpxConfig> for InstanceSpxConfig {
         let mut spx_attachments = Vec::with_capacity(config.spx_attachments.len());
         for attachment in config.spx_attachments.into_iter() {
             spx_attachments.push(InstanceSpxAttachment {
-                mac_addr: attachment.dpa_mac_addr,
+                device: attachment.device,
+                device_instance: attachment.device_instance,
                 spx_partition_id: attachment.spx_partition_id,
                 attachment_type: SpxAttachmentType::try_from(attachment.attachment_type)?,
                 virtual_function_id: attachment.virtual_function_id,
@@ -72,7 +73,8 @@ impl TryFrom<InstanceSpxConfig> for rpc::InstanceSpxConfig {
         let mut spx_attachments = Vec::with_capacity(config.spx_attachments.len());
         for attachment in config.spx_attachments.into_iter() {
             spx_attachments.push(rpc::InstanceSpxAttachment {
-                dpa_mac_addr: attachment.mac_addr,
+                device: attachment.device,
+                device_instance: attachment.device_instance,
                 spx_partition_id: attachment.spx_partition_id,
                 attachment_type: attachment.attachment_type as i32,
                 virtual_function_id: attachment.virtual_function_id,
@@ -108,7 +110,8 @@ impl TryFrom<i32> for SpxAttachmentType {
 /// The configuration that a customer desires for an instances SpectrumX NICs
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceSpxAttachment {
-    pub mac_addr: String,
+    pub device: String,
+    pub device_instance: u32,
     pub spx_partition_id: Option<SpxPartitionId>,
     pub attachment_type: SpxAttachmentType,
     pub virtual_function_id: Option<u32>,
