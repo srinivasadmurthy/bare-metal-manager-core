@@ -105,7 +105,14 @@ impl StateControllerIO for RackStateControllerIO {
         new_version: ConfigVersion,
         new_state: &Self::ControllerState,
     ) -> Result<(), DatabaseError> {
-        db::rack_state_history::persist(txn, rack_id, new_state, new_version).await?;
+        db::state_history::persist(
+            txn,
+            db::state_history::StateHistoryTableId::Rack,
+            rack_id,
+            new_state,
+            new_version,
+        )
+        .await?;
         Ok(())
     }
 
@@ -133,6 +140,7 @@ impl StateControllerIO for RackStateControllerIO {
             RackState::Ready => ("ready", ""),
             RackState::Maintenance { maintenance_state } => match maintenance_state {
                 RackMaintenanceState::FirmwareUpgrade { .. } => ("maintenance", "firmware_upgrade"),
+                RackMaintenanceState::NVOSUpdate { .. } => ("maintenance", "nvos_update"),
                 RackMaintenanceState::ConfigureNmxCluster => {
                     ("maintenance", "configure_nmx_cluster")
                 }

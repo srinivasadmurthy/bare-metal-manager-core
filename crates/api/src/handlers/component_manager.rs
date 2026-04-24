@@ -30,7 +30,8 @@ use db::{self, WithTransaction};
 use futures_util::FutureExt;
 use mac_address::MacAddress;
 use model::component_manager::{PowerAction, PowerShelfComponent};
-use tonic::{Request, Response, Status};
+use model::rack::{FirmwareUpgradeJob, MaintenanceActivity};
+use tonic::{Code, Request, Response, Status};
 
 use crate::api::{Api, log_request_data};
 
@@ -82,6 +83,128 @@ fn error_result(id: &str, error: String) -> rpc::ComponentResult {
         rpc::ComponentManagerStatusCode::InternalError,
         Some(error),
     )
+}
+
+fn status_result(id: &str, status: Status) -> rpc::ComponentResult {
+    let component_status = match status.code() {
+        Code::InvalidArgument | Code::FailedPrecondition | Code::OutOfRange => {
+            rpc::ComponentManagerStatusCode::InvalidArgument
+        }
+        Code::NotFound => rpc::ComponentManagerStatusCode::NotFound,
+        Code::AlreadyExists => rpc::ComponentManagerStatusCode::AlreadyExists,
+        Code::Unavailable | Code::DeadlineExceeded | Code::ResourceExhausted => {
+            rpc::ComponentManagerStatusCode::Unavailable
+        }
+        _ => rpc::ComponentManagerStatusCode::InternalError,
+    };
+    make_result(id, component_status, Some(status.message().to_string()))
+}
+
+fn not_found_component_result(id: &str, message: impl Into<String>) -> rpc::ComponentResult {
+    make_result(
+        id,
+        rpc::ComponentManagerStatusCode::NotFound,
+        Some(message.into()),
+    )
+}
+
+fn invalid_argument_component_result(id: &str, message: impl Into<String>) -> rpc::ComponentResult {
+    make_result(
+        id,
+        rpc::ComponentManagerStatusCode::InvalidArgument,
+        Some(message.into()),
+    )
+}
+
+fn rack_requested_firmware_version(rack: &model::rack::Rack) -> Option<String> {
+    rack.config
+        .maintenance_requested
+        .as_ref()?
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            MaintenanceActivity::FirmwareUpgrade {
+                firmware_version, ..
+            } => Some(firmware_version.clone().unwrap_or_default()),
+            _ => None,
+        })
+}
+
+fn firmware_job_state(job: &FirmwareUpgradeJob) -> i32 {
+    if let Some(status) = job.status.as_deref() {
+        match status.to_ascii_lowercase().as_str() {
+            "queued" | "pending" => return rpc::FirmwareUpdateState::FwStateQueued as i32,
+            "running" | "in_progress" | "active" => {
+                return rpc::FirmwareUpdateState::FwStateInProgress as i32;
+            }
+            "verifying" => return rpc::FirmwareUpdateState::FwStateVerifying as i32,
+            "completed" | "success" | "done" => {
+                return rpc::FirmwareUpdateState::FwStateCompleted as i32;
+            }
+            "failed" | "error" => return rpc::FirmwareUpdateState::FwStateFailed as i32,
+            "cancelled" | "canceled" => return rpc::FirmwareUpdateState::FwStateCancelled as i32,
+            _ => {}
+        }
+    }
+
+    let devices: Vec<_> = job.all_devices().collect();
+    let total = devices.len();
+
+    if total == 0 {
+        return rpc::FirmwareUpdateState::FwStateUnknown as i32;
+    }
+
+    let completed = devices
+        .iter()
+        .filter(|device| device.status == "completed")
+        .count();
+    let failed = devices
+        .iter()
+        .filter(|device| device.status == "failed")
+        .count();
+    let terminal = completed + failed;
+    let has_in_progress = devices
+        .iter()
+        .any(|device| matches!(device.status.as_str(), "in_progress" | "running" | "active"));
+    let all_queued = devices
+        .iter()
+        .all(|device| matches!(device.status.as_str(), "pending" | "queued" | "started"));
+
+    if failed > 0 && terminal == total {
+        rpc::FirmwareUpdateState::FwStateFailed as i32
+    } else if completed == total {
+        rpc::FirmwareUpdateState::FwStateCompleted as i32
+    } else if terminal > 0 || has_in_progress || job.started_at.is_some() {
+        rpc::FirmwareUpdateState::FwStateInProgress as i32
+    } else if all_queued {
+        rpc::FirmwareUpdateState::FwStateQueued as i32
+    } else {
+        rpc::FirmwareUpdateState::FwStateUnknown as i32
+    }
+}
+
+fn rack_firmware_status(rack: &model::rack::Rack) -> rpc::FirmwareUpdateStatus {
+    let requested_version = rack_requested_firmware_version(rack);
+    let state = if let Some(job) = rack.firmware_upgrade_job.as_ref() {
+        firmware_job_state(job)
+    } else if requested_version.is_some() {
+        rpc::FirmwareUpdateState::FwStateQueued as i32
+    } else {
+        rpc::FirmwareUpdateState::FwStateUnknown as i32
+    };
+    let updated_at = rack
+        .firmware_upgrade_job
+        .as_ref()
+        .and_then(|job| job.completed_at.or(job.started_at))
+        .or_else(|| requested_version.as_ref().map(|_| rack.updated))
+        .map(Into::into);
+
+    rpc::FirmwareUpdateStatus {
+        result: Some(success_result(rack.id.as_ref())),
+        state,
+        target_version: requested_version.unwrap_or_default(),
+        updated_at,
+    }
 }
 
 fn build_inventory_entries(
@@ -575,7 +698,6 @@ pub(crate) async fn update_component_firmware(
     request: Request<rpc::UpdateComponentFirmwareRequest>,
 ) -> Result<Response<rpc::UpdateComponentFirmwareResponse>, Status> {
     log_request_data(&request);
-    let cm = require_component_manager(api)?;
     let req = request.into_inner();
 
     let target = req
@@ -586,6 +708,7 @@ pub(crate) async fn update_component_firmware(
     let mut rack_switch_ids: Vec<String> = Vec::new();
     let mut rack_id: Option<carbide_uuid::rack::RackId> = None;
     let mut power_shelf_results: Option<Vec<rpc::ComponentResult>> = None;
+    let mut rack_results: Option<Vec<rpc::ComponentResult>> = None;
     let mut component_names: Vec<String> = Vec::new();
 
     match target {
@@ -648,6 +771,7 @@ pub(crate) async fn update_component_firmware(
             rack_machine_ids = list.machine_ids.iter().map(|id| id.to_string()).collect();
         }
         rpc::update_component_firmware_request::Target::PowerShelves(t) => {
+            let cm = require_component_manager(api)?;
             let list = t
                 .power_shelf_ids
                 .ok_or_else(|| Status::invalid_argument("power_shelf_ids is required"))?;
@@ -684,9 +808,53 @@ pub(crate) async fn update_component_firmware(
             }));
             power_shelf_results = Some(results);
         }
+        rpc::update_component_firmware_request::Target::Racks(t) => {
+            let list = t
+                .rack_ids
+                .ok_or_else(|| Status::invalid_argument("rack_ids is required"))?;
+            if list.rack_ids.is_empty() {
+                return Err(Status::invalid_argument("rack_ids must not be empty"));
+            }
+
+            let mut results = Vec::new();
+            for rack_id in list.rack_ids {
+                let rack_id_string = rack_id.to_string();
+                let maintenance_req = Request::new(rpc::RackMaintenanceOnDemandRequest {
+                    rack_id: Some(rack_id),
+                    scope: Some(rpc::RackMaintenanceScope {
+                        machine_ids: vec![],
+                        switch_ids: vec![],
+                        power_shelf_ids: vec![],
+                        activities: vec![rpc::MaintenanceActivityConfig {
+                            activity: Some(
+                                rpc::maintenance_activity_config::Activity::FirmwareUpgrade(
+                                    rpc::FirmwareUpgradeActivity {
+                                        firmware_version: req.target_version.clone(),
+                                        components: vec![],
+                                    },
+                                ),
+                            ),
+                        }],
+                    }),
+                });
+
+                match crate::handlers::rack::on_demand_rack_maintenance(api, maintenance_req).await
+                {
+                    Ok(_) => results.push(success_result(&rack_id_string)),
+                    Err(status) => results.push(status_result(&rack_id_string, status)),
+                }
+            }
+            rack_results = Some(results);
+        }
     }
 
     if let Some(results) = power_shelf_results {
+        return Ok(Response::new(rpc::UpdateComponentFirmwareResponse {
+            results,
+        }));
+    }
+
+    if let Some(results) = rack_results {
         return Ok(Response::new(rpc::UpdateComponentFirmwareResponse {
             results,
         }));
@@ -698,17 +866,19 @@ pub(crate) async fn update_component_firmware(
 
     let maintenance_req = Request::new(rpc::RackMaintenanceOnDemandRequest {
         rack_id: Some(rack_id),
-        machine_ids: rack_machine_ids.clone(),
-        switch_ids: rack_switch_ids.clone(),
-        power_shelf_ids: vec![],
-        activities: vec![rpc::MaintenanceActivityConfig {
-            activity: Some(rpc::maintenance_activity_config::Activity::FirmwareUpgrade(
-                rpc::FirmwareUpgradeActivity {
-                    firmware_version: req.target_version,
-                    components: component_names,
-                },
-            )),
-        }],
+        scope: Some(rpc::RackMaintenanceScope {
+            machine_ids: rack_machine_ids.clone(),
+            switch_ids: rack_switch_ids.clone(),
+            power_shelf_ids: vec![],
+            activities: vec![rpc::MaintenanceActivityConfig {
+                activity: Some(rpc::maintenance_activity_config::Activity::FirmwareUpgrade(
+                    rpc::FirmwareUpgradeActivity {
+                        firmware_version: req.target_version,
+                        components: component_names,
+                    },
+                )),
+            }],
+        }),
     });
 
     crate::handlers::rack::on_demand_rack_maintenance(api, maintenance_req).await?;
@@ -818,6 +988,40 @@ pub(crate) async fn get_component_firmware_status(
                 "machine firmware status is not supported via this RPC",
             ));
         }
+        rpc::get_component_firmware_status_request::Target::RackIds(list) => {
+            if list.rack_ids.is_empty() {
+                return Err(Status::invalid_argument("rack_ids must not be empty"));
+            }
+
+            let requested_rack_ids = list.rack_ids;
+            let racks = db::rack::find_by(
+                api.db_reader().as_mut(),
+                db::ObjectColumnFilter::List(db::rack::IdColumn, &requested_rack_ids),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("failed to look up racks: {e}")))?;
+            let rack_by_id: HashMap<_, _> = racks
+                .into_iter()
+                .map(|rack| (rack.id.clone(), rack))
+                .collect();
+
+            requested_rack_ids
+                .iter()
+                .map(|rack_id| {
+                    rack_by_id.get(rack_id).map(rack_firmware_status).unwrap_or(
+                        rpc::FirmwareUpdateStatus {
+                            result: Some(not_found_component_result(
+                                rack_id.as_ref(),
+                                format!("rack {rack_id} not found"),
+                            )),
+                            state: rpc::FirmwareUpdateState::FwStateUnknown as i32,
+                            target_version: String::new(),
+                            updated_at: None,
+                        },
+                    )
+                })
+                .collect()
+        }
     };
 
     Ok(Response::new(rpc::GetComponentFirmwareStatusResponse {
@@ -924,6 +1128,107 @@ pub(crate) async fn list_component_firmware_versions(
         rpc::list_component_firmware_versions_request::Target::MachineIds(_) => Err(
             Status::unimplemented("machine firmware versions are not supported via this RPC"),
         ),
+        rpc::list_component_firmware_versions_request::Target::RackIds(list) => {
+            if list.rack_ids.is_empty() {
+                return Err(Status::invalid_argument("rack_ids must not be empty"));
+            }
+
+            let requested_rack_ids = list.rack_ids;
+            let racks = db::rack::find_by(
+                api.db_reader().as_mut(),
+                db::ObjectColumnFilter::List(db::rack::IdColumn, &requested_rack_ids),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("failed to look up racks: {e}")))?;
+            let rack_by_id: HashMap<_, _> = racks
+                .into_iter()
+                .map(|rack| (rack.id.clone(), rack))
+                .collect();
+
+            let mut txn = api
+                .database_connection
+                .begin()
+                .await
+                .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+            let firmwares = db::rack_firmware::list_all(
+                &mut txn,
+                model::rack_firmware::RackFirmwareSearchFilter {
+                    only_available: true,
+                    rack_hardware_type: None,
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(format!("failed to list rack firmware: {e}")))?;
+            txn.commit()
+                .await
+                .map_err(|e| Status::internal(format!("failed to commit transaction: {e}")))?;
+
+            let devices = requested_rack_ids
+                .iter()
+                .map(|rack_id| {
+                    let Some(rack) = rack_by_id.get(rack_id) else {
+                        return rpc::DeviceFirmwareVersions {
+                            result: Some(not_found_component_result(
+                                rack_id.as_ref(),
+                                format!("rack {rack_id} not found"),
+                            )),
+                            versions: vec![],
+                        };
+                    };
+
+                    let Some(profile_id) = rack.rack_profile_id.as_ref() else {
+                        return rpc::DeviceFirmwareVersions {
+                            result: Some(invalid_argument_component_result(
+                                rack_id.as_ref(),
+                                format!("rack {rack_id} has no rack_profile_id"),
+                            )),
+                            versions: vec![],
+                        };
+                    };
+
+                    let Some(profile) = api.runtime_config.rack_profiles.get(profile_id.as_str())
+                    else {
+                        return rpc::DeviceFirmwareVersions {
+                            result: Some(not_found_component_result(
+                                rack_id.as_ref(),
+                                format!("rack profile {profile_id} not found"),
+                            )),
+                            versions: vec![],
+                        };
+                    };
+
+                    let Some(rack_hardware_type) = profile.rack_hardware_type.as_ref() else {
+                        return rpc::DeviceFirmwareVersions {
+                            result: Some(invalid_argument_component_result(
+                                rack_id.as_ref(),
+                                format!(
+                                    "rack profile {profile_id} does not define rack_hardware_type"
+                                ),
+                            )),
+                            versions: vec![],
+                        };
+                    };
+
+                    let versions = firmwares
+                        .iter()
+                        .filter(|firmware| {
+                            firmware.rack_hardware_type.is_any()
+                                || firmware.rack_hardware_type == *rack_hardware_type
+                        })
+                        .map(|firmware| firmware.id.clone())
+                        .collect();
+
+                    rpc::DeviceFirmwareVersions {
+                        result: Some(success_result(rack_id.as_ref())),
+                        versions,
+                    }
+                })
+                .collect();
+
+            Ok(Response::new(rpc::ListComponentFirmwareVersionsResponse {
+                devices,
+            }))
+        }
     }
 }
 
@@ -933,6 +1238,18 @@ mod tests {
     use tonic::Code;
 
     use super::*;
+
+    fn firmware_device(status: &str) -> model::rack::FirmwareUpgradeDeviceStatus {
+        model::rack::FirmwareUpgradeDeviceStatus {
+            node_id: String::new(),
+            mac: "00:00:00:00:00:00".to_string(),
+            bmc_ip: String::new(),
+            status: status.to_string(),
+            job_id: None,
+            parent_job_id: None,
+            error_message: None,
+        }
+    }
 
     #[test]
     fn error_to_status_unavailable() {
@@ -1023,6 +1340,96 @@ mod tests {
     fn power_action_invalid_value() {
         let err = map_power_action(9999).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn firmware_job_state_explicit_status_wins_for_empty_job() {
+        let job = FirmwareUpgradeJob {
+            status: Some("queued".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            firmware_job_state(&job),
+            rpc::FirmwareUpdateState::FwStateQueued as i32
+        );
+    }
+
+    #[test]
+    fn firmware_job_state_empty_job_without_status_is_unknown() {
+        assert_eq!(
+            firmware_job_state(&FirmwareUpgradeJob::default()),
+            rpc::FirmwareUpdateState::FwStateUnknown as i32
+        );
+    }
+
+    #[test]
+    fn firmware_job_state_all_completed_is_completed() {
+        let job = FirmwareUpgradeJob {
+            machines: vec![firmware_device("completed")],
+            switches: vec![firmware_device("completed")],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            firmware_job_state(&job),
+            rpc::FirmwareUpdateState::FwStateCompleted as i32
+        );
+    }
+
+    #[test]
+    fn firmware_job_state_mixed_terminal_with_failure_is_failed() {
+        let job = FirmwareUpgradeJob {
+            machines: vec![firmware_device("completed")],
+            switches: vec![firmware_device("failed")],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            firmware_job_state(&job),
+            rpc::FirmwareUpdateState::FwStateFailed as i32
+        );
+    }
+
+    #[test]
+    fn firmware_job_state_partial_terminal_is_in_progress() {
+        let job = FirmwareUpgradeJob {
+            machines: vec![firmware_device("completed")],
+            switches: vec![firmware_device("pending")],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            firmware_job_state(&job),
+            rpc::FirmwareUpdateState::FwStateInProgress as i32
+        );
+    }
+
+    #[test]
+    fn firmware_job_state_all_pending_without_start_is_queued() {
+        let job = FirmwareUpgradeJob {
+            machines: vec![firmware_device("pending")],
+            switches: vec![firmware_device("queued")],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            firmware_job_state(&job),
+            rpc::FirmwareUpdateState::FwStateQueued as i32
+        );
+    }
+
+    #[test]
+    fn firmware_job_state_unknown_device_status_is_unknown() {
+        let job = FirmwareUpgradeJob {
+            machines: vec![firmware_device("mystery")],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            firmware_job_state(&job),
+            rpc::FirmwareUpdateState::FwStateUnknown as i32
+        );
     }
 
     #[test]

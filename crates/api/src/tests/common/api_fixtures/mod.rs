@@ -29,9 +29,8 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use carbide_ipmi::IPMITool;
 use carbide_redfish::libredfish::test_support::RedfishSim;
-use carbide_redfish::nv_redfish::NvRedfishClientPool;
+use carbide_site_explorer::SiteExplorer;
 use carbide_site_explorer::config::{SiteExplorerConfig, SiteExplorerExploreMode};
-use carbide_site_explorer::{BmcEndpointExplorer, SiteExplorer};
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::instance_type::InstanceTypeId;
 use carbide_uuid::machine::MachineId;
@@ -86,6 +85,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::Request;
 use tracing_subscriber::EnvFilter;
+use utils::test_support::test_meter::TestMeter;
 
 use crate::api::Api;
 use crate::api::metrics::ApiMetricsEmitter;
@@ -140,7 +140,6 @@ use crate::tests::common::api_fixtures::network_segment::{
 };
 use crate::tests::common::rpc_builder::VpcCreationRequest;
 use crate::tests::common::test_certificates::TestCertificateProvider;
-use crate::tests::common::test_meter::TestMeter;
 
 pub mod dpu;
 pub mod endpoint_explorer;
@@ -378,6 +377,7 @@ impl TestEnv {
             site_config: self.config.clone(),
             dpa_info: None,
             rms_client: self.rms_sim.as_rms_client(),
+            switch_system_image_rms_client: self.rms_sim.as_switch_system_image_rms_client(),
             credential_manager: self.test_credential_manager.clone(),
         }
     }
@@ -1478,15 +1478,15 @@ pub async fn create_test_env_with_overrides(
     };
 
     let bmc_proxy = Arc::new(ArcSwap::new(None.into()));
-    let bmc_explorer = Arc::new(BmcEndpointExplorer::new(
+    let bmc_explorer = carbide_site_explorer::new_bmc_explorer(
         redfish_sim.clone(),
-        Arc::new(NvRedfishClientPool::new(bmc_proxy)),
+        carbide_redfish::nv_redfish::new_pool(bmc_proxy),
         carbide_ipmi::test_support(),
         composite_manager.clone(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // Tests use MockEndpointExplorer. So this doesn't affect anything.
         SiteExplorerExploreMode::NvRedfish,
-    ));
+    );
 
     let reachability_params = ReachabilityParams {
         dpu_wait_time: Duration::seconds(0),
@@ -1572,6 +1572,7 @@ pub async fn create_test_env_with_overrides(
         site_config: config.clone(),
         dpa_info: None,
         rms_client: rms_sim.as_rms_client(),
+        switch_system_image_rms_client: rms_sim.as_switch_system_image_rms_client(),
         credential_manager: credential_manager.clone(),
     });
 

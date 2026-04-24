@@ -1983,6 +1983,20 @@ message FabricManagerConfig {
   map<string, string> config_map = 1;
 }
 
+enum FabricManagerState {
+  FABRIC_MANAGER_STATE_UNSPECIFIED = 0;
+  FABRIC_MANAGER_STATE_OK = 1;
+  FABRIC_MANAGER_STATE_NOT_OK = 2;
+  FABRIC_MANAGER_STATE_UNKNOWN = 3;
+}
+
+message FabricManagerStatus {
+  FabricManagerState fabric_manager_state = 1;
+  optional string addition_info = 2;
+  optional string reason = 3;
+  optional string error_message = 4;
+}
+
 // Describe the status and applied configuration of a Switch
 message SwitchStatus {
   // The result of last state controller run - its outcome and an optional reason for that outcome
@@ -2005,6 +2019,8 @@ message SwitchStatus {
   repeated HealthSourceOrigin health_sources = 8;
   // Lifecycle related status
   LifecycleStatus lifecycle = 9;
+  optional string fabric_manager_status = 10;
+  optional FabricManagerStatus fabric_manager_status_details = 11;
 }
 
 message PlacementInRack {
@@ -2037,8 +2053,8 @@ message Switch {
   // The rack that this switch is associated with
   optional common.RackId rack_id = 10;
   optional PlacementInRack placement_in_rack = 11;
-
   reserved 12, 13;
+  bool is_primary = 14;
 }
 
 message SwitchList {
@@ -5544,16 +5560,24 @@ message MaintenanceActivityConfig {
   }
 }
 
+// Scope of an on-demand rack maintenance request: which devices to include
+// and which activities to run. When all three device-id lists are empty the
+// full rack is maintained. When the activities list is empty all activities
+// are run.
+message RackMaintenanceScope {
+  repeated string machine_ids = 1;
+  repeated string switch_ids = 2;
+  repeated string power_shelf_ids = 3;
+  // Which maintenance activities to run. Empty means all activities.
+  repeated MaintenanceActivityConfig activities = 4;
+}
+
 // On-demand rack maintenance – supports full-rack or partial (subset of
-// machines, switches, power shelves).  When all device-id lists are empty
-// the full rack is maintained.
+// machines, switches, power shelves).  When `scope` is unset, or all of its
+// device-id lists are empty, the full rack is maintained.
 message RackMaintenanceOnDemandRequest {
   common.RackId rack_id = 1;
-  repeated string machine_ids = 2;
-  repeated string switch_ids = 3;
-  repeated string power_shelf_ids = 4;
-  // Which maintenance activities to run. Empty means all activities.
-  repeated MaintenanceActivityConfig activities = 5;
+  RackMaintenanceScope scope = 2;
 }
 
 message RackMaintenanceOnDemandResponse {
@@ -7702,11 +7726,18 @@ message UpdatePowerShelfFirmwareTarget {
   repeated PowerShelfComponent components = 2;
 }
 
+// Whole-rack firmware update target. All eligible devices in each listed
+// rack are updated according to the SOT identified by `target_version`.
+message UpdateRackFirmwareTarget {
+  RackIdList rack_ids = 1;
+}
+
 message UpdateComponentFirmwareRequest {
   oneof target {
     UpdateComputeTrayFirmwareTarget compute_trays = 1;
     UpdateSwitchFirmwareTarget switches = 2;
     UpdatePowerShelfFirmwareTarget power_shelves = 3;
+    UpdateRackFirmwareTarget racks = 5;
   }
   string target_version = 4;
 }
@@ -7720,6 +7751,7 @@ message GetComponentFirmwareStatusRequest {
     common.MachineIdList machine_ids = 1;
     SwitchIdList switch_ids = 2;
     PowerShelfIdList power_shelf_ids = 3;
+    RackIdList rack_ids = 4;
   }
 }
 
@@ -7732,6 +7764,7 @@ message ListComponentFirmwareVersionsRequest {
     common.MachineIdList machine_ids = 1;
     SwitchIdList switch_ids = 2;
     PowerShelfIdList power_shelf_ids = 3;
+    RackIdList rack_ids = 4;
   }
 }
 

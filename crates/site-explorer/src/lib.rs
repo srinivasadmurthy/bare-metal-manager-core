@@ -84,11 +84,35 @@ use model::rack::Rack;
 pub use switch_creator::SwitchCreator;
 pub mod config;
 pub mod errors;
+use std::sync::atomic::AtomicBool;
 
+use carbide_ipmi::IPMITool;
+use carbide_redfish::libredfish::RedfishClientPool;
+use carbide_redfish::nv_redfish::NvRedfishClientPool;
 use errors::{SiteExplorerError, SiteExplorerResult};
 
 use self::metrics::{PairingBlockerReason, exploration_error_to_metric_label};
+use crate::config::SiteExplorerExploreMode;
 use crate::explored_endpoint_index::ExploredEndpointIndex;
+
+pub fn new_bmc_explorer(
+    redfish_client_pool: Arc<dyn RedfishClientPool>,
+    nv_redfish_client_pool: Arc<NvRedfishClientPool>,
+    ipmi_tool: Arc<dyn IPMITool>,
+    credential_manager: Arc<dyn CredentialManager>,
+    rotate_switch_nvos_credentials: Arc<AtomicBool>,
+    mode: SiteExplorerExploreMode,
+) -> Arc<BmcEndpointExplorer> {
+    BmcEndpointExplorer::new(
+        redfish_client_pool,
+        nv_redfish_client_pool,
+        ipmi_tool,
+        credential_manager,
+        rotate_switch_nvos_credentials,
+        mode,
+    )
+    .into()
+}
 
 /// Ensures a rack row exists for the given `rack_id`.
 ///
@@ -2181,41 +2205,81 @@ impl SiteExplorer {
         }
 
         let mut ingest_host = true;
+        let interface = match self
+            .find_machine_interface_for_ip(host_endpoint.address)
+            .await
+        {
+            Ok(interface) => Some(interface),
+            Err(e) => {
+                tracing::warn!(
+                    bmc_ip_address = %host_endpoint.address,
+                    error = %e,
+                    "Site Explorer could not find machine interface for host endpoint",
+                );
+                None
+            }
+        };
 
-        if !matches!(system.power_state, PowerState::On) {
+        // The cached `systems[].power_state` may be stale when this endpoint was
+        // not refreshed in the current iteration, so prefer a live Redfish power
+        // state check for uningested hosts. The exceptions are auth/lockout and
+        // unreachable failures, where another live read is either unsafe or very
+        // unlikely to help. `None` means we have no trustworthy reading; we fall
+        // back to the cached state for remediation decisions only and defer
+        // ingestion to a later run.
+        let fresh_power_state: Option<PowerState> =
+            match host_endpoint.report.last_exploration_error.as_ref() {
+                Some(err) if err.is_unauthorized() || err.is_unreachable() => None,
+                _ => match interface.as_ref() {
+                    Some(interface) => self
+                        .endpoint_explorer
+                        .redfish_get_power_state(bmc_target_addr, interface)
+                        .await
+                        .ok()
+                        .map(PowerState::from),
+                    None => None,
+                },
+            };
+
+        let effective_power_state = fresh_power_state.unwrap_or(system.power_state);
+
+        if fresh_power_state.is_none() {
+            ingest_host = false;
+        }
+
+        if !matches!(effective_power_state, PowerState::On) {
+            ingest_host = false;
+
             if host_endpoint.pause_remediation {
                 tracing::info!(
                     "Site Explorer found an uningested host (bmc_ip_address: {}) that is off, but remediation is paused — skipping power-on",
                     host_endpoint.address,
                 );
-            } else {
+            } else if fresh_power_state.is_some() {
                 tracing::warn!(
                     "Site Explorer found an uningested host (bmc_ip_address: {}) that isnt on: {:#?}",
                     host_endpoint.address,
-                    system.power_state
+                    effective_power_state
                 );
 
-                let interface = self
-                    .find_machine_interface_for_ip(host_endpoint.address)
-                    .await?;
-
-                self.endpoint_explorer
-                    .redfish_power_control(
-                        bmc_target_addr,
-                        &interface,
-                        libredfish::SystemPowerControl::On,
-                    )
-                    .await
-                    .map_err(|err| {
-                        tracing::error!(
-                            "Site Explorer failed to turn on host (bmc_ip_address: {}) through redfish: {}",
-                            host_endpoint.address,
-                            err
+                if let Some(interface) = interface.as_ref() {
+                    self.endpoint_explorer
+                        .redfish_power_control(
+                            bmc_target_addr,
+                            interface,
+                            libredfish::SystemPowerControl::On,
                         )
-                    }).ok();
+                        .await
+                        .map_err(|err| {
+                            tracing::error!(
+                                "Site Explorer failed to turn on host (bmc_ip_address: {}) through redfish: {}",
+                                host_endpoint.address,
+                                err
+                            )
+                        })
+                        .ok();
+                }
             }
-
-            ingest_host = false;
         }
 
         if host_endpoint.report.vendor.unwrap_or_default().is_nvidia() {

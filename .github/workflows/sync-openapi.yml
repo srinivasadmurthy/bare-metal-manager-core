@@ -1,0 +1,24 @@
+name: Sync OpenAPI Specs # can be customized
+on:                               # additional custom triggers can be configured
+  workflow_dispatch:              # Manual trigger
+  push:                                          
+    branches:
+      - main                      # Trigger on push to
+  schedule:
+    - cron: '0 3 * * *'           # Daily at 3:00 AM UTC
+jobs:
+  update-from-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      # Action pinned to v2 commit; requires fern-api/sync-openapi to be part of the allow-list.
+      - name: Update API with Fern
+        uses: fern-api/sync-openapi@8e936a4bac8ad11d698d7114f3074fa3397398ea
+        with:
+          update_from_source: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: 'fern/update-api'
+          auto_merge: false
+          add_timestamp: true

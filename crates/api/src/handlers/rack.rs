@@ -225,14 +225,18 @@ pub async fn find_rack_state_histories(
 
     let mut txn = api.txn_begin().await?;
 
-    let results = db::rack_state_history::find_by_rack_ids(&mut txn, &rack_ids)
-        .await
-        .map_err(CarbideError::from)?;
+    let results = db::state_history::find_by_object_ids(
+        &mut txn,
+        db::state_history::StateHistoryTableId::Rack,
+        &rack_ids,
+    )
+    .await
+    .map_err(CarbideError::from)?;
 
     let mut response = rpc::StateHistories::default();
     for (rack_id, records) in results {
         response.histories.insert(
-            rack_id.to_string(),
+            rack_id,
             ::rpc::forge::StateHistoryRecords {
                 records: records.into_iter().map(Into::into).collect(),
             },
@@ -572,7 +576,9 @@ pub(crate) async fn on_demand_rack_maintenance(
 
     use rpc::maintenance_activity_config::Activity as ProtoActivity;
 
-    let activities: Vec<MaintenanceActivity> = req
+    let proto_scope = req.scope.unwrap_or_default();
+
+    let activities: Vec<MaintenanceActivity> = proto_scope
         .activities
         .iter()
         .map(|entry| match &entry.activity {
@@ -595,19 +601,19 @@ pub(crate) async fn on_demand_rack_maintenance(
         .collect::<Result<Vec<_>, _>>()?;
 
     let scope = MaintenanceScope {
-        machine_ids: req
+        machine_ids: proto_scope
             .machine_ids
             .iter()
             .map(|s| MachineId::from_str(s))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| CarbideError::InvalidArgument(format!("Invalid machine_id: {e}")))?,
-        switch_ids: req
+        switch_ids: proto_scope
             .switch_ids
             .iter()
             .map(|s| SwitchId::from_str(s))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| CarbideError::InvalidArgument(format!("Invalid switch_id: {e}")))?,
-        power_shelf_ids: req
+        power_shelf_ids: proto_scope
             .power_shelf_ids
             .iter()
             .map(|s| PowerShelfId::from_str(s))
