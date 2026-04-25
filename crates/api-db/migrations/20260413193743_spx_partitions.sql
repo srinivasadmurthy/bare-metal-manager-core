@@ -13,3 +13,12 @@ CREATE TABLE IF NOT EXISTS spx_partitions
     updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     deleted TIMESTAMPTZ
 );
+
+ALTER TABLE IF EXISTS instances
+    ADD COLUMN IF NOT EXISTS spx_config_version     VARCHAR(64) NOT NULL DEFAULT ('V1-T1666644937952267'),
+    ADD COLUMN IF NOT EXISTS spx_config             jsonb       NOT NULL DEFAULT ('{"spx_attachments": []}')
+;
+
+ALTER TABLE IF EXISTS machines
+    ADD COLUMN IF NOT EXISTS spx_status_observation jsonb NULL
+;

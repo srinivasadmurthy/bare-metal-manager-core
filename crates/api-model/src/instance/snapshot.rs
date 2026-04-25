@@ -85,6 +85,8 @@ pub struct InstanceSnapshot {
 
     pub nvlink_config_version: ConfigVersion,
 
+    pub spx_config_version: ConfigVersion,
+
     /// Observed status of the instance
     pub observations: InstanceStatusObservations,
 
@@ -259,6 +261,12 @@ pub fn from_pg_json_and_os(
                 source: Box::new(e),
             }
         })?,
+        spx_config_version: value.spx_config_version.parse().map_err(|e| {
+            sqlx::error::Error::ColumnDecode {
+                index: "spx_config_version".to_string(),
+                source: Box::new(e),
+            }
+        })?,
         storage_config_version: value.storage_config_version.parse().map_err(|e| {
             sqlx::error::Error::ColumnDecode {
                 index: "storage_config_version".to_string(),
@@ -365,6 +373,12 @@ impl TryFrom<InstanceSnapshotPgJson> for InstanceSnapshot {
             nvlink_config_version: value.nvlink_config_version.parse().map_err(|e| {
                 sqlx::error::Error::ColumnDecode {
                     index: "nvl_config_version".to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+            spx_config_version: value.spx_config_version.parse().map_err(|e| {
+                sqlx::error::Error::ColumnDecode {
+                    index: "spx_config_version".to_string(),
                     source: Box::new(e),
                 }
             })?,

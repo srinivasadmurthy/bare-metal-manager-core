@@ -36,6 +36,7 @@ use model::instance::config::extension_services::InstanceExtensionServicesConfig
 use model::instance::config::infiniband::InstanceInfinibandConfig;
 use model::instance::config::network::{InstanceNetworkConfig, NetworkDetails};
 use model::instance::config::nvlink::InstanceNvLinkConfig;
+use model::instance::config::spx::InstanceSpxConfig;
 use model::instance::config::tenant_config::TenantConfig;
 use model::instance::snapshot::InstanceSnapshot;
 use model::machine::machine_search_config::MachineSearchConfig;
@@ -1245,6 +1246,13 @@ pub(crate) async fn update_instance_config(
     );
     update_instance_nvlink_config(&mh_snapshot, &instance, &config.nvlink, &mut txn).await?;
 
+    tracing::debug!(
+        "Updating instance {} with Spx config {:?}",
+        instance.id,
+        config.spxconfig
+    );
+    update_instance_spx_config(&mh_snapshot, &instance, &config.spxconfig, &mut txn).await?;
+
     db::instance::update_config(&mut txn, instance.id, expected_version, config, metadata).await?;
 
     let mh_snapshot = db::managed_host::load_snapshot(
@@ -1596,6 +1604,46 @@ pub async fn update_instance_nvlink_config(
         instance.id,
         instance.nvlink_config_version,
         nvlcfg,
+        true,
+    )
+    .await?;
+
+    Ok(())
+}
+
+pub async fn update_instance_spx_config(
+    mh_snapshot: &ManagedHostStateSnapshot,
+    instance: &InstanceSnapshot,
+    spxcfg: &InstanceSpxConfig,
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), CarbideError> {
+    if !instance
+        .config
+        .spxconfig
+        .is_spx_config_update_requested(spxcfg)
+    {
+        return Ok(());
+    }
+
+    if !matches!(
+        mh_snapshot.managed_state,
+        ManagedHostState::Assigned {
+            instance_state: InstanceState::Ready,
+        }
+    ) {
+        return Err(ConfigValidationError::InvalidState.into());
+    }
+
+    if instance.deleted.is_some() {
+        return Err(ConfigValidationError::InstanceDeletionIsRequested.into());
+    }
+
+    // Update config in db.
+    db::instance::update_spx_config(
+        txn,
+        instance.id,
+        instance.spx_config_version,
+        spxcfg,
         true,
     )
     .await?;

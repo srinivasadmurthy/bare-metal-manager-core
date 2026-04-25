@@ -881,6 +881,7 @@ pub async fn batch_allocate_instances(
     let extension_services_config_version = ConfigVersion::initial();
     let config_version = ConfigVersion::initial();
     let nvl_config_version = ConfigVersion::initial();
+    let spx_config_version = ConfigVersion::initial();
 
     let new_instances: Vec<NewInstance<'_>> = processed_requests
         .iter()
@@ -895,6 +896,7 @@ pub async fn batch_allocate_instances(
             ib_config_version,
             extension_services_config_version,
             nvlink_config_version: nvl_config_version,
+            spx_config_version: spx_config_version,
         })
         .collect();
 
