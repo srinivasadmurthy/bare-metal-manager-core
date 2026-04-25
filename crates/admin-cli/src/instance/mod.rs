@@ -22,6 +22,7 @@ mod release;
 mod show;
 mod update_ib_config;
 mod update_nvlink_config;
+mod update_spx_config;
 mod update_os;
 
 // Cross-module re-exports for jump module
