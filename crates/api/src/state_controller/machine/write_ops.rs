@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use carbide_uuid::machine::MachineId;
 use chrono::{DateTime, Utc};
 use config_version::ConfigVersion;
-use health_report::{HealthReport, OverrideMode};
+use health_report::{HealthReport, HealthReportApplyMode};
 use model::machine::{MachineLastRebootRequested, MachineLastRebootRequestedMode};
 use sqlx::PgTransaction;
 
@@ -78,9 +78,9 @@ pub enum MachineWriteOp {
         machine_id: MachineId,
         requested: bool,
     },
-    InsertHealthReportOverride {
+    InsertMachineHealthReport {
         machine_id: MachineId,
-        mode: OverrideMode,
+        mode: HealthReportApplyMode,
         health_report: HealthReport,
     },
     ReExploreIfVersionMatches {
@@ -112,7 +112,15 @@ impl WriteOp for MachineWriteOp {
             PersistMachineHealthHistory {
                 machine_id,
                 health_report,
-            } => db::machine_health_history::persist(txn, &machine_id, &health_report).await?,
+            } => {
+                db::health_history::persist(
+                    txn,
+                    db::health_history::HealthHistoryTableId::Machine,
+                    &machine_id,
+                    &health_report,
+                )
+                .await?
+            }
             ResetHostReprovisioningRequest {
                 machine_id,
                 clear_reset,
@@ -170,19 +178,13 @@ impl WriteOp for MachineWriteOp {
                 machine_id,
                 requested,
             } => db::instance::set_custom_pxe_reboot_requested(&machine_id, requested, txn).await?,
-            InsertHealthReportOverride {
+            InsertMachineHealthReport {
                 machine_id,
                 mode,
                 health_report,
             } => {
-                db::machine::insert_health_report_override(
-                    txn,
-                    &machine_id,
-                    mode,
-                    &health_report,
-                    false,
-                )
-                .await?
+                db::machine::insert_health_report(txn, &machine_id, mode, &health_report, false)
+                    .await?
             }
             ReExploreIfVersionMatches { address, version } => {
                 db::explored_endpoints::re_explore_if_version_matches(address, version, txn)
