@@ -569,10 +569,10 @@ impl InternalRBACRules {
             "ClearManagedHostQuarantineState",
             vec![ForgeAdminCLI, SiteAgent],
         );
-        x.perm("CreateVpcPeering", vec![ForgeAdminCLI]);
-        x.perm("FindVpcPeeringIds", vec![ForgeAdminCLI]);
-        x.perm("FindVpcPeeringsByIds", vec![ForgeAdminCLI]);
-        x.perm("DeleteVpcPeering", vec![ForgeAdminCLI]);
+        x.perm("CreateVpcPeering", vec![ForgeAdminCLI, SiteAgent]);
+        x.perm("FindVpcPeeringIds", vec![ForgeAdminCLI, SiteAgent]);
+        x.perm("FindVpcPeeringsByIds", vec![ForgeAdminCLI, SiteAgent]);
+        x.perm("DeleteVpcPeering", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("ResetHostReprovisioning", vec![ForgeAdminCLI, Rla]);
         x.perm("CopyBfbToDpuRshim", vec![ForgeAdminCLI]);
         x.perm("GetPowerOptions", vec![ForgeAdminCLI, SiteAgent, Rla]);
