@@ -334,6 +334,7 @@ type ApiGetAllTrayRequest struct {
 	type_       *string
 	componentId *string
 	id          *string
+	slotId      *int32
 	pageNumber  *int32
 	pageSize    *int32
 	orderBy     *string
@@ -375,6 +376,12 @@ func (r ApiGetAllTrayRequest) Id(id string) ApiGetAllTrayRequest {
 	return r
 }
 
+// Restrict to trays at this rack slot (matches &#x60;position.slotId&#x60;). Requires &#x60;rackId&#x60; or &#x60;rackName&#x60;. Composes with the rest of the filter via AND.
+func (r ApiGetAllTrayRequest) SlotId(slotId int32) ApiGetAllTrayRequest {
+	r.slotId = &slotId
+	return r
+}
+
 // Page number for pagination query
 func (r ApiGetAllTrayRequest) PageNumber(pageNumber int32) ApiGetAllTrayRequest {
 	r.pageNumber = &pageNumber
@@ -408,6 +415,7 @@ Org must have an Infrastructure Provider entity. User must have authorization ro
 - `rackId` and `rackName` are mutually exclusive
 - `rackId`/`rackName` cannot be combined with `id`/`componentId` (rack-level vs component-level targeting)
 - `componentId` requires `type` to be specified
+- `slotId` restricts to trays at that rack slot, requires `rackId` or `rackName`, and composes with the rest of the query via AND
 
 	@param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
 	@param org Name of the Org
@@ -462,6 +470,9 @@ func (a *TrayAPIService) GetAllTrayExecute(r ApiGetAllTrayRequest) ([]Tray, *htt
 	}
 	if r.id != nil {
 		parameterAddToHeaderOrQuery(localVarQueryParams, "id", r.id, "form", "")
+	}
+	if r.slotId != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "slotId", r.slotId, "form", "")
 	}
 	if r.pageNumber != nil {
 		parameterAddToHeaderOrQuery(localVarQueryParams, "pageNumber", r.pageNumber, "form", "")
@@ -1319,6 +1330,7 @@ type ApiValidateTraysRequest struct {
 	manufacturer *string
 	type_        *string
 	componentId  *string
+	slotId       *int32
 }
 
 // ID of the Site
@@ -1360,6 +1372,12 @@ func (r ApiValidateTraysRequest) Type_(type_ string) ApiValidateTraysRequest {
 // Filter by external component ID (requires type; mutually exclusive with rackId/rackName; use repeated params for multiple values)
 func (r ApiValidateTraysRequest) ComponentId(componentId string) ApiValidateTraysRequest {
 	r.componentId = &componentId
+	return r
+}
+
+// Restrict validation to trays at this rack slot (matches &#x60;position.slotId&#x60;). Requires &#x60;rackId&#x60; or &#x60;rackName&#x60;. Composes with the rest of the filter via AND.
+func (r ApiValidateTraysRequest) SlotId(slotId int32) ApiValidateTraysRequest {
+	r.slotId = &slotId
 	return r
 }
 
@@ -1434,6 +1452,9 @@ func (a *TrayAPIService) ValidateTraysExecute(r ApiValidateTraysRequest) (*RackV
 	}
 	if r.componentId != nil {
 		parameterAddToHeaderOrQuery(localVarQueryParams, "componentId", r.componentId, "form", "")
+	}
+	if r.slotId != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "slotId", r.slotId, "form", "")
 	}
 	// to determine the Content-Type header
 	localVarHTTPContentTypes := []string{}
