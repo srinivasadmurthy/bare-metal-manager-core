@@ -855,8 +855,22 @@ pub async fn initialize_and_start_controllers<'a>(
         tracing::info!("Created initial domain {domain_name}");
     }
 
-    const EXPECTED_MACHINE_FILE_PATH: &str = "/etc/forge/carbide-api/site/expected_machines.json";
-    if let Ok(file_str) = tokio::fs::read_to_string(EXPECTED_MACHINE_FILE_PATH).await {
+    // Probe the helm-chart layout first, then the forged-kustomize layout.
+    // The first path that exists wins; if reading that path then fails
+    // (e.g. permissions) the error propagates rather than silently falling
+    // through to the next layout.
+    const EXPECTED_MACHINE_FILE_PATHS: &[&str] = &[
+        "/etc/nico/nico-api/site/expected_machines.json",
+        "/etc/forge/carbide-api/site/expected_machines.json",
+    ];
+    let expected_machine_path = EXPECTED_MACHINE_FILE_PATHS
+        .iter()
+        .find(|p| std::path::Path::new(p).exists());
+    if let Some(path_used) = expected_machine_path {
+        tracing::debug!(path = path_used, "Loading expected_machines.json");
+        let file_str = tokio::fs::read_to_string(path_used)
+            .await
+            .wrap_err_with(|| format!("Failed to read {path_used}"))?;
         let expected_machines = serde_json::from_str::<Vec<ExpectedMachine>>(file_str.as_str()).inspect_err(|err| {
                 tracing::error!("expected_machines.json file exists, but unable to parse expected_machines file, nothing was written to db, bailing: {err}.");
             })?;
