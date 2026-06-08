@@ -95,6 +95,7 @@ pub async fn run(
             debug,
             crate::state_controller::machine::extra_logfmt_logging_fields(),
             None::<NoSubscriber>,
+            &carbide_config.tracing,
         )
         .wrap_err("setup_telemetry")?
     };

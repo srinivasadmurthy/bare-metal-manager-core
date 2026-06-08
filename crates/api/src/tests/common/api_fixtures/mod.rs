@@ -1340,6 +1340,7 @@ pub fn get_config() -> CarbideConfig {
         component_manager: None,
         initial_objects_file: None,
         config_ctx: None,
+        tracing: Default::default(),
     }
 }
 
