@@ -323,6 +323,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "forge.PrefixFilterPolicyEntry",
             "#[derive(serde::Serialize)]",
         )
+        .type_attribute("forge.AstraConfig", "#[derive(serde::Serialize)]")
+        .type_attribute("forge.AstraAttachment", "#[derive(serde::Serialize)]")
         .type_attribute("forge.TrafficInterceptConfig", "#[derive(serde::Serialize)]")
         .type_attribute("forge.TrafficInterceptBridging", "#[derive(serde::Serialize)]")
         .type_attribute("forge.HostRepresentorInterceptBridging", "#[derive(serde::Serialize)]")

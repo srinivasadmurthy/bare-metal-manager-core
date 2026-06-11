@@ -732,6 +732,7 @@ pub(crate) async fn get_managed_host_network_config_inner(
             },
             None => None,
         },
+        astra_config: None,
     };
 
     // If this all worked, we shouldn't emit a log line

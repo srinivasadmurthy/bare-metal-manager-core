@@ -4123,6 +4123,8 @@ message ManagedHostNetworkConfigResponse {
   // The password the DPU should use when configuring a
   // BGP session with the its TOR
   optional string bgp_leaf_session_password = 118;
+
+  optional AstraConfig astra_config = 119;
 }
 
 message TrafficInterceptConfig {
@@ -4916,6 +4918,7 @@ message DpuNetworkStatus {
   // Extension service status reported by DPU
   optional string dpu_extension_service_version = 15;
   repeated DpuExtensionServiceStatusObservation dpu_extension_services = 16;
+  optional AstraConfig astra_config = 17;
 }
 
 message LastDhcpRequest {
@@ -7304,6 +7307,21 @@ message MachineSpxAttachmentStatusObservation {
   optional SpxAttachmentType attachment_type = 3;
   optional uint32 virtual_function_id = 4;
   optional google.protobuf.Timestamp observed_at = 5;
+}
+
+message AstraConfig {
+  repeated AstraAttachment astra_attachments = 1;
+}
+
+message AstraAttachment {
+  string mac_address = 1;
+  int32 vni = 2;
+  string subnet_ipv4 = 3;
+  int32 subnet_mask = 4;
+  optional SpxAttachmentType attachment_type = 5;
+  optional int32 virtual_function_id = 6;
+  optional string network_name = 7; // Set if attachment_type is OVN
+  string revision = 8; // This is either spx_config_version from instance of network_config_version from dpa_interface
 }
 
 message NVLinkGpu {
