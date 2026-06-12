@@ -55,7 +55,6 @@ type ExpectedSwitch struct {
 	Manufacturer       *string   `bun:"manufacturer"`
 	Model              *string   `bun:"model"`
 	Description        *string   `bun:"description"`
-	FirmwareVersion    *string   `bun:"firmware_version"`
 	SlotID             *int32    `bun:"slot_id"`
 	TrayIdx            *int32    `bun:"tray_idx"`
 	HostID             *int32    `bun:"host_id"`
@@ -102,9 +101,6 @@ func (es *ExpectedSwitch) ToProto(creds ExpectedSwitchCredentials) *cwssaws.Expe
 	}
 	if es.Description != nil {
 		proto.Description = es.Description
-	}
-	if es.FirmwareVersion != nil {
-		proto.FirmwareVersion = es.FirmwareVersion
 	}
 	if es.SlotID != nil {
 		proto.SlotId = es.SlotID
@@ -181,7 +177,6 @@ func (es *ExpectedSwitch) FromProto(proto *cwssaws.ExpectedSwitch) {
 	es.Manufacturer = proto.Manufacturer
 	es.Model = proto.Model
 	es.Description = proto.Description
-	es.FirmwareVersion = proto.FirmwareVersion
 	es.SlotID = proto.SlotId
 	es.TrayIdx = proto.TrayIdx
 	es.HostID = proto.HostId
@@ -200,7 +195,6 @@ type ExpectedSwitchCreateInput struct {
 	Manufacturer       *string
 	Model              *string
 	Description        *string
-	FirmwareVersion    *string
 	SlotID             *int32
 	TrayIdx            *int32
 	HostID             *int32
@@ -219,7 +213,6 @@ type ExpectedSwitchUpdateInput struct {
 	Manufacturer       *string
 	Model              *string
 	Description        *string
-	FirmwareVersion    *string
 	SlotID             *int32
 	TrayIdx            *int32
 	HostID             *int32
@@ -235,7 +228,6 @@ type ExpectedSwitchClearInput struct {
 	Manufacturer     bool
 	Model            bool
 	Description      bool
-	FirmwareVersion  bool
 	SlotID           bool
 	TrayIdx          bool
 	HostID           bool
@@ -320,7 +312,6 @@ func (essd ExpectedSwitchSQLDAO) Create(ctx context.Context, tx *db.Tx, input Ex
 		Manufacturer:       input.Manufacturer,
 		Model:              input.Model,
 		Description:        input.Description,
-		FirmwareVersion:    input.FirmwareVersion,
 		SlotID:             input.SlotID,
 		TrayIdx:            input.TrayIdx,
 		HostID:             input.HostID,
@@ -530,10 +521,6 @@ func (essd ExpectedSwitchSQLDAO) Update(ctx context.Context, tx *db.Tx, input Ex
 		es.Description = input.Description
 		columnsSet["description"] = true
 	}
-	if input.FirmwareVersion != nil {
-		es.FirmwareVersion = input.FirmwareVersion
-		columnsSet["firmware_version"] = true
-	}
 	if input.SlotID != nil {
 		es.SlotID = input.SlotID
 		columnsSet["slot_id"] = true
@@ -619,10 +606,6 @@ func (essd ExpectedSwitchSQLDAO) Clear(ctx context.Context, tx *db.Tx, input Exp
 	if input.Description {
 		es.Description = nil
 		updatedFields = append(updatedFields, "description")
-	}
-	if input.FirmwareVersion {
-		es.FirmwareVersion = nil
-		updatedFields = append(updatedFields, "firmware_version")
 	}
 	if input.SlotID {
 		es.SlotID = nil

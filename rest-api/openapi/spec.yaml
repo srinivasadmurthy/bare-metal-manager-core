@@ -19936,11 +19936,6 @@ components:
             - string
             - 'null'
           description: Description of this component
-        firmwareVersion:
-          type:
-            - string
-            - 'null'
-          description: Firmware version of this component
         slotId:
           type:
             - integer
@@ -20063,11 +20058,6 @@ components:
             - string
             - 'null'
           description: Description of this component
-        firmwareVersion:
-          type:
-            - string
-            - 'null'
-          description: Firmware version of this component
         slotId:
           type:
             - integer
@@ -20193,11 +20183,6 @@ components:
             - string
             - 'null'
           description: Description of this component
-        firmwareVersion:
-          type:
-            - string
-            - 'null'
-          description: Firmware version of this component
         slotId:
           type:
             - integer
@@ -20287,11 +20272,6 @@ components:
             - string
             - 'null'
           description: Description of this component
-        firmwareVersion:
-          type:
-            - string
-            - 'null'
-          description: Firmware version of this component
         slotId:
           type:
             - integer
@@ -20398,11 +20378,6 @@ components:
             - string
             - 'null'
           description: Description of this component
-        firmwareVersion:
-          type:
-            - string
-            - 'null'
-          description: Firmware version of this component
         slotId:
           type:
             - integer
@@ -20507,11 +20482,6 @@ components:
             - string
             - 'null'
           description: Description of this component
-        firmwareVersion:
-          type:
-            - string
-            - 'null'
-          description: Firmware version of this component
         slotId:
           type:
             - integer
@@ -20822,11 +20792,6 @@ components:
             - string
             - 'null'
           description: Description of this component
-        firmwareVersion:
-          type:
-            - string
-            - 'null'
-          description: Firmware version of this component
         slotId:
           type:
             - integer
@@ -20945,11 +20910,6 @@ components:
             - string
             - 'null'
           description: Description of this component
-        firmwareVersion:
-          type:
-            - string
-            - 'null'
-          description: Firmware version of this component
         slotId:
           type:
             - integer
@@ -21065,11 +21025,6 @@ components:
             - string
             - 'null'
           description: Description of this component
-        firmwareVersion:
-          type:
-            - string
-            - 'null'
-          description: Firmware version of this component
         slotId:
           type:
             - integer
