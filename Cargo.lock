@@ -2133,6 +2133,7 @@ dependencies = [
 name = "carbide-ipxe-renderer"
 version = "0.0.1"
 dependencies = [
+ "carbide-test-support",
  "hex",
  "serde",
  "serde_yaml",
@@ -2562,6 +2563,7 @@ dependencies = [
  "carbide-health-report",
  "carbide-mqtt-common",
  "carbide-secrets",
+ "carbide-test-support",
  "carbide-uuid",
  "chrono",
  "eyre",
