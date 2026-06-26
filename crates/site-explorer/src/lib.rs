@@ -107,6 +107,7 @@ pub fn new_bmc_explorer(
     credential_manager: Arc<dyn CredentialManager>,
     rotate_switch_nvos_credentials: Arc<AtomicBool>,
     mode: SiteExplorerExploreMode,
+    database_connection: PgPool,
 ) -> Arc<BmcEndpointExplorer> {
     BmcEndpointExplorer::new(
         redfish_client_pool,
@@ -115,6 +116,7 @@ pub fn new_bmc_explorer(
         credential_manager,
         rotate_switch_nvos_credentials,
         mode,
+        Some(database_connection),
     )
     .into()
 }
