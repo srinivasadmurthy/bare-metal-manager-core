@@ -22,11 +22,11 @@ import (
 // checks if the MachinePowerControlRequest type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &MachinePowerControlRequest{}
 
-// MachinePowerControlRequest Request to power control a Machine through NICo Core.
+// MachinePowerControlRequest Request to power control a Machine
 type MachinePowerControlRequest struct {
 	// Power control action to apply.
 	Action string `json:"action"`
-	// Acknowledges that an Instance is currently attached to the Machine.
+	// Acknowledges that an Instance is currently attached to the Machine and this action may disrupt Tenant workload on the Instance.
 	AcknowledgeAttachedInstance *bool `json:"acknowledgeAttachedInstance,omitempty"`
 }
 

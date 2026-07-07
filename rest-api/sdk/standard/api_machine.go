@@ -32,7 +32,7 @@ type ApiDeleteMachineRequest struct {
 	machineId  string
 }
 
-func (r ApiDeleteMachineRequest) Execute() (*DeletionAcceptedResponse, *http.Response, error) {
+func (r ApiDeleteMachineRequest) Execute() (*MessageResponse, *http.Response, error) {
 	return r.ApiService.DeleteMachineExecute(r)
 }
 
@@ -57,13 +57,13 @@ func (a *MachineAPIService) DeleteMachine(ctx context.Context, org string, machi
 
 // Execute executes the request
 //
-//	@return DeletionAcceptedResponse
-func (a *MachineAPIService) DeleteMachineExecute(r ApiDeleteMachineRequest) (*DeletionAcceptedResponse, *http.Response, error) {
+//	@return MessageResponse
+func (a *MachineAPIService) DeleteMachineExecute(r ApiDeleteMachineRequest) (*MessageResponse, *http.Response, error) {
 	var (
 		localVarHTTPMethod  = http.MethodDelete
 		localVarPostBody    interface{}
 		formFiles           []formFile
-		localVarReturnValue *DeletionAcceptedResponse
+		localVarReturnValue *MessageResponse
 	)
 
 	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "MachineAPIService.DeleteMachine")
@@ -1566,16 +1566,16 @@ func (r ApiMachinePowerControlMachineRequest) MachinePowerControlRequest(machine
 	return r
 }
 
-func (r ApiMachinePowerControlMachineRequest) Execute() (*MachinePowerControlResponse, *http.Response, error) {
+func (r ApiMachinePowerControlMachineRequest) Execute() (*MessageResponse, *http.Response, error) {
 	return r.ApiService.MachinePowerControlMachineExecute(r)
 }
 
 /*
 MachinePowerControlMachine Machine power control
 
-Power control a Machine through NICo Core. The request is authorized,
-machine-scoped, and proxied to the Machine's owning Site. User must have
-authorization role with `PROVIDER_ADMIN` suffix.
+Execute power control actions for a specific Machine.
+
+Org must have an Infrastructure Provider entity and own the Site that the Machine belongs to. User must have authorization role with `PROVIDER_ADMIN` suffix.
 
 	@param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
 	@param org Name of the Org
@@ -1593,13 +1593,13 @@ func (a *MachineAPIService) MachinePowerControlMachine(ctx context.Context, org 
 
 // Execute executes the request
 //
-//	@return MachinePowerControlResponse
-func (a *MachineAPIService) MachinePowerControlMachineExecute(r ApiMachinePowerControlMachineRequest) (*MachinePowerControlResponse, *http.Response, error) {
+//	@return MessageResponse
+func (a *MachineAPIService) MachinePowerControlMachineExecute(r ApiMachinePowerControlMachineRequest) (*MessageResponse, *http.Response, error) {
 	var (
 		localVarHTTPMethod  = http.MethodPatch
 		localVarPostBody    interface{}
 		formFiles           []formFile
-		localVarReturnValue *MachinePowerControlResponse
+		localVarReturnValue *MessageResponse
 	)
 
 	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "MachineAPIService.MachinePowerControlMachine")
@@ -1741,7 +1741,11 @@ UpdateMachine Update Machine
 
 Instance Type attribute updates, maintenance attribute updates and labels updates must be specified in separate requests. They cannot be processed at the same time.
 
-Some attributes can only be updated by Provider, while others can be updated by Provider or a Privileged Tenant.
+Some attributes can only be updated by Provider, while others can be updated by Provider or a privileged Tenant.
+
+For Infrastructure Providers: Org must have an Infrastructure Provider entity and own the Site that the Machine belongs to. User must have authorization role with `PROVIDER_ADMIN` suffix.
+
+For Tenants: Org must have a Tenant with `TargetedInstanceCreation` capability enabled and Tenant Account with Machine's Provider. User must have authorization role with `TENANT_ADMIN` suffix.
 
 	@param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
 	@param org Name of the Org

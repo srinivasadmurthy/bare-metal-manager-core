@@ -46,15 +46,15 @@ func NewMachinePowerControlHandler(dbSession *cdb.Session, scp *sc.ClientPool, _
 
 // Handle godoc
 // @Summary Machine Power Control
-// @Description Power control a Machine through NICo Core. Provider Admin only.
+// @Description Power control a Machine.
 // @Tags machine-power
 // @Accept json
 // @Produce json
 // @Security ApiKeyAuth
 // @Param org path string true "Name of NGC organization"
-// @Param machineId path string true "ID of Machine"
+// @Param id path string true "ID of Machine"
 // @Param request body model.APIMachinePowerControlRequest true "Power control request"
-// @Success 200 {object} model.APIMachinePowerControlResponse
+// @Success 202 {object} model.APIMessageResponse
 // @Router /v2/org/{org}/nico/machine/{machineId}/power [patch]
 func (h MachinePowerControlHandler) Handle(c echo.Context) error {
 	org, dbUser, ctx, logger, handlerSpan := common.SetupHandler("MachinePower", "Control", c, h.tracerSpan)
@@ -63,22 +63,36 @@ func (h MachinePowerControlHandler) Handle(c echo.Context) error {
 	}
 
 	if dbUser == nil {
-		logger.Error().Msg("invalid User object found in request context")
+		logger.Error().Msg("Invalid User object found in request context")
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve current user", nil)
 	}
 
-	// Validate org
 	ok, err := auth.ValidateOrgMembership(dbUser, org)
 	if !ok {
 		if err != nil {
-			logger.Error().Err(err).Msg("error validating org membership for User in request")
+			logger.Error().Err(err).Msg("Error validating org membership for User in request")
 		} else {
-			logger.Warn().Msg("could not validate org membership for user, access denied")
+			logger.Warn().Msg("Could not validate org membership for user, access denied")
 		}
 		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, fmt.Sprintf("Failed to validate membership for org: %s", org), nil)
 	}
 
-	// Validate role: Provider Admins or Viewers, or privileged Tenant Admins (TargetedInstanceCreation; see filters below).
+	machineID := c.Param("id")
+	if machineID == "" {
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Machine ID was not specified in URL", nil)
+	}
+
+	var apiReq model.APIMachinePowerControlRequest
+	err = c.Bind(&apiReq)
+	if err != nil {
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Failed to parse request data, potentially invalid structure", nil)
+	}
+
+	err = apiReq.Validate()
+	if err != nil {
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, err.Error(), nil)
+	}
+
 	provider, _, apiError := common.IsProviderOrTenant(ctx, logger, h.dbSession, org, dbUser, true, true)
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
@@ -86,21 +100,10 @@ func (h MachinePowerControlHandler) Handle(c echo.Context) error {
 
 	if provider == nil {
 		logger.Warn().Msg("user does not have Provider role, access denied")
-		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "User does not have Provider role with org", nil)
+		return cutil.NewAPIErrorResponse(c, http.StatusForbidden, "User does not have Provider Admin role with org", nil)
 	}
 
-	var apiReq model.APIMachinePowerControlRequest
-	if err := c.Bind(&apiReq); err != nil {
-		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid request body", nil)
-	}
-
-	if err := apiReq.Validate(); err != nil {
-		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, err.Error(), nil)
-	}
-
-	// Retrieve Machine details
-	machineDAO := cdbm.NewMachineDAO(h.dbSession)
-	machine, err := machineDAO.GetByID(ctx, nil, apiReq.MachineID, []string{cdbm.SiteRelationName}, false)
+	machine, err := cdbm.NewMachineDAO(h.dbSession).GetByID(ctx, nil, machineID, []string{cdbm.SiteRelationName}, false)
 	if err != nil {
 		if errors.Is(err, cdb.ErrDoesNotExist) {
 			return cutil.NewAPIErrorResponse(c, http.StatusNotFound, "Could not find Machine with specified ID", nil)
@@ -109,18 +112,14 @@ func (h MachinePowerControlHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Machine details, DB error", nil)
 	}
 
-	// Check Site presence in Machine object
-	if machine.Site == nil {
-		logger.Error().Msg("Related Site was not returned for Machine DB entity")
-		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Site details for Machine, DB error", nil)
-	}
-
-	site := machine.Site
-
 	if machine.InfrastructureProviderID != provider.ID {
 		logger.Error().Msg("Machine doesn't belong to org's Infrastructure provider")
-		// Return 404 instead of 403 to avoid leaking information about the existence of the machine
 		return cutil.NewAPIErrorResponse(c, http.StatusNotFound, "Could not find Machine with specified ID", nil)
+	}
+
+	if machine.IsMissingOnSite {
+		logger.Error().Msg("Machine is missing on site, unable to power control")
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Machine is missing on site, unable to power control", nil)
 	}
 
 	if machine.IsAssigned && (apiReq.AcknowledgeAttachedInstance == nil || !*apiReq.AcknowledgeAttachedInstance) {
@@ -128,34 +127,34 @@ func (h MachinePowerControlHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Machine is currently in use by an Instance, set acknowledgeAttachedInstance to true to proceed", nil)
 	}
 
-	if site.Status != cdbm.SiteStatusRegistered {
-		logger.Warn().Msg("Site specified in request data is not in Registered state")
-		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Site specified in request data is not in Registered state, cannot execute power control", nil)
+	if machine.Site == nil {
+		logger.Error().Msg("Related Site was not returned for Machine DB entity")
+		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Site details for Machine, DB error", nil)
 	}
 
-	// Get Temporal client for Site
+	site := machine.Site
+
+	if site.Status != cdbm.SiteStatusRegistered {
+		logger.Warn().Msg("Site specified in request data is not in Registered state")
+		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Site specified in request data is not in Registered state, cannot execute admin operation", nil)
+	}
+
 	stc, err := h.scp.GetClientByID(site.ID)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to retrieve Temporal client for Site")
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve workflow client for Site", nil)
 	}
 
-	logger.Info().Str("machineID", apiReq.MachineID).Str("action", string(apiReq.Action)).Str("siteID", site.ID.String()).Msg("Sending power control request to Site via Core proxy")
+	logger.Info().Str("machine_id", machineID).Str("action", string(apiReq.Action)).Str("site_id", site.ID.String()).Msg("Sending Machine power control request via Core gRPC proxy")
 
 	coreResp := &cwssaws.AdminPowerControlResponse{}
-	apiErr := common.ExecuteCoreGRPC(ctx, stc, cwssaws.Forge_AdminPowerControl_FullMethodName, apiReq.ToProto(), coreResp, site.ID.String())
+	apiErr := common.ExecuteCoreGRPC(ctx, stc, cwssaws.Forge_AdminPowerControl_FullMethodName, apiReq.ToProto(machineID), coreResp, site.ID.String())
 	if apiErr != nil {
-		logAPIError(logger, apiErr, "failed to execute power control request on Site via Core proxy")
+		logAPIError(logger, apiErr, "Failed to execute Machine power control request via Core gRPC proxy")
 		return cutil.NewAPIErrorResponse(c, apiErr.Code, apiErr.Message, nil)
 	}
 
-	// Build response
-	response := model.APIMachinePowerControlResponse{
-		MachineID: apiReq.MachineID,
-		Action:    apiReq.Action,
-		Message:   coreResp.Msg,
-	}
-
-	// Return success response
-	return c.JSON(http.StatusOK, response)
+	return c.JSON(http.StatusAccepted, model.APIMessageResponse{
+		Message: coreResp.GetMsg(),
+	})
 }
