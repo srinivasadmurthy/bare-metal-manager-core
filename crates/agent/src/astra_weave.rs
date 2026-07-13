@@ -814,15 +814,13 @@ async fn build_synced_astra_config_status_if_version_unchanged(
     let weave_spx_version = list_vni_attachments_rsp
         .virtual_network_attachments
         .first()
-        .and_then(|virtual_network_attachment| virtual_network_attachment.metadata.as_ref())
-        .and_then(|metadata| metadata.user_data.get(WEAVE_EW_VPC_REVISION_USER_DATA_KEY))
-        .map(String::as_str);
+        .and_then(weave_ew_vpc_attachment_revision);
 
     // If version is changed, return so that we can update the Doca Weave
     // server with the latest astra config.
-    if weave_spx_version != Some(nico_spx_version) {
+    if weave_spx_version.as_deref() != Some(nico_spx_version) {
         tracing::info!(
-            weave_spx_version = weave_spx_version.unwrap_or("none"),
+            weave_spx_version = weave_spx_version.as_deref().unwrap_or("none"),
             nico_spx_version,
             "AstraConfig version changed; running full reconcile"
         );
@@ -839,6 +837,7 @@ async fn build_synced_astra_config_status_if_version_unchanged(
     match sync_astra_config_status_from_weave_ew_vpc_attachments(
         astra_config,
         &list_vni_attachments_rsp.virtual_network_attachments,
+        nico_spx_version,
     ) {
         Ok(astra_config_status) => Ok(Some(astra_config_status)),
         Err(err) => {
@@ -948,9 +947,23 @@ pub fn set_astra_attachment_status_with_weave_ew_vpc_status(
     });
 }
 
+/// Returns the SPX revision recorded in a DOCA Weave attachment's metadata, if
+/// present. Reads the `WEAVE_EW_VPC_REVISION_USER_DATA_KEY` entry from the
+/// attachment's `metadata.user_data`.
+fn weave_ew_vpc_attachment_revision(
+    virtual_network_attachment: &VirtualNetworkAttachment,
+) -> Option<String> {
+    virtual_network_attachment
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.user_data.get(WEAVE_EW_VPC_REVISION_USER_DATA_KEY))
+        .cloned()
+}
+
 fn sync_astra_config_status_from_weave_ew_vpc_attachments(
     astra_config: &AstraConfig,
     virtual_network_attachments: &[VirtualNetworkAttachment],
+    nico_spx_version: &str,
 ) -> eyre::Result<AstraConfigStatus> {
     // Only attachments with a real vni (>= 1) have a corresponding attachment
     // on the Weave server. Detached NICs (vni 0) are attached to no virtual
@@ -979,6 +992,11 @@ fn sync_astra_config_status_from_weave_ew_vpc_attachments(
     for astra_attachment in &astra_config.astra_attachments {
         // A detached NIC (vni 0) has no attachment on the Weave server; report
         // it Ready without requiring a matching server attachment.
+
+        if astra_attachment.revision != nico_spx_version {
+            tracing::warn!("Assumption violation: Astra attachment revision {} does not match Nico SPX version {}", astra_attachment.revision, nico_spx_version);
+        }
+
         if astra_attachment.vni == 0 {
             let revision = astra_attachment_revision(astra_attachment)?;
             astra_attachments_status.push(AstraAttachmentStatus {
@@ -1022,6 +1040,12 @@ fn sync_astra_config_status_from_weave_ew_vpc_attachments(
                 astra_attachment.vni
             ));
         };
+
+        // For debugging purposes, make sure all the attachments have the same revision.
+        let weave_revision = weave_ew_vpc_attachment_revision(virtual_network_attachment);
+        if weave_revision.as_deref() != Some(&astra_attachment.revision) {
+            tracing::warn!("Assumption violation: DOCA Weave attachment revision {:?} does not match Astra attachment revision {}", weave_revision, astra_attachment.revision);
+        }
 
         matched_weave_attachment_indices.insert(index);
 
