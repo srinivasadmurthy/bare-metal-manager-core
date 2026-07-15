@@ -18,6 +18,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use ::rpc::forge as rpc;
 use carbide_network::virtualization::{VpcVirtualizationType, get_svi_ip};
+use carbide_utils::none_if_empty::NoneIfEmpty;
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::machine::{MachineId, MachineInterfaceId};
 use carbide_uuid::network::NetworkSegmentId;
@@ -71,11 +72,7 @@ impl SiteFabricPrefixList {
         // the VPC isolation feature built on top of it, and it is better not
         // to construct one of these at all (and thus the Option-wrapped return
         // type).
-        if prefixes.is_empty() {
-            None
-        } else {
-            Some(Self { prefixes })
-        }
+        prefixes.none_if_empty().map(|prefixes| Self { prefixes })
     }
 
     pub fn as_ip_slice(&self) -> &[IpNetwork] {
@@ -478,7 +475,7 @@ pub async fn admin_network(
             None => {
                 // if FNN is enabled, VPC must be created and updated in admin_segment.
                 return Err(CarbideError::internal(
-                    "Admin VPC is not attached to admin segment.".to_string(),
+                    "admin VPC is not attached to admin segment".to_string(),
                 )
                 .into());
             }
