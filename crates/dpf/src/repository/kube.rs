@@ -105,11 +105,13 @@ impl BfbRepository for KubeRepository {
     async fn create(&self, bfb: &BFB) -> Result<BFB, DpfError> {
         let namespace = bfb.meta().namespace.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+        println!("SDM BFB create namespace: {namespace}, bfb: {:#?}", bfb);
         Ok(api.create(&PostParams::default(), bfb).await?)
     }
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError> {
         let api: Api<BFB> = self.api(namespace);
+        println!("SDM BFB delete namespace: {namespace}, name: {name}");
         api.delete(name, &Default::default()).await?;
         Ok(())
     }
@@ -135,11 +137,13 @@ impl BlueFieldSoftwareRepository for KubeRepository {
     async fn create(&self, bfs: &BlueFieldSoftware) -> Result<BlueFieldSoftware, DpfError> {
         let namespace = bfs.meta().namespace.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+        println!("SDM BlueFieldSoftware create namespace: {namespace}, bfs: {:#?}", bfs);
         Ok(api.create(&PostParams::default(), bfs).await?)
     }
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError> {
         let api: Api<BlueFieldSoftware> = self.api(namespace);
+        println!("SDM BlueFieldSoftware delete namespace: {namespace}, name: {name}");
         api.delete(name, &Default::default()).await?;
         Ok(())
     }
@@ -195,6 +199,7 @@ impl DpuRepository for KubeRepository {
         Fut: Future<Output = Result<(), DpfError>> + Send + 'static,
     {
         let api: Api<DPU> = self.api(namespace);
+        println!("SDM DPU watch namespace: {namespace}, label_selector: {:#?}", label_selector);
         let cancel = self.cancel.clone();
         let watcher_config = match label_selector {
             Some(selector) => watcher::Config::default().labels(selector),
@@ -241,11 +246,13 @@ impl DpuDeviceRepository for KubeRepository {
     async fn create(&self, device: &DPUDevice) -> Result<DPUDevice, DpfError> {
         let namespace = device.meta().namespace.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+        println!("SDM DPU device create namespace: {namespace}, device: {:#?}", device);
         Ok(api.create(&PostParams::default(), device).await?)
     }
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError> {
         let api: Api<DPUDevice> = self.api(namespace);
+        println!("SDM DPU device delete namespace: {namespace}, name: {name}");
         api.delete(name, &Default::default()).await?;
         Ok(())
     }
@@ -267,6 +274,7 @@ impl DpuNodeRepository for KubeRepository {
     async fn create(&self, node: &DPUNode) -> Result<DPUNode, DpfError> {
         let namespace = node.meta().namespace.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+        println!("SDM DPU node create namespace: {namespace}, node: {:#?}", node);
         Ok(api.create(&PostParams::default(), node).await?)
     }
 
@@ -277,6 +285,7 @@ impl DpuNodeRepository for KubeRepository {
         patch: serde_json::Value,
     ) -> Result<(), DpfError> {
         let api: Api<DPUNode> = self.api(namespace);
+        println!("SDM DPU node patch namespace: {namespace}, name: {name}");
         api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await?;
         Ok(())
@@ -284,6 +293,7 @@ impl DpuNodeRepository for KubeRepository {
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError> {
         let api: Api<DPUNode> = self.api(namespace);
+        println!("SDM DPU node delete namespace: {namespace}, name: {name}");
         api.delete(name, &Default::default()).await?;
         Ok(())
     }
@@ -307,6 +317,7 @@ impl DpuNodeMaintenanceRepository for KubeRepository {
         patch: serde_json::Value,
     ) -> Result<(), DpfError> {
         let api: Api<DPUNodeMaintenance> = self.api(namespace);
+        println!("SDM DPU node maintenance patch namespace: {namespace}, name: {name}");
         api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await?;
         Ok(())
@@ -323,6 +334,9 @@ impl DpuFlavorRepository for KubeRepository {
     async fn create(&self, flavor: &DPUFlavor) -> Result<DPUFlavor, DpfError> {
         let namespace = flavor.meta().namespace.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+
+        println!("SDM DPU flavor create namespace: {namespace}, flavor: {:#?}", flavor);
+
         Ok(api.create(&PostParams::default(), flavor).await?)
     }
 }
@@ -338,6 +352,7 @@ impl DpuSetRepository for KubeRepository {
         let namespace = set.meta().namespace.as_deref().unwrap_or("default");
         let name = set.meta().name.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+        println!("SDM DPU set apply namespace: {namespace}, name: {name}");
         Ok(api
             .patch(
                 name,
@@ -379,6 +394,7 @@ impl DpuDeploymentRepository for KubeRepository {
         let namespace = deployment.meta().namespace.as_deref().unwrap_or("default");
         let name = deployment.meta().name.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+        println!("SDM DPU deployment apply namespace: {namespace}, name: {name}");
         Ok(api
             .patch(
                 name,
@@ -395,6 +411,7 @@ impl DpuDeploymentRepository for KubeRepository {
         patch: serde_json::Value,
     ) -> Result<(), DpfError> {
         let api: Api<DPUDeployment> = self.api(namespace);
+        println!("SDM DPU deployment patch namespace: {namespace}, name: {name}");
         api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await?;
         Ok(())
@@ -402,6 +419,7 @@ impl DpuDeploymentRepository for KubeRepository {
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError> {
         let api: Api<DPUDeployment> = self.api(namespace);
+        println!("SDM DPU deployment delete namespace: {namespace}, name: {name}");
         api.delete(name, &Default::default()).await?;
         Ok(())
     }
@@ -428,6 +446,7 @@ impl DpuServiceTemplateRepository for KubeRepository {
         let namespace = template.meta().namespace.as_deref().unwrap_or("default");
         let name = template.meta().name.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+        println!("SDM DPU service template apply namespace: {namespace}, name: {name}");
         Ok(api
             .patch(
                 name,
@@ -462,6 +481,7 @@ impl DpuServiceConfigurationRepository for KubeRepository {
         let namespace = config.meta().namespace.as_deref().unwrap_or("default");
         let name = config.meta().name.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+        println!("SDM DPU service configuration apply namespace: {namespace}, name: {name}");
         Ok(api
             .patch(
                 name,
@@ -489,6 +509,7 @@ impl DpuServiceNADRepository for KubeRepository {
         let namespace = nad.meta().namespace.as_deref().unwrap_or("default");
         let name = nad.meta().name.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+        println!("SDM DPU service nad apply namespace: {namespace}, name: {name}");
         Ok(api
             .patch(
                 name,
@@ -548,6 +569,7 @@ impl DpuServiceInterfaceRepository for KubeRepository {
         let namespace = iface.meta().namespace.as_deref().unwrap_or("default");
         let name = iface.meta().name.as_deref().unwrap_or("default");
         let api = self.api(namespace);
+        println!("SDM DPU service interface apply namespace: {namespace}, name: {name}");
         Ok(api
             .patch(
                 name,
@@ -654,6 +676,7 @@ impl DpfOperatorConfigRepository for KubeRepository {
     ) -> Result<(), DpfError> {
         use crate::crds::dpfoperatorconfigs_generated::DPFOperatorConfig;
         let api: Api<DPFOperatorConfig> = Api::namespaced(self.client.clone(), namespace);
+        println!("SDM DPU operator config patch namespace: {namespace}, name: {name}");
         api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await?;
         Ok(())

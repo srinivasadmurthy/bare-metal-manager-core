@@ -214,9 +214,11 @@ async fn create_and_register_dpudevices_and_dpunode(
             is_primary: dpu.id == primary_dpu_id,
         };
         dpf_sdk
-            .register_dpu_device(device_info)
+            .register_dpu_device(device_info.clone())
             .await
             .map_err(dpf_error)?;
+
+        println!("SDM DPU device registered {:#?}", device_info.clone());
     }
 
     let primary_dpu = state
@@ -344,6 +346,8 @@ async fn handle_dpf_handle_reboot(
         host_power_state(redfish_client.as_ref()).await?
     };
 
+    println!("SDM power state {:#?}", power_state);
+
     match op {
         PerformPowerOperation::Off => {
             if power_state == libredfish::PowerState::Off {
@@ -448,6 +452,8 @@ async fn handle_dpf_waiting_for_ready(
         Err(err) => return Err(dpf_error(err)),
     };
 
+    println!("SDM current phase {:#?}", current_phase);
+
     // A DPU with a deletionTimestamp is a terminating old CR (get_dpu_phase maps that to
     // Deleting; its status.phase is still stale, often Ready or Error). Do nothing until
     // the operator has deleted it and created the fresh CR: don't release the maintenance
@@ -470,6 +476,7 @@ async fn handle_dpf_waiting_for_ready(
         .await
         .map_err(dpf_error)?
     {
+        println!("SDM reboot required");
         handler_host_power_control(state, ctx, SystemPowerControl::ForceOff).await?;
         let next = transition_all_dpus_to_dpf_state(
             DpfState::HandleReboot {

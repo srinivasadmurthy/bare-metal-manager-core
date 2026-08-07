@@ -621,6 +621,8 @@ async fn initialize_dpf_sdk(
         .await
         .map_err(|err| eyre::eyre!("failed to initialize bf3 DPF deployment: {err}"))?;
 
+    println!("SDM bf3 deployment created {:#?}", bf3);
+
     if let Some(bf4) = &carbide_config.dpf.deployments.bf4_generic {
         // Validation guarantees `bluefield_software` is set with exactly one PSID
         // entry for a BF4 deployment.
