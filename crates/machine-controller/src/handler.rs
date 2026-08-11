@@ -73,7 +73,7 @@ use model::machine::infiniband::{IbConfigNotSyncedReason, ib_config_synced};
 use model::machine::nvlink::nvlink_config_synced;
 use model::machine::{
     AttestationMode, BomValidating, BomValidatingContext, CleanupContext, CleanupState,
-    CreateBossVolumeContext, CreateBossVolumeState, DpuDiscoveringState, DpuInitNextStateResolver,
+    CreateBossVolumeContext, CreateBossVolumeState, DpuDiscoveringState, DpuDiscoveringStates, DpuInitNextStateResolver,
     DpuInitState, FailureCause, FailureDetails, FailureSource, HostPlatformConfigurationState,
     HostReprovisionState, InitialResetPhase, InstallDpuOsState, InstanceNextStateResolver,
     InstanceState, LockdownInfo, LockdownState, MAX_FIRMWARE_UPGRADE_RETRIES, Machine,
@@ -92,7 +92,7 @@ use model::predicted_machine_interface::PredictedMachineInterface;
 use model::resource_pool::common::CommonPools;
 use model::site_explorer::ExploredEndpoint;
 use sku::{handle_bom_validation_requested, handle_bom_validation_state};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgTransaction};
 use state_controller::state_handler::{
     StateHandler, StateHandlerContext, StateHandlerError, StateHandlerOutcome,
 };
@@ -830,7 +830,23 @@ impl MachineStateHandler {
             }
         }
 
-        match &mh_state {
+        match &mh_state { 
+            ManagedHostState::ConfigureAstra => {
+                let mut txn = ctx.services.db_pool.begin().await?;
+                // Enable Astra if necessary
+                self.enable_astra(&mut txn, mh_snapshot).await?;
+
+                // Now collect the ids of the DPUs in this managed host in dpu_ids,
+                // and our next state should be DpuDiscoveringState with the dpu_ids.
+                let dpu_ids = mh_snapshot.host_snapshot.associated_dpu_machine_ids();
+                Ok(StateHandlerOutcome::transition(
+                    ManagedHostState::DpuDiscoveringState {
+                        dpu_states: DpuDiscoveringStates {
+                            states: dpu_ids.iter().map(|id| (*id, DpuDiscoveringState::Initializing)).collect(),
+                        },
+                    },
+                ).with_txn(txn))
+            }
             ManagedHostState::DpuDiscoveringState { .. } => {
                 if mh_snapshot
                     .host_snapshot
@@ -1907,6 +1923,59 @@ impl MachineStateHandler {
                 }
             },
         }
+    }
+
+    async fn enable_astra(&self, txn: &mut PgTransaction<'static>, mh_snapshot: &ManagedHostStateSnapshot) -> Result<(), StateHandlerError> {
+        // Enable Astra if necessary
+        // Look at the entry in the expected_machines table for this managed host, and retrieve the host_nics
+        // field. If the host_nics is empty, just return.
+
+        // its unlikely we got here without a bmc mac
+        let Some(bmc_mac_address) = mh_snapshot.host_snapshot.status.bmc_info.mac else {
+            tracing::debug!(
+                machine_id = %mh_snapshot.host_snapshot.id,
+                "No BMC MAC address configured"
+            );
+            return Err(StateHandlerError::MissingData {
+                object_id: mh_snapshot.host_snapshot.id.to_string(),
+                missing: "bmc_mac_address",
+            });
+        };
+
+        // Retrieve the expected_machines table entry for this managed host.
+        let expected_machine =
+            db::expected_machine::find_by_bmc_mac_address(txn.as_mut(), bmc_mac_address)
+                .await
+                .map_err(|err| {
+                    tracing::error!(
+                        machine_id = %mh_snapshot.host_snapshot.id,
+                        %bmc_mac_address,
+                        error = %err,
+                        "Failed to look up expected machine for Astra enablement"
+                    );
+                    StateHandlerError::DBError(Box::new(err))
+                })?;
+
+        // No expected-machine entry means there are no declared host NICs to act on.
+        let Some(expected_machine) = expected_machine else {
+            return Ok(());
+        };
+
+        let host_nics = expected_machine.data.interfaces;
+        if host_nics.is_empty() {
+            return Ok(());
+        }
+
+        // At this point, we need to use Redfish to get all the CX cards in the host.
+        // The end point to explore is /redfish/v1/Chassis/CX_$i
+
+        for nic in host_nics.iter() {
+            if nic.nic_type != Some("CX9".to_string()) {
+                continue;
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_scout_heartbeat_timeout(

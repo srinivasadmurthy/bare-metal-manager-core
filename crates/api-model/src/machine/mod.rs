@@ -1267,6 +1267,9 @@ pub enum ManagedHostState {
     /// created.
     Created,
 
+    // Enable Astra if necessary
+    ConfigureAstra,
+
     /// Machine moved to failed state. Recovery will be based on FailedCause
     Failed {
         details: FailureDetails,
@@ -2552,6 +2555,9 @@ impl Display for ReadyBootConfigState {
 impl Display for ManagedHostState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ManagedHostState::ConfigureAstra  => {
+                write!(f, "ConfigureAstra")
+            }
             ManagedHostState::DpuDiscoveringState { dpu_states } => {
                 // Min state indicates the least processed DPU. The state machine is blocked
                 // becasue of this.
@@ -2667,6 +2673,7 @@ impl Display for ManagedHostState {
 impl ManagedHostState {
     pub fn dpu_state_string(&self, dpu_id: &MachineId) -> String {
         match self {
+            ManagedHostState::ConfigureAstra => "ConfigureAstra".to_string(),
             ManagedHostState::DpuDiscoveringState { dpu_states } => dpu_states
                 .states
                 .get(dpu_id)
@@ -2855,6 +2862,7 @@ pub fn state_sla(
         .unwrap_or(std::time::Duration::from_secs(60 * 60 * 24));
 
     match state {
+        ManagedHostState::ConfigureAstra => StateSla::with_sla(slas::CONFIGURE_ASTRA, time_in_state),
         ManagedHostState::DpuDiscoveringState { dpu_states } => {
             // Min state indicates the least processed DPU. The state machine is blocked
             // because of this.

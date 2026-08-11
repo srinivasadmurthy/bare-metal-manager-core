@@ -296,6 +296,7 @@ impl StateControllerIO for MachineStateControllerIO {
         }
 
         match state {
+            ManagedHostState::ConfigureAstra => ("configureastra", ""),
             ManagedHostState::DpuDiscoveringState { dpu_states } => {
                 // Min state indicates the least processed DPU. The state machine is blocked
                 // becasue of this.
