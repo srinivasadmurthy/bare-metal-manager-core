@@ -159,6 +159,57 @@ See [`crates/test-support/src/lib.rs`](crates/test-support/src/lib.rs) for the f
 
 ## gRPC API definitions
 
+**Choose presence by meaning.** Keep protobuf, Rust, database, and update semantics aligned. For proto3, use:
+
+| Meaning | Representation |
+| --- | --- |
+| Unset differs from zero or the default for a scalar or enum | `optional` |
+| Zero or one structured value | A singular message |
+| Unset differs from empty for a collection | A wrapper message containing a repeated field |
+| Mutually exclusive alternatives | `oneof` |
+
+A `oneof` can be unset. If one member is required, reject an unset `oneof` with a documented validation error;
+otherwise, document whether omission is valid. Do not use a repeated field for zero-or-one data or wrap a scalar when
+`optional` is enough.
+
+Use `Option<T>` in Rust while unset matters. Store `NULL` only when absence is a valid database state. Omitting an
+update field does not require nullable storage.
+
+**Define create and update semantics.**
+
+- **Create:** state whether omission infers, defaults, or rejects the value. Document explicit zero or default values
+  and errors.
+- **Update:** state whether the request is a complete replacement or a patch. Replacements require callers to resubmit
+  unchanged fields and selector variants, and define whether missing values default or fail. Patches preserve omitted
+  fields and document how each supported operation maps from the wire to Rust and storage.
+- **Preserve, set, and clear:** when a patch supports these operations, use a field mask plus values and a clear
+  convention; an operation enum plus its value; or an update `oneof` whose omission means preserve and whose variants
+  mean set and clear. Represent all three in Rust with a nested `Option` or dedicated enum; plain `Option<T>` is not
+  enough.
+- **Field masks:** define how path selection and value presence interact, including whether a selected path with an
+  omitted value preserves, defaults, clears, or fails validation. Define precedence or rejection for overlapping parent
+  and child paths.
+
+For replacements and patches, document operation precedence, fallback behavior, explicit zero or default values,
+invalid field combinations, and errors.
+
+**Make modes explicit.** Use `oneof` or a separate request type when each mode accepts different fields. If an enum
+selects the mode while sibling fields remain, document the valid combinations and reject the rest. Prefer distinct
+methods or a semantic enum over a boolean that selects different operations. When a boolean is clearest, use a positive
+name with obvious `true` and `false` behavior. An implicit proto3 `bool` treats omission as `false`. Use it only when
+both states have the same meaning. If presence matters, use `optional bool` and document the omitted case, including
+any validation error.
+
+**Roll out required fields in order.**
+
+1. Deploy readers that accept omitted and present forms, with documented fallback and error behavior.
+2. Update all writers and backfill existing data.
+3. Verify mixed-version clients and rollback behavior.
+4. Enforce requiredness.
+
+If omission has no safe fallback, add a versioned boundary instead of making a wire or persisted field mandatory in
+place.
+
 - APIs to list resources and retrieve resource state should be paginated in order to scale to a high amount of managed
   resources. Pagination should be achieved in the following fashion:
   - An API call with the format `FindResourceNameIds` (e.g. `FindMachineIds`) should be used to list the IDs of all
@@ -360,6 +411,26 @@ pub async fn create_resource(
 }
 ```
 
+## Configuration ownership and precedence
+
+Before adding a configuration option, ask whether the behavior can be safe and predictable without a knob. Keep true
+protocol invariants non-configurable and hard safety caps as named constants. When operators need to tune an operational
+limit, bound it with a non-configurable hard maximum and reject out-of-range values before activation. Do not bake
+values tied to one site or environment, such as cluster names, namespaces, and addresses, into behavior; expose them
+through configuration instead.
+
+When behavior must vary, give each setting one canonical owner and resolution path. Define what omission means: use a
+safe default when omission has a safe and predictable meaning; otherwise require the setting and fail validation.
+Validate values before they become active. State whether changes require a restart or take effect dynamically, and
+define precedence, fallback, and conflict behavior across every supported source.
+
+This does not require one storage location. Files, environment variables, command-line flags, Helm values, database
+values, and APIs can all be valid sources, but overlapping sources must resolve through one declared contract.
+
+Do not copy a configuration schema into another interface just to expose it. Reference the canonical contract or
+generate the interface from it when practical, and keep interface-specific adapters limited to translation and
+precedence.
+
 ## Crate Features
 
 Avoid using crate features unless there is a good reason. Our CI runners only build with the default features you get
@@ -401,9 +472,70 @@ immutable.
 
 Transactions should be used to group write operations together such that they can be rolled back on failure. But do
 not hold a transaction open while doing long-running work. Doing so can exhaust the connection pool if the thing
-you're awaiting is blocked or slow. We have a custom lint, `txn_held_across_await` which will catch cases where you're
-`await`ing a future while holding a transaction, which mitigates this. If it happens, your
-code needs to be fixed, do not `#[allow(txn_held_across_await)]`.
+you're awaiting is blocked or slow. We have a custom lint, `txn_held_across_await`, which catches an `.await` while a
+transaction or tracked database connection remains live unless the awaited call receives that transaction or
+connection, or a nested transaction derived from that transaction. Passing it onward gives the callee the same
+responsibility; it does not make unrelated work safe.
+
+Treat a production lint finding as a design problem: finish the transaction before awaiting unrelated work, or move
+that work outside the transaction. Do not add `#[allow(txn_held_across_await)]` merely to silence the lint. A narrowly
+reviewed infrastructure boundary may deliberately reserve a dedicated connection when that is the mechanism's purpose
+and its pool-capacity cost is fixed and documented; keep that proof next to the allowance. Tests may allow the lint
+when holding a transaction or row lock across an await is the behavior under test.
+
+### Concurrent updates
+
+Assume database updates can run concurrently. A transaction alone does not make a stale read-modify-write safe: do not
+read a row, modify an in-memory snapshot, and write the whole row back unless the operation prevents a concurrent
+change from being silently overwritten.
+
+Use the narrowest mechanism that proves the update is safe. Depending on the invariant, this may be an atomic SQL
+expression, an update of only the requested columns, a uniqueness or foreign-key constraint, `SELECT ... FOR UPDATE`,
+or optimistic concurrency with `UPDATE ... WHERE version = ...`. When the version is the entity's
+optimistic-concurrency token, the same statement must write the requested values and advance or replace that token;
+checking a token without changing it allows later writers to reuse the same snapshot.
+When using `SELECT ... FOR UPDATE`, acquire the lock and perform the dependent writes in the same transaction before
+committing it.
+
+Define the no-match contract explicitly. A version-checked predicate can match zero rows because the target is missing,
+is no longer eligible, including when it is soft-deleted, or has a stale version. For each outcome the operation can
+distinguish, define its exact error or not-applied result. Return `ConcurrentModificationError` only when the statement
+or transaction distinguishes a stale token from the missing or ineligible outcome, and return `NotFoundError` only for
+proven absence. If the API intentionally makes two or more outcomes indistinguishable, document which outcomes share
+the combined policy. A deliberately conditional API, such as a `try_*` helper, may return an explicit not-applied result
+instead; it must not report that the mutation succeeded.
+
+Add a concurrent-update test when the contract promises protection from lost updates. Do not add row locks by default
+when an atomic operation, constraint, or version predicate already excludes the invalid interleaving.
+
+### Long-running work locks
+
+Do not hold a database transaction or pooled connection open solely to keep slow or external work mutually exclusive.
+When long-running work needs database-coordinated admission across NICo process instances and cannot fit inside a short
+transaction, use [`WorkLockManager`](crates/api-db/src/work_lock_manager.rs) with a work key that names the protected
+resource or operation. Do not use it for task-local exclusion, where an in-process owner or mutex is enough. Before
+choosing a work lock, ensure that a prior worker continuing after lease expiry cannot make the operation unsafe. Keep
+database updates performed under the work lock in short transactions. In each transaction, call
+`WorkLock::fence_transaction` before any protected write and keep all writes guarded by that fence in the same
+transaction.
+
+If `fence_transaction` reports ownership loss, do not perform the guarded writes. Reconcile any earlier external work,
+then acquire a new `WorkLock` before retrying.
+
+The keepalive loop continues attempting renewal after database or manager communication failures, but stops once the
+database proves ownership was lost. It does not notify or cancel the task holding the `WorkLock`.
+
+Keep the guard until protected work stops. `Drop` stops renewal and queues a best-effort release without waiting, while
+`release()` consumes the guard and waits for the manager to acknowledge the database deletion. A cleanup error may
+leave the work key unavailable until the lease expires; it does not preserve ownership or permit the caller to continue
+protected work.
+
+A `WorkLock` is an expiring lease, not a fencing token. If its keepalives stop, another worker can acquire the same key
+while the previous worker is still running. The lease alone cannot protect an external side effect or prove that a
+later database mutation still belongs to the current owner. Fence the database transaction, and give external work
+its own fencing, idempotency, or a reconciliation protocol proven safe when execution repeats or overlaps. A work lock
+also does not replace atomic SQL, version predicates, or constraints for writers that do not participate in the same
+work key.
 
 ## Database wrappers
 
@@ -817,26 +949,81 @@ automatic conversions to convert between errors, or `.map_err()` if you have to.
 that are used for tests/mocks, or for toplevel binaries where errors are given to the user for informational purposes,
 and not intended to be inspected by other rust code. (We do not always adhere to this rule.)
 
-Avoid using `let _unused = foo();` to discard errors. This is error-prone: If later `foo()` is refactored to become
-an async function, assigning the result to `_unused` silences the compiler warning telling you forgot to call `.await`.
-If you don't care about the errors a function produces, prefer using `.ok()` to convert the error into a
-(discardable) Option.
+#### Preserve error sources and semantic meaning
+
+Preserve the source error as it moves through the system, and add context at abstraction boundaries. Do not replace an
+error with only its display string while another layer may still need to inspect its type or source. At an external API
+or user-facing boundary, map the failure to a stable semantic variant rather than exposing internal details. Where
+operators need root-cause detail, record the source chain internally, but redact secrets from both user-facing errors
+and operator records.
+
+Use a default only when absence is semantically equivalent to that value. Keep missing, malformed, unavailable, and
+explicitly empty states distinct when callers or operators need to react to them differently. Fallback helpers such as
+`unwrap_or_default()` and `or_default()` are appropriate only when this equivalence is part of the contract; do not use
+them merely to erase an error or simplify control flow. Compatibility defaults must preserve the previous contract;
+document omission behavior and test omitted values separately from explicitly supplied default values.
+
+#### Choose the failure policy before the syntax
+
+For each `Result`, deliberately choose whether to propagate, handle, retry, record and continue, or intentionally
+discard the failure. Avoid using `let _ = foo();` or an underscore-prefixed binding such as `let _unused = foo();` to
+discard errors. This is error-prone: if `foo()` is later refactored to become async, binding its result this way
+silences the compiler warning that `.await` is missing. When intentionally discarding an error, prefer `.ok()` to
+convert it into a discardable `Option`; this makes such an async refactor fail to compile. The use of `.ok()` does not
+itself justify ignoring an operational failure.
 
 ```rust
-fn fails() -> Result<(), Error> {}
+fn fails() -> std::io::Result<()> {
+    Err(std::io::Error::other("example failure"))
+}
 
 fn avoid() {
-    // if somebody makes `fails()` async later, the compiler won't complain, and the future will
-    // never get run
+    // If somebody makes `fails()` async later, the compiler won't complain, and the future will
+    // never get run.
     let _dontcare = fails();
 }
 
-
-fn prefer() {
-    // if somebody makes `fails()` async later, you get a compiler error
+fn intentionally_discard() {
+    // If somebody makes `fails()` async later, this becomes a compiler error.
     fails().ok();
 }
 ```
+
+Best-effort paths should still make repeated operational failures observable. Follow
+[Instrumentation](#instrumentation): use a plain `tracing::` macro when diagnostic text is enough; use a
+`carbide_instrument::Event` when the failure merits a count, rate, or duration.
+
+#### Keep operational failures recoverable
+
+Do not use a panicking operation — including `unwrap()`, `expect()`, `panic!`, `assert!`, or `unreachable!` — when
+failure can be caused by routine or malformed request data, persisted data, configuration, the network, hardware, or a
+recoverable dependency failure. Return a typed error with context so callers retain the option to apply appropriate
+logging, metrics, retry, and API error mapping. Do not leave `todo!` or `unimplemented!` on a reachable production path.
+
+Tests may use panicking assertions and call `unwrap()` on known-good fixture values when a panic is the intended failure
+report. In production, a task- or process-terminating operation is acceptable only for a proven local invariant or an
+intentional fail-fast boundary. Keep the proof or boundary rationale close to the operation, use an `expect()` message
+that explains the invariant where appropriate, and prefer a type or construction API that makes the invalid state
+unrepresentable.
+
+Treating a poisoned `std::sync::Mutex` as fatal can be an intentional fail-fast choice. If a thread panics while holding
+the lock, it may have left the guarded state in a condition where application invariants no longer hold. When the state
+cannot be safely validated or rebuilt, using `expect()` on `lock()` makes the decision to fail fast explicit:
+
+```rust
+let mut state = shared_state
+    .lock()
+    .expect("shared state mutex poisoned; guarded invariants may be broken");
+state.apply_update();
+```
+
+When recovery is safe, handle the `PoisonError` and validate or rebuild the state instead, calling `clear_poison()` only
+after restoring the invariant. Mutex poisoning signals a possible broken invariant; it does not by itself require
+termination.
+
+A supervised task boundary may intentionally propagate a child panic as described in
+[Background tasks](#background-tasks). This is different from panicking on an ordinary operational error inside the
+task.
 
 ### Avoid stringly-typed values
 
@@ -848,6 +1035,15 @@ and can't be exhaustively checked by the compiler. See
 [`ErrorCode`](crates/api-model/src/errors.rs) for the pattern: typed
 `ErrorSystem`/`ErrorSubsystem` parts plus a `code`, rendered to the wire string
 in one place. Reserve raw strings for genuinely open-ended values.
+
+**Parse once at the boundary.** Parse and validate structured values at an untyped interface, then keep the domain type
+internally. Prefer `IpAddr`, `Uri`, typed identifiers or enums, and typed serde structures over repeatedly parsing
+strings or generic JSON. Convert only at the interface that requires a string, bytes, number, or structured message.
+
+**Use a newtype only when it adds safety.** It should enforce an invariant or prevent values with the same representation
+from being confused. Otherwise, avoid it. Document the invariant and how invalid input is reported, or state that every
+underlying value is valid and the wrapper exists only to separate types. Test accepted and rejected values when
+applicable, plus each wire, serde, or database representation the type uses.
 
 ### Prefer methods over free functions
 

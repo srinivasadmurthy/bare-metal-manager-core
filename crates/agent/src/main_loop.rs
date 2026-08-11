@@ -76,7 +76,7 @@ use crate::{
 // instance metadata information and stores it. The main loop and the instance
 // metadata service use the information fetched be the periodic fetcher by reading
 // the information stored by the periodic config fetcher.
-pub async fn setup_and_run(
+pub(super) async fn setup_and_run(
     machine_id: MachineId,
     factory_mac_address: MacAddress,
     forge_client_config: Arc<ForgeClientConfig>,
@@ -501,10 +501,7 @@ struct CurrentNetworkVersion {
 
 impl CurrentNetworkVersion {
     // Return whether our stored version matches the specific config.
-    pub fn matches_versions_from(
-        &self,
-        conf: impl AsRef<ManagedHostNetworkConfigResponse>,
-    ) -> bool {
+    fn matches_versions_from(&self, conf: impl AsRef<ManagedHostNetworkConfigResponse>) -> bool {
         let conf = conf.as_ref();
         let managed_host_config_version = get_non_empty_str(&conf.managed_host_config_version);
         let instance_network_config_version =
@@ -529,7 +526,7 @@ impl CurrentNetworkVersion {
         }
     }
 
-    pub fn update_from(&mut self, conf: impl AsRef<ManagedHostNetworkConfigResponse>) {
+    fn update_from(&mut self, conf: impl AsRef<ManagedHostNetworkConfigResponse>) {
         let conf = conf.as_ref();
         self.managed_host_config_version =
             get_non_empty_str(&conf.managed_host_config_version).map(String::from);
@@ -607,22 +604,6 @@ impl CurrentNetworkVersion {
             interface.vpc_routing_profile.is_some().hash(h);
             if let Some(routing_profile) = &interface.vpc_routing_profile {
                 hash_routing_profile(routing_profile, h);
-            }
-        }
-
-        if let Some(traffic_intercept_config) = &conf.traffic_intercept_config {
-            traffic_intercept_config.additional_overlay_vtep_ip.hash(h);
-            traffic_intercept_config.public_prefixes.hash(h);
-            traffic_intercept_config
-                .secondary_vtep_aggregate_prefixes
-                .hash(h);
-            if let Some(bridging) = &traffic_intercept_config.bridging {
-                bridging.hbn_bridge.hash(h);
-                bridging.host_representor_intercept_bridging.hash(h);
-                bridging.internal_bridge_routing_prefix.hash(h);
-                bridging.vf_intercept_bridge_name.hash(h);
-                bridging.vf_intercept_bridge_port.hash(h);
-                bridging.vf_intercept_bridge_sf.hash(h);
             }
         }
 
@@ -952,43 +933,20 @@ impl MainLoop {
                             }
                         }
 
-                        // We'll update some internal bridging config if bridging config
-                        // for traffic_intercept was sent in.
-                        let bridging_result = if self.options.agent_platform_type.is_dpu_os()
-                            && conf
-                                .traffic_intercept_config
-                                .as_ref()
-                                .map(|vc| vc.bridging.is_some())
-                                .unwrap_or_default()
-                        {
-                            ethernet_virtualization::update_traffic_intercept_bridging(
-                                &conf,
-                                self.hbn_device_names.clone(),
-                                self.agent_config.hbn.skip_reload,
-                            )
-                            .await
-                        } else {
-                            Ok(false) // No errors and no change.
+                        let update_flavor = match self.nvue_context.as_mut() {
+                            Some(nvue_context) => NvueUpdateFlavor::RestApi { nvue_context },
+                            None => NvueUpdateFlavor::StartupFile {
+                                hbn_root: &self.agent_config.hbn.root_dir,
+                                skip_post: self.agent_config.hbn.skip_reload,
+                            },
                         };
-
-                        if bridging_result.is_ok() {
-                            let update_flavor = match self.nvue_context.as_mut() {
-                                Some(nvue_context) => NvueUpdateFlavor::RestApi { nvue_context },
-                                None => NvueUpdateFlavor::StartupFile {
-                                    hbn_root: &self.agent_config.hbn.root_dir,
-                                    skip_post: self.agent_config.hbn.skip_reload,
-                                },
-                            };
-                            ethernet_virtualization::update_nvue(
-                                virtualization_type,
-                                update_flavor,
-                                &conf,
-                                self.hbn_device_names.clone(),
-                            )
-                            .await
-                        } else {
-                            bridging_result
-                        }
+                        ethernet_virtualization::update_nvue(
+                            virtualization_type,
+                            update_flavor,
+                            &conf,
+                            self.hbn_device_names.clone(),
+                        )
+                        .await
                     };
 
                     let astra_config_status =
@@ -1462,7 +1420,7 @@ async fn plan_fmds_armos_routing(
         Ok(None)
     }
 }
-pub async fn record_network_status(
+async fn record_network_status(
     status: rpc::DpuNetworkStatus,
     forge_api: &str,
     forge_client_config: &forge_tls_client::ForgeClientConfig,

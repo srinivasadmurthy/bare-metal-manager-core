@@ -16,6 +16,7 @@
  */
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -87,7 +88,6 @@ use state_controller::controller::{Enqueuer, StateController};
 use state_controller::per_object::{PerObjectStateMetrics, PerObjectStateRecorder};
 use state_controller::state_change_emitter::StateChangeEmitterBuilder;
 use tokio::sync::Semaphore;
-use tokio::sync::oneshot::Sender;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -112,7 +112,7 @@ use crate::mqtt_state_change_hook::republisher::{
 use crate::scout_stream::ConnectionRegistry;
 use crate::{CarbideError, attestation, db_init, ethernet_virtualization, listener};
 
-pub fn create_ipmi_tool(
+fn create_ipmi_tool(
     credential_reader: Arc<dyn CredentialReader>,
     carbide_config: &CarbideConfig,
     bmc_proxy: Arc<ArcSwap<Option<HostPortPair>>>,
@@ -203,8 +203,7 @@ pub(crate) async fn start_runtime(
     secrets_context: Option<crate::secrets::SecretsContext>,
     admin_ui_routes_builder: Option<AdminUiRoutesBuilder>,
     cancel_token: CancellationToken,
-    ready_channel: Sender<()>,
-) -> eyre::Result<()> {
+) -> eyre::Result<SocketAddr> {
     eyre::ensure!(
         !matches!(
             (carbide_config.dpf.enabled, &carbide_config.vmaas_config),
@@ -298,6 +297,17 @@ pub(crate) async fn start_runtime(
         db::site_prefix::reconcile_configured(&mut txn, &carbide_config.site_fabric_prefixes)
             .await?;
 
+        if !carbide_config.site_fabric_prefixes.is_empty() {
+            let lineage =
+                db::site_prefix::backfill_vpc_prefix_site_prefix_lineage(&mut txn).await?;
+            eyre::ensure!(
+                lineage.unresolved_vpc_prefix_count() == 0,
+                "VpcPrefix SitePrefix lineage preflight failed: missing VpcPrefix IDs: {:?}; ambiguous VpcPrefixes: {:?}",
+                lineage.missing_vpc_prefix_ids,
+                lineage.ambiguous,
+            );
+        }
+
         txn.commit().await?;
 
         // Idempotently seed the dedicated site-wide lockdown IKM (v0) from the
@@ -310,6 +320,19 @@ pub(crate) async fn start_runtime(
         // `*_credential_rotation_backfill` data migration (see its header for the
         // ordering invariants), not seeded here.
     };
+
+    // A listen-only replica trusts another instance to reconcile configuration,
+    // but it still must not serve a configured-root site with unresolved
+    // VpcPrefix lineage.
+    if carbide_config.listen_only && !carbide_config.site_fabric_prefixes.is_empty() {
+        let unassigned =
+            db::site_prefix::find_unassigned_vpc_prefix_site_prefix_ids(&db_pool).await?;
+        eyre::ensure!(
+            unassigned.is_empty(),
+            "VpcPrefix SitePrefix lineage preflight failed: unassigned VpcPrefix IDs: {:?}",
+            unassigned,
+        );
+    }
 
     let common_pools =
         db::resource_pool::create_common_pools(db_pool.clone(), ib_fabric_ids).await?;
@@ -514,7 +537,7 @@ pub(crate) async fn start_runtime(
         None
     };
 
-    listener::start(
+    let listen_address = listener::start(
         join_set,
         api_service,
         listen_mode,
@@ -526,18 +549,7 @@ pub(crate) async fn start_runtime(
     )
     .await?;
 
-    ready_channel
-        .send(())
-        .inspect_err(|_e| {
-            // Note: the `_e` here is just sending us back (rejecting) the () that we sent to the ready
-            // channel. This will only happen if the other end is closed.
-            tracing::warn!(
-                "Bug: api server ready_channel is closed, could not notify readiness status"
-            )
-        })
-        .ok();
-
-    Ok(())
+    Ok(listen_address)
 }
 
 /// Initialize the DPF SDK and create all required Kubernetes CRs.
