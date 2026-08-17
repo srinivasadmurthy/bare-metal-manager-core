@@ -21,6 +21,7 @@ edition.workspace = true
 description = "Common networking code for Forge components."
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [lib]
 name = "carbide_network"
@@ -37,22 +38,24 @@ ipnetwork = { workspace = true, features = ["serde"], optional = true }
 mac_address = { workspace = true }
 serde = { features = ["derive"], workspace = true }
 sqlx = { workspace = true, features = [
-  "runtime-tokio-rustls",
-  "mac_address",
-  "ipnetwork",
-  "uuid",
-  "migrate",
-  "postgres",
-  "chrono",
-  "macros",
-  "json",
+    "tls-rustls",
+    "mac_address",
+    "ipnetwork",
+    "uuid",
+    "migrate",
+    "postgres",
+    "chrono",
+    "macros",
+    "json",
 ], optional = true }
 thiserror = { workspace = true }
 
-carbide-rpc = { path = "../rpc" }
-
 [dev-dependencies]
+carbide-test-support = { path = "../test-support" }
+carbide-macros = { path = "../macros" }
+carbide-sqlx-testing = { path = "../sqlx-testing", default-features = false }
 serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 
 [lints]
 workspace = true

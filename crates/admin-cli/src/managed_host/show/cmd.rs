@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use ::rpc::Machine;
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use carbide_uuid::machine::MachineId;
 use health_report::HealthProbeAlert;
 use prettytable::{Cell, Row, Table};
@@ -28,20 +28,21 @@ use tracing::warn;
 
 use super::args::Args;
 use crate::cfg::cli_options::SortField;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
-use crate::{async_write, async_write_table_as_csv};
+use crate::{async_write_table_as_csv, async_writeln};
 
 const UNKNOWN: &str = "Unknown";
 
 #[derive(Default, Serialize)]
 struct ManagedHostOutputWrapper {
     options: ManagedHostOutputOptions,
-    managed_host_output: carbide_utils::ManagedHostOutput,
+    managed_host_output: carbide_rpc_utils::ManagedHostOutput,
 }
 
 #[derive(Serialize)]
 struct ManagedHostList<'a> {
-    managed_hosts: &'a [carbide_utils::ManagedHostOutput],
+    managed_hosts: &'a [carbide_rpc_utils::ManagedHostOutput],
 }
 
 #[derive(Default, Clone, Copy, Serialize)]
@@ -155,9 +156,9 @@ impl From<ManagedHostOutputWrapper> for Row {
 }
 
 fn convert_managed_hosts_to_nice_output(
-    managed_hosts: Vec<carbide_utils::ManagedHostOutput>,
+    managed_hosts: Vec<carbide_rpc_utils::ManagedHostOutput>,
     options: ManagedHostOutputOptions,
-) -> Box<Table> {
+) -> (Box<Table>, Vec<String>) {
     let managed_hosts_wrapper = managed_hosts
         .into_iter()
         .map(|x| ManagedHostOutputWrapper {
@@ -196,21 +197,34 @@ fn convert_managed_hosts_to_nice_output(
         headers.into_iter().map(Cell::new).collect::<Vec<Cell>>(),
     ));
 
+    let mut is_dpf_not_used = false;
     for managed_host in managed_hosts_wrapper {
+        if let Some(dpf) = &managed_host.managed_host_output.dpf {
+            is_dpf_not_used |= !dpf.used_for_ingestion;
+        }
         table.add_row(managed_host.into());
     }
 
-    table.into()
+    let mut warnings = Vec::new();
+    if is_dpf_not_used {
+        warnings.push(
+            "One or more DPUs are using a provisioning strategy (internal) which is \
+deprecated and will be removed in v2.1, see https://docs.nvidia.com/infra-controller/documentation/getting-started/installation-options/dpf-setup for how to enable DPF management for DPUs"
+                .to_string(),
+        );
+    }
+
+    (table.into(), warnings)
 }
 
 async fn show_managed_hosts(
-    managed_host_data: carbide_utils::ManagedHostMetadata,
+    managed_host_data: carbide_rpc_utils::ManagedHostMetadata,
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
     output_format: OutputFormat,
     output_options: ManagedHostOutputOptions,
     sort_by: SortField,
 ) -> CarbideCliResult<()> {
-    let mut managed_hosts = carbide_utils::get_managed_host_output(managed_host_data);
+    let mut managed_hosts = carbide_rpc_utils::get_managed_host_output(managed_host_data);
     match sort_by {
         SortField::PrimaryId => managed_hosts.sort_by(|m1, m2| m1.machine_id.cmp(&m2.machine_id)),
         SortField::State => managed_hosts.sort_by(|m1, m2| m1.state.cmp(&m2.state)),
@@ -247,7 +261,7 @@ async fn show_managed_hosts(
             }
         }
         OutputFormat::Csv => {
-            let result = convert_managed_hosts_to_nice_output(managed_hosts, output_options);
+            let (result, _) = convert_managed_hosts_to_nice_output(managed_hosts, output_options);
             async_write_table_as_csv!(output_file, result)?;
         }
         _ => {
@@ -259,15 +273,19 @@ async fn show_managed_hosts(
                         .ok_or(CarbideCliError::Empty)?,
                 )?;
             } else {
-                let result = convert_managed_hosts_to_nice_output(managed_hosts, output_options);
-                async_write!(output_file, "{}", result)?;
+                let (result, warnings) =
+                    convert_managed_hosts_to_nice_output(managed_hosts, output_options);
+                crate::async_writeln!(output_file, "{}", result)?;
+                for warning in &warnings {
+                    async_writeln!(output_file, "WARNING: {warning}")?;
+                }
             }
         }
     }
     Ok(())
 }
 
-fn show_managed_host_details_view(m: carbide_utils::ManagedHostOutput) -> CarbideCliResult<()> {
+fn show_managed_host_details_view(m: carbide_rpc_utils::ManagedHostOutput) -> CarbideCliResult<()> {
     let width = 27;
     let mut lines = String::new();
 
@@ -293,14 +311,9 @@ fn show_managed_host_details_view(m: carbide_utils::ManagedHostOutput) -> Carbid
         writeln!(&mut lines, "    Reason        : {}", m.state_reason)?;
     }
 
-    if m.maintenance_reference.is_some() {
+    if let Some(maintenance_reference) = &m.maintenance_reference {
         writeln!(&mut lines, "Host is in maintenance mode")?;
-        writeln!(
-            &mut lines,
-            "  Reference  : {}",
-            m.maintenance_reference
-                .expect("Host in maintenance mode without reference - impossible")
-        )?;
+        writeln!(&mut lines, "  Reference  : {maintenance_reference}")?;
         writeln!(
             &mut lines,
             "  Started at : {}",
@@ -318,12 +331,8 @@ fn show_managed_host_details_view(m: carbide_utils::ManagedHostOutput) -> Carbid
         ("  ID", m.machine_id),
         ("  Slot Number", m.slot_number.map(|n| n.to_string())),
         ("  Tray Index", m.tray_index.map(|n| n.to_string())),
-        ("  Last reboot completed", m.host_last_reboot_time),
-        (
-            "  Last reboot requested",
-            m.host_last_reboot_requested_time_and_mode,
-        ),
         ("  Serial Number", m.host_serial_number),
+        ("  Rack ID", m.rack_id),
         ("  BIOS Version", m.host_bios_version),
         ("  GPU Count", Some(m.host_gpu_count.to_string())),
         (
@@ -333,6 +342,11 @@ fn show_managed_host_details_view(m: carbide_utils::ManagedHostOutput) -> Carbid
         ("  Memory", m.host_memory),
         ("  Admin IP", m.host_admin_ip),
         ("  Admin MAC", m.host_admin_mac),
+        ("  Last reboot completed", m.host_last_reboot_time),
+        (
+            "  Last reboot requested",
+            m.host_last_reboot_requested_time_and_mode,
+        ),
         (
             "  Associated Instance Type",
             Some(m.instance_type_id.unwrap_or("Unassociated".to_string())),
@@ -368,6 +382,25 @@ fn show_managed_host_details_view(m: carbide_utils::ManagedHostOutput) -> Carbid
         ("    MAC", m.host_bmc_mac),
     ];
     data.append(&mut bmc_details);
+
+    let mut dpf = vec![
+        ("  Dpf", Some("".to_string())),
+        ("    Enabled", m.dpf.as_ref().map(|x| x.enabled.to_string())),
+        (
+            "    Used For Ingestion",
+            m.dpf.as_ref().map(|x| x.used_for_ingestion.to_string()),
+        ),
+    ];
+    if let Some(dpf_state) = m.dpf
+        && !dpf_state.used_for_ingestion
+    {
+        dpf.push((
+            "    WARN! One or more DPUs are using a provisioning strategy (internal) which is \
+deprecated and will be removed in v2.1, see https://docs.nvidia.com/infra-controller/documentation/getting-started/installation-options/dpf-setup for how to enable DPF management for DPUs",
+            Some("".to_string()),
+        ));
+    }
+    data.append(&mut dpf);
 
     for (key, value) in data {
         if matches!(&value, Some(x) if x.is_empty()) {
@@ -464,7 +497,8 @@ fn format_health_alerts(alerts: &[HealthProbeAlert], width: usize) -> String {
         .join(&format!("\n{:<width$}: ", " "))
 }
 
-pub async fn show(
+#[allow(deprecated)]
+pub(super) async fn show(
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
     args: Args,
     output_format: OutputFormat,
@@ -567,7 +601,7 @@ pub async fn show(
     };
 
     show_managed_hosts(
-        carbide_utils::ManagedHostMetadata {
+        carbide_rpc_utils::ManagedHostMetadata {
             machines,
             connected_devices,
             network_devices,

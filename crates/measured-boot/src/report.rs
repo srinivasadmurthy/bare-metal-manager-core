@@ -20,20 +20,15 @@
  *  tables in the database, leveraging the report-specific record types.
  */
 
-use std::str::FromStr;
-
-use carbide_uuid::UuidEmptyStringError;
 use carbide_uuid::machine::MachineId;
 use carbide_uuid::measured_boot::MeasurementReportId;
 use chrono::Utc;
-#[cfg(feature = "cli")]
-use rpc::admin_cli::ToTable;
-use rpc::errors::RpcDataConversionError;
-use rpc::protos::measured_boot::MeasurementReportPb;
 use serde::Serialize;
 
 use super::pcr::PcrRegisterValue;
 use super::records::MeasurementReportValueRecord;
+#[cfg(feature = "cli")]
+use crate::ToTable;
 
 /// MeasurementReport is a composition of a MeasurementReportRecord,
 /// whose attributes are essentially copied directly it, as well as
@@ -52,68 +47,11 @@ impl MeasurementReport {
         let borrowed = &self.values;
         borrowed.iter().map(|rec| rec.clone().into()).collect()
     }
-
-    ////////////////////////////////////////////////////////////
-    /// from_grpc takes an optional protobuf (as populated in a
-    /// proto response from the API) and attempts to convert it
-    /// to the backing model.
-    ////////////////////////////////////////////////////////////
-    pub fn from_grpc(some_pb: Option<&MeasurementReportPb>) -> super::Result<Self> {
-        some_pb
-            .ok_or(super::Error::RpcConversion(
-                "report is unexpectedly empty".to_string(),
-            ))
-            .and_then(|pb| {
-                Self::try_from(pb.clone()).map_err(|e| {
-                    super::Error::RpcConversion(format!("report failed pb->model conversion: {e}"))
-                })
-            })
-    }
 }
 
-impl From<MeasurementReport> for MeasurementReportPb {
-    fn from(val: MeasurementReport) -> Self {
-        Self {
-            report_id: Some(val.report_id),
-            machine_id: val.machine_id.to_string(),
-            values: val
-                .values
-                .iter()
-                .map(|value| value.clone().into())
-                .collect(),
-            ts: Some(val.ts.into()),
-        }
-    }
-}
-
-impl TryFrom<MeasurementReportPb> for MeasurementReport {
-    type Error = Box<dyn std::error::Error>;
-
-    fn try_from(msg: MeasurementReportPb) -> Result<Self, Box<dyn std::error::Error>> {
-        if msg.machine_id.is_empty() {
-            return Err(UuidEmptyStringError {}.into());
-        }
-        let values: super::Result<Vec<MeasurementReportValueRecord>> = msg
-            .values
-            .iter()
-            .map(
-                |value| match MeasurementReportValueRecord::try_from(value.clone()) {
-                    Ok(worked) => Ok(worked),
-                    Err(failed) => Err(super::Error::RpcConversion(format!(
-                        "attr conversion failed: {failed}"
-                    ))),
-                },
-            )
-            .collect();
-
-        Ok(Self {
-            report_id: msg
-                .report_id
-                .ok_or(RpcDataConversionError::MissingArgument("report_id"))?,
-            machine_id: MachineId::from_str(&msg.machine_id)?,
-            values: values?,
-            ts: chrono::DateTime::<chrono::Utc>::try_from(msg.ts.unwrap())?,
-        })
+impl crate::DisplayName for MeasurementReport {
+    fn display_name() -> &'static str {
+        "report"
     }
 }
 
@@ -136,5 +74,61 @@ impl ToTable for MeasurementReport {
         table.add_row(prettytable::row!["created_ts", self.ts]);
         table.add_row(prettytable::row!["values", values_table]);
         Ok(table.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::{Check, check_values};
+    use carbide_uuid::machine::{MachineIdSource, MachineType};
+    use carbide_uuid::measured_boot::MeasurementReportValueId;
+    use chrono::DateTime;
+
+    use super::*;
+
+    fn report_value(pcr_register: i16, sha_any: &str) -> MeasurementReportValueRecord {
+        MeasurementReportValueRecord {
+            value_id: MeasurementReportValueId::new(),
+            report_id: MeasurementReportId::new(),
+            pcr_register,
+            sha_any: sha_any.to_string(),
+            ts: DateTime::<Utc>::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn pcr_value_projection_cases() {
+        check_values(
+            [
+                Check {
+                    scenario: "empty report",
+                    input: vec![],
+                    expect: vec![],
+                },
+                Check {
+                    scenario: "populated report preserves record order",
+                    input: vec![report_value(2, "sha-2"), report_value(11, "sha-11")],
+                    expect: vec![
+                        PcrRegisterValue {
+                            pcr_register: 2,
+                            sha_any: "sha-2".to_string(),
+                        },
+                        PcrRegisterValue {
+                            pcr_register: 11,
+                            sha_any: "sha-11".to_string(),
+                        },
+                    ],
+                },
+            ],
+            |values| {
+                MeasurementReport {
+                    report_id: MeasurementReportId::new(),
+                    machine_id: MachineId::new(MachineIdSource::Tpm, [0x11; 32], MachineType::Host),
+                    ts: DateTime::<Utc>::UNIX_EPOCH,
+                    values,
+                }
+                .pcr_values()
+            },
+        );
     }
 }

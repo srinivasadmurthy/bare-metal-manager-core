@@ -21,15 +21,27 @@ use clap::Parser;
 use rpc::forge::VpcPeeringCreationRequest;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Peer two VPCs:
+    $ nico-admin-cli vpc-peering create 12345678-1234-5678-90ab-cdef01234567 \
+    abcdef01-2345-6789-abcd-ef0123456789
+
+Peer two VPCs with a chosen peering ID:
+    $ nico-admin-cli vpc-peering create 12345678-1234-5678-90ab-cdef01234567 \
+    abcdef01-2345-6789-abcd-ef0123456789 --id 0fedcba9-8765-4321-0fed-cba987654321
+
+")]
+pub(crate) struct Args {
     #[clap(help = "The ID of one VPC ID to peer")]
-    pub vpc1_id: VpcId,
+    vpc1_id: VpcId,
 
     #[clap(help = "The ID of other VPC ID to peer")]
-    pub vpc2_id: VpcId,
+    vpc2_id: VpcId,
 
     #[clap(long, help = "Optional desired ID for the VPC peering")]
-    pub id: Option<VpcPeeringId>,
+    id: Option<VpcPeeringId>,
 }
 
 impl From<Args> for VpcPeeringCreationRequest {

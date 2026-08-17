@@ -15,12 +15,11 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliResult;
-
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn reboot(api_client: &ApiClient, args: Args) -> CarbideCliResult<()> {
+pub(super) async fn reboot(api_client: &ApiClient, args: Args) -> CarbideCliResult<()> {
     let res = api_client
         .admin_power_control(
             None,

@@ -18,9 +18,11 @@
 // tests/runner_integration_tests.rs
 // Integration tests for MlxConfigRunner functionality
 
-use std::fs;
 use std::time::Duration;
 
+use carbide_test_support::Outcome::*;
+use carbide_test_support::scenarios;
+use libmlx::runner::error::MlxRunnerError;
 use libmlx::runner::exec_options::ExecOptions;
 use libmlx::runner::runner::MlxConfigRunner;
 
@@ -30,69 +32,144 @@ use super::common;
 // rather than actually executing mlxconfig commands, since we can't rely on
 // mlxconfig being available or specific hardware being present in test environments.
 
-#[test]
-fn test_runner_temp_file_prefix() {
+// A dry-run runner over a fresh test registry, targeting `01:00.0`. Dry run keeps
+// these tests off any real mlxconfig binary; the construction was copy-pasted into
+// almost every test below.
+fn dry_run_runner() -> MlxConfigRunner {
     let registry = common::create_test_registry();
-    let mut runner = MlxConfigRunner::new("01:00.0".to_string(), registry);
+    let options = ExecOptions::new().with_dry_run(true);
+    MlxConfigRunner::with_options("01:00.0".to_string(), registry, options)
+}
 
-    // Should not panic when setting temp file prefix
-    runner.set_temp_file_prefix("/custom/tmp");
+// Runs `set` on a fresh dry-run runner and distills the error to a comparable
+// shape: a `VariableNotFound` becomes its offending variable name (the part of the
+// error that is the contract), any other failure becomes a generic marker. Lets one
+// `check_cases` table both pin the not-found name (`FailsWith`) and assert plain
+// rejection (`Fails`) for the validation failures.
+fn set_outcome(assignments: &[(&str, &str)]) -> Result<(), String> {
+    dry_run_runner().set(assignments).map_err(|err| match err {
+        MlxRunnerError::VariableNotFound { variable_name } => variable_name,
+        other => format!("other: {other:?}"),
+    })
+}
+
+// Every invalid `set` assignment is rejected before any mlxconfig command runs.
+// The not-found rows pin the offending variable name (it's the contract, and the
+// runner reports the *first* invalid variable); the enum / boolean / array-bounds /
+// preset-range rows just assert rejection.
+#[test]
+fn invalid_set_assignments_are_rejected() {
+    scenarios!(
+        run = set_outcome;
+        "unknown variable names itself" {
+            &[("SRIOV_EN", "true"), ("NONEXISTENT_VAR", "value")][..] => FailsWith("NONEXISTENT_VAR".to_string()),
+        }
+
+        "first invalid variable wins over later invalid values" {
+            &[
+                ("NONEXISTENT_VAR", "value"),   // Variable not found
+                ("POWER_MODE", "INVALID_MODE"), // Invalid enum value
+                ("GPIO_ENABLED[100]", "true"),  // Array index out of bounds
+            ][..] => FailsWith("NONEXISTENT_VAR".to_string()),
+        }
+
+        "enum value outside allowed options (LOW/MEDIUM/HIGH)" {
+            &[("POWER_MODE", "INVALID_POWER_MODE")][..] => Fails,
+        }
+
+        "non-boolean value for a boolean variable" {
+            &[("SRIOV_EN", "maybe")][..] => Fails,
+        }
+
+        "array index past the registry size of 4" {
+            &[("GPIO_ENABLED[10]", "true")][..] => Fails,
+        }
+
+        "preset above the max of 10" {
+            &[("PERFORMANCE_PRESET", "20")][..] => Fails,
+        }
+    );
 }
 
 #[test]
+fn test_query_nonexistent_variable() {
+    let runner = dry_run_runner();
+    let result = runner.query(["NONEXISTENT_VAR"]);
+
+    assert!(result.is_err());
+    if let Err(MlxRunnerError::VariableNotFound { variable_name }) = result {
+        assert_eq!(variable_name, "NONEXISTENT_VAR");
+    } else {
+        panic!("Expected VariableNotFound error, got: {result:?}");
+    }
+}
+
+#[test]
+fn test_empty_assignments() {
+    let runner = dry_run_runner();
+
+    // Empty assignments array should be handled gracefully
+    let empty_assignments: &[(&str, &str)] = &[];
+
+    let result = runner.set(empty_assignments);
+    // Should succeed (no operations to perform)
+    assert!(result.is_ok());
+}
+
+// Everything below drives `dry_run_runner`, which short-circuits before mlxconfig is ever
+// invoked: `query` returns an empty result rather than shelling out, `set` returns `Ok(())`,
+// and `sync`/`compare` take their counts from the assignment list. That makes the results
+// fully determined and host-independent.
+//
+// The comment that used to sit here claimed the opposite -- that no outcome could be pinned
+// without a mockable mlxconfig -- and every test below discarded its result with `let _ =`
+// on the strength of it. Since a dry-run query reports no current values, `sync` and
+// `compare` can never find a variable to change, which is the interesting half of the
+// contract and is now asserted.
+
+#[test]
 fn test_sync_with_no_changes_needed() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true); // Use dry run to avoid actual execution
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
+    let runner = dry_run_runner();
 
-    // Create a mock JSON response file that matches our desired values
-    let json_data = common::create_sample_json_response("01:00.0");
-    let temp_file = tempfile::NamedTempFile::new().unwrap();
-    let json_string = serde_json::to_string_pretty(&json_data).unwrap();
-    fs::write(temp_file.path(), json_string).unwrap();
+    let assignments = &[("SRIOV_EN", "true"), ("NUM_OF_VFS", "16")];
 
-    // Since we're in dry_run mode, the sync operation will attempt to parse
-    // but won't actually execute mlxconfig commands
-    let assignments = &[
-        ("SRIOV_EN", "true"), // Already true in mock JSON
-        ("NUM_OF_VFS", "16"), // Already 16 in mock JSON
-    ];
-
-    // This will fail because we can't mock the mlxconfig command execution easily,
-    // but it tests the basic sync flow setup
-    let result = runner.sync(assignments);
-
-    // In dry run mode with no actual mlxconfig, this will likely error
-    // but the sync logic path gets exercised
-    // We could make this more sophisticated with better mocking
-    assert!(result.is_err() || result.is_ok());
+    let result = runner
+        .sync(assignments)
+        .expect("dry-run sync should succeed");
+    assert_eq!(result.variables_checked, 2);
+    assert_eq!(
+        result.variables_changed, 0,
+        "a dry-run query returns no current values, so nothing can be found to change"
+    );
+    assert!(result.changes_applied.is_empty());
 }
 
 #[test]
 fn test_compare_operation() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
+    let runner = dry_run_runner();
 
     let assignments = &[
-        ("SRIOV_EN", "false"), // Different from mock JSON (which has true)
-        ("NUM_OF_VFS", "32"),  // Different from mock JSON (which has 16)
-        ("POWER_MODE", "LOW"), // Different from mock JSON (which has HIGH)
+        ("SRIOV_EN", "false"),
+        ("NUM_OF_VFS", "32"),
+        ("POWER_MODE", "LOW"),
     ];
 
-    // This will fail in the query phase since we can't mock mlxconfig,
-    // but it tests the compare flow setup
-    let result = runner.compare(assignments);
-    assert!(result.is_err() || result.is_ok());
+    let result = runner
+        .compare(assignments)
+        .expect("dry-run compare should succeed");
+    assert_eq!(result.variables_checked, 3);
+    assert_eq!(
+        result.variables_needing_change, 0,
+        "nothing to compare against without a real query"
+    );
+    assert!(result.planned_changes.is_empty());
 }
 
 #[test]
 fn test_set_with_array_variables() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
+    let runner = dry_run_runner();
 
-    // Test sparse array assignments
+    // Sparse indices, deliberately non-contiguous.
     let assignments = &[
         ("GPIO_ENABLED[0]", "true"),
         ("GPIO_ENABLED[2]", "false"),
@@ -100,141 +177,53 @@ fn test_set_with_array_variables() {
         ("GPIO_MODES[3]", "bidirectional"),
     ];
 
-    // In dry run mode, this should process the assignments and build the command
-    // but not actually execute it
-    let result = runner.set(assignments);
-    assert!(result.is_err() || result.is_ok());
-}
-
-#[test]
-fn test_set_with_invalid_variable() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
-
-    let assignments = &[("SRIOV_EN", "true"), ("NONEXISTENT_VAR", "value")];
-
-    let result = runner.set(assignments);
-    assert!(result.is_err());
-
-    if let Err(libmlx::runner::error::MlxRunnerError::VariableNotFound { variable_name }) = result {
-        assert_eq!(variable_name, "NONEXISTENT_VAR");
-    } else {
-        panic!("Expected VariableNotFound error, got: {result:?}");
-    }
-}
-
-#[test]
-fn test_set_with_invalid_enum_value() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
-
-    let assignments = &[
-        ("POWER_MODE", "INVALID_POWER_MODE"), // Not in allowed options: LOW, MEDIUM, HIGH
-    ];
-
-    let result = runner.set(assignments);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_set_with_invalid_boolean_value() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
-
-    let assignments = &[
-        ("SRIOV_EN", "maybe"), // Invalid boolean value
-    ];
-
-    let result = runner.set(assignments);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_set_with_array_out_of_bounds() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
-
-    let assignments = &[
-        ("GPIO_ENABLED[10]", "true"), // GPIO_ENABLED array size is 4, so index 10 is invalid
-    ];
-
-    let result = runner.set(assignments);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_set_with_preset_out_of_range() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
-
-    let assignments = &[
-        ("PERFORMANCE_PRESET", "20"), // Max preset is 10, so 20 is invalid
-    ];
-
-    let result = runner.set(assignments);
-    assert!(result.is_err());
+    assert!(
+        runner.set(assignments).is_ok(),
+        "sparse array assignments should resolve against the registry and build a command"
+    );
 }
 
 #[test]
 fn test_query_all_variables() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
+    let runner = dry_run_runner();
 
-    // This will fail because we can't actually execute mlxconfig,
-    // but it tests the query_all flow
-    let result = runner.query_all();
-    assert!(result.is_err() || result.is_ok());
+    let result = runner
+        .query_all()
+        .expect("dry-run query_all should succeed");
+    assert!(
+        result.variables.is_empty(),
+        "a dry run reports nothing back from the card"
+    );
 }
 
 #[test]
 fn test_query_specific_variables() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
+    let runner = dry_run_runner();
 
-    let variables = &["SRIOV_EN", "NUM_OF_VFS"];
-
-    // This will fail because we can't actually execute mlxconfig,
-    // but it tests the query flow
-    let result = runner.query(variables);
-    assert!(result.is_err() || result.is_ok());
+    let result = runner
+        .query(["SRIOV_EN", "NUM_OF_VFS"])
+        .expect("dry-run query should succeed");
+    assert!(result.variables.is_empty());
 }
 
 #[test]
-fn test_query_array_variables() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
+fn test_sync_vs_set_vs_compare_consistency() {
+    let runner = dry_run_runner();
 
-    // Query array variables - should expand to individual indices
-    let variables = &["GPIO_ENABLED", "THERMAL_SENSORS"];
+    let assignments = &[("SRIOV_EN", "true"), ("NUM_OF_VFS", "32")];
 
-    let result = runner.query(variables);
-    assert!(result.is_err() || result.is_ok());
-}
+    // The point of the test is that all three agree on the same assignment list, so pin
+    // that rather than just running them: each accepts the two variables, and neither
+    // sync nor compare finds anything to do without a real query behind it.
+    assert!(runner.set(assignments).is_ok());
 
-#[test]
-fn test_query_nonexistent_variable() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
+    let synced = runner.sync(assignments).expect("sync should succeed");
+    assert_eq!(synced.variables_checked, 2);
+    assert_eq!(synced.variables_changed, 0);
 
-    let variables = &["NONEXISTENT_VAR"];
-
-    let result = runner.query(variables);
-    assert!(result.is_err());
-
-    if let Err(libmlx::runner::error::MlxRunnerError::VariableNotFound { variable_name }) = result {
-        assert_eq!(variable_name, "NONEXISTENT_VAR");
-    } else {
-        panic!("Expected VariableNotFound error, got: {result:?}");
-    }
+    let compared = runner.compare(assignments).expect("compare should succeed");
+    assert_eq!(compared.variables_checked, 2);
+    assert_eq!(compared.variables_needing_change, 0);
 }
 
 #[test]
@@ -250,15 +239,12 @@ fn test_different_device_identifiers() {
     ];
 
     for device in &devices {
-        // Should be able to create runners for different device formats
-        // Basic smoke test - construction should succeed.
         let options = ExecOptions::new().with_dry_run(true);
-        let runner_with_options =
-            MlxConfigRunner::with_options(device.to_string(), registry.clone(), options);
-
-        // Test a basic operation
-        let result = runner_with_options.set([("SRIOV_EN", "true")]);
-        assert!(result.is_err() || result.is_ok());
+        let runner = MlxConfigRunner::with_options(device.to_string(), registry.clone(), options);
+        assert!(
+            runner.set([("SRIOV_EN", "true")]).is_ok(),
+            "device identifier {device} should be accepted"
+        );
     }
 }
 
@@ -280,96 +266,13 @@ fn test_execution_options_propagation() {
     ];
 
     for options in test_cases {
+        // Only the dry-run cases can be asserted here -- the others would shell out to a
+        // real mlxconfig. What this pins is that no option combination makes the runner
+        // reject an assignment it would otherwise accept.
+        let dry_run = options.clone().with_dry_run(true);
         let runner =
-            MlxConfigRunner::with_options("01:00.0".to_string(), registry.clone(), options);
-
-        // Test that runner can be created with different option combinations
-        let result = runner.set([("SRIOV_EN", "true")]);
-        assert!(result.is_err() || result.is_ok());
-    }
-}
-
-#[test]
-fn test_empty_assignments() {
-    let registry = common::create_test_registry();
-    let options = ExecOptions::new().with_dry_run(true);
-    let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
-
-    // Empty assignments array should be handled gracefully
-    let empty_assignments: &[(&str, &str)] = &[];
-
-    let result = runner.set(empty_assignments);
-    // Should succeed (no operations to perform)
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_temp_file_prefix_setting() {
-    let registry = common::create_test_registry();
-    let mut runner = MlxConfigRunner::new("01:00.0".to_string(), registry);
-
-    // Test different temp file prefixes
-    runner.set_temp_file_prefix("/tmp");
-    runner.set_temp_file_prefix("/custom/temp");
-    runner.set_temp_file_prefix("/var/tmp");
-
-    // Should not panic or error
-}
-
-#[cfg(test)]
-mod error_handling_tests {
-    use super::*;
-
-    #[test]
-    fn test_multiple_error_conditions() {
-        let registry = common::create_test_registry();
-        let options = ExecOptions::new().with_dry_run(true);
-        let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
-
-        // Test multiple invalid conditions at once
-        let assignments = &[
-            ("NONEXISTENT_VAR", "value"),   // Variable not found
-            ("POWER_MODE", "INVALID_MODE"), // Invalid enum value
-            ("GPIO_ENABLED[100]", "true"),  // Array index out of bounds
-        ];
-
-        let result = runner.set(assignments);
-        assert!(result.is_err());
-
-        // Should get the first error encountered (variable not found)
-        if let Err(libmlx::runner::error::MlxRunnerError::VariableNotFound { variable_name }) =
-            result
-        {
-            assert_eq!(variable_name, "NONEXISTENT_VAR");
-        } else {
-            panic!("Expected VariableNotFound error for first invalid variable");
-        }
-    }
-
-    #[test]
-    fn test_sync_vs_set_vs_compare_consistency() {
-        let registry = common::create_test_registry();
-        let options = ExecOptions::new().with_dry_run(true);
-        let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
-
-        let assignments = &[("SRIOV_EN", "true"), ("NUM_OF_VFS", "32")];
-
-        // All three operations should handle the same assignments consistently
-        // (Even though they'll fail due to no mlxconfig, they should fail in the same way)
-
-        let set_result = runner.set(assignments);
-        let sync_result = runner.sync(assignments);
-        let compare_result = runner.compare(assignments);
-
-        // All should either succeed or fail with similar error patterns
-        match (&set_result, &sync_result, &compare_result) {
-            (Ok(_), Ok(_), Ok(_)) => {}    // All succeeded
-            (Err(_), Err(_), Err(_)) => {} // All failed (expected in test environment)
-            _ => {
-                // Mixed results might indicate inconsistent handling
-                // But we'll allow it since mocking is complex
-            }
-        }
+            MlxConfigRunner::with_options("01:00.0".to_string(), registry.clone(), dry_run);
+        assert!(runner.set([("SRIOV_EN", "true")]).is_ok());
     }
 }
 
@@ -390,15 +293,12 @@ mod realistic_scenarios {
         // Typical SRIOV configuration
         let sriov_config = &[("SRIOV_EN", "true"), ("NUM_OF_VFS", "8")];
 
-        let result = runner.set(sriov_config);
-        assert!(result.is_err() || result.is_ok());
+        assert!(runner.set(sriov_config).is_ok());
     }
 
     #[test]
     fn test_gpio_array_configuration() {
-        let registry = common::create_test_registry();
-        let options = ExecOptions::new().with_dry_run(true);
-        let runner = MlxConfigRunner::with_options("01:00.0".to_string(), registry, options);
+        let runner = dry_run_runner();
 
         // Configure GPIO pins with mixed modes
         let gpio_config = &[
@@ -411,8 +311,7 @@ mod realistic_scenarios {
             ("GPIO_MODES[3]", "bidirectional"),
         ];
 
-        let result = runner.set(gpio_config);
-        assert!(result.is_err() || result.is_ok());
+        assert!(runner.set(gpio_config).is_ok());
     }
 
     #[test]
@@ -430,7 +329,8 @@ mod realistic_scenarios {
             ("PERFORMANCE_PRESET", "8"),
         ];
 
-        let result = runner.sync(perf_config);
-        assert!(result.is_err() || result.is_ok());
+        let result = runner.sync(perf_config).expect("sync should succeed");
+        assert_eq!(result.variables_checked, 4);
+        assert_eq!(result.variables_changed, 0);
     }
 }

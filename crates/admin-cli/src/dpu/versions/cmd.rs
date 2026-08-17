@@ -18,16 +18,17 @@
 use std::collections::HashMap;
 
 use ::rpc::Machine;
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use carbide_uuid::machine::MachineId;
 use prettytable::{Row, Table};
 use serde::Serialize;
 
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 use crate::{async_write, async_write_table_as_csv};
 
-pub async fn versions(
+pub(super) async fn versions(
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
     output_format: OutputFormat,
     api_client: &ApiClient,
@@ -57,6 +58,7 @@ struct DpuVersions {
 }
 
 impl From<Machine> for DpuVersions {
+    #[allow(deprecated)]
     fn from(machine: Machine) -> Self {
         let state = match machine.state.split_once(' ') {
             Some((state, _)) => state.to_owned(),
@@ -99,7 +101,7 @@ impl From<Machine> for DpuVersions {
             hbn_version: machine.inventory.and_then(|inv| {
                 inv.components
                     .into_iter()
-                    .find(|c| c.name == "doca_hbn")
+                    .find(|c| c.name.contains("hbn"))
                     .map(|c| c.version)
             }),
             agent_version: machine.dpu_agent_version,
@@ -122,12 +124,12 @@ impl From<DpuVersions> for Row {
     }
 }
 
-pub fn generate_firmware_status_json(machines: Vec<Machine>) -> CarbideCliResult<String> {
+fn generate_firmware_status_json(machines: Vec<Machine>) -> CarbideCliResult<String> {
     let machines: Vec<DpuVersions> = machines.into_iter().map(DpuVersions::from).collect();
     Ok(serde_json::to_string_pretty(&machines)?)
 }
 
-pub fn generate_firmware_status_table(machines: Vec<Machine>) -> Box<Table> {
+fn generate_firmware_status_table(machines: Vec<Machine>) -> Box<Table> {
     let mut table = Table::new();
 
     let headers = vec![
@@ -143,7 +145,8 @@ pub fn generate_firmware_status_table(machines: Vec<Machine>) -> Box<Table> {
     Box::new(table)
 }
 
-pub async fn handle_dpu_versions(
+#[allow(deprecated)]
+async fn handle_dpu_versions(
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
     output_format: OutputFormat,
     api_client: &ApiClient,

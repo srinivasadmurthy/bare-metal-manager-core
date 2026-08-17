@@ -60,8 +60,57 @@ spec:
             description: DPUServiceInterfaceSpec defines the desired state of DPUServiceInterfaceSpec
             properties:
               clusterSelector:
-                description: Select the Clusters with specific labels, ServiceInterfaceSet
-                  CRs will be created only for these Clusters
+                description: |-
+                  Select the Clusters with specific labels, ServiceInterfaceSet CRs will be created only for these Clusters
+
+                  Deprecated: This field is deprecated and will be removed with v26.7.0. Use DPUClusterSelector instead.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              dpuClusterSelector:
+                description: DPUClusterSelector determines in which clusters the DPUServiceInterface
+                  controller should apply the configuration.
                 properties:
                   matchExpressions:
                     description: matchExpressions is a list of label selector requirements.
@@ -201,20 +250,24 @@ spec:
                             properties:
                               interfaceType:
                                 description: The interface type ("vlan", "physical",
-                                  "pf", "vf", "ovn", "service")
+                                  "pf", "vf", "ovn", "patch", "service")
                                 enum:
                                 - vlan
                                 - physical
                                 - pf
                                 - vf
                                 - ovn
+                                - patch
                                 - service
                                 type: string
                               node:
                                 description: Node where this interface exists
                                 type: string
                               ovn:
-                                description: The OVN definition
+                                description: |-
+                                  The OVN definition
+                                  Deprecated: This field is deprecated and will be removed with v26.10.0.
+                                  Migrate to interfaceType="patch" with spec.patch.peerBridge and spec.patch.peerPatchName instead.
                                 properties:
                                   externalBridge:
                                     default: br-ovn
@@ -222,11 +275,78 @@ spec:
                                       OVN bridge
                                     type: string
                                 type: object
+                              patch:
+                                description: The Patch definition
+                                properties:
+                                  peerBridge:
+                                    description: |-
+                                      PeerBridge is the name of the bridge to which the patch port is connected.
+                                      This bridge must be created before the ServiceInterface is created.
+                                    type: string
+                                  peerExternalIDs:
+                                    additionalProperties:
+                                      type: string
+                                    description: PeerExternalIDs are the external
+                                      IDs used to identify the peer patch port.
+                                    type: object
+                                  peerPatchName:
+                                    description: |-
+                                      PeerPatchName is the name of the patch port on the peer bridge.
+                                      If not set, it is auto-generated in the format: `p_<bridgeA>_to_<bridgeB>_<hash>`
+                                      where bridge names have hyphens removed and `<hash>` is an 8-character FNV-1a hash
+                                      derived from the ServiceInterface's namespace/name.
+                                      Example: p_brovn_to_brsfc_7aea60f7 (for bridges br-ovn and br-sfc).
+                                    type: string
+                                required:
+                                - peerBridge
+                                type: object
                               pf:
                                 description: The PF definition
                                 properties:
+                                  nicSelector:
+                                    description: NICSelector defines the NIC selected
+                                      for the PF interface
+                                    properties:
+                                      controllerNumber:
+                                        description: |-
+                                          ControllerNumber specifies the controller number that will be used to find the matching representor on the DPU.
+                                          A value of 0 targets the local controller, >=1 targets external controllers with the specified number. If unspecified controller number 1 is used.
+                                          In case of a DPU/NIC with socket direct or MultiHost, the user should specify the controller number explicitly
+                                        format: int32
+                                        maximum: 255
+                                        minimum: 0
+                                        type: integer
+                                      pci:
+                                        description: PCI is the PCI selector. valid
+                                          only for selector type pci
+                                        properties:
+                                          address:
+                                            description: Address is the PCI address
+                                              of any of the NIC's Embedded CPU PFs
+                                              (ECPFs)
+                                            pattern: ^[0-9a-f]{4}:[0-9a-f]{2}:[0-1][0-9a-f]\.[0-7]{1}$
+                                            type: string
+                                        required:
+                                        - address
+                                        type: object
+                                      type:
+                                        description: Type is the type of selector
+                                          to be used to identify the NIC.
+                                        enum:
+                                        - dpu
+                                        - pci
+                                        type: string
+                                    required:
+                                    - type
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: for type=pci, pci must be set
+                                      rule: (self.type == 'dpu') || (self.type ==
+                                        'pci' && has(self.pci))
                                   pfID:
                                     description: The PF ID
+                                    maximum: 255
+                                    minimum: 0
                                     type: integer
                                   virtualNetwork:
                                     description: VirtualNetwork is the VirtualNetwork
@@ -254,6 +374,8 @@ spec:
                                 properties:
                                   interfaceName:
                                     description: The interface name
+                                    maxLength: 15
+                                    minLength: 1
                                     type: string
                                   network:
                                     description: |-
@@ -280,14 +402,58 @@ spec:
                               vf:
                                 description: The VF definition
                                 properties:
+                                  nicSelector:
+                                    description: NICSelector defines the NIC selected
+                                      for the VF interface
+                                    properties:
+                                      controllerNumber:
+                                        description: |-
+                                          ControllerNumber specifies the controller number that will be used to find the matching representor on the DPU.
+                                          A value of 0 targets the local controller, >=1 targets external controllers with the specified number. If unspecified controller number 1 is used.
+                                          In case of a DPU/NIC with socket direct or MultiHost, the user should specify the controller number explicitly
+                                        format: int32
+                                        maximum: 255
+                                        minimum: 0
+                                        type: integer
+                                      pci:
+                                        description: PCI is the PCI selector. valid
+                                          only for selector type pci
+                                        properties:
+                                          address:
+                                            description: Address is the PCI address
+                                              of any of the NIC's Embedded CPU PFs
+                                              (ECPFs)
+                                            pattern: ^[0-9a-f]{4}:[0-9a-f]{2}:[0-1][0-9a-f]\.[0-7]{1}$
+                                            type: string
+                                        required:
+                                        - address
+                                        type: object
+                                      type:
+                                        description: Type is the type of selector
+                                          to be used to identify the NIC.
+                                        enum:
+                                        - dpu
+                                        - pci
+                                        type: string
+                                    required:
+                                    - type
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: for type=pci, pci must be set
+                                      rule: (self.type == 'dpu') || (self.type ==
+                                        'pci' && has(self.pci))
                                   parentInterfaceRef:
                                     description: The parent interface reference
                                     type: string
                                   pfID:
                                     description: The PF ID
+                                    maximum: 255
+                                    minimum: 0
                                     type: integer
                                   vfID:
                                     description: The VF ID
+                                    maximum: 255
+                                    minimum: 0
                                     type: integer
                                   virtualNetwork:
                                     description: VirtualNetwork is the VirtualNetwork
@@ -319,17 +485,14 @@ spec:
                             - interfaceType
                             type: object
                             x-kubernetes-validations:
-                            - message: '`for interfaceType=vlan, vlan must be set;
-                                for interfaceType=pf, pf must be set; for interfaceType=vf,
-                                vf must be set; for interfaceType=physical, physical
-                                must be set; for interfaceType=service, service must
-                                be set`'
+                            - messageExpression: '''for interfaceType='' + self.interfaceType
+                                + '', '' + self.interfaceType + '' must be set'''
                               rule: (self.interfaceType == 'vlan' && has(self.vlan))
                                 || (self.interfaceType == 'pf' && has(self.pf)) ||
                                 (self.interfaceType == 'vf' && has(self.vf)) || (self.interfaceType
                                 == 'physical' && has(self.physical)) || (self.interfaceType
                                 == 'service' && has(self.service)) || (self.interfaceType
-                                == 'ovn')
+                                == 'ovn') || (self.interfaceType == 'patch' && has(self.patch))
                         required:
                         - spec
                         type: object

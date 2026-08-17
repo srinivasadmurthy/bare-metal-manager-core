@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -22,12 +22,16 @@ use std::sync::Arc;
 use std::time::{self, Duration};
 
 use ::carbide_utils::HostPortPair;
-use ::machine_a_tron::{BmcMockRegistry, HostMachineHandle, MachineATronConfig, MachineConfig};
+use ::machine_a_tron::{
+    BmcMockRegistry, DeviceHandle, DhcpType, MachineATronConfig, MachineConfig,
+};
+use api_test_helper::utils::TestApiServerArgs;
 use api_test_helper::{
     IntegrationTestEnvironment, domain, instance, machine, metrics, subnet, tenant, utils, vpc,
     vpc_prefix,
 };
-use bmc_mock::{HostHardwareType, ListenerOrAddress};
+use bmc_mock::test_support::TEST_MAC_POOL;
+use bmc_mock::{HardwareType, ListenerOrAddress};
 use eyre::ContextCompat;
 use futures::FutureExt;
 use futures::future::join_all;
@@ -36,7 +40,7 @@ use sqlx::{Postgres, Row};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn setup() {
     api_test_helper::setup_logging()
 }
@@ -47,14 +51,12 @@ async fn test_integration() -> eyre::Result<()> {
     // NOTE: These tests run two carbide-api servers, and the clients are configured to randomly
     // switch between them on every API call. This helps prevent issues that arise when multiple API
     // severs may be running in production.
-    let Some(test_env) =
+    let Some(mut test_env) =
         IntegrationTestEnvironment::try_from_environment(2, "api_server_test_integration").await?
     else {
         println!("test_integration: SKIPPED (set REPO_ROOT and DATABASE_URL to run)");
         return Ok(());
     };
-
-    let carbide_api_addrs = &test_env.carbide_api_addrs;
 
     let bmc_address_registry = BmcMockRegistry::default();
     let certs_dir = PathBuf::from(format!("{}/crates/bmc-mock", test_env.root_dir.display()));
@@ -78,32 +80,43 @@ async fn test_integration() -> eyre::Result<()> {
     // Begin the integration test by starting an API server. This will be shared between multiple
     // individual machine-a-tron-based tests, which can run in parallel against the same instance.
     let cancel_token = CancellationToken::new();
-    let (server_handle_1, server_handle_2) = (
-        utils::start_api_server(
-            test_env.clone(),
-            Some(HostPortPair::HostAndPort(
+    let server_handle_1 = utils::start_api_server(
+        &mut test_env,
+        TestApiServerArgs {
+            bmc_proxy: Some(HostPortPair::HostAndPort(
                 "127.0.0.1".to_string(),
                 bmc_mock_handle.address.port(),
             )),
-            empty_firmware_dir.path().to_owned(),
-            0,
-            true,
-            cancel_token.clone(),
-        )
-        .await?,
-        utils::start_api_server(
-            test_env.clone(),
-            Some(HostPortPair::HostAndPort(
+            firmware_directory: empty_firmware_dir.path().to_owned(),
+            addr_index: 0,
+            put_dev_bin_in_path: true,
+            insecure_discovery: true,
+        },
+        cancel_token.clone(),
+    )
+    .await?;
+    let server_handle_2 = utils::start_api_server(
+        &mut test_env,
+        TestApiServerArgs {
+            bmc_proxy: Some(HostPortPair::HostAndPort(
                 "127.0.0.1".to_string(),
                 bmc_mock_handle.address.port(),
             )),
-            empty_firmware_dir.path().to_owned(),
-            1,
-            true,
-            cancel_token.clone(),
-        )
-        .await?,
+            firmware_directory: empty_firmware_dir.path().to_owned(),
+            addr_index: 1,
+            put_dev_bin_in_path: true,
+            insecure_discovery: true,
+        },
+        cancel_token.clone(),
+    )
+    .await?;
+
+    assert_ne!(test_env.carbide_api_addrs[0], test_env.carbide_api_addrs[1]);
+    assert_ne!(
+        test_env.carbide_metrics_addrs[0],
+        test_env.carbide_metrics_addrs[1]
     );
+    let carbide_api_addrs = &test_env.carbide_api_addrs;
 
     let tenant_org_id = "tenant_organization";
     tenant::create(carbide_api_addrs, tenant_org_id, "Tenant Organization").await?;
@@ -111,7 +124,12 @@ async fn test_integration() -> eyre::Result<()> {
     let domain_id = domain::create(carbide_api_addrs, "tenant-1.local").await?;
     let managed_segment_id =
         subnet::create(carbide_api_addrs, &tenant1_vpc, &domain_id, 10, false).await?;
-    subnet::create(carbide_api_addrs, &tenant1_vpc, &domain_id, 11, true).await?;
+
+    // HostInband segments must live in a Flat VPC -- those VPC types are
+    // mutually bound. Create one for the HostInband fixture.
+    let flat_vpc = vpc::create_flat(carbide_api_addrs, tenant_org_id).await?;
+    let host_inband_segment_id =
+        subnet::create(carbide_api_addrs, &flat_vpc, &domain_id, 11, true).await?;
 
     // Create FNN VPC + VPC prefixes (IPv4 + IPv6) for dual-stack L3 linknet testing.
     let fnn_vpc = vpc::create_fnn(carbide_api_addrs, tenant_org_id).await?;
@@ -127,7 +145,7 @@ async fn test_integration() -> eyre::Result<()> {
     // Run several tests in parallel.
     let all_tests = join_all([
         test_machine_a_tron_multidpu(
-            HostHardwareType::DellPowerEdgeR750,
+            HardwareType::DellPowerEdgeR750,
             &test_env,
             &bmc_address_registry,
             &managed_segment_id,
@@ -136,7 +154,7 @@ async fn test_integration() -> eyre::Result<()> {
         )
         .boxed(),
         test_machine_a_tron_multidpu(
-            HostHardwareType::NvidiaDgxH100,
+            HardwareType::NvidiaDgxH100,
             &test_env,
             &bmc_address_registry,
             &managed_segment_id,
@@ -145,7 +163,34 @@ async fn test_integration() -> eyre::Result<()> {
         )
         .boxed(),
         test_machine_a_tron_multidpu(
-            HostHardwareType::WiwynnGB200Nvl,
+            HardwareType::WiwynnGB200Nvl,
+            &test_env,
+            &bmc_address_registry,
+            &managed_segment_id,
+            // Relay IP in admin net
+            Ipv4Addr::new(172, 20, 0, 2),
+        )
+        .boxed(),
+        test_machine_a_tron_multidpu(
+            HardwareType::LenovoGB300Nvl,
+            &test_env,
+            &bmc_address_registry,
+            &managed_segment_id,
+            // Relay IP in admin net
+            Ipv4Addr::new(172, 20, 0, 2),
+        )
+        .boxed(),
+        test_machine_a_tron_multidpu(
+            HardwareType::NvidiaDgxGb300,
+            &test_env,
+            &bmc_address_registry,
+            &managed_segment_id,
+            // Relay IP in admin net
+            Ipv4Addr::new(172, 20, 0, 2),
+        )
+        .boxed(),
+        test_machine_a_tron_multidpu(
+            HardwareType::SupermicroGb300Nvl,
             &test_env,
             &bmc_address_registry,
             &managed_segment_id,
@@ -154,25 +199,54 @@ async fn test_integration() -> eyre::Result<()> {
         )
         .boxed(),
         test_machine_a_tron_zerodpu(
-            HostHardwareType::DellPowerEdgeR750,
+            HardwareType::DellPowerEdgeR750,
             &test_env,
             &bmc_address_registry,
-            // Relay IP in host-inband net
-            Ipv4Addr::new(10, 10, 11, 2),
+            &flat_vpc,
         )
         .boxed(),
-        test_machine_a_tron_singledpu_nic_mode(
-            HostHardwareType::DellPowerEdgeR750,
+        test_machine_a_tron_nic_mode(
+            HardwareType::DellPowerEdgeR750,
             &test_env,
             &bmc_address_registry,
-            // Relay IP in host-inband  net
-            Ipv4Addr::new(10, 10, 11, 2),
+            &flat_vpc,
+            &host_inband_segment_id,
         )
         .boxed(),
+        test_machine_a_tron_nic_mode(
+            HardwareType::HpeProliantDl380aGen11,
+            &test_env,
+            &bmc_address_registry,
+            &flat_vpc,
+            &host_inband_segment_id,
+        )
+        .boxed(),
+        test_machine_a_tron_nic_mode(
+            HardwareType::WiwynnGB200Nvl,
+            &test_env,
+            &bmc_address_registry,
+            &flat_vpc,
+            &host_inband_segment_id,
+        )
+        .boxed(),
+        test_machine_a_tron_nic_mode(
+            HardwareType::SupermicroGb300Nvl,
+            &test_env,
+            &bmc_address_registry,
+            &flat_vpc,
+            &host_inband_segment_id,
+        )
+        .boxed(),
+        // TODO: https://github.com/NVIDIA/infra-controller/issues/3709
+        // Re-enable `test_machine_a_tron_dpu_to_nic_mode_reregistration` after the
+        // Admin-to-HostInband re-ingestion race is fixed. The scenario currently flakes in CI when
+        // the host-facing DPU MAC is re-created on the Admin segment before the NIC-mode
+        // transition completes.
         test_machine_a_tron_dual_stack(
-            HostHardwareType::DellPowerEdgeR750,
+            HardwareType::DellPowerEdgeR750,
             &test_env,
             &bmc_address_registry,
+            tenant_org_id,
             &v4_vpc_prefix_id,
             &v6_vpc_prefix_id,
             // Relay IP in admin net
@@ -180,7 +254,7 @@ async fn test_integration() -> eyre::Result<()> {
         )
         .boxed(),
         test_machine_a_tron_dual_stack_l2(
-            HostHardwareType::DellPowerEdgeR750,
+            HardwareType::DellPowerEdgeR750,
             &test_env,
             &bmc_address_registry,
             &dual_stack_l2_segment_id,
@@ -208,22 +282,30 @@ async fn test_integration() -> eyre::Result<()> {
 }
 
 fn generate_core_metric_docs(metrics_endpoints: &[SocketAddr]) {
-    let infos = metrics::collect_metric_infos(metrics_endpoints).unwrap();
+    let mut infos = metrics::collect_metric_infos(metrics_endpoints).unwrap();
+    retain_existing_core_metric_infos(&mut infos);
+
     // Delete everything with "alt_metric_" prefix
-    let infos: Vec<_> = infos
+    let mut infos: Vec<_> = infos
         .into_iter()
         .filter(|metric| !metric.name.starts_with("alt_metric"))
         .collect();
-    let mut docs = "# NCX Infra Controller (NICo) core metrics\n\n".to_string();
+
+    // Sort metrics for consistency
+    infos.sort_by(|e1, e2| e1.name.cmp(&e2.name));
+
+    let mut docs = "# NVIDIA Infra Controller (NICo) Core Metrics\n\n".to_string();
     use std::fmt::Write;
 
     use askama_escape::Escaper;
 
     writeln!(
         &mut docs,
-        "This file contains a list of metrics exported by NCX Infra Controller (NICo). \
+        "This file contains a list of metrics exported by NVIDIA Infra Controller (NICo). \
         The list is auto-generated from an integration test (`test_integration`). \
-        Metrics for workflows which are not exercised by the test are missing."
+        Metrics no test exercises are added with `cargo xtask check-metric-docs --fix`. \
+        NVLink partition monitor's metrics are documented in the manual: \
+        [NVLink Partitioning](../manuals/nvlink_partitioning.md#metrics)."
     )
     .unwrap();
     writeln!(&mut docs).unwrap();
@@ -245,7 +327,7 @@ fn generate_core_metric_docs(metrics_endpoints: &[SocketAddr]) {
         write!(&mut docs, "</td>").unwrap();
         writeln!(&mut docs, "</tr>").unwrap();
     }
-    writeln!(&mut docs, "<table>").unwrap();
+    writeln!(&mut docs, "</table>").unwrap();
 
     let path = std::path::Path::new(METRIC_DOC_PATH);
     assert!(
@@ -257,33 +339,78 @@ fn generate_core_metric_docs(metrics_endpoints: &[SocketAddr]) {
     std::fs::write(path, docs).unwrap();
 }
 
+fn retain_existing_core_metric_infos(infos: &mut Vec<metrics::MetricInfo>) {
+    let mut infos_by_name = infos
+        .drain(..)
+        .map(|info| (info.name.clone(), info))
+        .collect::<HashMap<_, _>>();
+
+    for line in std::fs::read_to_string(METRIC_DOC_PATH)
+        .unwrap_or_default()
+        .lines()
+    {
+        if let Some(info) = metrics::MetricInfo::parse_from_docs_line(line) {
+            infos_by_name.entry(info.name.clone()).or_insert(info);
+        }
+    }
+
+    infos.extend(infos_by_name.into_values());
+}
+
+trait ParseFromHtmlDocs {
+    fn parse_from_docs_line(line: &str) -> Option<Self>
+    where
+        Self: Sized;
+}
+
+impl ParseFromHtmlDocs for metrics::MetricInfo {
+    fn parse_from_docs_line(line: &str) -> Option<Self> {
+        let row = line.strip_prefix("<tr><td>")?.strip_suffix("</td></tr>")?;
+        let cells = row.split("</td><td>").collect::<Vec<_>>();
+        let [name, ty, help] = cells.as_slice() else {
+            return None;
+        };
+
+        if *name == "Name" {
+            return None;
+        }
+
+        let unescape_html_cell = |value: &str| -> String {
+            if value.contains('&') {
+                value
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&#39;", "'")
+                    .replace("&quot;", "\"")
+                    .replace("&amp;", "&")
+            } else {
+                value.to_string()
+            }
+        };
+
+        Some(metrics::MetricInfo {
+            name: unescape_html_cell(name),
+            ty: unescape_html_cell(ty),
+            help: unescape_html_cell(help),
+        })
+    }
+}
+
 pub(crate) const METRIC_DOC_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../docs/manuals/metrics/core_metrics.md"
+    "/../../docs/observability/core_metrics.md"
 );
 
 /// Run integration tests with machine-a-tron, asserting on metrics. This has to run as its own
 /// test, to make the values in the metrics buckets predictable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn test_metrics_integration() -> eyre::Result<()> {
-    let Some(test_env) =
+    let Some(mut test_env) =
         IntegrationTestEnvironment::try_from_environment(1, "api_server_test_metrics_integration")
             .await?
     else {
         return Ok(());
     };
-
-    // Save typing...
-    let IntegrationTestEnvironment {
-        carbide_api_addrs,
-        root_dir: _,
-        carbide_metrics_addrs,
-        db_pool,
-        metrics: _,
-        db_url: _,
-        credential_config: _,
-        _vault_handle,
-    } = test_env.clone();
 
     let bmc_address_registry = BmcMockRegistry::default();
     let certs_dir = PathBuf::from(format!("{}/crates/bmc-mock", test_env.root_dir.display()));
@@ -308,24 +435,39 @@ async fn test_metrics_integration() -> eyre::Result<()> {
     // individual machine-a-tron-based tests, which can run in parallel against the same instance.
     let cancel_token = CancellationToken::new();
     let server_handle = utils::start_api_server(
-        test_env.clone(),
-        Some(HostPortPair::HostAndPort(
-            "127.0.0.1".to_string(),
-            bmc_mock_handle.address.port(),
-        )),
-        empty_firmware_dir.path().to_owned(),
-        0,
-        true,
+        &mut test_env,
+        TestApiServerArgs {
+            bmc_proxy: Some(HostPortPair::HostAndPort(
+                "127.0.0.1".to_string(),
+                bmc_mock_handle.address.port(),
+            )),
+            firmware_directory: empty_firmware_dir.path().to_owned(),
+            addr_index: 0,
+            put_dev_bin_in_path: true,
+            insecure_discovery: true,
+        },
         cancel_token.clone(),
     )
     .await?;
+
+    // Save typing after the server has replaced the port-zero placeholders.
+    let IntegrationTestEnvironment {
+        carbide_api_addrs,
+        root_dir: _,
+        carbide_metrics_addrs,
+        db_pool,
+        metrics: _,
+        db_url: _,
+        credential_config: _,
+        _vault_handle,
+    } = test_env.clone();
 
     // Before the initial host bootstrap, the dns_records view
     // should contain 0 entries.
     assert_eq!(0i64, get_dns_record_count(&db_pool).await);
 
-    run_machine_a_tron_test(
-        HostHardwareType::DellPowerEdgeR750,
+    run_machine_a_tron_machine_test(
+        HardwareType::DellPowerEdgeR750,
         1,
         1,
         false,
@@ -374,7 +516,7 @@ async fn test_metrics_integration() -> eyre::Result<()> {
                 let instance_id = instance::create(
                     &carbide_api_addrs,
                     &host_machine_id,
-                    Some(&segment_id),
+                    &segment_id,
                     Some("test"),
                     true,
                     true,
@@ -465,13 +607,13 @@ async fn test_metrics_integration() -> eyre::Result<()> {
 }
 
 async fn test_machine_a_tron_multidpu(
-    hw_type: HostHardwareType,
+    hw_type: HardwareType,
     test_env: &IntegrationTestEnvironment,
     bmc_mock_registry: &BmcMockRegistry,
     segment_id: &str,
     admin_dhcp_relay_address: Ipv4Addr,
 ) -> eyre::Result<()> {
-    run_machine_a_tron_test(
+    run_machine_a_tron_machine_test(
         hw_type,
         1,
         2,
@@ -489,11 +631,14 @@ async fn test_machine_a_tron_multidpu(
                 let machine_id = machine_handle
                     .observed_machine_id()
                     .expect("Machine ID should be set if host is ready");
-                tracing::info!("Machine {machine_id} has made it to Ready, allocating instance");
+                tracing::info!(
+                    machine_id = %machine_id,
+                    "Machine has made it to Ready, allocating instance",
+                );
                 let instance_id = instance::create(
                     carbide_api_addrs,
                     &machine_id,
-                    Some(&segment_id),
+                    &segment_id,
                     None,
                     false,
                     false,
@@ -532,14 +677,18 @@ async fn test_machine_a_tron_multidpu(
                 assert_eq!(gateways.len(), 1);
 
                 tracing::info!(
-                    "Machine {machine_id} has made it to Assigned/Ready, releasing instance"
+                    machine_id = %machine_id,
+                    "Machine has made it to Assigned/Ready, releasing instance",
                 );
                 instance::release(carbide_api_addrs, &machine_id, &instance_id, false).await?;
 
                 machine_handle
                     .wait_until_machine_up_with_api_state("Ready", Duration::from_secs(90))
                     .await?;
-                tracing::info!("Machine {machine_id} has made it to Ready again, all done");
+                tracing::info!(
+                    machine_id = %machine_id,
+                    "Machine has made it to Ready again, all done",
+                );
                 Ok::<(), eyre::Report>(())
             }
         },
@@ -548,21 +697,22 @@ async fn test_machine_a_tron_multidpu(
 }
 
 async fn test_machine_a_tron_zerodpu(
-    hw_type: HostHardwareType,
+    hw_type: HardwareType,
     test_env: &IntegrationTestEnvironment,
     bmc_mock_registry: &BmcMockRegistry,
-    admin_dhcp_relay_address: Ipv4Addr,
+    flat_vpc_id: &str,
 ) -> eyre::Result<()> {
-    run_machine_a_tron_test(
+    run_machine_a_tron_machine_test(
         hw_type,
         1,
         0,
         false,
         test_env,
         bmc_mock_registry,
-        admin_dhcp_relay_address,
+        Ipv4Addr::new(172, 20, 0, 2),
         |machine_handle| {
             let carbide_api_addrs = &test_env.carbide_api_addrs;
+            let flat_vpc_id = flat_vpc_id.to_string();
             async move {
                 machine_handle
                     .wait_until_machine_up_with_api_state("Ready", Duration::from_secs(90))
@@ -570,27 +720,25 @@ async fn test_machine_a_tron_zerodpu(
                 let machine_id = machine_handle
                     .observed_machine_id()
                     .expect("Machine ID should be set if host is ready");
-                tracing::info!("Machine {machine_id} has made it to Ready, allocating instance");
+                tracing::info!(
+                    machine_id = %machine_id,
+                    "Machine has made it to Ready, allocating instance",
+                );
 
-                // Zero-DPU tenants don't pass any network config; the allocator instead
-                // auto-picks a HostInband segment for them (which is covered as part of
-                // the test_zero_dpu_instance_allocation_no_network_config test).
-                let instance_id = instance::create(
+                let instance_id = instance::create_with_auto_host_inband_networking(
                     carbide_api_addrs,
                     &machine_id,
-                    None,
-                    None,
-                    false,
-                    false,
-                    &[],
+                    &flat_vpc_id,
                 )
                 .await?;
 
                 machine_handle
                     .wait_until_machine_up_with_api_state("Assigned/Ready", Duration::from_secs(90))
                     .await?;
+                assert_auto_instance_network(carbide_api_addrs, &instance_id, &flat_vpc_id).await?;
                 tracing::info!(
-                    "Machine {machine_id} has made it to Assigned/Ready, releasing instance"
+                    machine_id = %machine_id,
+                    "Machine has made it to Assigned/Ready, releasing instance",
                 );
 
                 instance::release(carbide_api_addrs, &machine_id, &instance_id, false).await?;
@@ -598,7 +746,10 @@ async fn test_machine_a_tron_zerodpu(
                 machine_handle
                     .wait_until_machine_up_with_api_state("Ready", Duration::from_secs(90))
                     .await?;
-                tracing::info!("Machine {machine_id} has made it to Ready again, all done");
+                tracing::info!(
+                    machine_id = %machine_id,
+                    "Machine has made it to Ready again, all done",
+                );
                 Ok::<(), eyre::Report>(())
             }
         },
@@ -606,22 +757,32 @@ async fn test_machine_a_tron_zerodpu(
     .await
 }
 
-async fn test_machine_a_tron_singledpu_nic_mode(
-    hw_type: HostHardwareType,
+async fn test_machine_a_tron_nic_mode(
+    hw_type: HardwareType,
     test_env: &IntegrationTestEnvironment,
     bmc_mock_registry: &BmcMockRegistry,
-    admin_dhcp_relay_address: Ipv4Addr,
+    flat_vpc_id: &str,
+    host_inband_segment_id: &str,
 ) -> eyre::Result<()> {
-    run_machine_a_tron_test(
+    run_machine_a_tron_machine_test(
         hw_type,
         1,
         1,
         true,
         test_env,
         bmc_mock_registry,
-        admin_dhcp_relay_address,
+        Ipv4Addr::new(172, 20, 0, 2),
         |machine_handle| {
             let carbide_api_addrs = &test_env.carbide_api_addrs;
+            let flat_vpc_id = flat_vpc_id.to_string();
+            let host_inband_segment_id = host_inband_segment_id.to_string();
+            let expected_host_mac = machine_handle
+                .host_info()
+                .dpus
+                .first()
+                .expect("NIC-mode host should contain at least one DPU NIC")
+                .host_mac_address
+                .to_string();
             async move {
                 machine_handle
                     .wait_until_machine_up_with_api_state("Ready", Duration::from_secs(90))
@@ -629,27 +790,33 @@ async fn test_machine_a_tron_singledpu_nic_mode(
                 let machine_id = machine_handle
                     .observed_machine_id()
                     .expect("Machine ID should be set if host is ready");
-                tracing::info!("Machine {machine_id} has made it to Ready, allocating instance");
+                tracing::info!(
+                    machine_id = %machine_id,
+                    "Machine has made it to Ready, allocating instance",
+                );
 
-                // For a DPU in NIC-mode, the DPU is treated as a plain NIC, meaning
-                // allocation goes through HostInband the same way the zero-DPU path
-                // allocation does; no network config, and the allocator auto-picks.
-                let instance_id = instance::create(
+                assert_nic_mode_host(
                     carbide_api_addrs,
                     &machine_id,
-                    None,
-                    None,
-                    false,
-                    false,
-                    &[],
+                    &expected_host_mac,
+                    &host_inband_segment_id,
+                )
+                .await?;
+
+                let instance_id = instance::create_with_auto_host_inband_networking(
+                    carbide_api_addrs,
+                    &machine_id,
+                    &flat_vpc_id,
                 )
                 .await?;
 
                 machine_handle
                     .wait_until_machine_up_with_api_state("Assigned/Ready", Duration::from_secs(90))
                     .await?;
+                assert_auto_instance_network(carbide_api_addrs, &instance_id, &flat_vpc_id).await?;
                 tracing::info!(
-                    "Machine {machine_id} has made it to Assigned/Ready, releasing instance"
+                    machine_id = %machine_id,
+                    "Machine has made it to Assigned/Ready, releasing instance",
                 );
 
                 instance::release(carbide_api_addrs, &machine_id, &instance_id, false).await?;
@@ -657,7 +824,339 @@ async fn test_machine_a_tron_singledpu_nic_mode(
                 machine_handle
                     .wait_until_machine_up_with_api_state("Ready", Duration::from_secs(90))
                     .await?;
-                tracing::info!("Machine {machine_id} has made it to Ready again, all done");
+                tracing::info!(
+                    machine_id = %machine_id,
+                    "Machine has made it to Ready again, all done",
+                );
+                Ok::<(), eyre::Report>(())
+            }
+        },
+    )
+    .await
+}
+
+async fn assert_nic_mode_host(
+    carbide_api_addrs: &[SocketAddr],
+    machine_id: &carbide_uuid::machine::MachineId,
+    expected_host_mac: &str,
+    host_inband_segment_id: &str,
+) -> eyre::Result<()> {
+    let machine = machine::get_json_by_id(carbide_api_addrs, machine_id).await?;
+    let associated_dpus = machine["associatedDpuMachineIds"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    eyre::ensure!(
+        associated_dpus.is_empty(),
+        "NIC-mode host {machine_id} still has associated DPUs: {associated_dpus:?}"
+    );
+
+    let interfaces = machine["interfaces"]
+        .as_array()
+        .ok_or_else(|| eyre::eyre!("NIC-mode host {machine_id} has no interfaces"))?;
+    eyre::ensure!(
+        interfaces
+            .iter()
+            .all(|interface| interface["attachedDpuMachineId"].is_null()),
+        "NIC-mode host {machine_id} still has a DPU-backed interface: {interfaces:?}"
+    );
+
+    let has_expected_primary_host_inband_interface = interfaces.iter().any(|interface| {
+        interface["macAddress"]
+            .as_str()
+            .is_some_and(|mac| mac.eq_ignore_ascii_case(expected_host_mac))
+            && interface["primaryInterface"] == true
+            && interface["segmentId"]["value"] == host_inband_segment_id
+            && interface["interfaceType"] != "INTERFACE_TYPE_BMC"
+    });
+    eyre::ensure!(
+        has_expected_primary_host_inband_interface,
+        "NIC-mode host {machine_id} did not promote DPU host-facing PF {expected_host_mac} as its primary HostInband interface"
+    );
+    Ok(())
+}
+
+async fn assert_auto_instance_network(
+    carbide_api_addrs: &[SocketAddr],
+    instance_id: &str,
+    flat_vpc_id: &str,
+) -> eyre::Result<()> {
+    let instance = instance::get_instance_json_by_id(carbide_api_addrs, instance_id).await?;
+    let network = &instance["config"]["network"];
+    eyre::ensure!(
+        network["auto"] == true,
+        "instance {instance_id} did not retain auto networking: {network}"
+    );
+    eyre::ensure!(
+        network["interfaces"].as_array().is_some_and(Vec::is_empty),
+        "instance {instance_id} exposed resolved interfaces in its external config: {network}"
+    );
+    eyre::ensure!(
+        network["autoConfig"]["vpcId"]["value"] == flat_vpc_id,
+        "instance {instance_id} did not retain flat VPC {flat_vpc_id}: {network}"
+    );
+
+    let status_interfaces = instance["status"]["network"]["interfaces"]
+        .as_array()
+        .ok_or_else(|| eyre::eyre!("instance {instance_id} has no network status interfaces"))?;
+    eyre::ensure!(
+        !status_interfaces.is_empty()
+            && status_interfaces.iter().all(|interface| {
+                interface["vpcId"]["value"] == flat_vpc_id
+                    && interface["macAddress"]
+                        .as_str()
+                        .is_some_and(|mac| !mac.is_empty())
+                    && interface["addresses"]
+                        .as_array()
+                        .is_some_and(|values| !values.is_empty())
+                    && interface["gateways"]
+                        .as_array()
+                        .is_some_and(|values| !values.is_empty())
+                    && interface["prefixes"]
+                        .as_array()
+                        .is_some_and(|values| !values.is_empty())
+            }),
+        "instance {instance_id} status does not contain resolved flat VPC networking: {status_interfaces:?}"
+    );
+    eyre::ensure!(
+        instance["status"]["network"]["configsSynced"] == "SYNCED",
+        "instance {instance_id} network status is not synced: {}",
+        instance["status"]["network"]
+    );
+    Ok(())
+}
+
+/// DPU-mode -> NIC-mode flip + zero-DPU re-ingestion (machine-a-tron harness,
+/// #2661 / #2632). A host boots as a managed-DPU machine, an operator declares
+/// NIC mode and force-deletes it with `--delete-interfaces`, and the host
+/// re-ingests with no managed DPUs -- exercising the simulated BlueField flip
+/// (`Mode.Set` staged, applied on power-cycle), the host converging off its DPU
+/// DHCP relay and dropping the DPU from its inventory, and site-explorer
+/// re-registering the host with zero managed DPUs.
+///
+/// Asserts the re-ingest milestone directly against the database -- the host's
+/// (stable, TPM-derived) machine row returns with its data-plane NIC and no
+/// managed DPU -- then drives the re-ingested NIC-mode host all the way to Ready.
+#[expect(dead_code, reason = "temporarily disabled due to a CI race")]
+async fn test_machine_a_tron_dpu_to_nic_mode_reregistration(
+    hw_type: HardwareType,
+    test_env: &IntegrationTestEnvironment,
+    bmc_mock_registry: &BmcMockRegistry,
+    admin_dhcp_relay_address: Ipv4Addr,
+) -> eyre::Result<()> {
+    run_machine_a_tron_machine_test(
+        hw_type,
+        1,
+        1,
+        // Start in DPU mode: the host comes up as a managed-DPU machine, and we
+        // flip it to NIC mode below.
+        false,
+        test_env,
+        bmc_mock_registry,
+        admin_dhcp_relay_address,
+        |machine_handle| {
+            let carbide_api_addrs = &test_env.carbide_api_addrs;
+            async move {
+                // 1. Host reaches Ready as a managed-DPU machine.
+                machine_handle
+                    .wait_until_machine_up_with_api_state("Ready", Duration::from_secs(90))
+                    .await?;
+                let bmc_mac = machine_handle.host_info().bmc_mac_address.to_string();
+                let initial_machine_id = machine_handle
+                    .observed_machine_id()
+                    .expect("Machine ID should be set if host is ready");
+                tracing::info!(
+                    initial_machine_id = %initial_machine_id,
+                    bmc_mac_address = %bmc_mac,
+                    "Machine is Ready in DPU mode; flipping to NIC mode",
+                );
+
+                // 2. Flip the ExpectedMachine to NIC mode. Get the current record,
+                //    set the stable Forge `dpu_mode` field (translated to
+                //    HostDpuPolicy internally), and round-trip the full message
+                //    back through UpdateExpectedMachine. This is the same
+                //    get-mutate-update flow the admin CLI uses.
+                let get_req = serde_json::json!({ "bmc_mac_address": bmc_mac });
+                let expected_machine_json =
+                    api_test_helper::grpcurl::grpcurl(carbide_api_addrs, "GetExpectedMachine", Some(&get_req))
+                        .await?;
+                let mut expected_machine: serde_json::Value =
+                    serde_json::from_str(&expected_machine_json)?;
+                expected_machine["dpu_mode"] = serde_json::json!("NIC_MODE");
+                api_test_helper::grpcurl::grpcurl(
+                    carbide_api_addrs,
+                    "UpdateExpectedMachine",
+                    Some(&expected_machine),
+                )
+                .await?;
+                tracing::info!(
+                    bmc_mac_address = %bmc_mac,
+                    "ExpectedMachine for now declares NIC mode",
+                );
+
+                // 3. Force-delete the managed-DPU machine so site-explorer
+                //    re-ingests the host under the new declared mode. This is the
+                //    issue's `force-delete --delete-interfaces`: it removes the host
+                //    + DPU machine rows, their interfaces, and their explored-endpoint
+                //    records, so site-explorer rediscovers and re-ingests from scratch.
+                //
+                //    Query by the host's MachineId: `host_query` resolves a
+                //    data-plane MAC or a machine id, but not a BMC MAC
+                //    (`find_by_mac_address` excludes BMC interfaces), so the BMC MAC
+                //    used for the ExpectedMachine lookups above would not match here.
+                let force_delete_req = serde_json::json!({
+                    "host_query": initial_machine_id,
+                    "delete_interfaces": true,
+                });
+                api_test_helper::grpcurl::grpcurl(
+                    carbide_api_addrs,
+                    "AdminForceDeleteMachine",
+                    Some(&force_delete_req),
+                )
+                .await?;
+                tracing::info!(
+                    initial_machine_id = %initial_machine_id,
+                    "Force-deleted machine; awaiting re-ingestion as NicMode",
+                );
+
+                // 4. Wait for the physical host to re-ingest as a zero-managed-DPU
+                //    machine, asserted directly against the database. Zero-DPU
+                //    ingestion initially mints an `fm100ps...` predicted host ID
+                //    from the host serial. Later host discovery supplies the TPM
+                //    identity and atomically promotes that row back to its stable
+                //    `fm100ht...` ID. Follow the BMC MAC across that rename instead
+                //    of requiring promotion to have happened before declaring the
+                //    re-ingestion milestone complete.
+                let host_id = initial_machine_id.to_string();
+                let pool = &test_env.db_pool;
+                let reingest_deadline = time::Instant::now() + Duration::from_secs(180);
+                loop {
+                    // The machine ID may still be predicted here. The BMC MAC is
+                    // the stable physical identity throughout re-ingestion.
+                    let current_host_id: Option<String> = sqlx::query_scalar(
+                        "SELECT machine_id FROM machine_interfaces \
+                         WHERE interface_type = 'Bmc' \
+                         AND machine_id IS NOT NULL \
+                         AND mac_address = $1::macaddr",
+                    )
+                    .bind(&bmc_mac)
+                    .fetch_optional(pool)
+                    .await?;
+                    // It re-ingested with at least one data-plane (non-BMC) NIC.
+                    let nic_count: i64 = if let Some(current_host_id) = &current_host_id {
+                        sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM machine_interfaces \
+                             WHERE machine_id = $1 AND interface_type != 'Bmc'",
+                        )
+                        .bind(current_host_id)
+                        .fetch_one(pool)
+                        .await?
+                    } else {
+                        0
+                    };
+                    // Zero managed DPUs: no data-plane interface still points at a
+                    // DPU (any non-null `attached_dpu_machine_id`), so the BlueField
+                    // flipped to NIC mode and is no longer managed. Count attachments
+                    // directly instead of joining `machines`, so a stale attachment
+                    // pointing at an already-deleted DPU row still counts.
+                    let managed_dpu_count: i64 = if let Some(current_host_id) = &current_host_id {
+                        sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM machine_interfaces \
+                             WHERE machine_id = $1 \
+                             AND interface_type != 'Bmc' \
+                             AND attached_dpu_machine_id IS NOT NULL",
+                        )
+                        .bind(current_host_id)
+                        .fetch_one(pool)
+                        .await?
+                    } else {
+                        0
+                    };
+
+                    if let Some(current_host_id) = &current_host_id
+                        && nic_count >= 1
+                        && managed_dpu_count == 0
+                    {
+                        tracing::info!(
+                            host_machine_id = %current_host_id,
+                            stable_host_machine_id = %host_id,
+                            nic_interface_count = nic_count,
+                            "Host re-ingested as a zero-managed-DPU machine; DPU-to-NIC flip applied",
+                        );
+                        break;
+                    }
+                    if time::Instant::now() >= reingest_deadline {
+                        panic!(
+                            "host with BMC MAC {bmc_mac} did not re-ingest as a zero-managed-DPU \
+                             NicMode machine within the timeout (stable_host_id={host_id}, \
+                             current_host_id={current_host_id:?}, nic_count={nic_count}, \
+                             managed_dpu_count={managed_dpu_count})"
+                        );
+                    }
+                    sleep(Duration::from_secs(2)).await;
+                }
+
+                // 5. Drive the re-ingested NicMode host all the way to Ready and
+                //    verify that discovery promoted its predicted ID back to the
+                //    original stable TPM-derived ID. The host BMC now serves an
+                //    event log so the controller's
+                //    restart verification can confirm reboots, and the zero-DPU
+                //    lockdown short-circuit lets it skip the DPU-down wait.
+                tracing::info!(
+                    host_machine_id = %host_id,
+                    "Waiting for re-ingested NicMode host to reach Ready",
+                );
+                let ready_deadline = time::Instant::now() + Duration::from_secs(240);
+                loop {
+                    let current_host_id: Option<String> = sqlx::query_scalar(
+                        "SELECT machine_id FROM machine_interfaces \
+                         WHERE interface_type = 'Bmc' \
+                         AND machine_id IS NOT NULL \
+                         AND mac_address = $1::macaddr",
+                    )
+                    .bind(&bmc_mac)
+                    .fetch_optional(pool)
+                    .await?;
+                    let Some(current_host_id) = current_host_id else {
+                        if time::Instant::now() >= ready_deadline {
+                            panic!(
+                                "re-ingested NicMode host with BMC MAC {bmc_mac} disappeared \
+                                 before reaching Ready"
+                            );
+                        }
+                        sleep(Duration::from_secs(2)).await;
+                        continue;
+                    };
+                    let resp = api_test_helper::grpcurl::grpcurl(
+                        carbide_api_addrs,
+                        "FindMachinesByIds",
+                        Some(&serde_json::json!({ "machine_ids": [{"id": current_host_id}] })),
+                    )
+                    .await?;
+                    let resp: serde_json::Value = serde_json::from_str(&resp)?;
+                    let state = resp["machines"][0]["state"].as_str().unwrap_or("");
+                    if state == "Ready" {
+                        eyre::ensure!(
+                            current_host_id == host_id,
+                            "re-ingested NicMode host reached ready without promotion to its \
+                             original stable ID (current={current_host_id}, expected={host_id})"
+                        );
+                        tracing::info!(
+                            host_machine_id = %current_host_id,
+                            machine_state = state,
+                            "Re-ingested NicMode host reached Ready",
+                        );
+                        break;
+                    }
+                    if time::Instant::now() >= ready_deadline {
+                        panic!(
+                            "Re-ingested NicMode host with BMC MAC {bmc_mac} did not reach Ready \
+                             within the timeout (current_host_id={current_host_id}, \
+                             stable_host_id={host_id}, last_state={state})"
+                        );
+                    }
+                    sleep(Duration::from_secs(2)).await;
+                }
                 Ok::<(), eyre::Report>(())
             }
         },
@@ -666,14 +1165,15 @@ async fn test_machine_a_tron_singledpu_nic_mode(
 }
 
 async fn test_machine_a_tron_dual_stack(
-    hw_type: HostHardwareType,
+    hw_type: HardwareType,
     test_env: &IntegrationTestEnvironment,
     bmc_mock_registry: &BmcMockRegistry,
+    tenant_organization_id: &str,
     v4_vpc_prefix_id: &str,
     v6_vpc_prefix_id: &str,
     admin_dhcp_relay_address: Ipv4Addr,
 ) -> eyre::Result<()> {
-    run_machine_a_tron_test(
+    run_machine_a_tron_machine_test(
         hw_type,
         1,
         1,
@@ -684,6 +1184,7 @@ async fn test_machine_a_tron_dual_stack(
         |machine_handle| {
             let v4_prefix_id = v4_vpc_prefix_id.to_string();
             let v6_prefix_id = v6_vpc_prefix_id.to_string();
+            let tenant_organization_id = tenant_organization_id.to_string();
             let carbide_api_addrs = &test_env.carbide_api_addrs;
             async move {
                 machine_handle
@@ -693,11 +1194,13 @@ async fn test_machine_a_tron_dual_stack(
                     .observed_machine_id()
                     .expect("Machine ID should be set if host is ready");
                 tracing::info!(
-                    "Machine {machine_id} is Ready, allocating dual-stack instance via ipv6 config"
+                    machine_id = %machine_id,
+                    "Machine is Ready, allocating dual-stack instance via ipv6 config",
                 );
                 let instance_id = instance::create_with_vpc_prefixes(
                     carbide_api_addrs,
                     &machine_id,
+                    &tenant_organization_id,
                     &[&v4_prefix_id, &v6_prefix_id],
                 )
                 .await?;
@@ -751,7 +1254,9 @@ async fn test_machine_a_tron_dual_stack(
                 );
 
                 tracing::info!(
-                    "Machine {machine_id} dual-stack allocation verified: addresses = {addr_strings:?}"
+                    machine_id = %machine_id,
+                    addresses = ?addr_strings,
+                    "Machine dual-stack allocation verified",
                 );
 
                 instance::release(carbide_api_addrs, &machine_id, &instance_id, false)
@@ -761,7 +1266,8 @@ async fn test_machine_a_tron_dual_stack(
                     .wait_until_machine_up_with_api_state("Ready", Duration::from_secs(90))
                     .await?;
                 tracing::info!(
-                    "Machine {machine_id} back to Ready after dual-stack release"
+                    machine_id = %machine_id,
+                    "Machine back to Ready after dual-stack release",
                 );
                 Ok::<(), eyre::Report>(())
             }
@@ -774,13 +1280,13 @@ async fn test_machine_a_tron_dual_stack(
 /// The segment is pre-created with both IPv4 and IPv6 prefixes, and the
 /// handler allocates SVI IPs for both. Instances get one IP per prefix.
 async fn test_machine_a_tron_dual_stack_l2(
-    hw_type: HostHardwareType,
+    hw_type: HardwareType,
     test_env: &IntegrationTestEnvironment,
     bmc_mock_registry: &BmcMockRegistry,
     dual_stack_segment_id: &str,
     admin_dhcp_relay_address: Ipv4Addr,
 ) -> eyre::Result<()> {
-    run_machine_a_tron_test(
+    run_machine_a_tron_machine_test(
         hw_type,
         1,
         1,
@@ -799,12 +1305,13 @@ async fn test_machine_a_tron_dual_stack_l2(
                     .observed_machine_id()
                     .expect("Machine ID should be set if host is ready");
                 tracing::info!(
-                    "Machine {machine_id} is Ready, allocating dual-stack L2 instance"
+                    machine_id = %machine_id,
+                    "Machine is Ready, allocating dual-stack L2 instance",
                 );
                 let instance_id = instance::create(
                     carbide_api_addrs,
                     &machine_id,
-                    Some(&segment_id),
+                    &segment_id,
                     None,
                     false,
                     false,
@@ -820,17 +1327,18 @@ async fn test_machine_a_tron_dual_stack_l2(
                     .await?;
 
                 tracing::info!(
-                    "Machine {machine_id} dual-stack L2 instance allocated and reached Assigned/Ready"
+                    machine_id = %machine_id,
+                    "Machine dual-stack L2 instance allocated and reached Assigned/Ready",
                 );
 
-                instance::release(carbide_api_addrs, &machine_id, &instance_id, false)
-                    .await?;
+                instance::release(carbide_api_addrs, &machine_id, &instance_id, false).await?;
 
                 machine_handle
                     .wait_until_machine_up_with_api_state("Ready", Duration::from_secs(90))
                     .await?;
                 tracing::info!(
-                    "Machine {machine_id} back to Ready after dual-stack L2 release"
+                    machine_id = %machine_id,
+                    "Machine back to Ready after dual-stack L2 release",
                 );
                 Ok::<(), eyre::Report>(())
             }
@@ -840,8 +1348,8 @@ async fn test_machine_a_tron_dual_stack_l2(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_machine_a_tron_test<F, O>(
-    hw_type: HostHardwareType,
+async fn run_machine_a_tron_machine_test<F, O>(
+    hw_type: HardwareType,
     host_count: u32,
     dpu_per_host_count: u32,
     dpus_in_nic_mode: bool,
@@ -851,34 +1359,33 @@ async fn run_machine_a_tron_test<F, O>(
     run_assertions: F,
 ) -> eyre::Result<()>
 where
-    F: Fn(HostMachineHandle) -> O,
+    F: Fn(DeviceHandle) -> O,
     O: Future<Output = eyre::Result<()>>,
 {
     let api_addr = test_env
         .carbide_api_addrs
         .first()
         .copied()
-        .context("No carbide API addresses configured")?;
+        .context("no carbide API addresses configured")?;
     let additional_api_urls = test_env.carbide_api_addrs[1..]
         .iter()
         .map(|a| format!("https://{}:{}", a.ip(), a.port()))
         .collect();
     let mat_config = MachineATronConfig {
+        racks: BTreeMap::new(),
         machines: BTreeMap::from([(
             "config".to_string(),
             Arc::new(MachineConfig {
+                rack_id: None,
                 hw_type,
                 host_count,
                 dpu_per_host_count,
                 dpu_reboot_delay: 1,
                 host_reboot_delay: 1,
-                template_dir: test_env
-                    .root_dir
-                    .join("crates/machine-a-tron/templates")
-                    .to_str()
-                    .unwrap()
-                    .to_string(),
                 admin_dhcp_relay_address,
+                // Keep this distinct from the Admin relay so NIC-mode tests
+                // fail if machine-a-tron sends host DHCP through Admin.
+                host_inband_dhcp_relay_address: Some(Ipv4Addr::new(10, 10, 11, 2)),
                 oob_dhcp_relay_address: Ipv4Addr::new(172, 20, 1, 1),
                 vpc_count: 0,
                 subnets_per_vpc: 0,
@@ -889,39 +1396,52 @@ where
                 network_virtualization_type: None,
                 dpus_in_nic_mode,
                 dpu_firmware_versions: None,
+                host_firmware_versions: None,
                 dpu_agent_version: None,
             }),
         )]),
         carbide_api_url: format!("https://{}:{}", api_addr.ip(), api_addr.port()),
+        dhcp: DhcpType::Api {},
         log_file: None,
-        use_pxe_api: true,
-        pxe_server_host: None,
-        pxe_server_port: None,
         bmc_mock_port: 0, // unused, we're using dynamic ports on localhost
+        bmc_mock_certs_dir: None,
         interface: String::from("UNUSED"), // unused, we're using dynamic ports on localhost
         tui_enabled: false,
         use_single_bmc_mock: false, // unused, we're constructing machines ourselves
         configure_carbide_bmc_proxy_host: None,
         persist_dir: None,
         cleanup_on_quit: false,
+        register_expected_machines: true,
+        host_bmc_password: None,
+        dpu_bmc_password: None,
         api_refresh_interval: Duration::from_millis(500),
         mock_bmc_ssh_server: false,
         mock_bmc_ssh_port: None,
+        enable_ipmi_simulation: false,
+        ipmi_reachable_port: None,
+        hw_mac_address_ranges: None,
+        mac_address_pool: None,
+        ufm_mock: Default::default(),
     };
 
-    let (machine_handles, _mat_handle) = api_test_helper::machine_a_tron::run_local(
+    let (provisionable_handles, mat_handle) = api_test_helper::machine_a_tron::run_local(
         mat_config,
         additional_api_urls,
         &test_env.root_dir,
         Some(bmc_mock_registry.clone()),
+        TEST_MAC_POOL.clone(),
     )
     .await
     .unwrap();
 
-    let results = join_all(machine_handles.into_iter().map(run_assertions)).await;
-    assert_eq!(results.len(), host_count as usize);
+    let results = join_all(provisionable_handles.into_iter().map(run_assertions)).await;
+    let result_count = results.len();
+    let assertion_result: eyre::Result<()> = results.into_iter().try_collect();
+    let shutdown_result = mat_handle.shutdown().await;
 
-    results.into_iter().try_collect()
+    assert_eq!(result_count, host_count as usize);
+    assertion_result?;
+    shutdown_result
 }
 
 // Get the current number of rows in the dns_records view,

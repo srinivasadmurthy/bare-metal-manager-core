@@ -15,20 +15,51 @@
  * limitations under the License.
  */
 
+mod discovery;
+mod entity_metrics;
 mod firmware;
+mod gpu_inventory;
+pub(crate) mod inventory;
+mod leak_detector;
 mod logs;
+mod nmxc;
+mod nmxc_schema_override;
 mod nmxt;
 mod nvue;
+#[cfg(test)]
+pub(in crate::collectors) mod projection_test_support;
+mod reachability;
 mod runtime;
 mod sensors;
+mod telemetry;
 
+pub use discovery::{EntityDiscoveryCollector, EntityDiscoveryCollectorConfig};
+pub use entity_metrics::{MetricsCollector, MetricsCollectorConfig};
 pub use firmware::{FirmwareCollector, FirmwareCollectorConfig};
-pub use logs::{LogsCollector, LogsCollectorConfig, SseLogCollector, SseLogCollectorConfig};
+pub use gpu_inventory::{GpuInventoryCollector, GpuInventoryCollectorConfig};
+pub(crate) use inventory::SharedInventory;
+pub use leak_detector::{LeakDetectorCollector, LeakDetectorCollectorConfig};
+pub(crate) use logs::auto::{AutoFailureBudget, BudgetDecision, FailureKind};
+pub use logs::{
+    DowngradeEvent, DowngradeReason, LogDowngradeRegistry, LogsCollector, LogsCollectorConfig,
+    SseLogCollector, SseLogCollectorConfig,
+};
+pub use nmxc::{NmxcCollector, NmxcCollectorConfig};
+pub(crate) use nmxc_schema_override::{
+    NmxcSchemaOverride, NmxcSchemaOverrideCollector, NmxcSchemaOverrideCollectorConfig,
+};
+pub(crate) use nmxt::NMXT_PORT;
 pub use nmxt::{NmxtCollector, NmxtCollectorConfig};
+pub(crate) use nvue::gnmi::subscriber::spawn_gnmi_collector;
 pub use nvue::rest::collector::{NvueRestCollector, NvueRestCollectorConfig};
+pub(crate) use reachability::{
+    COLLECTOR_TYPE as REACHABILITY_COLLECTOR_TYPE, ReachabilityCollector,
+    ReachabilityCollectorStartConfig, ReachabilityService, ReachabilityTarget,
+};
 pub use runtime::{
     BackoffConfig, Collector, CollectorStartContext, EventStream, ExponentialBackoff,
     IterationResult, PeriodicCollector, StreamMetrics, StreamingCollector,
-    StreamingCollectorStartContext, open_sse_stream,
+    StreamingCollectorStartContext, StreamingConnectResult,
 };
 pub use sensors::{SensorCollector, SensorCollectorConfig};
+pub use telemetry::{TelemetryCollector, TelemetryCollectorConfig};

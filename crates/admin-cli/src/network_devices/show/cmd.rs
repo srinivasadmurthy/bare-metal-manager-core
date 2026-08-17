@@ -17,12 +17,13 @@
 
 use std::fmt::Write;
 
-use ::rpc::admin_cli::{CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn handle_show(
+pub(super) async fn handle_show(
     output_format: OutputFormat,
     query: Args,
     api_client: &ApiClient,

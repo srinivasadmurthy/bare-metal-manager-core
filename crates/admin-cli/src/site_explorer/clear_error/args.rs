@@ -23,7 +23,14 @@ use super::super::common::ExploreOptions;
 // specific newtype to allow sharing of ExploreOptions, and still
 // providing a subcommand-specific Run trait implementation.
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Clear the last known error for a BMC in the latest report:
+    $ nico-admin-cli site-explorer clear-error 192.0.2.10
+
+")]
+pub(crate) struct Args {
     #[clap(flatten)]
-    pub inner: ExploreOptions,
+    pub(super) inner: ExploreOptions,
 }

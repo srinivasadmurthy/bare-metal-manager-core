@@ -18,16 +18,39 @@
 use carbide_uuid::vpc::VpcId;
 use clap::Parser;
 use ipnet::IpNet;
+use rpc::forge::DeletedFilter;
 
 use crate::vpc_prefix::common::VpcPrefixSelector;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all VPC prefixes:
+    $ nico-admin-cli vpc-prefix show
+
+Show one prefix by ID:
+    $ nico-admin-cli vpc-prefix show 12345678-1234-5678-90ab-cdef01234567
+
+Show one prefix by its exact CIDR:
+    $ nico-admin-cli vpc-prefix show 10.0.0.0/24
+
+List the prefixes belonging to one VPC:
+    $ nico-admin-cli vpc-prefix show --vpc-id 12345678-1234-5678-90ab-cdef01234567
+
+Find the prefix that contains an address:
+    $ nico-admin-cli vpc-prefix show --contains 10.0.0.5
+
+Find the prefixes contained by a larger prefix:
+    $ nico-admin-cli vpc-prefix show --contained-by 10.0.0.0/16
+
+")]
+pub(crate) struct Args {
     #[clap(
         name = "VpcPrefixSelector",
         help = "The VPC prefix (by ID or exact unique prefix) to show (omit for all)"
     )]
-    pub prefix_selector: Option<VpcPrefixSelector>,
+    pub(super) prefix_selector: Option<VpcPrefixSelector>,
 
     #[clap(
         long,
@@ -36,7 +59,7 @@ pub struct Args {
         help = "Search by VPC ID",
         conflicts_with = "VpcPrefixSelector"
     )]
-    pub vpc_id: Option<VpcId>,
+    pub(super) vpc_id: Option<VpcId>,
 
     #[clap(
         long,
@@ -45,7 +68,7 @@ pub struct Args {
         help = "Search by an address or prefix the VPC prefix contains",
         conflicts_with_all = ["VpcPrefixSelector", "contained-by"],
     )]
-    pub contains: Option<IpNet>,
+    pub(super) contains: Option<IpNet>,
 
     #[clap(
         long,
@@ -54,5 +77,9 @@ pub struct Args {
         help = "Search by a prefix containing the VPC prefix",
         conflicts_with_all = ["VpcPrefixSelector", "contains"],
     )]
-    pub contained_by: Option<IpNet>,
+    pub(super) contained_by: Option<IpNet>,
+
+    /// Include soft-deleted VPC prefixes
+    #[clap(long, value_enum, default_value = "exclude")]
+    pub(super) deleted: DeletedFilter,
 }

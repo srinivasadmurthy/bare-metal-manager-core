@@ -19,13 +19,18 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::header::HeaderMap;
+use axum::http::{StatusCode, Uri};
+use axum::response::Response;
 use axum::routing::{get, post};
+use forge_dpu_fmds_shared::machine_identity;
 
 use crate::state::FmdsState;
 
 const PUBLIC_IPV4_CATEGORY: &str = "public-ipv4";
+const PUBLIC_IPV6_CATEGORY: &str = "public-ipv6";
 const HOSTNAME_CATEGORY: &str = "hostname";
+const INSTANCE_NAME_CATEGORY: &str = "instance-name";
 const SITENAME_CATEGORY: &str = "sitename";
 const USER_DATA_CATEGORY: &str = "user-data";
 const META_DATA_CATEGORY: &str = "meta-data";
@@ -65,6 +70,10 @@ pub fn get_fmds_router(state: Arc<FmdsState>) -> Router {
         .route(&format!("/{PHONE_HOME_CATEGORY}"), post(post_phone_home))
         .route(&format!("/{INSTANCE_ID_CATEGORY}"), get(get_instance_id))
         .route(&format!("/{MACHINE_ID_CATEGORY}"), get(get_machine_id))
+        .route(
+            &format!("/{}", machine_identity::META_DATA_IDENTITY_CATEGORY),
+            get(get_metadata_identity),
+        )
         .route("/{category}", get(get_metadata_parameter));
 
     let metadata_router = Router::new()
@@ -104,8 +113,30 @@ fn extract_metadata(category: String, state: &FmdsState) -> (StatusCode, String)
     };
 
     match category.as_str() {
-        PUBLIC_IPV4_CATEGORY => (StatusCode::OK, config.address.clone()),
+        PUBLIC_IPV4_CATEGORY => (
+            StatusCode::OK,
+            config
+                .public_ipv4
+                .map(|address| address.to_string())
+                .unwrap_or_default(),
+        ),
+        PUBLIC_IPV6_CATEGORY => (
+            StatusCode::OK,
+            config
+                .public_ipv6
+                .map(|address| address.to_string())
+                .unwrap_or_default(),
+        ),
         HOSTNAME_CATEGORY => (StatusCode::OK, config.hostname.clone()),
+        INSTANCE_NAME_CATEGORY => match &config.instance_name {
+            Some(instance_name) if !instance_name.is_empty() => {
+                (StatusCode::OK, instance_name.clone())
+            }
+            _ => (
+                StatusCode::NOT_FOUND,
+                "instance name not available".to_string(),
+            ),
+        },
         SITENAME_CATEGORY => (
             StatusCode::OK,
             config.sitename.clone().unwrap_or(String::new()),
@@ -117,6 +148,14 @@ fn extract_metadata(category: String, state: &FmdsState) -> (StatusCode, String)
             format!("metadata category not found: {category}"),
         ),
     }
+}
+
+async fn get_metadata_identity(
+    State(state): State<Arc<FmdsState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    machine_identity::serve_meta_data_identity(state.as_ref(), uri, headers).await
 }
 
 async fn get_machine_id(State(state): State<Arc<FmdsState>>) -> (StatusCode, String) {
@@ -166,10 +205,13 @@ async fn get_metadata_params(State(_state): State<Arc<FmdsState>>) -> (StatusCod
         StatusCode::OK,
         [
             HOSTNAME_CATEGORY,
+            INSTANCE_NAME_CATEGORY,
             SITENAME_CATEGORY,
             MACHINE_ID_CATEGORY,
             INSTANCE_ID_CATEGORY,
             ASN_CATEGORY,
+            PUBLIC_IPV4_CATEGORY,
+            PUBLIC_IPV6_CATEGORY,
         ]
         .join("\n"),
     )
@@ -341,7 +383,10 @@ async fn post_phone_home(State(state): State<Arc<FmdsState>>) -> (StatusCode, St
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
     use axum::http;
+    use forge_dpu_fmds_shared::machine_identity::MachineIdentityParams;
     use http_body_util::{BodyExt, Full};
     use hyper::body::Bytes;
     use hyper_util::rt::TokioExecutor;
@@ -350,13 +395,15 @@ mod tests {
     use crate::state::{FmdsConfig, IBDeviceConfig, IBInstanceConfig};
 
     fn make_test_state() -> Arc<FmdsState> {
-        Arc::new(FmdsState::new("https://api.test".to_string(), None))
+        Arc::new(FmdsState::try_new("https://api.test".to_string(), None).unwrap())
     }
 
     fn make_test_config() -> FmdsConfig {
         FmdsConfig {
-            address: "10.0.0.1".to_string(),
+            public_ipv4: Some("10.0.0.1".parse().unwrap()),
+            public_ipv6: Some("2001:db8::1".parse().unwrap()),
             hostname: "test-host".to_string(),
+            instance_name: Some("test-instance".to_string()),
             sitename: Some("test-site".to_string()),
             instance_id: Some(uuid::uuid!("67e55044-10b1-426f-9247-bb680e5fe0c8").into()),
             machine_id: Some(
@@ -376,10 +423,9 @@ mod tests {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let server_port = listener.local_addr().unwrap().port();
-        let std_listener = listener.into_std().unwrap();
 
         let server = tokio::spawn(async move {
-            axum_server::Server::from_tcp(std_listener)
+            axum_server::Server::<SocketAddr>::from_listener(listener)
                 .serve(router.into_make_service())
                 .await
                 .unwrap();
@@ -421,27 +467,91 @@ mod tests {
 
     // Test basic metadata fields.
     #[tokio::test]
-    async fn test_get_hostname() {
+    async fn test_get_hostname_and_instance_name() {
         let state = make_test_state();
         state.update_config(make_test_config());
-        let (server, port) = setup_server(state).await;
+        let (server, port) = setup_server(state.clone()).await;
 
         let (status, body) = get_request(port, "meta-data/hostname").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "test-host");
 
+        for (instance_name, expected_status, expected_body) in [
+            (Some("test-instance"), StatusCode::OK, "test-instance"),
+            (None, StatusCode::NOT_FOUND, "instance name not available"),
+            (
+                Some(""),
+                StatusCode::NOT_FOUND,
+                "instance name not available",
+            ),
+        ] {
+            state.update_config(FmdsConfig {
+                instance_name: instance_name.map(str::to_owned),
+                ..make_test_config()
+            });
+            let (status, body) = get_request(port, "meta-data/instance-name").await;
+            assert_eq!(status, expected_status);
+            assert_eq!(body, expected_body);
+        }
+
         server.abort();
     }
 
     #[tokio::test]
-    async fn test_get_public_ipv4() {
+    async fn test_get_public_ip_addresses() {
+        struct PublicAddressCase {
+            public_ipv4: Option<Ipv4Addr>,
+            public_ipv6: Option<Ipv6Addr>,
+            expected_ipv4: &'static str,
+            expected_ipv6: &'static str,
+        }
+
         let state = make_test_state();
         state.update_config(make_test_config());
-        let (server, port) = setup_server(state).await;
+        let (server, port) = setup_server(state.clone()).await;
 
         let (status, body) = get_request(port, "meta-data/public-ipv4").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "10.0.0.1");
+
+        let (status, body) = get_request(port, "meta-data/public-ipv6").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "2001:db8::1");
+
+        for case in [
+            PublicAddressCase {
+                public_ipv4: None,
+                public_ipv6: Some("2001:db8::1".parse().unwrap()),
+                expected_ipv4: "",
+                expected_ipv6: "2001:db8::1",
+            },
+            PublicAddressCase {
+                public_ipv4: Some("10.0.0.1".parse().unwrap()),
+                public_ipv6: None,
+                expected_ipv4: "10.0.0.1",
+                expected_ipv6: "",
+            },
+            PublicAddressCase {
+                public_ipv4: None,
+                public_ipv6: None,
+                expected_ipv4: "",
+                expected_ipv6: "",
+            },
+        ] {
+            state.update_config(FmdsConfig {
+                public_ipv4: case.public_ipv4,
+                public_ipv6: case.public_ipv6,
+                ..make_test_config()
+            });
+
+            let (status, body) = get_request(port, "meta-data/public-ipv4").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, case.expected_ipv4);
+
+            let (status, body) = get_request(port, "meta-data/public-ipv6").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, case.expected_ipv6);
+        }
 
         server.abort();
     }
@@ -515,22 +625,49 @@ mod tests {
     }
 
     // Test metadata listing.
+    //
+    // `identity` must not appear in the plain /meta-data/ index: cloud-init's EC2
+    // IMDS crawler GETs every advertised key without a Metadata header, and the
+    // identity handler returns 400 without that header — which aborts the crawl.
+    // The /meta-data/identity route remains for clients that send Metadata: true.
     #[tokio::test]
     async fn test_get_metadata_listing() {
         let state = make_test_state();
         state.update_config(make_test_config());
         let (server, port) = setup_server(state).await;
 
-        let expected = ["hostname", "sitename", "machine-id", "instance-id", "asn"].join("\n");
+        let expected = [
+            "hostname",
+            "instance-name",
+            "sitename",
+            "machine-id",
+            "instance-id",
+            "asn",
+            "public-ipv4",
+            "public-ipv6",
+        ]
+        .join("\n");
 
         let (status, body) = get_request(port, "meta-data").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, expected);
+        assert!(
+            !body
+                .lines()
+                .any(|line| line == machine_identity::META_DATA_IDENTITY_CATEGORY),
+            "identity must not be listed in /meta-data/ (cloud-init EC2 crawl)"
+        );
 
         // Also check with trailing slash (cloud-init compat).
         let (status, body) = get_request(port, "meta-data/").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, expected);
+        assert!(
+            !body
+                .lines()
+                .any(|line| line == machine_identity::META_DATA_IDENTITY_CATEGORY),
+            "identity must not be listed in /meta-data/ (cloud-init EC2 crawl)"
+        );
 
         server.abort();
     }
@@ -683,13 +820,16 @@ mod tests {
         let grpc_server = FmdsGrpcServer::new(state.clone());
         let update = FmdsConfigUpdate {
             address: "192.168.1.1".to_string(),
+            address_ipv6: "2001:db8::1".to_string(),
             hostname: "grpc-pushed-host".to_string(),
+            instance_name: Some("grpc-pushed-instance".to_string()),
             sitename: Some("grpc-site".to_string()),
             instance_id: Some(uuid::uuid!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").into()),
             machine_id: None,
             user_data: "grpc-user-data".to_string(),
             ib_devices: vec![],
             asn: 12345,
+            machine_identity: Some(MachineIdentityParams::default().into()),
         };
         grpc_server
             .update_config(Request::new(UpdateConfigRequest {
@@ -705,9 +845,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "grpc-pushed-host");
 
+        let (status, body) = get_request(port, "meta-data/instance-name").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "grpc-pushed-instance");
+
         let (status, body) = get_request(port, "meta-data/public-ipv4").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "192.168.1.1");
+
+        let (status, body) = get_request(port, "meta-data/public-ipv6").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "2001:db8::1");
 
         let (status, body) = get_request(port, "meta-data/asn").await;
         assert_eq!(status, StatusCode::OK);

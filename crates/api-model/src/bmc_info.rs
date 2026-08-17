@@ -18,8 +18,7 @@ use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use ::rpc::errors::RpcDataConversionError;
-use ::rpc::forge as rpc;
+use carbide_uuid::machine::MachineInterfaceId;
 use eyre::{Report, eyre};
 use mac_address::MacAddress;
 use serde::{Deserialize, Serialize};
@@ -28,13 +27,10 @@ use sqlx::{FromRow, Row};
 use version_compare::Cmp;
 
 use crate::errors::{ModelError, ModelResult};
-// TODO(chet): Once SocketAddr::parse_ascii is no longer an experimental
-// feature, it would be good to parse bmc_info.ip to verify it's a valid IP
-// address.
-
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BmcInfo {
-    pub ip: Option<String>,
+    pub machine_interface_id: Option<MachineInterfaceId>,
+    pub ip: Option<IpAddr>,
     pub port: Option<u16>,
     pub mac: Option<MacAddress>,
     pub version: Option<String>,
@@ -44,8 +40,13 @@ pub struct BmcInfo {
 impl BmcInfo {
     pub fn supports_bfb_install(&self) -> bool {
         self.firmware_version.as_ref().is_some_and(|v| {
-            version_compare::compare_to(v.to_lowercase().replace("bf-", ""), "24.10", Cmp::Ge)
-                .is_ok_and(|r| r)
+            // `firmware_version` is normalized to a numeric version by
+            // `dpu_bmc_version` (the generation prefix "bf-"/"bf4-" is stripped);
+            // strip here too in case it arrives raw from another source. BFB
+            // install requires firmware >= 24.10; BF4 firmware is year-based
+            // (>= 26.x) so it always clears this gate.
+            let version = v.to_lowercase().replace("bf4-", "").replace("bf-", "");
+            version_compare::compare_to(version, "24.10", Cmp::Ge).is_ok_and(|r| r)
         })
     }
 }
@@ -60,50 +61,9 @@ impl<'r> FromRow<'r, PgRow> for BmcInfo {
     }
 }
 
-impl TryFrom<rpc::BmcInfo> for BmcInfo {
-    type Error = RpcDataConversionError;
-    fn try_from(value: rpc::BmcInfo) -> Result<Self, RpcDataConversionError> {
-        let mac: Option<MacAddress> = if let Some(mac_address) = value.mac {
-            Some(
-                mac_address
-                    .parse()
-                    .map_err(|_| RpcDataConversionError::InvalidMacAddress(mac_address))?,
-            )
-        } else {
-            None
-        };
-
-        Ok(BmcInfo {
-            ip: value.ip,
-            port: value.port.map(|p| p as u16),
-            mac,
-            version: value.version,
-            firmware_version: value.firmware_version,
-        })
-    }
-}
-
 impl BmcInfo {
     pub fn ip_addr(&self) -> Result<IpAddr, Report> {
-        self.ip
-            .as_ref()
-            .ok_or(eyre! {"Missing BMC address"})?
-            .parse()
-            .map_err(|e| {
-                eyre! {"Bad address {:?} {e}", self.ip }
-            })
-    }
-}
-
-impl From<BmcInfo> for rpc::BmcInfo {
-    fn from(value: BmcInfo) -> Self {
-        rpc::BmcInfo {
-            ip: value.ip,
-            port: value.port.map(|p| p as u32),
-            mac: value.mac.map(|mac| mac.to_string()),
-            version: value.version,
-            firmware_version: value.firmware_version,
-        }
+        self.ip.ok_or(eyre! {"missing BMC address"})
     }
 }
 
@@ -130,28 +90,6 @@ impl Display for UserRoles {
     }
 }
 
-impl From<rpc::UserRoles> for UserRoles {
-    fn from(action: rpc::UserRoles) -> Self {
-        match action {
-            rpc::UserRoles::User => UserRoles::User,
-            rpc::UserRoles::Administrator => UserRoles::Administrator,
-            rpc::UserRoles::Operator => UserRoles::Operator,
-            rpc::UserRoles::Noaccess => UserRoles::Noaccess,
-        }
-    }
-}
-
-impl From<UserRoles> for rpc::UserRoles {
-    fn from(action: UserRoles) -> Self {
-        match action {
-            UserRoles::User => rpc::UserRoles::User,
-            UserRoles::Administrator => rpc::UserRoles::Administrator,
-            UserRoles::Operator => rpc::UserRoles::Operator,
-            UserRoles::Noaccess => rpc::UserRoles::Noaccess,
-        }
-    }
-}
-
 impl FromStr for UserRoles {
     type Err = ModelError;
 
@@ -165,5 +103,63 @@ impl FromStr for UserRoles {
                 "Unknown role found in database: {x}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::{Check, check_values};
+
+    use super::*;
+
+    fn bmc_with_firmware(version: Option<&str>) -> BmcInfo {
+        BmcInfo {
+            firmware_version: version.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn supports_bfb_install_firmware_matrix() {
+        check_values(
+            [
+                Check {
+                    scenario: "normalized BF4 firmware clears the minimum",
+                    input: Some("26.04-8"),
+                    expect: true,
+                },
+                Check {
+                    scenario: "raw BF4 firmware clears the minimum",
+                    input: Some("BF4-26.04-8"),
+                    expect: true,
+                },
+                Check {
+                    scenario: "newer raw BF3 firmware clears the minimum",
+                    input: Some("BF-25.10-9"),
+                    expect: true,
+                },
+                Check {
+                    scenario: "BF3 firmware at the minimum is supported",
+                    input: Some("BF-24.10-0"),
+                    expect: true,
+                },
+                Check {
+                    scenario: "normalized BF3 firmware clears the minimum",
+                    input: Some("25.10-9"),
+                    expect: true,
+                },
+                Check {
+                    scenario: "older BF3 firmware is unsupported",
+                    input: Some("BF-24.04-1"),
+                    expect: false,
+                },
+                Check {
+                    scenario: "absent firmware is unsupported",
+                    input: None,
+                    expect: false,
+                },
+            ],
+            |version| bmc_with_firmware(version).supports_bfb_install(),
+        );
     }
 }

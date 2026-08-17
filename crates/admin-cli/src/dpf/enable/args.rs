@@ -23,7 +23,14 @@ use crate::dpf::common::DpfQuery;
 // specific newtype to allow sharing of DpfQuery, and still
 // providing a subcommand-specific Run trait implementation.
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Enable DPF for a host machine:
+    $ nico-admin-cli dpf enable 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(flatten)]
-    pub inner: DpfQuery,
+    pub(super) inner: DpfQuery,
 }

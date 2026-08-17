@@ -17,13 +17,14 @@
 
 use std::fmt::Write;
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge as forgerpc;
 use prettytable::{Table, row};
 
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 
-pub async fn external_config_show(
+pub(super) async fn external_config_show(
     api_client: &ApiClient,
     config_names: Vec<String>,
     extended: bool,
@@ -43,7 +44,7 @@ pub async fn external_config_show(
     Ok(())
 }
 
-pub fn show_external_config_show_details(
+fn show_external_config_show_details(
     configs: Vec<forgerpc::MachineValidationExternalConfig>,
     json: bool,
 ) -> CarbideCliResult<()> {
@@ -55,7 +56,7 @@ pub fn show_external_config_show_details(
     Ok(())
 }
 
-pub fn show_external_config_show(
+fn show_external_config_show(
     configs: Vec<forgerpc::MachineValidationExternalConfig>,
     json: bool,
 ) -> CarbideCliResult<()> {
@@ -126,7 +127,7 @@ fn convert_external_config_to_nice_table(
     table.into()
 }
 
-pub async fn external_config_add_update(
+pub(super) async fn external_config_add_update(
     api_client: &ApiClient,
     config_name: String,
     file_name: String,
@@ -140,7 +141,10 @@ pub async fn external_config_add_update(
     Ok(())
 }
 
-pub async fn remove_external_config(api_client: &ApiClient, name: String) -> CarbideCliResult<()> {
+pub(super) async fn remove_external_config(
+    api_client: &ApiClient,
+    name: String,
+) -> CarbideCliResult<()> {
     api_client
         .0
         .remove_machine_validation_external_config(name)

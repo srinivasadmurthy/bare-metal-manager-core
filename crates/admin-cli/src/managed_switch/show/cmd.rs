@@ -18,13 +18,15 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use carbide_utils::none_if_empty::NoneIfEmpty;
 use carbide_uuid::switch::SwitchId;
 use prettytable::{Cell, Row, Table};
-use rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use rpc::admin_cli::OutputFormat;
 use rpc::forge::{LinkedExpectedSwitch, MachineInterface, Switch};
 use serde::Serialize;
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 use crate::{async_write, async_write_table_as_csv};
 
@@ -55,6 +57,8 @@ struct ManagedSwitchOutput {
     serial_number: String,
     bmc_mac: String,
     bmc_ip: Option<String>,
+    bmc_version: Option<String>,
+    bmc_firmware_version: Option<String>,
     nvos_mac_addresses: Vec<String>,
     controller_state: String,
     power_state: Option<String>,
@@ -124,6 +128,12 @@ fn build_managed_switch_outputs(
             serial_number: linked_switch.switch_serial_number.clone(),
             bmc_mac: linked_switch.bmc_mac_address.clone(),
             bmc_ip: linked_switch.explored_endpoint_address.clone(),
+            bmc_version: switch
+                .and_then(|s| s.bmc_info.as_ref())
+                .and_then(|b| b.version.clone()),
+            bmc_firmware_version: switch
+                .and_then(|s| s.bmc_info.as_ref())
+                .and_then(|b| b.firmware_version.clone()),
             nvos_mac_addresses: nvos_macs,
             controller_state: switch
                 .map(|s| s.controller_state.clone())
@@ -184,6 +194,11 @@ fn build_managed_switch_outputs(
                 .and_then(|b| b.mac.clone())
                 .unwrap_or_default(),
             bmc_ip: switch.bmc_info.as_ref().and_then(|b| b.ip.clone()),
+            bmc_version: switch.bmc_info.as_ref().and_then(|b| b.version.clone()),
+            bmc_firmware_version: switch
+                .bmc_info
+                .as_ref()
+                .and_then(|b| b.firmware_version.clone()),
             nvos_mac_addresses: nvos_macs,
             controller_state: switch.controller_state.clone(),
             power_state: switch.status.as_ref().and_then(|st| st.power_state.clone()),
@@ -358,11 +373,6 @@ fn show_managed_switch_details_view(m: ManagedSwitchOutput) -> CarbideCliResult<
     let mut lines = String::new();
 
     writeln!(&mut lines, "Name        : {}", m.name)?;
-    writeln!(
-        &mut lines,
-        "Switch ID   : {}",
-        m.switch_id.as_deref().unwrap_or(UNKNOWN)
-    )?;
     writeln!(&mut lines, "State       : {}", m.controller_state)?;
     if let Some(ref reason) = m.state_reason {
         writeln!(&mut lines, "    Reason  : {}", reason)?;
@@ -374,22 +384,22 @@ fn show_managed_switch_details_view(m: ManagedSwitchOutput) -> CarbideCliResult<
     )?;
 
     let data = vec![
-        ("  Serial Number", non_empty(m.serial_number)),
+        ("  ID", m.switch_id),
         ("  Slot Number", m.slot_number.map(|n| n.to_string())),
         ("  Tray Index", m.tray_index.map(|n| n.to_string())),
+        ("  Serial Number", m.serial_number.none_if_empty()),
+        ("  Rack ID", m.rack_id),
         ("  Power State", m.power_state),
         ("  Health", m.health_status),
         (
             "  NVOS MAC Addresses",
-            non_empty(m.nvos_mac_addresses.join(", ")),
+            m.nvos_mac_addresses.join(", ").none_if_empty(),
         ),
         ("  BMC", Some(String::new())),
+        ("    Version", m.bmc_version),
+        ("    Firmware Version", m.bmc_firmware_version),
         ("    IP", m.bmc_ip),
-        ("    MAC", non_empty(m.bmc_mac)),
-        ("  Inventory", Some(String::new())),
-        ("    Expected Switch ID", m.expected_switch_id),
-        ("    Explored Endpoint", m.explored_endpoint),
-        ("    Rack ID", m.rack_id),
+        ("    MAC", m.bmc_mac.none_if_empty()),
     ];
 
     for (key, value) in data {
@@ -409,11 +419,7 @@ fn show_managed_switch_details_view(m: ManagedSwitchOutput) -> CarbideCliResult<
     Ok(())
 }
 
-fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
-}
-
-pub async fn handle_show(
+pub(super) async fn handle_show(
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
     args: Args,
     output_format: OutputFormat,

@@ -15,17 +15,17 @@
  * limitations under the License.
  */
 
-pub mod args;
-pub mod cmd;
+mod args;
+mod cmd;
 
-use ::rpc::admin_cli::CarbideCliResult;
-pub use args::Args;
+pub(super) use args::Args;
 
 use crate::cfg::run::Run;
 use crate::cfg::runtime::RuntimeContext;
+use crate::errors::CarbideCliResult;
 
 impl Run for Args {
     async fn run(self, ctx: &mut RuntimeContext) -> CarbideCliResult<()> {
-        cmd::remove_association(self, ctx.config.cloud_unsafe_op_enabled, &ctx.api_client).await
+        cmd::remove_association(self, ctx.config.cloud_unsafe_op.is_some(), &ctx.api_client).await
     }
 }

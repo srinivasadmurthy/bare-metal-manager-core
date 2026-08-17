@@ -16,15 +16,15 @@
  */
 
 use db::DatabaseError;
-use rpc::errors::RpcDataConversionError;
+use model::errors::ModelError;
 
 #[derive(thiserror::Error, Debug)]
 pub enum NvLinkManagerError {
-    #[error("Database error: {0}")]
+    #[error("database error: {0}")]
     DatabaseError(#[from] DatabaseError),
-    #[error("Can not convert between RPC data model and internal data model - {0}")]
-    RpcDataConversionError(#[from] RpcDataConversionError),
-    #[error("Internal error: {message}")]
+    #[error("data model error: {0}")]
+    ModelError(#[from] ModelError),
+    #[error("internal error: {message}")]
     Internal { message: String },
 }
 
@@ -35,4 +35,4 @@ impl NvLinkManagerError {
     }
 }
 
-pub type NvLinkManagerResult<T> = Result<T, NvLinkManagerError>;
+pub(super) type NvLinkManagerResult<T> = Result<T, NvLinkManagerError>;

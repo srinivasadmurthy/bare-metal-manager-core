@@ -23,7 +23,19 @@ use crate::bmc_machine::common::InfiniteBootArgs;
 // specific newtype to allow sharing of InfiniteBootArgs, and still
 // providing a subcommand-specific Run trait implementation.
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Enable infinite boot on a machine:
+    $ nico-admin-cli bmc-machine enable-infinite-boot \
+    --machine 12345678-1234-5678-90ab-cdef01234567
+
+Enable infinite boot and reboot to apply the BIOS change:
+    $ nico-admin-cli bmc-machine enable-infinite-boot \
+    --machine 12345678-1234-5678-90ab-cdef01234567 --reboot
+
+")]
+pub(crate) struct Args {
     #[clap(flatten)]
-    pub inner: InfiniteBootArgs,
+    pub(super) inner: InfiniteBootArgs,
 }

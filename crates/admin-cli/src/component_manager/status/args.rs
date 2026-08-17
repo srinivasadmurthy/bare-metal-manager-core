@@ -20,9 +20,25 @@ use clap::Parser;
 use crate::component_manager::common::DeviceTargetArgs;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Get firmware update status for switches:
+    $ nico-admin-cli component-manager get-firmware-update-status switch \
+    --switch-id 12345678-1234-5678-90ab-cdef01234567
+
+Get status for several compute trays at once:
+    $ nico-admin-cli component-manager get-firmware-update-status compute-tray \
+    --machine-id 12345678-1234-5678-90ab-cdef01234567,abcdef01-2345-6789-abcd-ef0123456789
+
+Get status for an entire rack:
+    $ nico-admin-cli component-manager get-firmware-update-status rack \
+    --rack-id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(subcommand)]
-    pub target: DeviceTargetArgs,
+    target: DeviceTargetArgs,
 }
 
 impl From<Args> for rpc::forge::GetComponentFirmwareStatusRequest {

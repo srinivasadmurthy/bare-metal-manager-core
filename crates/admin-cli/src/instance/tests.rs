@@ -23,9 +23,14 @@
 // Command Structure - Baseline debug_assert() of the entire command.
 // Argument Parsing  - Ensure required/optional arg combinations parse correctly.
 
+use carbide_test_support::Outcome::*;
+use carbide_test_support::scenarios;
+use carbide_uuid::instance::InstanceId;
+use carbide_uuid::machine::MachineId;
 use clap::{CommandFactory, Parser};
 
 use super::*;
+use crate::test_support::{parse_leaf, raw_value, raw_values};
 
 // Valid InstanceId format for tests (standard UUID format)
 const TEST_INSTANCE_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -50,187 +55,182 @@ fn verify_cmd_structure() {
 // including testing required arguments, as well as optional
 // flag-specific checking.
 
-// parse_show_no_args ensures show parses with no
-// arguments (all instances).
+// Show parses with no arguments (all instances) and with filter options;
+// the tuple is (id.is_empty(), tenant_org_id, vpc_id, extrainfo).
 #[test]
-fn parse_show_no_args() {
-    let cmd = Cmd::try_parse_from(["instance", "show"]).expect("should parse show");
-
-    match cmd {
-        Cmd::Show(args) => {
-            assert!(args.id.is_empty());
-            assert!(!args.extrainfo);
+fn parse_show_routes_and_carries_filters() {
+    scenarios!(
+        run = |argv| {
+            parse_leaf::<Cmd>(argv, &["show"])
+                .map(|matches| {
+                    (
+                        raw_value(&matches, "id").is_none_or(|id| id.is_empty()),
+                        raw_value(&matches, "tenant_org_id"),
+                        raw_value(&matches, "vpc_id"),
+                        matches.get_flag("extrainfo"),
+                    )
+                })
+                .map_err(drop)
+        };
+        "show with no arguments" {
+            &["instance", "show"][..] => Yields((true, None, None, false)),
         }
-        _ => panic!("expected Show variant"),
-    }
-}
 
-// parse_show_with_filters ensures show parses with
-// filter options.
-#[test]
-fn parse_show_with_filters() {
-    let cmd = Cmd::try_parse_from([
-        "instance",
-        "show",
-        "--tenant-org-id",
-        "tenant-123",
-        "--vpc-id",
-        "vpc-456",
-        "--extrainfo",
-    ])
-    .expect("should parse show with filters");
-
-    match cmd {
-        Cmd::Show(args) => {
-            assert_eq!(args.tenant_org_id, Some("tenant-123".to_string()));
-            assert_eq!(args.vpc_id, Some("vpc-456".to_string()));
-            assert!(args.extrainfo);
+        "show with filter options" {
+            &[
+                "instance",
+                "show",
+                "--tenant-org-id",
+                "tenant-123",
+                "--vpc-id",
+                "vpc-456",
+                "--extrainfo",
+            ][..] => Yields((
+                true,
+                Some("tenant-123".to_string()),
+                Some("vpc-456".to_string()),
+                true,
+            )),
         }
-        _ => panic!("expected Show variant"),
-    }
-}
-
-// parse_reboot ensures reboot parses with instance ID.
-#[test]
-fn parse_reboot() {
-    let cmd = Cmd::try_parse_from(["instance", "reboot", "--instance", TEST_INSTANCE_ID])
-        .expect("should parse reboot");
-
-    match cmd {
-        Cmd::Reboot(args) => {
-            assert_eq!(args.instance.to_string(), TEST_INSTANCE_ID);
-            assert!(!args.custom_pxe);
-            assert!(!args.apply_updates_on_reboot);
-        }
-        _ => panic!("expected Reboot variant"),
-    }
-}
-
-// parse_reboot_with_options ensures reboot parses with
-// all options.
-#[test]
-fn parse_reboot_with_options() {
-    let cmd = Cmd::try_parse_from([
-        "instance",
-        "reboot",
-        "--instance",
-        TEST_INSTANCE_ID,
-        "--custom-pxe",
-        "--apply-updates-on-reboot",
-    ])
-    .expect("should parse reboot with options");
-
-    match cmd {
-        Cmd::Reboot(args) => {
-            assert!(args.custom_pxe);
-            assert!(args.apply_updates_on_reboot);
-        }
-        _ => panic!("expected Reboot variant"),
-    }
-}
-
-// parse_release_by_instance ensures release parses with
-// --instance.
-#[test]
-fn parse_release_by_instance() {
-    let cmd = Cmd::try_parse_from(["instance", "release", "--instance", TEST_INSTANCE_ID])
-        .expect("should parse release");
-
-    match cmd {
-        Cmd::Release(args) => {
-            assert_eq!(args.instance, Some(TEST_INSTANCE_ID.to_string()));
-            assert!(args.machine.is_none());
-        }
-        _ => panic!("expected Release variant"),
-    }
-}
-
-// parse_release_by_machine ensures release parses with
-// --machine.
-#[test]
-fn parse_release_by_machine() {
-    let cmd = Cmd::try_parse_from(["instance", "release", "--machine", TEST_MACHINE_ID])
-        .expect("should parse release by machine");
-
-    match cmd {
-        Cmd::Release(args) => {
-            assert!(args.instance.is_none());
-            assert!(args.machine.is_some());
-        }
-        _ => panic!("expected Release variant"),
-    }
-}
-
-// parse_allocate ensures allocate parses with required
-// arguments.
-#[test]
-fn parse_allocate() {
-    let cmd = Cmd::try_parse_from([
-        "instance",
-        "allocate",
-        "--subnet",
-        "10.0.0.0/24",
-        "--prefix-name",
-        "my-prefix",
-    ])
-    .expect("should parse allocate");
-
-    match cmd {
-        Cmd::Allocate(args) => {
-            assert_eq!(args.subnet, vec!["10.0.0.0/24"]);
-            assert_eq!(args.prefix_name, "my-prefix");
-        }
-        _ => panic!("expected Allocate variant"),
-    }
-}
-
-// parse_allocate_with_options ensures allocate parses
-// with all options.
-#[test]
-fn parse_allocate_with_options() {
-    let cmd = Cmd::try_parse_from([
-        "instance",
-        "allocate",
-        "--subnet",
-        "10.0.0.0/24",
-        "--prefix-name",
-        "my-prefix",
-        "--number",
-        "5",
-        "--tenant-org",
-        "tenant-123",
-        "--transactional",
-    ])
-    .expect("should parse allocate with options");
-
-    match cmd {
-        Cmd::Allocate(args) => {
-            assert_eq!(args.number, Some(5));
-            assert_eq!(args.tenant_org, Some("tenant-123".to_string()));
-            assert!(args.transactional);
-        }
-        _ => panic!("expected Allocate variant"),
-    }
-}
-
-// parse_release_missing_required_fails ensures release
-// fails without required arguments.
-#[test]
-fn parse_release_missing_required_fails() {
-    let result = Cmd::try_parse_from(["instance", "release"]);
-    assert!(
-        result.is_err(),
-        "should fail without instance/machine/label"
     );
 }
 
-// parse_allocate_missing_required_fails ensures
-// allocate fails without required arguments.
+// Reboot parses with just the instance ID and with all optional flags;
+// the tuple is (instance, custom_pxe, apply_updates_on_reboot).
 #[test]
-fn parse_allocate_missing_required_fails() {
-    let result = Cmd::try_parse_from(["instance", "allocate"]);
-    assert!(
-        result.is_err(),
-        "should fail without subnet/vpc_prefix and prefix-name"
+fn parse_reboot_routes_and_carries_options() {
+    scenarios!(
+        run = |argv| {
+            parse_leaf::<Cmd>(argv, &["reboot"])
+                .map(|matches| {
+                    (
+                        matches
+                            .get_one::<InstanceId>("instance")
+                            .copied()
+                            .expect("instance ID is required"),
+                        matches.get_flag("custom_pxe"),
+                        matches.get_flag("apply_updates_on_reboot"),
+                    )
+                })
+                .map_err(drop)
+        };
+        "reboot with instance only" {
+            &["instance", "reboot", "--instance", TEST_INSTANCE_ID][..] => Yields((TEST_INSTANCE_ID.parse::<InstanceId>().unwrap(), false, false)),
+        }
+
+        "reboot with all options" {
+            &[
+                "instance",
+                "reboot",
+                "--instance",
+                TEST_INSTANCE_ID,
+                "--custom-pxe",
+                "--apply-updates-on-reboot",
+            ][..] => Yields((TEST_INSTANCE_ID.parse::<InstanceId>().unwrap(), true, true)),
+        }
+    );
+}
+
+// Release parses by --instance or by --machine; the tuple is
+// (instance, machine.is_some()).
+#[test]
+fn parse_release_routes_by_target() {
+    scenarios!(
+        run = |argv| {
+            parse_leaf::<Cmd>(argv, &["release"])
+                .map(|matches| {
+                    (
+                        raw_value(&matches, "instance"),
+                        matches.get_one::<MachineId>("machine").is_some(),
+                    )
+                })
+                .map_err(drop)
+        };
+        "release by --instance" {
+            &["instance", "release", "--instance", TEST_INSTANCE_ID][..] => Yields((Some(TEST_INSTANCE_ID.to_string()), false)),
+        }
+
+        "release by --machine" {
+            &["instance", "release", "--machine", TEST_MACHINE_ID][..] => Yields((None, true)),
+        }
+    );
+}
+
+// Allocate parses with just its required arguments and with all options;
+// the tuple is (subnet, prefix_name, number, tenant_org, transactional).
+#[test]
+fn parse_allocate_routes_and_carries_options() {
+    scenarios!(
+        run = |argv| {
+            parse_leaf::<Cmd>(argv, &["allocate"])
+                .map(|matches| {
+                    (
+                        raw_values(&matches, "subnet"),
+                        raw_value(&matches, "prefix_name").expect("prefix name is required"),
+                        matches.get_one::<u16>("number").copied(),
+                        raw_value(&matches, "tenant_org"),
+                        matches.get_flag("transactional"),
+                    )
+                })
+                .map_err(drop)
+        };
+        "allocate with required arguments" {
+            &[
+                "instance",
+                "allocate",
+                "--subnet",
+                "10.0.0.0/24",
+                "--prefix-name",
+                "my-prefix",
+            ][..] => Yields((
+                vec!["10.0.0.0/24".to_string()],
+                "my-prefix".to_string(),
+                None,
+                None,
+                false,
+            )),
+        }
+
+        "allocate with all options" {
+            &[
+                "instance",
+                "allocate",
+                "--subnet",
+                "10.0.0.0/24",
+                "--prefix-name",
+                "my-prefix",
+                "--number",
+                "5",
+                "--tenant-org",
+                "tenant-123",
+                "--transactional",
+            ][..] => Yields((
+                vec!["10.0.0.0/24".to_string()],
+                "my-prefix".to_string(),
+                Some(5),
+                Some("tenant-123".to_string()),
+                true,
+            )),
+        }
+    );
+}
+
+// Every malformed invocation is rejected at parse time -- a subcommand
+// invoked without the required arguments it needs to act on.
+#[test]
+fn invalid_invocations_are_rejected() {
+    scenarios!(
+        run = |argv| {
+            Cmd::try_parse_from(argv.iter().copied())
+                .map(|_| ())
+                .map_err(drop)
+        };
+        "release without instance/machine/label" {
+            &["instance", "release"][..] => Fails,
+        }
+
+        "allocate without subnet/vpc_prefix and prefix-name" {
+            &["instance", "allocate"][..] => Fails,
+        }
     );
 }

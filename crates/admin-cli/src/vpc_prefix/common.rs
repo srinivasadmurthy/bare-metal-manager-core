@@ -17,27 +17,33 @@
 
 use std::str::FromStr;
 
-use ::rpc::admin_cli::CarbideCliError;
-use ::rpc::admin_cli::CarbideCliError::GenericError;
 use carbide_uuid::vpc::VpcPrefixId;
 use ipnet::IpNet;
-use rpc::forge::{PrefixMatchType, VpcPrefix, VpcPrefixSearchQuery};
+use rpc::forge::{DeletedFilter, PrefixMatchType, VpcPrefix, VpcPrefixSearchQuery};
 
+use crate::errors::CarbideCliError;
+use crate::errors::CarbideCliError::GenericError;
 use crate::rpc::ApiClient;
 
 #[derive(Clone, Debug)]
-pub enum VpcPrefixSelector {
+pub(super) enum VpcPrefixSelector {
     Id(VpcPrefixId),
     Prefix(ipnet::IpNet),
 }
 
 impl VpcPrefixSelector {
-    pub async fn fetch(self, api_client: &ApiClient) -> Result<VpcPrefix, CarbideCliError> {
+    pub(super) async fn fetch(
+        self,
+        api_client: &ApiClient,
+        deleted: DeletedFilter,
+    ) -> Result<VpcPrefix, CarbideCliError> {
         match self {
-            VpcPrefixSelector::Id(id) => get_one_by_id(api_client, id).await,
+            VpcPrefixSelector::Id(id) => get_one_by_id(api_client, id, deleted).await,
             VpcPrefixSelector::Prefix(prefix) => {
                 let id = {
-                    let uuids = search(api_client, prefix_match_exact(&prefix)).await?;
+                    let mut query = prefix_match_exact(&prefix);
+                    query.deleted = deleted as i32;
+                    let uuids = search(api_client, query).await?;
                     let uuid = match Quantity::from(uuids) {
                         Quantity::One(uuid) => Ok(uuid),
                         Quantity::Zero => Err(GenericError(format!(
@@ -54,7 +60,7 @@ impl VpcPrefixSelector {
                         })
                     })
                 }?;
-                get_one_by_id(api_client, id).await
+                get_one_by_id(api_client, id, deleted).await
             }
         }
     }
@@ -76,7 +82,7 @@ impl FromStr for VpcPrefixSelector {
     }
 }
 
-pub fn prefix_match_exact(prefix: &IpNet) -> VpcPrefixSearchQuery {
+fn prefix_match_exact(prefix: &IpNet) -> VpcPrefixSearchQuery {
     VpcPrefixSearchQuery {
         prefix_match: Some(prefix.to_string()),
         prefix_match_type: Some(PrefixMatchType::PrefixExact as i32),
@@ -84,13 +90,13 @@ pub fn prefix_match_exact(prefix: &IpNet) -> VpcPrefixSearchQuery {
     }
 }
 
-pub fn match_all() -> VpcPrefixSearchQuery {
+pub(super) fn match_all() -> VpcPrefixSearchQuery {
     VpcPrefixSearchQuery {
         ..Default::default()
     }
 }
 
-pub async fn search(
+pub(super) async fn search(
     api_client: &ApiClient,
     query: VpcPrefixSearchQuery,
 ) -> Result<Vec<VpcPrefixId>, CarbideCliError> {
@@ -101,15 +107,17 @@ pub async fn search(
         .map(|response| response.vpc_prefix_ids)?)
 }
 
-pub async fn get_by_ids(
+pub(super) async fn get_by_ids(
     api_client: &ApiClient,
     batch_size: usize,
     ids: &[VpcPrefixId],
+    deleted: i32,
 ) -> Result<Vec<VpcPrefix>, CarbideCliError> {
     let mut vpc_prefixes = Vec::with_capacity(ids.len());
     for ids in ids.chunks(batch_size) {
         let vpc_id_list = rpc::forge::VpcPrefixGetRequest {
             vpc_prefix_ids: ids.to_owned(),
+            deleted,
         };
         let prefixes_batch = api_client
             .0
@@ -121,11 +129,12 @@ pub async fn get_by_ids(
     Ok(vpc_prefixes)
 }
 
-pub async fn get_one_by_id(
+async fn get_one_by_id(
     api_client: &ApiClient,
     id: VpcPrefixId,
+    deleted: DeletedFilter,
 ) -> Result<VpcPrefix, CarbideCliError> {
-    let mut prefixes = get_by_ids(api_client, 1, &[id]).await?;
+    let mut prefixes = get_by_ids(api_client, 1, &[id], deleted as i32).await?;
     match (prefixes.len(), prefixes.pop()) {
         (1, Some(prefix)) => Ok(prefix),
         (0, None) => Err(CarbideCliError::GenericError(format!(
@@ -140,7 +149,7 @@ pub async fn get_one_by_id(
     }
 }
 
-pub enum Quantity<T> {
+enum Quantity<T> {
     Zero,
     One(T),
     Many(Vec<T>),
@@ -151,7 +160,7 @@ impl<T> From<Vec<T>> for Quantity<T> {
         let mut items = value;
         match items.len() {
             0 => Quantity::Zero,
-            1 => Quantity::One(items.pop().unwrap()),
+            1 => Quantity::One(items.pop().expect("len()==1 should have an item")),
             _ => Quantity::Many(items),
         }
     }

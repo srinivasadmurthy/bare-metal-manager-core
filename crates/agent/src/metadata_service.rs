@@ -20,21 +20,14 @@ use std::sync::Arc;
 use axum::Router;
 
 use crate::instance_metadata_endpoint::{InstanceMetadataRouterStateImpl, get_fmds_router};
-use crate::instrumentation::{
-    AgentMetricsState, WithTracingLayer, get_metrics_router, get_prometheus_registry,
-};
+use crate::instrumentation::{AgentMetricsState, WithTracingLayer};
 
-pub fn spawn_metadata_service(
+pub(super) fn spawn_metadata_service(
     metadata_service_address: String,
-    metrics_address: String,
     metrics_state: Arc<AgentMetricsState>,
     state: Arc<InstanceMetadataRouterStateImpl>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let instance_metadata_state = state;
-
-    let prometheus_registry = get_prometheus_registry();
-    // let meter = get_dpu_agent_meter();
-    // let metrics_state = create_metrics(meter);
 
     start_server(
         metadata_service_address,
@@ -51,10 +44,7 @@ pub fn spawn_metadata_service(
     )
     .expect("metadata server panicked");
 
-    start_server(
-        metrics_address,
-        Router::new().nest("/metrics", get_metrics_router(prometheus_registry)),
-    )
+    Ok(())
 }
 
 /// Spawns a background task to run an axum server listening on given socket, and returns.

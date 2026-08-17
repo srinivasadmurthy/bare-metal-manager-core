@@ -15,15 +15,15 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge::{self as forgerpc};
 use prettytable::{Table, row};
 
-use crate::machine::health_report::cmd::get_empty_template;
-use crate::machine::{HealthReportTemplates, get_health_report};
+use crate::errors::{CarbideCliError, CarbideCliResult};
+use crate::machine::{HealthReportTemplates, get_empty_template, get_health_report};
 
 /// Display a list of health report entries.
-pub fn display_health_reports(
+pub(crate) fn display_health_reports(
     entries: Vec<forgerpc::HealthReportEntry>,
     output_format: OutputFormat,
 ) -> CarbideCliResult<()> {
@@ -68,7 +68,7 @@ pub fn display_health_reports(
 }
 
 /// Resolve a health report from either a template or raw JSON.
-pub fn resolve_health_report(
+pub(crate) fn resolve_health_report(
     template: Option<HealthReportTemplates>,
     health_report_json: Option<String>,
     message: Option<String>,
@@ -86,9 +86,10 @@ pub fn resolve_health_report(
 }
 
 /// Print the empty health report template.
-pub fn print_empty_template() {
+pub(crate) fn print_empty_template() {
     println!(
         "{}",
-        serde_json::to_string_pretty(&get_empty_template()).unwrap()
+        serde_json::to_string_pretty(&get_empty_template())
+            .expect("empty template should convert to json")
     );
 }

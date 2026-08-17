@@ -19,12 +19,22 @@ use carbide_uuid::rack::RackId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all expected racks:
+    $ nico-admin-cli expected-rack show
+
+Show one expected rack by rack ID:
+    $ nico-admin-cli expected-rack show 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(
         default_value(None),
         help = "Rack ID of the expected rack to show. Leave unset for all."
     )]
-    pub rack_id: Option<RackId>,
+    rack_id: Option<RackId>,
 }
 
 impl From<&Args> for Option<rpc::forge::ExpectedRackRequest> {

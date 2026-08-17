@@ -15,244 +15,369 @@
  * limitations under the License.
  */
 
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
-use carbide_utils::HostPortPair;
+use carbide_api_core::AdminUiRoutesBuilder;
+use carbide_api_core::bootstrap::{Logging, RuntimeInputs, start_runtime, start_runtime_prelude};
+use carbide_secrets::CredentialConfig;
 use eyre::WrapErr;
-use forge_secrets::credentials::{CredentialReader, CredentialWriter};
-use forge_secrets::{CredentialConfig, create_credential_manager_from, create_vault_client};
+use ipnetwork::IpNetwork;
+use tokio::net::TcpListener;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::subscriber::NoSubscriber;
 
-use crate::logging::metrics_endpoint::{MetricsEndpointConfig, run_metrics_endpoint};
-use crate::logging::setup::{
-    Logging, create_metric_for_spancount_reader, create_metrics, setup_logging,
-};
-use crate::{CarbideError, dynamic_settings, setup};
+use crate::logging::setup_logging;
+use crate::metrics::{Metrics, setup_metrics};
+use crate::resources::{RuntimeResources, setup_resources};
 
+/// Effective addresses owned by a running carbide-api server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiServerAddresses {
+    /// Address of the API listener.
+    pub listen_address: SocketAddr,
+    /// Address of the metrics listener, when configured.
+    pub metrics_address: Option<SocketAddr>,
+}
+
+/// Run the carbide-api server until `cancel_token` is cancelled or the process
+/// receives a shutdown signal.
+///
+/// Once startup completes, `ready_channel` receives the effective API and metrics listener
+/// addresses. This includes OS-selected ports when either endpoint is configured with port zero.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     debug: u8,
-    config_str: String,
-    site_config_str: Option<String>,
+    config_path: PathBuf,
+    site_config_path: Option<PathBuf>,
     credential_config: CredentialConfig,
     skip_logging_setup: bool,
+    admin_ui_routes_builder: Option<AdminUiRoutesBuilder>,
     cancel_token: CancellationToken,
-    ready_channel: Sender<()>,
+    ready_channel: Sender<ApiServerAddresses>,
 ) -> eyre::Result<()> {
-    let carbide_config = setup::parse_carbide_config(config_str, site_config_str)?;
+    let carbide_config = carbide_api_core::cfg::load::parse_carbide_config(
+        &config_path,
+        site_config_path.as_deref(),
+    )?;
 
-    // Reject config that contains overlaps between deny_prefixes and site_fabric_prefixes.
-    // deny_prefixes are IPv4-only; only check against IPv4 site fabric prefixes.
-    for deny_prefix in carbide_config.deny_prefixes.iter() {
-        for site_fabric_prefix in carbide_config.site_fabric_prefixes.iter() {
-            if let ipnetwork::IpNetwork::V4(site_v4) = site_fabric_prefix
-                && deny_prefix.overlaps(*site_v4)
-            {
-                return Err(eyre::eyre!(
-                    "overlap found in deny_prefixes `{}` and site_fabric_prefixes `{}`",
-                    deny_prefix,
-                    site_fabric_prefix,
-                ));
-            }
-        }
-    }
+    // If `CarbideConfig.initial_objects_file` is set, load it into an
+    // `InitialObjectsConfig` so that the core runtime can reconcile its contents
+    // against the database on first startup.
+    let initial_objects = if let Some(path) = carbide_config.initial_objects_file.as_deref() {
+        Some(
+            carbide_api_core::cfg::load::parse_initial_objects_config_with_policy(
+                path,
+                carbide_config.deny_unknown_fields,
+            )?,
+        )
+    } else {
+        None
+    };
 
-    let tconf = if skip_logging_setup {
+    validate_network_prefixes(&carbide_config)?;
+
+    let log_history_max_bytes = carbide_config
+        .log_history
+        .max_megabytes
+        .saturating_mul(1024 * 1024);
+    let logging = if skip_logging_setup {
         Logging::default()
     } else {
         setup_logging(
             debug,
-            crate::state_controller::machine::extra_logfmt_logging_fields(),
+            carbide_machine_controller::extra_logfmt_logging_fields(),
             None::<NoSubscriber>,
+            log_history_max_bytes,
+            carbide_config.enable_admin_ui,
+            &carbide_config.tracing,
         )
         .wrap_err("setup_telemetry")?
     };
 
-    // Redact credentials before printing the config
-    let print_config = carbide_config.redacted();
-
-    tracing::info!("Using configuration: {:#?}", print_config);
-    tracing::info!(
-        "Tokio worker thread count: {} (num_cpus::get()={}, TOKIO_WORKER_THREADS={})",
-        tokio::runtime::Handle::current().metrics().num_workers(),
-        num_cpus::get(),
-        std::env::var("TOKIO_WORKER_THREADS").unwrap_or_else(|_| "UNSET".to_string())
-    );
-
-    let metrics = create_metrics()?;
-    create_metric_for_spancount_reader(&metrics.meter, tconf.spancount_reader);
+    let Metrics {
+        registry,
+        meter,
+        _meter_provider,
+    } = setup_metrics(logging.spancount_reader.clone())?;
 
     // All background tasks that run "forever" (until canceled) are added to this JoinSet. When
     // initialization is complete, we use [`JoinSet::join_all`] to wait for them all to complete,
     // while propagating any panics to the current task.
     let mut join_set = JoinSet::new();
-
-    // Spin up the webserver which servers `/metrics` requests
-    if let Some(metrics_address) = carbide_config.metrics_endpoint {
-        // If a replacement prefix for "carbide_" is configured, also emit metrics under that
-        let additional_prefix = carbide_config
-            .alt_metric_prefix
-            .clone()
-            .map(|alt_prefix| ("carbide_".to_string(), alt_prefix));
-        join_set.build_task().name("metrics_endpoint").spawn({
-            let cancel_token = cancel_token.clone();
-            async move {
-                if let Err(e) = run_metrics_endpoint(
-                    &MetricsEndpointConfig {
-                        address: metrics_address,
-                        registry: metrics.registry,
-                        additional_prefix,
-                    },
-                    cancel_token,
-                )
-                .await
-                {
-                    tracing::error!("Metrics endpoint failed with error: {}", e);
-                }
-            }
-        })?;
-    }
-
-    let dynamic_settings = crate::dynamic_settings::DynamicSettings {
-        log_filter: tconf.filter.clone(),
-        site_explorer_enabled: carbide_config.site_explorer.enabled.clone(),
-        create_machines: carbide_config.site_explorer.create_machines.clone(),
-        bmc_proxy: carbide_config.site_explorer.bmc_proxy.clone(),
-        tracing_enabled: tconf.tracing_enabled,
-    };
-    dynamic_settings.start_reset_task(
+    crate::shutdown_handler::start(&mut join_set, cancel_token.clone());
+    let metrics_address = start_metrics_endpoint(
         &mut join_set,
-        dynamic_settings::RESET_PERIOD,
+        &carbide_config,
+        registry,
         cancel_token.clone(),
-    );
-
-    tracing::info!(
-        address = carbide_config.listen.to_string(),
-        build_version = carbide_version::v!(build_version),
-        build_date = carbide_version::v!(build_date),
-        rust_version = carbide_version::v!(rust_version),
-        "Start carbide-api",
-    );
-
-    let certificate_provider =
-        create_vault_client(&credential_config.vault, metrics.meter.clone())?;
-
-    // Build credential reader chain. The idea is this chain
-    // can be flexible, to allow us to introduce an ordered
-    // list of readers, which we build on-demand based on
-    // configuration.
-    let mut readers: Vec<Box<dyn CredentialReader>> = Vec::new();
-
-    // If EnvCredentials are enabled, then add that
-    // to our chained credentials reader. It's expected
-    // that this comes first if configured.
-    if credential_config.env.enabled() {
-        readers.push(Box::new(
-            forge_secrets::local_credentials::EnvCredentials::new(credential_config.env.clone())?,
-        ));
-    }
-
-    // Next, if FileCredentials are enabled, then
-    // add those in as well. We expect these *after*
-    // EnvCredentials.
-    if credential_config.file.enabled() {
-        readers.push(Box::new(
-            forge_secrets::local_credentials::FileCredentialsWatcher::new(
-                credential_config.file.clone(),
-            )
-            .await?,
-        ));
-    }
-
-    // Last, we tack on the VaultClient to the end.
-    let vault_client = create_vault_client(&credential_config.vault, metrics.meter.clone())?;
-    readers.push(Box::new(vault_client.clone()));
-
-    // And our vault_client is also implemented as the writer.
-    let writer: Arc<dyn CredentialWriter> = vault_client;
-
-    // And now we create our new composite credential manager
-    // from the list of readers we just built, plus the Vault
-    // client.
-    let credential_manager = create_credential_manager_from(writer, readers);
-
-    let redfish_pool = {
-        let rf_pool = libredfish::RedfishClientPool::builder()
-            .build()
-            .map_err(CarbideError::from)?;
-
-        // Support deprecated configuration for site_explorer.override_target_ip and override_target_port. Configuration should migrate to site_explorer.bmc_proxy.
-        match (
-            &carbide_config.site_explorer.override_target_ip,
-            carbide_config.site_explorer.override_target_port,
-            carbide_config.site_explorer.bmc_proxy.load().as_ref(),
-        ) {
-            (Some(_), _, Some(_)) => {
-                tracing::warn!(
-                    "Ignoring deprecated config site_explorer.override_target_ip, since site_explorer.bmc_proxy is also set. Please delete override_target_ip from site_explorer config."
-                );
-            }
-            (Some(ip), maybe_target_port, None) => {
-                tracing::warn!(
-                    "Deprecated site_explorer.override_target_ip in carbide config. Setting site_explorer.bmc_proxy instead. Please migrate configuration."
-                );
-                if let Some(port) = maybe_target_port {
-                    carbide_config.site_explorer.bmc_proxy.store(Arc::new(Some(
-                        HostPortPair::HostAndPort(ip.to_string(), port),
-                    )));
-                } else {
-                    carbide_config
-                        .site_explorer
-                        .bmc_proxy
-                        .store(Arc::new(Some(HostPortPair::HostOnly(ip.to_string()))));
-                }
-            }
-            (None, Some(port), None) => {
-                tracing::warn!(
-                    "Deprecated site_explorer.override_target_port in carbide config. Setting site_explorer.bmc_proxy instead. Please migrate configuration."
-                );
-                carbide_config
-                    .site_explorer
-                    .bmc_proxy
-                    .store(Arc::new(Some(HostPortPair::PortOnly(port))));
-            }
-            (None, Some(_), Some(_)) => {
-                tracing::warn!(
-                    "Ignoring deprecated config site_explorer.override_target_port, since site_explorer.bmc_proxy is also set. Please delete override_target_port from site_explorer config."
-                );
-            }
-            (None, None, _) => {} // leave bmc_proxy untouched
-        }
-
-        carbide_redfish::libredfish::new_pool(
-            credential_manager.clone(),
-            rf_pool,
-            carbide_config.site_explorer.bmc_proxy.clone(),
-        )
-    };
-
-    let nv_redfish_pool =
-        carbide_redfish::nv_redfish::new_pool(carbide_config.site_explorer.bmc_proxy.clone());
-
-    setup::start_api(
-        &mut join_set,
-        carbide_config,
-        metrics.meter,
-        dynamic_settings,
-        redfish_pool,
-        nv_redfish_pool,
-        credential_manager,
-        certificate_provider,
-        cancel_token,
-        ready_channel,
     )
     .await?;
+    let per_object_metrics =
+        start_per_object_metrics_endpoint(&mut join_set, &carbide_config, cancel_token.clone())?;
+
+    let runtime_prelude =
+        start_runtime_prelude(&carbide_config, logging, &mut join_set, &cancel_token);
+
+    let RuntimeResources {
+        credential_manager,
+        certificate_provider,
+        db_pool,
+        work_lock_manager_handle,
+        secrets_context,
+    } = setup_resources(
+        &carbide_config,
+        &credential_config,
+        &mut join_set,
+        &cancel_token,
+    )
+    .await?;
+
+    let listen_address = start_runtime(RuntimeInputs {
+        carbide_config,
+        initial_objects,
+        meter,
+        per_object_metrics,
+        join_set: &mut join_set,
+        runtime_prelude,
+        credential_manager,
+        certificate_provider,
+        db_pool,
+        work_lock_manager_handle,
+        secrets_context,
+        admin_ui_routes_builder,
+        cancel_token,
+    })
+    .await?;
+
+    if ready_channel
+        .send(ApiServerAddresses {
+            listen_address,
+            metrics_address,
+        })
+        .is_err()
+    {
+        tracing::warn!(
+            "Bug: api server ready_channel is closed, could not notify readiness status"
+        );
+    }
 
     // Block forever until all spawned tasks complete. Any panics in spawned tasks will be
     // propagated here.
     join_set.join_all().await;
-
     Ok(())
+}
+
+async fn start_metrics_endpoint(
+    join_set: &mut JoinSet<()>,
+    carbide_config: &carbide_api_core::cfg::file::CarbideConfig,
+    registry: prometheus::Registry,
+    cancel_token: CancellationToken,
+) -> eyre::Result<Option<SocketAddr>> {
+    let Some(metrics_address) = carbide_config.metrics_endpoint else {
+        return Ok(None);
+    };
+
+    let listener = TcpListener::bind(metrics_address)
+        .await
+        .wrap_err_with(|| format!("could not bind metrics endpoint at {metrics_address}"))?;
+    let metrics_address = listener
+        .local_addr()
+        .wrap_err("could not read metrics endpoint address")?;
+
+    tracing::info!(%metrics_address, "Starting metrics listener");
+
+    // Spin up the web server which serves `/metrics` requests
+    // If a replacement prefix for "carbide_" is configured, also emit metrics under that
+    let additional_prefix =
+        carbide_config
+            .alt_metric_prefix
+            .clone()
+            .map(|alt| metrics_endpoint::PrefixMigration {
+                old: "carbide_".to_string(),
+                new: alt,
+            });
+    join_set
+        .build_task()
+        .name("metrics_endpoint")
+        .spawn(async move {
+            if let Err(error) = metrics_endpoint::run_metrics_endpoint_with_listener(
+                &metrics_endpoint::MetricsEndpointConfig {
+                    address: metrics_address,
+                    registry,
+                    health_controller: None,
+                    additional_prefix,
+                },
+                cancel_token,
+                listener,
+            )
+            .await
+            {
+                tracing::error!(
+                    metrics_address = %metrics_address,
+                    error = %error,
+                    "Metrics endpoint failed",
+                );
+            }
+        })?;
+
+    Ok(Some(metrics_address))
+}
+
+/// Starts the dedicated listener for the opt-in per-object state metrics and
+/// returns their bare Prometheus registry (`None` when disabled). Per-object
+/// series are native pull collectors on their own registry — not
+/// OpenTelemetry instruments, whose per-stream cardinality limit a per-object
+/// fleet vastly exceeds — and their own endpoint, so operators can scrape (or
+/// skip) them independently. No alt-prefix mirroring here: it would double
+/// every per-object family.
+fn start_per_object_metrics_endpoint(
+    join_set: &mut JoinSet<()>,
+    carbide_config: &carbide_api_core::cfg::file::CarbideConfig,
+    cancel_token: CancellationToken,
+) -> eyre::Result<Option<prometheus::Registry>> {
+    let per_object_config = &carbide_config.observability.per_object_state_metrics;
+    if per_object_config.enabled && per_object_config.object_types.is_empty() {
+        tracing::warn!(
+            "observability.per_object_state_metrics.enabled is set but object_types is empty; \
+             not starting the per-object metrics endpoint"
+        );
+    }
+    let per_object_metrics = (per_object_config.enabled
+        && !per_object_config.object_types.is_empty())
+    .then(prometheus::Registry::new);
+    if let Some(registry) = &per_object_metrics {
+        let address = per_object_config.listen_address;
+        join_set
+            .build_task()
+            .name("per_object_metrics_endpoint")
+            .spawn({
+                let registry = registry.clone();
+                async move {
+                    if let Err(error) = metrics_endpoint::run_metrics_endpoint_with_cancellation(
+                        &metrics_endpoint::MetricsEndpointConfig {
+                            address,
+                            registry,
+                            health_controller: None,
+                            additional_prefix: None,
+                        },
+                        cancel_token,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            per_object_metrics_address = %address,
+                            error = %error,
+                            "Per-object metrics endpoint failed",
+                        );
+                    }
+                }
+            })?;
+    }
+    Ok(per_object_metrics)
+}
+
+/// Returns whether two CIDR prefixes claim any of the same addresses.
+///
+/// Prefixes within one address family are nested or disjoint, so checking both network addresses
+/// covers either containment direction. `IpNetwork::contains` rejects cross-family addresses.
+fn prefixes_overlap(left: IpNetwork, right: IpNetwork) -> bool {
+    left.contains(right.network()) || right.contains(left.network())
+}
+
+fn validate_network_prefixes(
+    carbide_config: &carbide_api_core::cfg::file::CarbideConfig,
+) -> eyre::Result<()> {
+    // Reject config that contains overlaps between deny_prefixes and site_fabric_prefixes.
+    for deny_prefix in &carbide_config.deny_prefixes {
+        for site_fabric_prefix in &carbide_config.site_fabric_prefixes {
+            if prefixes_overlap(*deny_prefix, *site_fabric_prefix) {
+                return Err(eyre::eyre!(
+                    "overlap found in deny_prefixes `{deny_prefix}` and site_fabric_prefixes \
+                     `{site_fabric_prefix}`",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::value_scenarios;
+
+    use super::*;
+
+    struct PrefixPair {
+        deny: &'static str,
+        site_fabric: &'static str,
+    }
+
+    #[test]
+    fn deny_site_fabric_overlap_is_address_family_aware() {
+        value_scenarios!(run = |pair: PrefixPair| {
+            prefixes_overlap(
+                pair.deny.parse().expect("valid deny prefix"),
+                pair.site_fabric.parse().expect("valid site fabric prefix"),
+            )
+        };
+            "IPv4 deny prefix contains site fabric prefix" {
+                PrefixPair {
+                    deny: "10.0.0.0/8",
+                    site_fabric: "10.20.0.0/16",
+                } => true,
+            }
+
+            "IPv4 site fabric prefix contains deny prefix" {
+                PrefixPair {
+                    deny: "10.20.0.0/16",
+                    site_fabric: "10.0.0.0/8",
+                } => true,
+            }
+
+            "IPv6 deny prefix contains site fabric prefix" {
+                PrefixPair {
+                    deny: "2001:db8::/32",
+                    site_fabric: "2001:db8:20::/48",
+                } => true,
+            }
+
+            "identical IPv6 prefixes overlap" {
+                PrefixPair {
+                    deny: "2001:db8:20::/48",
+                    site_fabric: "2001:db8:20::/48",
+                } => true,
+            }
+
+            "IPv4 prefixes are disjoint" {
+                PrefixPair {
+                    deny: "10.0.0.0/8",
+                    site_fabric: "192.0.2.0/24",
+                } => false,
+            }
+
+            "IPv6 prefixes are disjoint" {
+                PrefixPair {
+                    deny: "2001:db8::/32",
+                    site_fabric: "2001:db9::/32",
+                } => false,
+            }
+
+            "IPv4 deny and IPv6 site fabric prefixes are separate" {
+                PrefixPair {
+                    deny: "10.0.0.0/8",
+                    site_fabric: "2001:db8::/32",
+                } => false,
+            }
+
+            "IPv6 deny and IPv4 site fabric prefixes are separate" {
+                PrefixPair {
+                    deny: "2001:db8::/32",
+                    site_fabric: "10.0.0.0/8",
+                } => false,
+            }
+        );
+    }
 }

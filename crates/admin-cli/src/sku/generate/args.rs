@@ -19,9 +19,19 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Generate SKU data from an existing machine:
+    $ nico-admin-cli sku generate 12345678-1234-5678-90ab-cdef01234567
+
+Generate and override the resulting SKU ID:
+    $ nico-admin-cli sku generate 12345678-1234-5678-90ab-cdef01234567 --id DGX-H100-640GB
+
+")]
+pub(crate) struct Args {
     #[clap(help = "The machine id of the machine to use to generate a SKU")]
-    pub machine_id: MachineId,
+    pub(super) machine_id: MachineId,
     #[clap(help = "override the ID of the SKU", long)]
-    pub id: Option<String>,
+    pub(super) id: Option<String>,
 }

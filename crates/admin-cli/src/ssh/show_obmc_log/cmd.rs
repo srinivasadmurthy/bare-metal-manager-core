@@ -15,12 +15,12 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use forge_ssh::ssh::read_obmc_console_log;
 
 use super::super::common::SshArgs;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 
-pub async fn show_obmc_log(args: SshArgs) -> CarbideCliResult<()> {
+pub(super) async fn show_obmc_log(args: SshArgs) -> CarbideCliResult<()> {
     let log = read_obmc_console_log(
         args.credentials.bmc_ip_address,
         args.credentials.bmc_username,

@@ -19,9 +19,19 @@ use carbide_uuid::switch::SwitchId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Force delete a switch:
+    $ nico-admin-cli switch force-delete 12345678-1234-5678-90ab-cdef01234567
+
+Force delete a switch and its machine interfaces:
+    $ nico-admin-cli switch force-delete 12345678-1234-5678-90ab-cdef01234567 --delete-interfaces
+
+")]
+pub(crate) struct Args {
     #[clap(help = "Switch ID to force delete.")]
-    pub switch_id: SwitchId,
+    pub(super) switch_id: SwitchId,
 
     #[clap(
         short = 'd',
@@ -29,5 +39,5 @@ pub struct Args {
         action,
         help = "Delete machine interfaces associated with this switch."
     )]
-    pub delete_interfaces: bool,
+    pub(super) delete_interfaces: bool,
 }

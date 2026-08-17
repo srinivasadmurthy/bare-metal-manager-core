@@ -20,12 +20,29 @@
 
 use carbide_uuid::machine::MachineId;
 use clap::Parser;
-use rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use rpc::protos::mlx_device as mlx_device_pb;
 
+use crate::cfg::dispatch::Dispatch;
+use crate::errors::{CarbideCliError, CarbideCliResult};
+
 // ConfigCommand are the config subcommands.
-#[derive(Parser, Debug)]
-pub enum ConfigCommand {
+#[derive(Parser, Debug, Dispatch)]
+#[command(after_long_help = "\
+EXAMPLES:
+
+Query device configuration values (all, or specific comma-separated variables):
+    $ nico-admin-cli mlx config query 12345678-1234-5678-90ab-cdef01234567 0000:01:00.0 my-registry
+
+Set configuration values (variable=value, comma-separated):
+    $ nico-admin-cli mlx config set 12345678-1234-5678-90ab-cdef01234567 0000:01:00.0 my-registry \
+    LINK_TYPE=eth,SRIOV_EN=true
+
+Compare a device against expected values:
+    $ nico-admin-cli mlx config compare 12345678-1234-5678-90ab-cdef01234567 0000:01:00.0 my-registry \
+    LINK_TYPE=eth
+
+")]
+pub(crate) enum ConfigCommand {
     #[clap(about = "Query device configuration values")]
     Query(ConfigQueryCommand),
 
@@ -41,67 +58,67 @@ pub enum ConfigCommand {
 
 // ConfigQueryCommand queries device configuration values.
 #[derive(Parser, Debug)]
-pub struct ConfigQueryCommand {
+pub(crate) struct ConfigQueryCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Device ID is the PCI or mst path on the target machine")]
-    pub device_id: String,
+    device_id: String,
 
     // registry_name is the registry to use.
     #[arg(help = "Backing variable registry to query against")]
-    pub registry_name: String,
+    registry_name: String,
     // variables are optional specific variables to query.
     #[arg(help = "Variables to query, all if unset.", value_delimiter = ',')]
-    pub variables: Vec<String>,
+    variables: Vec<String>,
 }
 
 // ConfigSetCommand sets device configuration values.
 #[derive(Parser, Debug)]
-pub struct ConfigSetCommand {
+pub(crate) struct ConfigSetCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Device ID is the PCI or mst path on the target machine")]
-    pub device_id: String,
+    device_id: String,
 
     // registry_name is the registry to use.
-    pub registry_name: String,
+    registry_name: String,
     // assignments are variable=value assignments.
     #[arg(value_delimiter = ',')]
-    pub assignments: Vec<String>,
+    assignments: Vec<String>,
 }
 
 // ConfigSyncCommand synchronizes configuration values to a device.
 #[derive(Parser, Debug)]
-pub struct ConfigSyncCommand {
+pub(crate) struct ConfigSyncCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Device ID is the PCI or mst path on the target machine")]
-    pub device_id: String,
+    device_id: String,
 
     // registry_name is the registry to use.
-    pub registry_name: String,
+    registry_name: String,
     // assignments are variable=value assignments.
     #[arg(value_delimiter = ',')]
-    pub assignments: Vec<String>,
+    assignments: Vec<String>,
 }
 
 // ConfigCompareCommand compares device configuration against expected values.
 #[derive(Parser, Debug)]
-pub struct ConfigCompareCommand {
+pub(crate) struct ConfigCompareCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Device ID is the PCI or mst path on the target machine")]
-    pub device_id: String,
+    device_id: String,
 
     // registry_name is the registry to use.
-    pub registry_name: String,
+    registry_name: String,
     // assignments are variable=value assignments.
     #[arg(value_delimiter = ',')]
-    pub assignments: Vec<String>,
+    assignments: Vec<String>,
 }
 
 impl From<ConfigQueryCommand> for mlx_device_pb::MlxAdminConfigQueryRequest {

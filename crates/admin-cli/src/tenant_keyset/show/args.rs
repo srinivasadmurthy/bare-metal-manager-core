@@ -15,20 +15,34 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliError;
 use ::rpc::forge as forgerpc;
 use clap::Parser;
 
+use crate::errors::CarbideCliError;
+
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all tenant keysets:
+    $ nico-admin-cli tenant-key-set show
+
+Show one keyset by its <tenant_org_id>/<keyset_id>:
+    $ nico-admin-cli tenant-key-set show fds34511233a/87654321-4321-8765-cdef-0123456789ab
+
+Filter by tenant org:
+    $ nico-admin-cli tenant-key-set show --tenant-org-id fds34511233a
+
+")]
+pub(crate) struct Args {
     #[clap(
         default_value(""),
         help = "The Tenant KeySet ID in the format of <tenant_org_id>/<keyset_id> to query, leave empty for all (default)"
     )]
-    pub id: String,
+    id: String,
 
     #[clap(short, long, help = "The Tenant Org ID to query")]
-    pub tenant_org_id: Option<String>,
+    pub(super) tenant_org_id: Option<String>,
 }
 
 impl TryFrom<&Args> for Option<forgerpc::TenantKeysetIdentifier> {

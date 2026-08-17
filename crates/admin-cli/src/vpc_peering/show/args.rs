@@ -20,18 +20,31 @@ use carbide_uuid::vpc_peering::VpcPeeringId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all VPC peerings:
+    $ nico-admin-cli vpc-peering show
+
+Show details for one VPC peering:
+    $ nico-admin-cli vpc-peering show --id 12345678-1234-5678-90ab-cdef01234567
+
+List the peerings for one VPC:
+    $ nico-admin-cli vpc-peering show --vpc-id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(
         long,
         conflicts_with = "vpc_id",
         help = "The ID of the VPC peering to show"
     )]
-    pub id: Option<VpcPeeringId>,
+    pub(super) id: Option<VpcPeeringId>,
 
     #[clap(
         long,
         conflicts_with = "id",
         help = "The ID of the VPC to show VPC peerings for"
     )]
-    pub vpc_id: Option<VpcId>,
+    pub(super) vpc_id: Option<VpcId>,
 }

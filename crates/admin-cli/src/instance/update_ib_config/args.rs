@@ -20,14 +20,22 @@ use clap::Parser;
 use rpc::InstanceInfinibandConfig;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Update an instance's InfiniBand configuration:
+    $ nico-admin-cli instance update-ib-config --instance 12345678-1234-5678-90ab-cdef01234567 \
+    --config '{\"partitions\":[]}'
+
+")]
+pub(crate) struct Args {
     #[clap(short, long, required(true))]
-    pub instance: InstanceId,
+    pub(super) instance: InstanceId,
     #[clap(
         long,
         required(true),
         help = "IB configuration in JSON format",
         value_name = "IB_JSON"
     )]
-    pub config: InstanceInfinibandConfig,
+    pub(super) config: InstanceInfinibandConfig,
 }

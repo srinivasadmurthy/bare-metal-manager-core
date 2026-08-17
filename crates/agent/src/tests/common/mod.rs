@@ -15,15 +15,20 @@
  * limitations under the License.
  */
 
+use std::convert::Infallible;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
-use axum::http::header;
+use axum::body::Bytes;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, header};
 use axum::response::IntoResponse;
 use axum_server::tls_rustls::RustlsConfig;
+use http_body::{Body as HttpBody, Frame};
 use rustls::ServerConfig;
 use rustls_pemfile::Item;
 use rustls_pki_types::PrivateKeyDer;
@@ -62,7 +67,7 @@ discovery-retry-secs = 1
 discovery-retries-max = 1000
 "#;
 
-pub fn setup_agent_run_env(
+pub(super) fn setup_agent_run_env(
     addr: &SocketAddr,
     td: &TempDir,
     acf: &NamedTempFile,
@@ -76,6 +81,10 @@ pub fn setup_agent_run_env(
     };
     let root_dir = PathBuf::from(repo_root);
 
+    // SAFETY: Initial lint enablement: these test settings are installed before the
+    // in-process agent starts, but the parallel test harness and Tokio runtimes may
+    // already have other threads. Unix process-wide exclusion from environment readers
+    // is not proven; this needs owner review.
     unsafe {
         env::set_var("DISABLE_TLS_ENFORCEMENT", "true");
         env::set_var("IGNORE_MGMT_VRF", "true");
@@ -92,7 +101,7 @@ pub fn setup_agent_run_env(
     }
 
     let hbn_root = td.path();
-    tracing::info!("Using hbn_root: {:?}", hbn_root);
+    tracing::info!(?hbn_root, "Using HBN root");
     fs::create_dir_all(hbn_root.join("etc/frr"))?;
     fs::create_dir_all(hbn_root.join("etc/network"))?;
     fs::create_dir_all(hbn_root.join("etc/supervisor/conf.d"))?;
@@ -124,15 +133,18 @@ pub fn setup_agent_run_env(
     Ok(Some(opts))
 }
 
-pub async fn run_grpc_server(
+pub(super) async fn run_grpc_server(
     app: axum::Router<()>,
 ) -> eyre::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind("127.0.0.1:0")?; // 0 let OS choose available port
+    listener.set_nonblocking(true)?;
     let addr = listener.local_addr()?;
     let server_config = make_rustls_server_config()?;
     let join_handle = tokio::spawn(async move {
         let config = RustlsConfig::from_config(Arc::new(server_config));
         axum_server::from_tcp_rustls(listener, config)
+            // Safety: This only happens if the socket is nonblocking, and we already did set_nonblocking above.
+            .expect("BUG: Could not bind to listener")
             .serve(app.into_make_service())
             .await
             .unwrap();
@@ -161,7 +173,7 @@ fn make_rustls_server_config() -> eyre::Result<ServerConfig> {
         })
         .map(|data| PrivateKeyDer::try_from(data).map_err(|s| eyre::eyre!("{s}")))
         .next()
-        .ok_or(eyre::eyre!("No keys in key file"))??;
+        .ok_or(eyre::eyre!("no keys in key file"))??;
 
     let mut server_config = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -188,7 +200,7 @@ async fn wait_for_server_to_start(addr: SocketAddr) -> eyre::Result<()> {
             }
             Ok(resp) => {
                 eyre::bail!(
-                    "Invalid status code from /up on mock grpc server: {}",
+                    "invalid status code from /up on mock grpc server: {}",
                     resp.status(),
                 );
             }
@@ -196,13 +208,57 @@ async fn wait_for_server_to_start(addr: SocketAddr) -> eyre::Result<()> {
         }
     }
     if Instant::now() >= deadline {
-        eyre::bail!("Timed out waiting for mock grpc server to start");
+        eyre::bail!("timed out waiting for mock grpc server to start");
     }
     Ok(())
 }
 
+struct GrpcBody {
+    data: Option<Bytes>,
+    trailers: Option<HeaderMap>,
+}
+
+impl GrpcBody {
+    fn new(data: Vec<u8>) -> Self {
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            HeaderName::from_static("grpc-status"),
+            HeaderValue::from_static("0"),
+        );
+
+        Self {
+            data: Some(Bytes::from(data)),
+            trailers: Some(trailers),
+        }
+    }
+}
+
+impl HttpBody for GrpcBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(data) = this.data.take() {
+            return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        if let Some(trailers) = this.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+
+        Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_none() && self.trailers.is_none()
+    }
+}
+
 /// Takes an rpc object (built from rpc/proto/forge.proto) and turns into into a gRPC axum response
-pub fn respond(out: impl prost::Message) -> impl IntoResponse {
+pub(super) fn respond(out: impl prost::Message) -> impl IntoResponse {
     let msg_len = out.encoded_len() as u32;
     let mut body = Vec::with_capacity(1 + 4 + msg_len as usize);
     // first byte is compression: 0 means none
@@ -212,6 +268,8 @@ pub fn respond(out: impl prost::Message) -> impl IntoResponse {
     // and finally the message
     out.encode(&mut body).unwrap();
 
-    let headers = [(header::CONTENT_TYPE, "application/grpc+tonic")];
-    (headers, body)
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/grpc+tonic")
+        .body(GrpcBody::new(body))
+        .unwrap()
 }

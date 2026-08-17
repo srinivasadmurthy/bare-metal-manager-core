@@ -21,13 +21,14 @@ mod power_options;
 mod quarantine;
 mod reset_host_reprovisioning;
 mod set_primary_dpu;
+mod set_primary_interface;
 mod show;
 mod start_updates;
 
 // Cross-module re-exports for firmware/start_updates.rs
 // Cross-module re-exports for debug_bundle/cmds.rs
-pub use debug_bundle::args::Args as DebugBundle;
-pub use start_updates::args::Args as StartUpdates;
+pub(crate) use debug_bundle::args::Args as DebugBundle;
+pub(crate) use start_updates::args::Args as StartUpdates;
 
 #[cfg(test)]
 mod tests;
@@ -37,7 +38,7 @@ use clap::Parser;
 use crate::cfg::dispatch::Dispatch;
 
 #[derive(Parser, Debug, Dispatch)]
-pub enum Cmd {
+pub(crate) enum Cmd {
     #[clap(about = "Display managed host information")]
     Show(show::Args),
     #[clap(
@@ -57,7 +58,9 @@ pub enum Cmd {
     PowerOptions(power_options::Args),
     #[clap(about = "Start updates for machines with delayed updates, such as GB200")]
     StartUpdates(start_updates::Args),
-    #[clap(about = "Set the primary DPU for the managed host")]
+    #[clap(about = "Set the primary interface (boot device) for the managed host")]
+    SetPrimaryInterface(set_primary_interface::Args),
+    #[clap(about = "Deprecated: use set-primary-interface. Sets the primary DPU.")]
     SetPrimaryDpu(set_primary_dpu::Args),
     #[clap(about = "Download debug bundle with logs for a specific host")]
     DebugBundle(debug_bundle::Args),

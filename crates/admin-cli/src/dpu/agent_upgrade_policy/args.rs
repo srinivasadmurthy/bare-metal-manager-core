@@ -19,9 +19,25 @@ use clap::{Parser, ValueEnum};
 use rpc::forge::DpuAgentUpgradePolicyRequest;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show the current forge-dpu-agent upgrade policy:
+    $ nico-admin-cli dpu agent-upgrade-policy
+
+Allow the agent to upgrade only (never downgrade):
+    $ nico-admin-cli dpu agent-upgrade-policy --set up-only
+
+Allow the agent to both upgrade and downgrade:
+    $ nico-admin-cli dpu agent-upgrade-policy --set up-down
+
+Disable automatic agent version changes:
+    $ nico-admin-cli dpu agent-upgrade-policy --set off
+
+")]
+pub(crate) struct Args {
     #[clap(long)]
-    pub set: Option<AgentUpgradePolicyChoice>,
+    pub(super) set: Option<AgentUpgradePolicyChoice>,
 }
 
 impl From<Args> for DpuAgentUpgradePolicyRequest {
@@ -38,7 +54,7 @@ impl From<Args> for DpuAgentUpgradePolicyRequest {
 
 // Should match api/src/model/machine/upgrade_policy.rs AgentUpgradePolicy
 #[derive(ValueEnum, Debug, Clone)]
-pub enum AgentUpgradePolicyChoice {
+pub(super) enum AgentUpgradePolicyChoice {
     Off,
     UpOnly,
     UpDown,
@@ -63,5 +79,44 @@ impl From<i32> for AgentUpgradePolicyChoice {
                 unreachable!();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::scenarios;
+    use clap::ValueEnum;
+
+    use super::AgentUpgradePolicyChoice;
+
+    #[test]
+    fn agent_upgrade_policy_choice_value_enum() {
+        scenarios!(
+            run = |value| {
+                AgentUpgradePolicyChoice::from_str(value, false)
+                    .map(|choice| match choice {
+                        AgentUpgradePolicyChoice::Off => "off",
+                        AgentUpgradePolicyChoice::UpOnly => "up-only",
+                        AgentUpgradePolicyChoice::UpDown => "up-down",
+                    })
+                    .map_err(drop)
+            };
+            "off" {
+                "off" => Yields("off"),
+            }
+
+            "up-only" {
+                "up-only" => Yields("up-only"),
+            }
+
+            "up-down" {
+                "up-down" => Yields("up-down"),
+            }
+
+            "invalid value" {
+                "invalid" => Fails,
+            }
+        );
     }
 }

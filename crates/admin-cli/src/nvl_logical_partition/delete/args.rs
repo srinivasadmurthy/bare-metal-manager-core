@@ -15,15 +15,23 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliError;
 use ::rpc::forge as forgerpc;
 use carbide_uuid::nvlink::NvLinkLogicalPartitionId;
 use clap::Parser;
 
+use crate::errors::CarbideCliError;
+
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Delete a logical partition by name:
+    $ nico-admin-cli logical-partition delete --name my-partition
+
+")]
+pub(crate) struct Args {
     #[clap(short = 'n', long, help = "name of the partition")]
-    pub name: String,
+    name: String,
 }
 
 impl TryFrom<Args> for forgerpc::NvLinkLogicalPartitionDeletionRequest {

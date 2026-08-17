@@ -18,7 +18,14 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Erase every expected machine (requires explicit confirmation):
+    $ nico-admin-cli expected-machine erase --confirm
+
+")]
+pub(crate) struct Args {
     #[clap(long, help = "Confirm that you want to erase all records.")]
-    pub confirm: bool,
+    pub(super) confirm: bool,
 }

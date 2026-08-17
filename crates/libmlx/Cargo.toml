@@ -20,6 +20,7 @@ version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 description = "Consolidated Mellanox NIC configuration, firmware, and device management library."
 
 [lib]
@@ -48,11 +49,11 @@ prettytable-rs = { workspace = true }
 
 # Async / networking
 tokio = { features = ["full"], workspace = true }
-reqwest = { features = ["rustls-tls"], workspace = true }
-async-ssh2-tokio = { workspace = true }
+reqwest = { features = ["rustls"], workspace = true }
+reqwest-middleware = { workspace = true }
+reqwest-tracing = { workspace = true }
 
 # Error handling
-anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 # Logging
@@ -64,6 +65,7 @@ quick-xml = { features = ["serialize"], workspace = true }
 prost-types = { workspace = true }
 
 # Utility
+async-trait = { workspace = true }
 regex = { workspace = true }
 chrono = { features = ["serde"], workspace = true }
 hostname = { workspace = true }
@@ -76,8 +78,10 @@ tempfile = { workspace = true }
 url = { workspace = true }
 
 # Internal
+carbide-libmlx-model = { path = "../libmlx-model" }
 carbide-rpc = { path = "../rpc" }
 carbide-uuid = { path = "../uuid" }
+carbide-ssh = { path = "../ssh" }
 
 [build-dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -85,8 +89,15 @@ serde_yaml = "0.9"
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+carbide-libmlx-model = { path = "../libmlx-model", features = ["test-support"] }
+carbide-ssh = { path = "../ssh", features = ["test_support"] }
+carbide-test-support = { path = "../test-support" }
+russh = { workspace = true }
 
 [features]
 #default = ["mockdpa"]
 default = []
 mockdpa = []
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

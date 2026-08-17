@@ -21,9 +21,9 @@ use mac_address::MacAddress;
 
 use crate::redfish;
 
-pub struct LiteOnPowerShelf<'a> {
-    pub bmc_mac_address: MacAddress,
-    pub product_serial_number: Cow<'a, str>,
+pub(crate) struct LiteOnPowerShelf<'a> {
+    pub(crate) bmc_mac_address: MacAddress,
+    pub(crate) product_serial_number: Cow<'a, str>,
 }
 
 impl LiteOnPowerShelf<'_> {
@@ -33,11 +33,11 @@ impl LiteOnPowerShelf<'_> {
             fan: 6,
             power: 12,
             current: 12,
-            leak: 0,
+            voltage: 0,
         }
     }
 
-    pub fn manager_config(&self) -> redfish::manager::Config {
+    pub(crate) fn manager_config(&self) -> redfish::manager::Config {
         redfish::manager::Config {
             managers: vec![redfish::manager::SingleConfig {
                 id: "bmc",
@@ -56,13 +56,14 @@ impl LiteOnPowerShelf<'_> {
                     .build(),
                 ]),
                 host_interfaces: None,
+                serial_interfaces: None,
                 firmware_version: Some("r1.3.9"),
                 oem: None,
             }],
         }
     }
 
-    pub fn system_config(&self) -> redfish::computer_system::Config {
+    pub(crate) fn system_config(&self) -> redfish::computer_system::Config {
         let system_id = "system";
 
         redfish::computer_system::Config {
@@ -80,15 +81,18 @@ impl LiteOnPowerShelf<'_> {
                 oem: redfish::computer_system::Oem::Generic,
                 log_services: None,
                 storage: None,
+                processors: None,
+                memory: None,
                 base_bios: Some(
                     redfish::bios::builder(&redfish::bios::resource(system_id)).build(),
                 ),
+                serial_console: None,
                 secure_boot_available: false,
             }],
         }
     }
 
-    pub fn chassis_config(&self) -> redfish::chassis::ChassisConfig {
+    pub(crate) fn chassis_config(&self) -> redfish::chassis::ChassisConfig {
         let chassis_id = "powershelf";
 
         redfish::chassis::ChassisConfig {
@@ -123,9 +127,10 @@ impl LiteOnPowerShelf<'_> {
         }
     }
 
-    pub fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
+    pub(crate) fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
         redfish::update_service::UpdateServiceConfig {
             firmware_inventory: vec![],
+            ..Default::default()
         }
     }
 }

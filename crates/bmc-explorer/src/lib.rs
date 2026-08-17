@@ -22,6 +22,8 @@ pub mod hw;
 mod inventories;
 mod manager;
 mod network_adapter;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 use std::collections::HashMap;
 use std::convert::identity;
 use std::sync::Arc;
@@ -40,6 +42,7 @@ use model::site_explorer::{
 };
 use nv_redfish::assembly::Model as AssemblyModel;
 use nv_redfish::computer_system::BootOption;
+use nv_redfish::core::ODataId;
 use nv_redfish::oem::ami::config_bmc::{
     LockdownBiosSettingsChangeState, LockdownBiosUpgradeDowngradeState,
     LockoutBiosVariableWriteMode, LockoutHostControlState,
@@ -48,8 +51,9 @@ use nv_redfish::oem::lenovo::computer_system::{FpMode, PortSwitchingTo};
 use nv_redfish::oem::lenovo::manager::KcsState;
 use nv_redfish::oem::lenovo::security_service::FwRollbackState;
 use nv_redfish::oem::supermicro::Privilege as SupermicroPrivilege;
-use nv_redfish::resource::ResourceNameRef;
-use nv_redfish::service_root::{Product, Vendor};
+use nv_redfish::resource::{ResourceIdRef, ResourceNameRef};
+pub use nv_redfish::service_root::Product;
+use nv_redfish::service_root::Vendor;
 use nv_redfish::{Bmc, Resource, ServiceRoot};
 
 #[derive(PartialEq, Eq)]
@@ -60,36 +64,82 @@ pub enum ErrorClass {
 
 pub type ErrorClassifier<'a, B> = &'a (dyn Fn(&<B as Bmc>::Error) -> Option<ErrorClass> + Sync);
 
+fn is_bluefield_system_id(id: ResourceIdRef<'_>) -> bool {
+    matches!(id.into_inner(), "Bluefield" | "BlueField_0")
+}
+
 pub struct Config<'a, B: Bmc> {
     pub boot_interface_mac: Option<MacAddress>,
     pub error_classifier: ErrorClassifier<'a, B>,
     pub retry_timeout: Duration,
 }
 
-pub async fn nv_generate_exploration_report<B: Bmc>(
-    mut root: Arc<ServiceRoot<B>>,
-    config: &Config<'_, B>,
-) -> Result<EndpointExplorationReport, Error<B>> {
-    let chassis_explore_config = chassis::Config {
+pub fn is_bf4_product(product: Option<Product<&str>>) -> bool {
+    // TODO: we should use part_number similar to BF3.
+    product == Some(Product::new("B4240V")) || product == Some(Product::new("BlueField-4"))
+}
+
+/// BlueField-4 BMC firmware reports a non-UUID value (`STATIC:1026:0:MCTP_EID:101`)
+/// in the `UUID` of the IRoT NIC chassis. skip it for now. TODO: remove this once we have a fix.
+fn should_fetch_bf4_chassis_except_irot_nic(odata_id: &ODataId) -> bool {
+    odata_id.last_segment() != Some("BlueField_IRoT_NIC_0")
+}
+
+/// Builds the chassis exploration config shared by [`nv_generate_exploration_report`]
+/// and the [`detect_hw_type`] accessor, so detection cannot drift between them.
+fn build_chassis_explore_config<B: Bmc>(root: &ServiceRoot<B>) -> chassis::Config {
+    let is_nvidia_vendor = root.vendor() == Some(Vendor::new("Nvidia"))
+        || root.vendor() == Some(Vendor::new("NVIDIA"));
+    let need_bf4_network_device_fns = is_nvidia_vendor && is_bf4_product(root.product());
+
+    chassis::Config {
         network_adapter: network_adapter::Config {
-            need_network_device_fns: root.vendor() == Some(Vendor::new("Dell")),
+            // Dell exploration needs NDF data for host-DPU pairing. BF4 needs
+            // NDF0 `PermanentMACAddress` to derive PF0 base MAC as (NDF0 - 0x10)
+            // while some BMC firmware does not expose ComputerSystem BaseMAC.
+            need_network_device_fns: root.vendor() == Some(Vendor::new("Dell"))
+                || need_bf4_network_device_fns,
         },
         need_assembly_sn: |id| {
-            // For GB200s, use the Chassis_0 assembly serial number to match Nautobot.
-            (*id.inner() == "Chassis_0")
-                .then_some(|model| model == Some(AssemblyModel::new("GB200 NVL")))
+            // For GB200 and Vera Rubin hosts, use the Chassis_0 assembly serial
+            // number to match Nautobot / expected-machine inventory serials.
+            (*id.inner() == "Chassis_0").then_some(|model| {
+                model.is_some_and(|model| {
+                    hw::vera_rubin::chassis_assembly_serial_model(model.into_inner())
+                }) || model == Some(AssemblyModel::new("GB200 NVL"))
+            })
         },
         // BlueField-3 DPU (Tested on BF-25.10-9 firmware) has issue
         // with ERoT chassis. It stucks sometimes until next request
         // of BlueField_ERoT. Because carbide doesn't need
         // BlueField_ERoT we just skip it.
-        lazy_fetch: (root.vendor() == Some(Vendor::new("Nvidia"))
-            && root.product() == Some(Product::new("BlueField-3 DPU")))
-        .then_some(|odata_id| odata_id.last_segment() != Some("Bluefield_ERoT")),
-    };
-    let explored_chassis =
+        // BlueField-4: skip IRoT NIC (invalid STATIC UUID breaks parsing).
+        lazy_fetch: if is_nvidia_vendor && is_bf4_product(root.product()) {
+            Some(should_fetch_bf4_chassis_except_irot_nic)
+        } else {
+            (root.vendor() == Some(Vendor::new("Nvidia"))
+                && root.product() == Some(Product::new("BlueField-3 DPU")))
+            .then_some(|odata_id| odata_id.last_segment() != Some("Bluefield_ERoT"))
+        },
+    }
+}
+
+pub async fn nv_generate_exploration_report<B: Bmc>(
+    mut root: Arc<ServiceRoot<B>>,
+    config: &Config<'_, B>,
+) -> Result<EndpointExplorationReport, Error<B>> {
+    let chassis_explore_config = build_chassis_explore_config(&root);
+    let mut explored_chassis =
         ExploredChassisCollection::explore(&root, &chassis_explore_config).await?;
     let explored_inventories = ExploredInventories::explore(&root).await?;
+
+    // Delta power shelves do not expose a `/redfish/v1/Systems` collection (and
+    // report no vendor in the service root, so nv-redfish fabricates the path
+    // and gets a 404). Detect them from the chassis and synthesize the report
+    // from chassis + manager data instead of fetching a ComputerSystem.
+    if explored_chassis.is_delta_powershelf() {
+        return build_delta_powershelf_report(&root, explored_chassis, explored_inventories).await;
+    }
 
     if explored_chassis.is_bluefield2() {
         root = root.as_ref().clone().restrict_expand().into();
@@ -123,7 +173,7 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
         .next()
         .ok_or_else(Error::bmc_not_provided("at least one manager"))?;
 
-    let is_bluefield_system = system.id().into_inner() == "Bluefield";
+    let is_bluefield_system = is_bluefield_system_id(system.id());
     let system_explore_config = computer_system::Config {
         need_oem_nvidia_bluefield: is_bluefield_system,
         ignore_500_on_bios_fetch: is_bluefield_system,
@@ -133,6 +183,22 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
     let explored_system = ExploredComputerSystem::explore(system, &system_explore_config).await?;
 
     let hw_type = hw_type(&root, &explored_system, &explored_chassis);
+    let linked_chassis_ids = explored_system.linked_chassis_ids();
+    let has_system_mac_address = explored_system.has_usable_ethernet_mac_address();
+    if should_use_network_adapter_port_fallback(
+        hw_type,
+        has_system_mac_address,
+        &linked_chassis_ids,
+    ) || should_fetch_supplemental_network_adapter_ports(
+        hw_type,
+        has_system_mac_address,
+        &linked_chassis_ids,
+    ) {
+        explored_chassis
+            .fetch_network_adapter_ports(&linked_chassis_ids)
+            .await;
+    }
+    let is_mgx_c2 = explored_chassis.is_mgx_c2();
     let manager_explore_config = hw_type
         .map(|hw_type| match hw_type {
             hw::HwType::Ami => manager::Config {
@@ -151,9 +217,13 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
                 need_oem_ami_config_bmc: true,
                 ..Default::default()
             },
+            hw::HwType::LenovoGb300 => manager::Config {
+                need_host_interfaces: true,
+                ..Default::default()
+            },
             hw::HwType::Supermicro => manager::Config {
                 need_host_interfaces: true,
-                need_oem_supermicro_kcs_interface: true,
+                need_oem_supermicro_kcs_interface: !is_mgx_c2,
                 need_oem_supermicro_sys_lockdown: true,
                 ..Default::default()
             },
@@ -179,15 +249,18 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
             ) => chassis.chassis.id().into_inner() == explored_system.system.id().into_inner(),
             // Provides only one Chassis.
             Some(hw::HwType::LenovoAmi) => true,
-            Some(hw::HwType::LenovoGb300) => {
-                let chassis_id = chassis.chassis.id().into_inner();
-                chassis_id.starts_with("HGX_GPU_")
-            }
+            Some(
+                hw::HwType::LenovoGb300
+                | hw::HwType::DgxGb300
+                | hw::HwType::SupermicroGb300
+                | hw::HwType::VeraRubin,
+            ) => chassis.chassis.id().into_inner().starts_with("HGX_GPU_"),
             // No meaningful PCIeDevices.
             Some(
                 hw::HwType::Bluefield
                 | hw::HwType::Gb200
                 | hw::HwType::LiteonPowerShelf
+                | hw::HwType::DeltaPowerShelf
                 | hw::HwType::NvSwitch,
             ) => false,
             None => false,
@@ -195,7 +268,14 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
         .await?;
 
     let lockdown_status = hw_type
-        .map(|hw_type| lockdown_status(&hw_type, &explored_system, &explored_manager))
+        .map(|hw_type| {
+            lockdown_status(
+                &hw_type,
+                &explored_system,
+                &explored_manager,
+                &explored_chassis,
+            )
+        })
         .transpose()?
         .and_then(identity);
 
@@ -222,6 +302,7 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
                 expected: "can detect".into(),
                 actual: "cannot detect".into(),
             }],
+            evaluated_boot_interface: None,
         });
 
     let system = explored_system.to_model(hw_type, &explored_chassis, &pcie_devices)?;
@@ -249,6 +330,87 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
         compute_tray_index: None,
         topology_id: None,
         revision_id: None,
+        remediation_error: None,
+    })
+}
+
+/// `should_use_network_adapter_port_fallback` limits supplemental host MAC
+/// discovery to platforms where we have verified the Redfish relationship.
+///
+/// Lenovo XCC can omit usable `EthernetInterfaces` while exposing host MAC
+/// addresses through adapter `Ports` on the linked chassis. Keep this policy
+/// narrow: a chassis `Port` is not necessarily a host or PXE interface.
+fn should_use_network_adapter_port_fallback(
+    hw_type: Option<hw::HwType>,
+    has_system_mac_address: bool,
+    linked_chassis_ids: &[nv_redfish::core::ODataId],
+) -> bool {
+    hw_type == Some(hw::HwType::Lenovo) && !has_system_mac_address && !linked_chassis_ids.is_empty()
+}
+
+/// Whether linked adapter Ports can supplement a Lenovo XCC's System inventory.
+fn should_fetch_supplemental_network_adapter_ports(
+    hw_type: Option<hw::HwType>,
+    has_system_mac_address: bool,
+    linked_chassis_ids: &[nv_redfish::core::ODataId],
+) -> bool {
+    hw_type == Some(hw::HwType::Lenovo) && has_system_mac_address && !linked_chassis_ids.is_empty()
+}
+
+/// Builds an exploration report for a Delta power shelf.
+///
+/// Delta BMCs do not serve `/redfish/v1/Systems`, so the standard flow (which
+/// unconditionally fetches a `ComputerSystem`) fails with a 404. Here we skip
+/// that fetch and synthesize a `ComputerSystem` from the chassis, matching the
+/// behavior of the libredfish Delta power-shelf path.
+async fn build_delta_powershelf_report<B: Bmc>(
+    root: &ServiceRoot<B>,
+    explored_chassis: ExploredChassisCollection<B>,
+    explored_inventories: ExploredInventories<B>,
+) -> Result<EndpointExplorationReport, Error<B>> {
+    let hw_type = hw::HwType::DeltaPowerShelf;
+
+    let manager = root
+        .managers()
+        .await
+        .map_err(Error::nv_redfish("managers"))?
+        .ok_or_else(Error::bmc_not_provided("managers"))?
+        .members()
+        .await
+        .map_err(Error::nv_redfish("managers members"))?
+        .into_iter()
+        .next()
+        .ok_or_else(Error::bmc_not_provided("at least one manager"))?;
+    let explored_manager = ExploredManager::explore(manager, &manager::Config::default()).await?;
+
+    let system = explored_chassis.synthesized_powershelf_system();
+
+    Ok(EndpointExplorationReport {
+        endpoint_type: EndpointType::Bmc,
+        last_exploration_error: None,
+        last_exploration_latency: None,
+        machine_id: None,
+        managers: vec![explored_manager.to_model()?],
+        systems: vec![system],
+        chassis: explored_chassis.to_model(),
+        service: explored_inventories.to_model(Some(hw_type)),
+        vendor: hw_type.bmc_vendor(),
+        versions: HashMap::default(),
+        model: None,
+        power_shelf_id: None,
+        switch_id: None,
+        machine_setup_status: Some(MachineSetupStatus {
+            is_done: true,
+            diffs: vec![],
+            evaluated_boot_interface: None,
+        }),
+        secure_boot_status: None,
+        lockdown_status: None,
+        physical_slot_number: None,
+        compute_tray_index: None,
+        topology_id: None,
+        revision_id: None,
+        remediation_error: None,
     })
 }
 
@@ -259,21 +421,45 @@ pub(crate) fn hw_type<B: Bmc>(
 ) -> Option<hw::HwType> {
     let system = &explored_system.system;
     let oem_id = root.oem_id().map(|v| v.into_inner());
+
+    // GB300 is an NVIDIA HGX platform identity, recognized by the NVIDIA "NVIDIA GB300"
+    // GPU chassis (`is_gb300()`) independent of the host BMC vendor. Resolve it before the
+    // host-vendor match below so platform classification is not gated on the host ODM; the
+    // ODM only selects the ODM-specific variant.
+    if explored_chassis.is_gb300() {
+        // Lenovo GB300: AMI host BMC + Lenovo host chassis.
+        if explored_chassis.is_lenovo() {
+            return Some(hw::HwType::LenovoGb300);
+        }
+        // DGX GB300: NVIDIA "GB BMC" host (same BMC family as GB200). Resolved here, ahead of
+        // the GB200 arm below, since it shares GB200's ServiceRoot signature -- the GB300 GPU
+        // chassis (`is_gb300()`) is what distinguishes it from a real GB200.
+        if root.vendor() == Some(Vendor::new("NVIDIA"))
+            && root.product() == Some(Product::new("GB BMC"))
+        {
+            return Some(hw::HwType::DgxGb300);
+        }
+        // SMC GB300: Supermicro OpenBMC host.
+        if root.vendor() == Some(Vendor::new("Supermicro")) {
+            return Some(hw::HwType::SupermicroGb300);
+        }
+    }
+
     root.vendor()
         .map(|v| v.into_inner())
         .or_else(|| (oem_id == Some("Supermicro")).then_some("Supermicro"))
         .and_then(|vendor_id| match vendor_id {
             "AMI" if system.id().into_inner() == "DGX" => Some(hw::HwType::Viking),
-            "AMI" if explored_chassis.is_gb300() && explored_chassis.is_lenovo() => {
-                Some(hw::HwType::LenovoGb300)
-            }
             "AMI" => Some(hw::HwType::Ami),
             "Dell" => Some(hw::HwType::Dell),
             "Lenovo" if oem_id == Some("Ami") => Some(hw::HwType::LenovoAmi),
             "Lenovo" if oem_id != Some("Ami") => Some(hw::HwType::Lenovo),
             "Supermicro" => Some(hw::HwType::Supermicro),
             "HPE" => Some(hw::HwType::Hpe),
-            "Nvidia" if system.id().into_inner() == "Bluefield" => Some(hw::HwType::Bluefield),
+            "Nvidia" if is_bluefield_system_id(system.id()) => Some(hw::HwType::Bluefield),
+            "NVIDIA" if root.product() == Some(Product::new("VR NVL72")) => {
+                Some(hw::HwType::VeraRubin)
+            }
             "WIWYNN" | "NVIDIA"
                 if root.product() == Some(Product::new("GB200 NVL"))
                     || root.product() == Some(Product::new("GB BMC")) =>
@@ -288,12 +474,18 @@ pub(crate) fn hw_type<B: Bmc>(
                 .is_liteon_powershelf()
                 .then_some(hw::HwType::LiteonPowerShelf)
         })
+        .or_else(|| {
+            explored_chassis
+                .is_delta_powershelf()
+                .then_some(hw::HwType::DeltaPowerShelf)
+        })
 }
 
 fn lockdown_status<B: Bmc>(
     hw_type: &hw::HwType,
     explored_system: &ExploredComputerSystem<B>,
     explored_manager: &ExploredManager<B>,
+    explored_chassis: &ExploredChassisCollection<B>,
 ) -> Result<Option<LockdownStatus>, Error<B>> {
     let bios = &explored_system.bios;
     let system = &explored_system.system;
@@ -339,10 +531,30 @@ fn lockdown_status<B: Bmc>(
             match (kcsacp, usb000, hi_enabled) {
                 (Some("Deny All"), Some("Disabled"), false) => Ok(InternalLockdownStatus::Enabled),
                 (Some("Allow All"), Some("Enabled"), true) => Ok(InternalLockdownStatus::Disabled),
-                (Some(_), Some(_), _) => Ok(InternalLockdownStatus::Partial),
-                _ => Err(Error::InvalidValue(format!(
-                    "AMI lockdown status: {message}"
-                ))),
+                _ => Ok(InternalLockdownStatus::Partial),
+            }
+            .map(|status| Some(LockdownStatus { status, message }))
+        }
+
+        // LenovoGB300 (Grace-based AMI host BMC) has neither the KCS BIOS
+        // attribute nor the OEM ConfigBMC endpoint. Lockdown is read from the
+        // USB support attribute (attribute-id prefixed enum, e.g.
+        // "USB000Disabled") together with the host interface state.
+        hw::HwType::LenovoGb300 => {
+            let bios = bios.as_ref().ok_or_else(Error::bmc_not_provided("bios"))?;
+            let usb000 = bios.attribute("USB000");
+            let usb000 = usb000.as_ref().and_then(|v| v.str_value());
+            let hi_enabled = explored_manager
+                .host_interfaces
+                .as_ref()
+                .ok_or_else(Error::bmc_not_provided("host interfaces"))?
+                .iter()
+                .any(|i| i.interface_enabled().is_none_or(identity));
+            let message = format!("usb_support={usb000:?}; host_interface={hi_enabled}");
+            match (usb000, hi_enabled) {
+                (Some("USB000Disabled"), false) => Ok(InternalLockdownStatus::Enabled),
+                (Some("USB000Enabled"), true) => Ok(InternalLockdownStatus::Disabled),
+                _ => Ok(InternalLockdownStatus::Partial),
             }
             .map(|status| Some(LockdownStatus { status, message }))
         }
@@ -511,33 +723,42 @@ fn lockdown_status<B: Bmc>(
                 .as_ref()
                 .and_then(|lck| lck.sys_lockdown_enabled())
                 .ok_or_else(Error::bmc_not_provided("Supermicro lockdown status"))?;
+            let ipmi_host_interface_enabled = system
+                .raw()
+                .ipmi_host_interface
+                .as_ref()
+                .and_then(|interface| interface.service_enabled);
             let message = format!(
-                "SysLockdownEnabled={is_syslockdown}, kcs_privilege={kcs_privilege:#?}, host_interface_enabled={hi_enabled}"
+                "SysLockdownEnabled={is_syslockdown}, kcs_privilege={kcs_privilege:#?}, \
+                 host_interface_enabled={hi_enabled}, \
+                 ipmi_host_interface_enabled={ipmi_host_interface_enabled:?}"
             );
 
             let model = system.hardware_id().model.map(|v| v.into_inner());
-            if model == Some("ARS-121L-DNR") {
-                // Grace-Grace SMCs (ARS-121L-DNR):
-                // 1. Need host_interface enabled even with lockdown
-                // 2. Doesn't provide KCSInterface
-                match (hi_enabled, is_syslockdown) {
-                    (true, true) => Ok(InternalLockdownStatus::Enabled),
-                    (true, false) => Ok(InternalLockdownStatus::Disabled),
-                    _ => Ok(InternalLockdownStatus::Partial),
-                }
+            let is_ars_121l_dnr = model == Some("ARS-121L-DNR");
+            let (inband_locked, inband_unlocked) = if explored_chassis.is_mgx_c2() {
+                (
+                    ipmi_host_interface_enabled.is_none_or(|enabled| !enabled),
+                    ipmi_host_interface_enabled.is_none_or(identity),
+                )
             } else {
-                match (hi_enabled, kcs_privilege, is_syslockdown) {
-                    (false, Some(SupermicroPrivilege::Callback), true) => {
-                        Ok(InternalLockdownStatus::Enabled)
-                    }
-                    (true, Some(SupermicroPrivilege::Administrator), false) => {
-                        Ok(InternalLockdownStatus::Disabled)
-                    }
-                    (true, None, false) => Ok(InternalLockdownStatus::Disabled),
-                    _ => Ok(InternalLockdownStatus::Partial),
-                }
-            }
-            .map(|status| Some(LockdownStatus { status, message }))
+                (
+                    kcs_privilege == Some(SupermicroPrivilege::Callback),
+                    kcs_privilege.is_none()
+                        || kcs_privilege == Some(SupermicroPrivilege::Administrator),
+                )
+            };
+            // ARS-121L-DNR must keep HostInterface enabled to PXE boot.
+            let host_interface_locked = hi_enabled == is_ars_121l_dnr;
+
+            let status = if is_syslockdown && inband_locked && host_interface_locked {
+                InternalLockdownStatus::Enabled
+            } else if !is_syslockdown && inband_unlocked && hi_enabled {
+                InternalLockdownStatus::Disabled
+            } else {
+                InternalLockdownStatus::Partial
+            };
+            Ok(Some(LockdownStatus { status, message }))
         }
 
         hw::HwType::Hpe => {
@@ -588,6 +809,7 @@ fn machine_setup_status<B: Bmc>(
     }
     match hw_type {
         hw::HwType::LiteonPowerShelf => (),
+        hw::HwType::DeltaPowerShelf => (),
         hw::HwType::NvSwitch => (),
         hw::HwType::Viking => {
             diffs.extend(
@@ -736,10 +958,13 @@ fn machine_setup_status<B: Bmc>(
                     .iter()
                     .flat_map(|expected| explored_system.verify_bios_attr(expected)),
             );
-            if let Some(mac) = boot_interface_mac
-                && let Some(diff) = explored_system.check_boot_by_uefi_prefix(mac)
-            {
-                diffs.push(diff)
+            if let Some(mac) = boot_interface_mac {
+                if let Some(diff) = explored_system.check_boot_by_uefi_prefix(mac) {
+                    diffs.push(diff);
+                }
+                if let Some(diff) = explored_system.check_boot_option_enabled_by_uefi_prefix(mac) {
+                    diffs.push(diff);
+                }
             }
         }
 
@@ -846,11 +1071,101 @@ fn machine_setup_status<B: Bmc>(
                 }
             }
         }
+
+        hw::HwType::VeraRubin => {
+            if explored_system
+                .secure_boot_status()
+                .is_ok_and(|s| s.is_enabled)
+            {
+                diffs.push(MachineSetupDiff {
+                    key: "SecureBoot".to_string(),
+                    expected: "false".to_string(),
+                    actual: "true".to_string(),
+                })
+            }
+            diffs.extend(
+                hw::vera_rubin::EXPECTED_BIOS_ATTRS
+                    .iter()
+                    .flat_map(|expected| explored_system.verify_bios_attr(expected)),
+            );
+            if let Some(mac) = boot_interface_mac {
+                // Looking for UEFI Device path:
+                // VenHw(...)/.../MAC(020304050607,0x1)/IPv4(0.0.0.0)/Uri()
+                let actual = explored_system.boot_order_first_option();
+                let mac_str = format!("/MAC({},", mac.to_string().replace(":", ""));
+                let expected = explored_system.boot_options.iter().find(|option| {
+                    option.uefi_device_path().is_some_and(|path| {
+                        path.inner().contains(&mac_str)
+                            && path.inner().contains("/IPv4(")
+                            && path.inner().ends_with("/Uri()")
+                    })
+                });
+                if let Some(diff) = compare_boot_options(expected, actual) {
+                    diffs.push(diff)
+                }
+            }
+        }
+
+        hw::HwType::DgxGb300 => {
+            // DGX GB300 on the NVIDIA "GB BMC" uses the platform-level setup expectations:
+            // secure boot off and boot order by MAC.
+            // TODO(dgx-gb300): add EXPECTED_BIOS_ATTRS once the tray BIOS is characterized.
+            if explored_system
+                .secure_boot_status()
+                .is_ok_and(|s| s.is_enabled)
+            {
+                diffs.push(MachineSetupDiff {
+                    key: "SecureBoot".to_string(),
+                    expected: "false".to_string(),
+                    actual: "true".to_string(),
+                })
+            }
+            if let Some(mac) = boot_interface_mac {
+                let actual = explored_system.boot_order_first_option();
+                let mac_str = format!("/MAC({},", mac.to_string().replace(":", ""));
+                let expected = explored_system.boot_options.iter().find(|option| {
+                    option.uefi_device_path().is_some_and(|path| {
+                        path.inner().contains(&mac_str)
+                            && path.inner().contains("/IPv4(")
+                            && path.inner().ends_with("/Uri()")
+                    })
+                });
+                if let Some(diff) = compare_boot_options(expected, actual) {
+                    diffs.push(diff)
+                }
+            }
+        }
+
+        hw::HwType::SupermicroGb300 => {
+            // Supermicro GB300 uses the GBx00 OpenBMC flow, but its firmware does not expose
+            // SecureBootEnable or EmbeddedUefiShell. Verify only the controls present in the
+            // real tray: TPM support and the DPU-facing PCIe option ROMs.
+            diffs.extend(
+                hw::supermicro_gb300::EXPECTED_BIOS_ATTRS
+                    .iter()
+                    .flat_map(|expected| explored_system.verify_bios_attr(expected)),
+            );
+            if let Some(mac) = boot_interface_mac {
+                let actual = explored_system.boot_order_first_option();
+                let mac_str = format!("/MAC({},", mac.to_string().replace(":", ""));
+                let expected = explored_system.boot_options.iter().find(|option| {
+                    option.uefi_device_path().is_some_and(|path| {
+                        path.inner().contains(&mac_str)
+                            && path.inner().contains("/IPv4(")
+                            && path.inner().ends_with("/Uri()")
+                    })
+                });
+                if let Some(diff) = compare_boot_options(expected, actual) {
+                    diffs.push(diff)
+                }
+            }
+        }
     }
 
     MachineSetupStatus {
         is_done: diffs.is_empty(),
         diffs,
+        evaluated_boot_interface: None,
     }
 }
 
@@ -880,5 +1195,102 @@ fn compare_boot_options<B: Bmc>(
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::value_scenarios;
+    use nv_redfish::core::ODataId;
+
+    use super::hw::HwType;
+    use super::{
+        Product, is_bf4_product, should_fetch_bf4_chassis_except_irot_nic,
+        should_fetch_supplemental_network_adapter_ports, should_use_network_adapter_port_fallback,
+    };
+
+    #[test]
+    fn is_bf4_product_matches_bf4_service_root_products() {
+        assert!(is_bf4_product(Some(Product::new("B4240V"))));
+        assert!(is_bf4_product(Some(Product::new("BlueField-4"))));
+        assert!(!is_bf4_product(Some(Product::new("BlueField-3 DPU"))));
+        assert!(!is_bf4_product(None));
+    }
+
+    #[test]
+    fn bf4_chassis_fetch_excludes_irot_nic() {
+        assert!(!should_fetch_bf4_chassis_except_irot_nic(&ODataId::from(
+            "/redfish/v1/Chassis/BlueField_IRoT_NIC_0".to_string()
+        )));
+        assert!(should_fetch_bf4_chassis_except_irot_nic(&ODataId::from(
+            "/redfish/v1/Chassis/BlueField_ERoT_BMC_0".to_string()
+        )));
+        assert!(should_fetch_bf4_chassis_except_irot_nic(&ODataId::from(
+            "/redfish/v1/Chassis/BlueField_0".to_string()
+        )));
+    }
+
+    #[test]
+    fn lenovo_network_adapter_port_fallback_is_narrow() {
+        value_scenarios!(run = |(hw_type, has_system_mac_address, has_linked_chassis)| {
+            let linked_chassis_ids = has_linked_chassis
+                .then(|| ODataId::from("/redfish/v1/Chassis/Self".to_string()))
+                .into_iter()
+                .collect::<Vec<_>>();
+
+            should_use_network_adapter_port_fallback(
+                hw_type,
+                has_system_mac_address,
+                &linked_chassis_ids,
+            )
+        };
+            "Lenovo XCC without a System MAC and with a chassis link" {
+                (Some(HwType::Lenovo), false, true) => true,
+            }
+            "non-Lenovo host" {
+                (Some(HwType::Ami), false, true) => false,
+            }
+            "Lenovo AMI host" {
+                (Some(HwType::LenovoAmi), false, true) => false,
+            }
+            "Lenovo XCC with a System MAC" {
+                (Some(HwType::Lenovo), true, true) => false,
+            }
+            "Lenovo XCC without a linked chassis" {
+                (Some(HwType::Lenovo), false, false) => false,
+            }
+        );
+    }
+
+    #[test]
+    fn lenovo_network_adapter_port_fetch_supplements_partial_inventory() {
+        value_scenarios!(run = |(hw_type, has_system_mac_address, has_linked_chassis)| {
+            let linked_chassis_ids = has_linked_chassis
+                .then(|| ODataId::from("/redfish/v1/Chassis/Self".to_string()))
+                .into_iter()
+                .collect::<Vec<_>>();
+
+            should_fetch_supplemental_network_adapter_ports(
+                hw_type,
+                has_system_mac_address,
+                &linked_chassis_ids,
+            )
+        };
+            "Lenovo XCC without a System MAC" {
+                (Some(HwType::Lenovo), false, true) => false,
+            }
+            "Lenovo XCC with a System MAC supplements its inventory" {
+                (Some(HwType::Lenovo), true, true) => true,
+            }
+            "non-Lenovo host" {
+                (Some(HwType::Ami), true, true) => false,
+            }
+            "Lenovo AMI host" {
+                (Some(HwType::LenovoAmi), true, true) => false,
+            }
+            "Lenovo XCC without a linked chassis" {
+                (Some(HwType::Lenovo), true, false) => false,
+            }
+        );
     }
 }

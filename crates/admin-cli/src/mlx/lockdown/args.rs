@@ -22,9 +22,24 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 use rpc::protos::mlx_device as mlx_device_pb;
 
+use crate::cfg::dispatch::Dispatch;
+
 // LockdownCommand are the lockdown subcommands.
-#[derive(Parser, Debug)]
-pub enum LockdownCommand {
+#[derive(Parser, Debug, Dispatch)]
+#[command(after_long_help = "\
+EXAMPLES:
+
+Lock hardware access on a device:
+    $ nico-admin-cli mlx lockdown lock 12345678-1234-5678-90ab-cdef01234567 0000:01:00.0
+
+Unlock hardware access on a device:
+    $ nico-admin-cli mlx lockdown unlock 12345678-1234-5678-90ab-cdef01234567 0000:01:00.0
+
+Check a device's lockdown status:
+    $ nico-admin-cli mlx lockdown status 12345678-1234-5678-90ab-cdef01234567 0000:01:00.0
+
+")]
+pub(crate) enum LockdownCommand {
     #[clap(about = "Lock hardware access on a device")]
     Lock(LockdownLockCommand),
 
@@ -37,32 +52,32 @@ pub enum LockdownCommand {
 
 // LockdownLockCommand locks hardware access on a device.
 #[derive(Parser, Debug)]
-pub struct LockdownLockCommand {
+pub(crate) struct LockdownLockCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Device ID is the PCI or mst path on the target machine")]
-    pub device_id: String,
+    device_id: String,
 }
 
 // LockdownUnlockCommand unlocks hardware access on a device.
 #[derive(Parser, Debug)]
-pub struct LockdownUnlockCommand {
+pub(crate) struct LockdownUnlockCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Device ID is the PCI or mst path on the target machine")]
-    pub device_id: String,
+    device_id: String,
 }
 
 // LockdownStatusCommand gets the current lockdown status of a device.
 #[derive(Parser, Debug)]
-pub struct LockdownStatusCommand {
+pub(crate) struct LockdownStatusCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Device ID is the PCI or mst path on the target machine")]
-    pub device_id: String,
+    device_id: String,
 }
 
 impl From<LockdownLockCommand> for mlx_device_pb::MlxAdminLockdownLockRequest {

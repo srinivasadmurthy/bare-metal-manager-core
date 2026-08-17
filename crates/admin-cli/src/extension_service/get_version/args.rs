@@ -18,9 +18,20 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Get version info for all versions of a service:
+    $ nico-admin-cli extension-service get-version --service-id 12345678-1234-5678-90ab-cdef01234567
+
+Get version info for specific versions:
+    $ nico-admin-cli extension-service get-version --service-id 12345678-1234-5678-90ab-cdef01234567 \
+    --versions 1.0,1.1
+
+")]
+pub(crate) struct Args {
     #[clap(short = 'i', long, help = "The extension service ID")]
-    pub service_id: String,
+    service_id: String,
 
     #[clap(
         short = 'v',
@@ -28,7 +39,7 @@ pub struct Args {
         help = "Version strings to get (optional, leave empty to get all versions)",
         value_delimiter = ','
     )]
-    pub versions: Vec<String>,
+    versions: Vec<String>,
 }
 
 impl From<Args> for ::rpc::forge::GetDpuExtensionServiceVersionsInfoRequest {

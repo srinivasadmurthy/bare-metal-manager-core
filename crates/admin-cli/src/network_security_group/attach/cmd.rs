@@ -15,14 +15,13 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
-
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 
 /// "Attaches" a network security group to an object (VPC/Instance)
 /// by updating the config of the object.
-pub async fn attach(args: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
+pub(super) async fn attach(args: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
     // Check that at least one of instance ID or VPC ID has been sent
     if args.instance_id.is_none() && args.vpc_id.is_none() {
         return Err(CarbideCliError::GenericError(
@@ -80,13 +79,7 @@ pub async fn attach(args: Args, api_client: &ApiClient) -> CarbideCliResult<()> 
         // Submit the VPC details back to the system but change the
         // NSG ID value.
         let _vpc = api_client
-            .update_vpc_config(
-                v,
-                vpc.version,
-                vpc.name,
-                vpc.metadata,
-                Some(args.id.clone()),
-            )
+            .update_vpc_config(v, vpc.version, vpc.metadata, Some(args.id.clone()))
             .await?;
 
         println!(

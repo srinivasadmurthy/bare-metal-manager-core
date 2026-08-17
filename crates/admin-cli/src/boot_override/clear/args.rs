@@ -24,9 +24,16 @@ use crate::boot_override::common::BootOverride;
 // specific newtype to allow sharing of BootOverride, and still
 // providing a subcommand-specific Run trait implementation.
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Clear the boot override on a machine interface:
+    $ nico-admin-cli boot-override clear 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(flatten)]
-    pub inner: BootOverride,
+    inner: BootOverride,
 }
 
 impl From<Args> for MachineInterfaceId {

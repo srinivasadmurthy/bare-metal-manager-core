@@ -18,13 +18,12 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use ::rpc::forge as rpc;
 use carbide_uuid::machine::MachineId;
 use serde::{Deserialize, Serialize};
 
 use super::infiniband::MachineInfinibandStatusObservation;
-use crate::hardware_info::{CpuInfo, InfinibandInterface};
-use crate::machine::{HardwareInfo, MachineInterfaceSnapshot, RpcDataConversionError};
+use crate::hardware_info::{CpuInfo, HardwareInfo, InfinibandInterface, is_mnnvl_capable_gpu};
+use crate::machine::MachineInterfaceSnapshot;
 
 lazy_static::lazy_static! {
     static ref BLOCK_STORAGE_REGEX: regex::Regex = regex::Regex::new(r"(Virtual_CDROM\d+|Virtual_SD\d+|NO_MODEL|LOGICAL_VOLUME)").unwrap();
@@ -63,39 +62,6 @@ impl fmt::Display for MachineCapabilityType {
     }
 }
 
-impl From<MachineCapabilityType> for rpc::MachineCapabilityType {
-    fn from(t: MachineCapabilityType) -> Self {
-        match t {
-            MachineCapabilityType::Cpu => rpc::MachineCapabilityType::CapTypeCpu,
-            MachineCapabilityType::Gpu => rpc::MachineCapabilityType::CapTypeGpu,
-            MachineCapabilityType::Memory => rpc::MachineCapabilityType::CapTypeMemory,
-            MachineCapabilityType::Storage => rpc::MachineCapabilityType::CapTypeStorage,
-            MachineCapabilityType::Network => rpc::MachineCapabilityType::CapTypeNetwork,
-            MachineCapabilityType::Infiniband => rpc::MachineCapabilityType::CapTypeInfiniband,
-            MachineCapabilityType::Dpu => rpc::MachineCapabilityType::CapTypeDpu,
-        }
-    }
-}
-
-impl TryFrom<rpc::MachineCapabilityType> for MachineCapabilityType {
-    type Error = RpcDataConversionError;
-
-    fn try_from(t: rpc::MachineCapabilityType) -> Result<Self, Self::Error> {
-        match t {
-            rpc::MachineCapabilityType::CapTypeInvalid => Err(
-                RpcDataConversionError::InvalidArgument(t.as_str_name().to_string()),
-            ),
-            rpc::MachineCapabilityType::CapTypeCpu => Ok(MachineCapabilityType::Cpu),
-            rpc::MachineCapabilityType::CapTypeGpu => Ok(MachineCapabilityType::Gpu),
-            rpc::MachineCapabilityType::CapTypeMemory => Ok(MachineCapabilityType::Memory),
-            rpc::MachineCapabilityType::CapTypeStorage => Ok(MachineCapabilityType::Storage),
-            rpc::MachineCapabilityType::CapTypeNetwork => Ok(MachineCapabilityType::Network),
-            rpc::MachineCapabilityType::CapTypeInfiniband => Ok(MachineCapabilityType::Infiniband),
-            rpc::MachineCapabilityType::CapTypeDpu => Ok(MachineCapabilityType::Dpu),
-        }
-    }
-}
-
 /* ********************************** */
 /*         MachineCapabilityCpu       */
 /* ********************************** */
@@ -126,18 +92,6 @@ impl From<&CpuInfo> for MachineCapabilityCpu {
     }
 }
 
-impl From<MachineCapabilityCpu> for rpc::MachineCapabilityAttributesCpu {
-    fn from(cap: MachineCapabilityCpu) -> Self {
-        rpc::MachineCapabilityAttributesCpu {
-            name: cap.name,
-            count: cap.count,
-            vendor: cap.vendor,
-            cores: cap.cores,
-            threads: cap.threads,
-        }
-    }
-}
-
 /* ********************************** */
 /*         MachineCapabilityGpu       */
 /* ********************************** */
@@ -154,23 +108,6 @@ pub struct MachineCapabilityGpu {
     pub device_type: Option<MachineCapabilityDeviceType>,
 }
 
-impl From<MachineCapabilityGpu> for rpc::MachineCapabilityAttributesGpu {
-    fn from(cap: MachineCapabilityGpu) -> Self {
-        rpc::MachineCapabilityAttributesGpu {
-            name: cap.name,
-            frequency: cap.frequency,
-            vendor: cap.vendor,
-            count: cap.count,
-            capacity: cap.memory_capacity,
-            cores: cap.cores,
-            threads: cap.threads,
-            device_type: cap
-                .device_type
-                .map(|dt| rpc::MachineCapabilityDeviceType::from(dt).into()),
-        }
-    }
-}
-
 /* ********************************** */
 /*       MachineCapabilityMemory      */
 /* ********************************** */
@@ -181,17 +118,6 @@ pub struct MachineCapabilityMemory {
     pub count: u32,
     pub vendor: Option<String>,
     pub capacity: Option<String>,
-}
-
-impl From<MachineCapabilityMemory> for rpc::MachineCapabilityAttributesMemory {
-    fn from(cap: MachineCapabilityMemory) -> Self {
-        rpc::MachineCapabilityAttributesMemory {
-            name: cap.name,
-            count: cap.count,
-            vendor: cap.vendor,
-            capacity: cap.capacity,
-        }
-    }
 }
 
 /* ********************************** */
@@ -206,17 +132,6 @@ pub struct MachineCapabilityStorage {
     pub capacity: Option<String>,
 }
 
-impl From<MachineCapabilityStorage> for rpc::MachineCapabilityAttributesStorage {
-    fn from(cap: MachineCapabilityStorage) -> Self {
-        rpc::MachineCapabilityAttributesStorage {
-            name: cap.name,
-            count: cap.count,
-            vendor: cap.vendor,
-            capacity: cap.capacity,
-        }
-    }
-}
-
 /* ********************************** */
 /*       MachineCapabilityNetwork     */
 /* ********************************** */
@@ -227,19 +142,6 @@ pub struct MachineCapabilityNetwork {
     pub count: u32,
     pub vendor: Option<String>,
     pub device_type: Option<MachineCapabilityDeviceType>,
-}
-
-impl From<MachineCapabilityNetwork> for rpc::MachineCapabilityAttributesNetwork {
-    fn from(cap: MachineCapabilityNetwork) -> Self {
-        rpc::MachineCapabilityAttributesNetwork {
-            name: cap.name,
-            count: cap.count,
-            vendor: cap.vendor,
-            device_type: cap
-                .device_type
-                .map(|dt| rpc::MachineCapabilityDeviceType::from(dt).into()),
-        }
-    }
 }
 
 /* ********************************** */
@@ -261,17 +163,6 @@ pub struct MachineCapabilityInfiniband {
     pub inactive_devices: Vec<u32>,
 }
 
-impl From<MachineCapabilityInfiniband> for rpc::MachineCapabilityAttributesInfiniband {
-    fn from(cap: MachineCapabilityInfiniband) -> Self {
-        rpc::MachineCapabilityAttributesInfiniband {
-            name: cap.name,
-            vendor: Some(cap.vendor),
-            count: cap.count,
-            inactive_devices: cap.inactive_devices,
-        }
-    }
-}
-
 impl MachineCapabilityInfiniband {
     /// Derives a Machines Infiniband capabilities based on a hardware snapshot
     /// and the current InfiniBand connection status
@@ -280,15 +171,20 @@ impl MachineCapabilityInfiniband {
         ib_status: Option<&MachineInfinibandStatusObservation>,
     ) -> Vec<Self> {
         // IB interfaces get sorted by PCI Slot ID so that the inactive device
-        // indices can be derived correctly
-        let mut sorted_ib_interfaces = infiniband_interfaces.to_vec();
-        sorted_ib_interfaces.sort_by_key(|iface| match &iface.pci_properties {
-            Some(pci_properties) => pci_properties.slot.clone().unwrap_or_default(),
-            None => "".to_owned(),
+        // indices can be derived correctly. Sorting reorders borrowed
+        // references; only strings placed in the result are cloned.
+        let mut sorted_ib_interfaces: Vec<&InfinibandInterface> =
+            infiniband_interfaces.iter().collect();
+        sorted_ib_interfaces.sort_by_key(|&iface| {
+            iface
+                .pci_properties
+                .as_ref()
+                .and_then(|pci_properties| pci_properties.slot.as_deref())
+                .unwrap_or_default()
         });
         let mut infiniband_interface_map = HashMap::<String, MachineCapabilityInfiniband>::new();
 
-        for infiniband_interface_info in sorted_ib_interfaces.iter() {
+        for infiniband_interface_info in sorted_ib_interfaces {
             // Skip any interface where we can't get PCI details.
             // This is how this data is handled in forge-cloud, but
             // does it make sense here?
@@ -343,15 +239,6 @@ pub struct MachineCapabilityDpu {
     pub hardware_revision: Option<String>,
 }
 
-impl From<MachineCapabilityDpu> for rpc::MachineCapabilityAttributesDpu {
-    fn from(cap: MachineCapabilityDpu) -> Self {
-        rpc::MachineCapabilityAttributesDpu {
-            name: cap.name,
-            count: cap.count,
-            hardware_revision: cap.hardware_revision,
-        }
-    }
-}
 /* ********************************** */
 /*       MachineCapabilitiesSet       */
 /* ********************************** */
@@ -369,24 +256,6 @@ pub struct MachineCapabilitiesSet {
     pub network: Vec<MachineCapabilityNetwork>,
     pub infiniband: Vec<MachineCapabilityInfiniband>,
     pub dpu: Vec<MachineCapabilityDpu>,
-}
-
-impl From<MachineCapabilitiesSet> for rpc::MachineCapabilitiesSet {
-    fn from(cap_set: MachineCapabilitiesSet) -> Self {
-        rpc::MachineCapabilitiesSet {
-            cpu: cap_set.cpu.into_iter().map(|cap| cap.into()).collect(),
-            gpu: cap_set.gpu.into_iter().map(|cap| cap.into()).collect(),
-            memory: cap_set.memory.into_iter().map(|cap| cap.into()).collect(),
-            storage: cap_set.storage.into_iter().map(|cap| cap.into()).collect(),
-            network: cap_set.network.into_iter().map(|cap| cap.into()).collect(),
-            infiniband: cap_set
-                .infiniband
-                .into_iter()
-                .map(|cap| cap.into())
-                .collect(),
-            dpu: cap_set.dpu.into_iter().map(|cap| cap.into()).collect(),
-        }
-    }
 }
 
 /* ********************************************* */
@@ -411,28 +280,6 @@ impl fmt::Display for MachineCapabilityDeviceType {
     }
 }
 
-impl From<MachineCapabilityDeviceType> for rpc::MachineCapabilityDeviceType {
-    fn from(t: MachineCapabilityDeviceType) -> Self {
-        match t {
-            MachineCapabilityDeviceType::Unknown => rpc::MachineCapabilityDeviceType::Unknown,
-            MachineCapabilityDeviceType::Dpu => rpc::MachineCapabilityDeviceType::Dpu,
-            MachineCapabilityDeviceType::NvLink => rpc::MachineCapabilityDeviceType::Nvlink,
-        }
-    }
-}
-
-impl TryFrom<rpc::MachineCapabilityDeviceType> for MachineCapabilityDeviceType {
-    type Error = RpcDataConversionError;
-
-    fn try_from(t: rpc::MachineCapabilityDeviceType) -> Result<Self, Self::Error> {
-        match t {
-            rpc::MachineCapabilityDeviceType::Unknown => Ok(MachineCapabilityDeviceType::Unknown),
-            rpc::MachineCapabilityDeviceType::Dpu => Ok(MachineCapabilityDeviceType::Dpu),
-            rpc::MachineCapabilityDeviceType::Nvlink => Ok(MachineCapabilityDeviceType::NvLink),
-        }
-    }
-}
-
 impl MachineCapabilitiesSet {
     /// The arrays in each property of a capability set are not guaranteed to
     /// to have deterministic ordering, which is probably fine for most cases.
@@ -448,44 +295,47 @@ impl MachineCapabilitiesSet {
         self.dpu.sort();
     }
 
+    /// Derives the capability set from borrowed hardware/interface data,
+    /// cloning only the strings that end up in the result. Callers keep
+    /// ownership of the (large) `HardwareInfo` and interface list.
     pub fn from_hardware_info(
-        hardware_info: HardwareInfo,
+        hardware_info: &HardwareInfo,
         ib_status: Option<&MachineInfinibandStatusObservation>,
         dpu_machine_ids: Vec<MachineId>,
-        machine_interfaces: Vec<MachineInterfaceSnapshot>,
+        machine_interfaces: &[MachineInterfaceSnapshot],
     ) -> Self {
         //
         //  Process GPU data
         //
 
-        let mut gpu_map = HashMap::<String, MachineCapabilityGpu>::new();
+        // The de-duplication maps borrow their keys from `hardware_info`;
+        // only the strings placed in the result values are cloned.
+        let mut gpu_map = HashMap::<&str, MachineCapabilityGpu>::new();
 
-        let is_gbx00 = hardware_info.is_gbx00();
-        for gpu_info in hardware_info.gpus.into_iter() {
-            match gpu_map.get_mut(&gpu_info.name) {
-                None => {
-                    gpu_map.insert(
-                        gpu_info.name.clone(),
-                        MachineCapabilityGpu {
-                            name: gpu_info.name,
-                            count: 1,
-                            vendor: None, // hardware_info doesn't provide this.
-                            frequency: Some(gpu_info.frequency),
-                            cores: None,   // hardware_info doesn't provide this.
-                            threads: None, // hardware_info doesn't provide this.
-                            memory_capacity: Some(gpu_info.total_memory),
-                            device_type: if is_gbx00 {
-                                Some(MachineCapabilityDeviceType::NvLink)
-                            } else {
-                                Some(MachineCapabilityDeviceType::Unknown)
-                            },
-                        },
-                    );
-                }
-                Some(gpu_cap) => {
-                    gpu_cap.count += 1;
-                }
+        let dmi_product_name = hardware_info
+            .dmi_data
+            .as_ref()
+            .map(|dmi| dmi.product_name.as_str());
+
+        for gpu_info in hardware_info.gpus.iter() {
+            let device_type = if is_mnnvl_capable_gpu(gpu_info, dmi_product_name) {
+                Some(MachineCapabilityDeviceType::NvLink)
+            } else {
+                Some(MachineCapabilityDeviceType::Unknown)
             };
+            gpu_map
+                .entry(&gpu_info.name)
+                .and_modify(|gpu_cap| gpu_cap.count += 1)
+                .or_insert_with(|| MachineCapabilityGpu {
+                    name: gpu_info.name.clone(),
+                    count: 1,
+                    vendor: None, // hardware_info doesn't provide this.
+                    frequency: Some(gpu_info.frequency.clone()),
+                    cores: None,   // hardware_info doesn't provide this.
+                    threads: None, // hardware_info doesn't provide this.
+                    memory_capacity: Some(gpu_info.total_memory.clone()),
+                    device_type,
+                });
         }
 
         //
@@ -494,11 +344,14 @@ impl MachineCapabilitiesSet {
 
         let mut mem_map = HashMap::<String, usize>::new();
 
-        for mem_info in hardware_info.memory_devices.into_iter() {
-            let name = mem_info.mem_type.unwrap_or("unknown".to_string());
+        for mem_info in hardware_info.memory_devices.iter() {
+            let name = mem_info
+                .mem_type
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
 
             mem_map
-                .entry(name.clone())
+                .entry(name)
                 .and_modify(|e| {
                     *e = e.saturating_add(mem_info.size_mb.unwrap_or_default() as usize)
                 })
@@ -510,74 +363,60 @@ impl MachineCapabilitiesSet {
         // NVME and block storage get flattened out into just "storage"
         //
 
-        let mut storage_map = HashMap::<String, MachineCapabilityStorage>::new();
+        let mut storage_map = HashMap::<&str, MachineCapabilityStorage>::new();
 
         // Start with any NVME devices.
-        for storage_info in hardware_info.nvme_devices.into_iter() {
+        for storage_info in hardware_info.nvme_devices.iter() {
             // Skip missing models, logical volumes, and virtual storage.
             if NVME_STORAGE_REGEX.is_match(&storage_info.model) {
                 continue;
             }
 
-            match storage_map.get_mut(&storage_info.model) {
-                None => {
-                    storage_map.insert(
-                        storage_info.model.clone(),
-                        MachineCapabilityStorage {
-                            name: storage_info.model.clone(),
-                            count: 1,
-                            vendor: None,   // hardware_info doesn't provide this.
-                            capacity: None, // hardware_info doesn't provide this.
-                        },
-                    );
-                }
-                Some(storage_cap) => {
-                    storage_cap.count += 1;
-                }
-            };
+            storage_map
+                .entry(&storage_info.model)
+                .and_modify(|storage_cap| storage_cap.count += 1)
+                .or_insert_with(|| MachineCapabilityStorage {
+                    name: storage_info.model.clone(),
+                    count: 1,
+                    vendor: None,   // hardware_info doesn't provide this.
+                    capacity: None, // hardware_info doesn't provide this.
+                });
         }
 
         // Next, add in any block storage devices.
-        for storage_info in hardware_info.block_devices.into_iter() {
+        for storage_info in hardware_info.block_devices.iter() {
             // Skip missing models, logical volumes, and virtual storage.
             if BLOCK_STORAGE_REGEX.is_match(&storage_info.model) {
                 continue;
             }
 
-            match storage_map.get_mut(&storage_info.model) {
-                None => {
-                    storage_map.insert(
-                        storage_info.model.clone(),
-                        MachineCapabilityStorage {
-                            name: storage_info.model.clone(),
-                            count: 1,
-                            vendor: None,   // hardware_info doesn't provide this.
-                            capacity: None, // hardware_info doesn't provide this.
-                        },
-                    );
-                }
-                Some(storage_cap) => {
-                    storage_cap.count += 1;
-                }
-            };
+            storage_map
+                .entry(&storage_info.model)
+                .and_modify(|storage_cap| storage_cap.count += 1)
+                .or_insert_with(|| MachineCapabilityStorage {
+                    name: storage_info.model.clone(),
+                    count: 1,
+                    vendor: None,   // hardware_info doesn't provide this.
+                    capacity: None, // hardware_info doesn't provide this.
+                });
         }
 
         //
         // Process network interface data
         //
 
-        let mut network_interface_map = HashMap::<String, MachineCapabilityNetwork>::new();
+        let mut network_interface_map = HashMap::<&str, MachineCapabilityNetwork>::new();
 
-        for network_interface_info in hardware_info.network_interfaces.into_iter() {
+        for network_interface_info in hardware_info.network_interfaces.iter() {
             // Skip any interface where we can't get PCI details.
             // This is how this data is handled in forge-cloud, but
             // does it make sense here?
-            let pci_properties = match network_interface_info.pci_properties {
+            let pci_properties = match &network_interface_info.pci_properties {
                 None => continue,
                 Some(p) => p,
             };
 
-            let interface_name = match pci_properties.description {
+            let interface_name = match &pci_properties.description {
                 None => continue,
                 Some(n) => n,
             };
@@ -589,22 +428,15 @@ impl MachineCapabilitiesSet {
                 Some(_i) => MachineCapabilityDeviceType::Dpu,
             };
 
-            match network_interface_map.get_mut(&interface_name) {
-                None => {
-                    network_interface_map.insert(
-                        interface_name.clone(),
-                        MachineCapabilityNetwork {
-                            name: interface_name.clone(),
-                            count: 1,
-                            vendor: Some(pci_properties.vendor),
-                            device_type: Some(device_type),
-                        },
-                    );
-                }
-                Some(network_interface_cap) => {
-                    network_interface_cap.count += 1;
-                }
-            };
+            network_interface_map
+                .entry(interface_name)
+                .and_modify(|network_interface_cap| network_interface_cap.count += 1)
+                .or_insert_with(|| MachineCapabilityNetwork {
+                    name: interface_name.to_string(),
+                    count: 1,
+                    vendor: Some(pci_properties.vendor.clone()),
+                    device_type: Some(device_type),
+                });
         }
 
         //
@@ -668,300 +500,20 @@ impl MachineCapabilitiesSet {
 mod tests {
     use std::str::FromStr;
 
-    use ::rpc::forge as rpc;
+    use carbide_test_support::{Check, value_scenarios};
 
     use super::*;
     use crate::hardware_info::*;
     use crate::ib::DEFAULT_IB_FABRIC_NAME;
     use crate::machine::MachineInterfaceId;
     use crate::machine::infiniband::MachineIbInterfaceStatusObservation;
+    use crate::machine_interface::InterfaceType;
     use crate::{MacAddress, NetworkSegmentId};
 
     const X86_INFO_JSON: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/hardware_info/test_data/x86_info.json"
     ));
-
-    #[test]
-    fn test_model_cpu_capability_to_rpc_conversion() {
-        let req_type = rpc::MachineCapabilityAttributesCpu {
-            name: "pentium 4 HT".to_string(),
-            count: 1,
-            vendor: Some("intel".to_string()),
-            cores: Some(1),
-            threads: Some(2),
-        };
-
-        let machine_cap = MachineCapabilityCpu {
-            name: "pentium 4 HT".to_string(),
-            count: 1,
-            vendor: Some("intel".to_string()),
-            cores: Some(1),
-            threads: Some(2),
-        };
-
-        assert_eq!(
-            req_type,
-            rpc::MachineCapabilityAttributesCpu::from(machine_cap)
-        );
-    }
-
-    #[test]
-    fn test_model_gpu_capability_to_rpc_conversion() {
-        let req_type = rpc::MachineCapabilityAttributesGpu {
-            name: "RTX 6000".to_string(),
-            count: 1,
-            frequency: Some("1.2 giggawattz".to_string()),
-            vendor: Some("nvidia".to_string()),
-            cores: Some(1),
-            threads: Some(2),
-            capacity: Some("24 GB".to_string()),
-            device_type: Some(MachineCapabilityDeviceType::Unknown as i32),
-        };
-
-        let machine_cap = MachineCapabilityGpu {
-            name: "RTX 6000".to_string(),
-            count: 1,
-            frequency: Some("1.2 giggawattz".to_string()),
-            vendor: Some("nvidia".to_string()),
-            cores: Some(1),
-            threads: Some(2),
-            memory_capacity: Some("24 GB".to_string()),
-            device_type: Some(MachineCapabilityDeviceType::Unknown),
-        };
-
-        assert_eq!(
-            req_type,
-            rpc::MachineCapabilityAttributesGpu::from(machine_cap)
-        );
-    }
-
-    #[test]
-    fn test_model_memory_capability_to_rpc_conversion() {
-        let req_type = rpc::MachineCapabilityAttributesMemory {
-            name: "DDR4".to_string(),
-            count: 1,
-            vendor: Some("crucial".to_string()),
-            capacity: Some("32 GB".to_string()),
-        };
-
-        let machine_cap = MachineCapabilityMemory {
-            name: "DDR4".to_string(),
-            count: 1,
-            vendor: Some("crucial".to_string()),
-            capacity: Some("32 GB".to_string()),
-        };
-
-        assert_eq!(
-            req_type,
-            rpc::MachineCapabilityAttributesMemory::from(machine_cap)
-        );
-    }
-
-    #[test]
-    fn test_model_storage_capability_to_rpc_conversion() {
-        let req_type = rpc::MachineCapabilityAttributesStorage {
-            name: "Spinning Disk".to_string(),
-            count: 1,
-            vendor: Some("western digital".to_string()),
-            capacity: Some("1 TB".to_string()),
-        };
-
-        let machine_cap = MachineCapabilityStorage {
-            name: "Spinning Disk".to_string(),
-            count: 1,
-            vendor: Some("western digital".to_string()),
-            capacity: Some("1 TB".to_string()),
-        };
-
-        assert_eq!(
-            req_type,
-            rpc::MachineCapabilityAttributesStorage::from(machine_cap)
-        );
-    }
-
-    #[test]
-    fn test_model_network_capability_to_rpc_conversion() {
-        let req_type = rpc::MachineCapabilityAttributesNetwork {
-            name: "BCM57414 NetXtreme-E 10Gb/25Gb RDMA Ethernet Controller".to_string(),
-            count: 1,
-            vendor: Some("0x14e4".to_string()),
-            device_type: Some(MachineCapabilityDeviceType::Unknown as i32),
-        };
-
-        let machine_cap = MachineCapabilityNetwork {
-            name: "BCM57414 NetXtreme-E 10Gb/25Gb RDMA Ethernet Controller".to_string(),
-            count: 1,
-            vendor: Some("0x14e4".to_string()),
-            device_type: Some(MachineCapabilityDeviceType::Unknown),
-        };
-
-        assert_eq!(
-            req_type,
-            rpc::MachineCapabilityAttributesNetwork::from(machine_cap)
-        );
-    }
-
-    #[test]
-    fn test_model_infiniband_capability_to_rpc_conversion() {
-        let req_type = rpc::MachineCapabilityAttributesInfiniband {
-            name: "IB NIC".to_string(),
-            count: 4,
-            vendor: Some("IB NIC Vendor".to_string()),
-            inactive_devices: vec![0, 2],
-        };
-
-        let machine_cap = MachineCapabilityInfiniband {
-            name: "IB NIC".to_string(),
-            count: 4,
-            vendor: "IB NIC Vendor".to_string(),
-            inactive_devices: vec![0, 2],
-        };
-
-        assert_eq!(
-            req_type,
-            rpc::MachineCapabilityAttributesInfiniband::from(machine_cap)
-        );
-    }
-
-    #[test]
-    fn test_model_dpu_capability_to_rpc_conversion() {
-        let req_type = rpc::MachineCapabilityAttributesDpu {
-            name: "bf3".to_string(),
-            count: 1,
-            hardware_revision: Some("uh, 3?".to_string()),
-        };
-
-        let machine_cap = MachineCapabilityDpu {
-            name: "bf3".to_string(),
-            count: 1,
-            hardware_revision: Some("uh, 3?".to_string()),
-        };
-
-        assert_eq!(
-            req_type,
-            rpc::MachineCapabilityAttributesDpu::from(machine_cap)
-        );
-    }
-
-    #[test]
-    fn test_model_capability_set_to_rpc_conversion() {
-        let req_type = rpc::MachineCapabilitiesSet {
-            cpu: vec![rpc::MachineCapabilityAttributesCpu {
-                name: "xeon".to_string(),
-                count: 2,
-                vendor: Some("intel".to_string()),
-                cores: Some(24),
-                threads: Some(48),
-            }],
-            gpu: vec![rpc::MachineCapabilityAttributesGpu {
-                name: "rtx6000".to_string(),
-                count: 1,
-                frequency: Some("3 GHZ".to_string()),
-                capacity: Some("12 GB".to_string()),
-                vendor: Some("intel".to_string()),
-                cores: Some(4),
-                threads: Some(8),
-                device_type: Some(MachineCapabilityDeviceType::Unknown as i32),
-            }],
-            memory: vec![rpc::MachineCapabilityAttributesMemory {
-                name: "ddr4".to_string(),
-                count: 2,
-                capacity: Some("64 GB".to_string()),
-                vendor: Some("micron".to_string()),
-            }],
-            storage: vec![
-                rpc::MachineCapabilityAttributesStorage {
-                    name: "nvme".to_string(),
-                    count: 1,
-                    capacity: Some("1 TB".to_string()),
-                    vendor: Some("samsung".to_string()),
-                },
-                rpc::MachineCapabilityAttributesStorage {
-                    name: "spinning disk".to_string(),
-                    count: 1,
-                    capacity: Some("1 TB".to_string()),
-                    vendor: Some("maxtor".to_string()),
-                },
-            ],
-            network: vec![rpc::MachineCapabilityAttributesNetwork {
-                name: "intel e1000".to_string(),
-                count: 1,
-                vendor: Some("intel".to_string()),
-                device_type: Some(MachineCapabilityDeviceType::Unknown as i32),
-            }],
-            infiniband: vec![rpc::MachineCapabilityAttributesInfiniband {
-                name: "infiniband".to_string(),
-                count: 1,
-                vendor: Some("mellanox".to_string()),
-                inactive_devices: Vec::new(),
-            }],
-            dpu: vec![rpc::MachineCapabilityAttributesDpu {
-                name: "bf3".to_string(),
-                count: 1,
-                hardware_revision: Some("3".to_string()),
-            }],
-        };
-
-        let machine_cap = MachineCapabilitiesSet {
-            cpu: vec![MachineCapabilityCpu {
-                name: "xeon".to_string(),
-                count: 2,
-                vendor: Some("intel".to_string()),
-                cores: Some(24),
-                threads: Some(48),
-            }],
-            gpu: vec![MachineCapabilityGpu {
-                name: "rtx6000".to_string(),
-                count: 1,
-                frequency: Some("3 GHZ".to_string()),
-                memory_capacity: Some("12 GB".to_string()),
-                vendor: Some("intel".to_string()),
-                cores: Some(4),
-                threads: Some(8),
-                device_type: Some(MachineCapabilityDeviceType::Unknown),
-            }],
-            memory: vec![MachineCapabilityMemory {
-                name: "ddr4".to_string(),
-                count: 2,
-                capacity: Some("64 GB".to_string()),
-                vendor: Some("micron".to_string()),
-            }],
-            storage: vec![
-                MachineCapabilityStorage {
-                    name: "nvme".to_string(),
-                    count: 1,
-                    capacity: Some("1 TB".to_string()),
-                    vendor: Some("samsung".to_string()),
-                },
-                MachineCapabilityStorage {
-                    name: "spinning disk".to_string(),
-                    count: 1,
-                    capacity: Some("1 TB".to_string()),
-                    vendor: Some("maxtor".to_string()),
-                },
-            ],
-            network: vec![MachineCapabilityNetwork {
-                name: "intel e1000".to_string(),
-                count: 1,
-                vendor: Some("intel".to_string()),
-                device_type: Some(MachineCapabilityDeviceType::Unknown),
-            }],
-            infiniband: vec![MachineCapabilityInfiniband {
-                name: "infiniband".to_string(),
-                count: 1,
-                vendor: "mellanox".to_string(),
-                inactive_devices: Vec::new(),
-            }],
-            dpu: vec![MachineCapabilityDpu {
-                name: "bf3".to_string(),
-                count: 1,
-                hardware_revision: Some("3".to_string()),
-            }],
-        };
-
-        assert_eq!(req_type, rpc::MachineCapabilitiesSet::from(machine_cap));
-    }
 
     #[test]
     fn test_model_capability_set_from_hw_info_conversion() {
@@ -1053,7 +605,7 @@ mod tests {
         machine_cap.sort();
 
         let mut compare_cap = MachineCapabilitiesSet::from_hardware_info(
-            serde_json::from_slice::<HardwareInfo>(X86_INFO_JSON).unwrap(),
+            &serde_json::from_slice::<HardwareInfo>(X86_INFO_JSON).unwrap(),
             None,
             vec![
                 "fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80"
@@ -1063,12 +615,14 @@ mod tests {
                     .parse()
                     .unwrap(),
             ],
-            vec![
+            &[
                 MachineInterfaceSnapshot {
                     id: MachineInterfaceId::from(uuid::Uuid::nil()),
                     hostname: String::new(),
+                    interface_type: InterfaceType::Data,
                     primary_interface: true,
                     mac_address: MacAddress::from_str("08:c0:eb:cb:0e:96").unwrap(),
+                    boot_interface_id: None,
                     attached_dpu_machine_id: Some(
                         MachineId::from_str(
                             "fm100dsbiu5ckus880v8407u0mkcensa39cule26im5gnpvmuufckacguc0",
@@ -1090,8 +644,10 @@ mod tests {
                 MachineInterfaceSnapshot {
                     id: MachineInterfaceId::from(uuid::Uuid::nil()),
                     hostname: String::new(),
+                    interface_type: InterfaceType::Data,
                     primary_interface: true,
                     mac_address: MacAddress::from_str("08:c0:eb:cb:0e:97").unwrap(),
+                    boot_interface_id: None,
                     attached_dpu_machine_id: Some(
                         MachineId::from_str(
                             "fm100dsg23d2f4tq4tt5m2hgib5pcldrm3gvefbduau7gj3itgc3iqg3lpg",
@@ -1185,14 +741,16 @@ mod tests {
         };
 
         let mut compare_cap = MachineCapabilitiesSet::from_hardware_info(
-            serde_json::from_slice::<HardwareInfo>(X86_INFO_JSON).unwrap(),
+            &serde_json::from_slice::<HardwareInfo>(X86_INFO_JSON).unwrap(),
             Some(&ib_status),
             vec![],
-            vec![MachineInterfaceSnapshot {
+            &[MachineInterfaceSnapshot {
                 id: MachineInterfaceId::from(uuid::Uuid::nil()),
                 hostname: String::new(),
+                interface_type: InterfaceType::Data,
                 primary_interface: true,
                 mac_address: MacAddress::from_str("00:00:00:00:00:00").unwrap(),
+                boot_interface_id: None,
                 attached_dpu_machine_id: None,
                 domain_id: None,
                 machine_id: None,
@@ -1273,14 +831,224 @@ mod tests {
         };
 
         let mut compare_cap = MachineCapabilitiesSet::from_hardware_info(
-            serde_json::from_slice::<HardwareInfo>(X86_INFO_JSON).unwrap(),
+            &serde_json::from_slice::<HardwareInfo>(X86_INFO_JSON).unwrap(),
             Some(&ib_status),
             vec![],
-            vec![],
+            &[],
         );
 
         compare_cap.sort();
 
         assert_eq!(expected_ib_caps, compare_cap.infiniband);
+    }
+
+    #[test]
+    fn capability_type_display_covers_every_variant() {
+        value_scenarios!(
+            run = |variant| variant.to_string();
+            "cpu" {
+                MachineCapabilityType::Cpu => "CPU".to_string(),
+            }
+
+            "gpu" {
+                MachineCapabilityType::Gpu => "GPU".to_string(),
+            }
+
+            "memory" {
+                MachineCapabilityType::Memory => "MEMORY".to_string(),
+            }
+
+            "storage" {
+                MachineCapabilityType::Storage => "STORAGE".to_string(),
+            }
+
+            "network" {
+                MachineCapabilityType::Network => "NETWORK".to_string(),
+            }
+
+            "infiniband" {
+                MachineCapabilityType::Infiniband => "INFINIBAND".to_string(),
+            }
+
+            "dpu" {
+                MachineCapabilityType::Dpu => "DPU".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn capability_type_default_is_cpu() {
+        Check {
+            scenario: "default capability type",
+            input: (),
+            expect: MachineCapabilityType::Cpu,
+        }
+        .check(|()| MachineCapabilityType::default());
+    }
+
+    #[test]
+    fn device_type_display_covers_every_variant() {
+        value_scenarios!(
+            run = |variant| variant.to_string();
+            "unknown" {
+                MachineCapabilityDeviceType::Unknown => "UNKNOWN".to_string(),
+            }
+
+            "dpu" {
+                MachineCapabilityDeviceType::Dpu => "DPU".to_string(),
+            }
+
+            "nvlink" {
+                MachineCapabilityDeviceType::NvLink => "NVLINK".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn cpu_capability_from_cpu_info_maps_every_field() {
+        fn cpu_info(model: &str, vendor: &str, sockets: u32, cores: u32, threads: u32) -> CpuInfo {
+            CpuInfo {
+                model: model.to_string(),
+                vendor: vendor.to_string(),
+                sockets,
+                cores,
+                threads,
+            }
+        }
+
+        value_scenarios!(
+            run = |info| MachineCapabilityCpu::from(&info);
+            "typical dual-socket" {
+                cpu_info("Xeon Gold 6354", "GenuineIntel", 2, 18, 36) => MachineCapabilityCpu {
+                    name: "Xeon Gold 6354".to_string(),
+                    count: 2,
+                    vendor: Some("GenuineIntel".to_string()),
+                    cores: Some(18),
+                    threads: Some(36),
+                },
+            }
+
+            "single socket" {
+                cpu_info("EPYC 7763", "AuthenticAMD", 1, 64, 128) => MachineCapabilityCpu {
+                    name: "EPYC 7763".to_string(),
+                    count: 1,
+                    vendor: Some("AuthenticAMD".to_string()),
+                    cores: Some(64),
+                    threads: Some(128),
+                },
+            }
+
+            "all-zero / empty defaults" {
+                cpu_info("", "", 0, 0, 0) => MachineCapabilityCpu {
+                    name: String::new(),
+                    count: 0,
+                    // From always wraps the source fields in Some, even when empty/zero.
+                    vendor: Some(String::new()),
+                    cores: Some(0),
+                    threads: Some(0),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn infiniband_caps_from_interfaces_and_status() {
+        fn iface(guid: &str, pci: Option<PciDeviceProperties>) -> InfinibandInterface {
+            InfinibandInterface {
+                guid: guid.to_string(),
+                pci_properties: pci,
+            }
+        }
+
+        fn pci(vendor: &str, description: Option<&str>, slot: Option<&str>) -> PciDeviceProperties {
+            PciDeviceProperties {
+                vendor: vendor.to_string(),
+                device: String::new(),
+                path: String::new(),
+                numa_node: 0,
+                description: description.map(str::to_string),
+                slot: slot.map(str::to_string),
+            }
+        }
+
+        // No status observation: every device defaults to inactive.
+        value_scenarios!(
+            run = |interfaces| {
+                MachineCapabilityInfiniband::from_ib_interfaces_and_status(&interfaces, None).len()
+            };
+            "empty interface list -> no capabilities" {
+                Vec::<InfinibandInterface>::new() => 0,
+            }
+
+            "interface without pci_properties is skipped" {
+                vec![iface("g0", None)] => 0,
+            }
+
+            "pci_properties without description is skipped" {
+                vec![iface("g0", Some(pci("0x15b3", None, Some("0"))))] => 0,
+            }
+
+            "two devices of the same model roll into one capability" {
+                vec![
+                    iface("g0", Some(pci("0x15b3", Some("ConnectX-7"), Some("1")))),
+                    iface("g1", Some(pci("0x15b3", Some("ConnectX-7"), Some("0")))),
+                ] => 1,
+            }
+
+            "two distinct models produce two capabilities" {
+                vec![
+                    iface("g0", Some(pci("0x15b3", Some("ConnectX-5"), Some("0")))),
+                    iface("g1", Some(pci("0x15b3", Some("ConnectX-7"), Some("1")))),
+                ] => 2,
+            }
+        );
+    }
+
+    #[test]
+    fn infiniband_caps_count_and_inactive_without_status() {
+        // Without a status observation, lid lookups never succeed, so every
+        // device is treated as inactive and recorded in inactive_devices.
+        let interfaces = vec![
+            InfinibandInterface {
+                guid: "g0".to_string(),
+                pci_properties: Some(PciDeviceProperties {
+                    vendor: "0x15b3".to_string(),
+                    device: String::new(),
+                    path: String::new(),
+                    numa_node: 0,
+                    description: Some("ConnectX-7".to_string()),
+                    slot: Some("0".to_string()),
+                }),
+            },
+            InfinibandInterface {
+                guid: "g1".to_string(),
+                pci_properties: Some(PciDeviceProperties {
+                    vendor: "0x15b3".to_string(),
+                    device: String::new(),
+                    path: String::new(),
+                    numa_node: 0,
+                    description: Some("ConnectX-7".to_string()),
+                    slot: Some("1".to_string()),
+                }),
+            },
+        ];
+
+        let caps = MachineCapabilityInfiniband::from_ib_interfaces_and_status(&interfaces, None);
+        assert_eq!(caps.len(), 1);
+
+        value_scenarios!(
+            run = |field| match field {
+                "count" => caps[0].count,
+                "inactive_len" => caps[0].inactive_devices.len() as u32,
+                other => panic!("unknown field {other}"),
+            };
+            "rolled-up count" {
+                "count" => 2u32,
+            }
+
+            "all inactive without status" {
+                "inactive_len" => 2u32,
+            }
+        );
     }
 }

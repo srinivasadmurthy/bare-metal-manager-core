@@ -17,12 +17,13 @@
 
 use carbide_uuid::machine::MachineId;
 use clap::Parser;
-use rpc::admin_cli::{CarbideCliError, CarbideCliResult};
+
+use crate::errors::{CarbideCliError, CarbideCliResult};
 
 #[derive(Parser, Debug)]
-pub struct DpfQuery {
+pub(super) struct DpfQuery {
     #[clap(help = "Host machine id")]
-    pub host: Option<MachineId>,
+    pub(super) host: Option<MachineId>,
 }
 
 impl TryFrom<&DpfQuery> for MachineId {

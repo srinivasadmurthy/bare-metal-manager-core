@@ -65,6 +65,8 @@ pub struct Config {
     pub override_ipmi_port: Option<u16>,
     #[serde(default)]
     pub insecure_ipmi_ciphers: bool,
+    #[serde(default)]
+    pub force_deactivate_conflicting_ipmi_sol_sessions: bool,
     #[serde(default = "Defaults::root_ca_path")]
     pub forge_root_ca_path: PathBuf,
     #[serde(default = "Defaults::client_cert_path")]
@@ -208,6 +210,7 @@ impl Config {
             override_bmc_ssh_port: _,
             override_ipmi_port: _,
             insecure_ipmi_ciphers,
+            force_deactivate_conflicting_ipmi_sol_sessions,
             forge_root_ca_path,
             client_cert_path,
             client_key_path,
@@ -314,6 +317,11 @@ insecure = {insecure}
 ## If true, use insecure ciphers when connecting to IPMI, like SHA1. Useful for ipmi_sim.
 insecure_ipmi_ciphers = {insecure_ipmi_ciphers}
 
+## Force-deactivate a conflicting IPMI SOL session before reconnecting. The BMC cannot determine
+## whether the existing session is stale or belongs to an active operator, so enabling this may
+## disconnect someone using the console. Enable only when ssh-console has exclusive SOL ownership.
+force_deactivate_conflicting_ipmi_sol_sessions = {force_deactivate_conflicting_ipmi_sol_sessions}
+
 ## Optional: For development mode, gives keys that are authorized to connect to ssh-console. Meant
 ## for integration tests. For interactive use, consider using openssh certificates instead.
 # authorized_keys_path = <path>
@@ -384,7 +392,10 @@ role_separator = {cert_authorization_keyid_format_role_separator:?}
 
     pub fn make_forge_api_client(&self) -> ForgeApiClient {
         let carbide_uri_string = self.carbide_uri.to_string();
-        tracing::info!("carbide_uri_string: {}", carbide_uri_string);
+        tracing::info!(
+            carbide_uri = carbide_uri_string.as_str(),
+            "Configured Carbide API URI"
+        );
 
         // TODO: The API's for ClientCert/ForgeClientConfig/etc really ought to take PathBufs, not Strings.
         let client_cert = ClientCert {
@@ -468,6 +479,7 @@ impl Default for Config {
             override_bmcs: None,
             insecure: false,
             insecure_ipmi_ciphers: false,
+            force_deactivate_conflicting_ipmi_sol_sessions: false,
             override_bmc_ssh_host: None,
             admin_certificate_role: None,
             openssh_certificate_ca_fingerprints: vec![],
@@ -479,7 +491,7 @@ pub struct Defaults;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ConfigError {
-    #[error("Could not read config file at {path}: {error}")]
+    #[error("could not read config file at {path}: {error}")]
     CouldNotRead { path: String, error: std::io::Error },
     #[error("TOML error reading config file at {path}: {error}")]
     InvalidToml {
@@ -494,7 +506,7 @@ pub enum ConfigError {
     },
     #[error("{what} {host} did not resolve to any addresses")]
     HostNotFound { what: String, host: String },
-    #[error("Invalid machine_id in BMC override config: {0}")]
+    #[error("invalid machine_id in BMC override config: {0}")]
     InvalidBmcOverrideMachineId(MachineIdParseError),
 }
 
@@ -674,6 +686,16 @@ mod tests {
         let empty_config: Config = toml::from_str("").expect("empty toml didn't parse");
         let default_config = Config::default();
         assert_eq!(empty_config, default_config);
+        assert!(!empty_config.force_deactivate_conflicting_ipmi_sol_sessions);
+    }
+
+    #[test]
+    fn test_conflicting_ipmi_sol_deactivation_requires_explicit_opt_in() {
+        let config: Config =
+            toml::from_str("force_deactivate_conflicting_ipmi_sol_sessions = true")
+                .expect("explicit opt-in config didn't parse");
+
+        assert!(config.force_deactivate_conflicting_ipmi_sol_sessions);
     }
 
     #[test]

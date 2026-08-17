@@ -19,15 +19,15 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::FromDer;
 use x509_parser::validate::*;
 
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 
-pub async fn add_filename(filename: &str, api_client: &ApiClient) -> CarbideCliResult<()> {
+pub(super) async fn add_filename(filename: &str, api_client: &ApiClient) -> CarbideCliResult<()> {
     let filepath = Path::new(filename);
     let is_pem = filepath.with_extension("pem").is_file();
     let is_der =

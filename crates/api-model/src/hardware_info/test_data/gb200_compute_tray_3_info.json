@@ -234,7 +234,7 @@
     "tpm_ek_certificate": "U29tZSBhcmJpdHJhcnkgYmFzZTY0",
     "gpus": [
         {
-            "name": "NVIDIA H100 PCIe",
+            "name": "NVIDIA GB200",
             "serial": "1654422005699",
             "driver_version": "530.30.02",
             "vbios_version": "96.00.30.00.01",
@@ -247,12 +247,12 @@
                 "slot_number": 1,
                 "tray_index": 1,
                 "host_id": 1,
-                "module_id": 0,
-                "fabric_guid": "688ad73d9db488cb17978480"
+                "module_id": 1,
+                "fabric_guid": "0xfb488cb17978480"
             }
         },
         {
-            "name": "NVIDIA H100 PCIe",
+            "name": "NVIDIA GB200",
             "serial": "1754422005699",
             "driver_version": "530.30.02",
             "vbios_version": "96.00.30.00.01",
@@ -265,12 +265,12 @@
                 "slot_number": 1,
                 "tray_index": 1,
                 "host_id": 1,
-                "module_id": 1,
-                "fabric_guid": "688ad73d9db488cb17978481"
+                "module_id": 2,
+                "fabric_guid": "0xfb488cb17978481"
             }
         },
         {
-            "name": "NVIDIA H100 PCIe",
+            "name": "NVIDIA GB200",
             "serial": "1854422005699",
             "driver_version": "530.30.02",
             "vbios_version": "96.00.30.00.01",
@@ -283,12 +283,12 @@
                 "slot_number": 1,
                 "tray_index": 1,
                 "host_id": 1,
-                "module_id": 2,
-                "fabric_guid": "688ad73d9db488cb17978482"
+                "module_id": 3,
+                "fabric_guid": "0xfb488cb17978482"
             }
         },
         {
-            "name": "NVIDIA H100 PCIe",
+            "name": "NVIDIA GB200",
             "serial": "1954422005699",
             "driver_version": "530.30.02",
             "vbios_version": "96.00.30.00.01",
@@ -301,8 +301,8 @@
                 "slot_number": 1,
                 "tray_index": 1,
                 "host_id": 1,
-                "module_id": 3,
-                "fabric_guid": "688ad73d9db488cb17978483"
+                "module_id": 4,
+                "fabric_guid": "0xfb488cb17978483"
             }
         }
     ],

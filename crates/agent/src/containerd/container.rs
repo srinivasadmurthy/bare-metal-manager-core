@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tracing::log::error;
+use tracing::error;
 
 use crate::containerd::image::{Image, ImageNameComponent};
 use crate::containerd::{BashCommand, Command};
@@ -115,7 +115,7 @@ impl Images {
         self.images
             .into_iter()
             .find(|x| x.names.iter().any(|y| y.name.contains(name.as_ref())))
-            .ok_or_else(|| eyre::eyre!("Could not find container image for name {}", name.as_ref()))
+            .ok_or_else(|| eyre::eyre!("could not find container image for name {}", name.as_ref()))
     }
 
     pub fn find_by_id<T>(self, container_id: T) -> eyre::Result<Image>
@@ -128,7 +128,7 @@ impl Images {
             .find(|x| x.id == container_id.as_ref())
             .ok_or_else(|| {
                 eyre::eyre!(
-                    "Could not find container image for id {}",
+                    "could not find container image for id {}",
                     container_id.as_ref()
                 )
             })
@@ -186,6 +186,28 @@ impl Containers {
         Ok(Containers { containers })
     }
 
+    /// Keep only the latest attempt for each container name.
+    ///
+    /// `crictl ps -a` returns historical attempts; this function only keeps latest attempt.
+    pub fn filter_by_latest_attempt(self) -> Self {
+        let mut latest_by_name: HashMap<String, ContainerSummary> = HashMap::new();
+
+        for container in self.containers {
+            let name = container.metadata.name.clone();
+            if let Some(existing) = latest_by_name.get(&name)
+                && container.metadata.attempt <= existing.metadata.attempt
+            {
+                continue;
+            }
+            latest_by_name.insert(name, container);
+        }
+
+        let mut containers: Vec<_> = latest_by_name.into_values().collect();
+        containers.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+
+        Containers { containers }
+    }
+
     pub fn find_by_name<T>(self, name: T) -> eyre::Result<ContainerSummary>
     where
         T: AsRef<str>,
@@ -194,7 +216,7 @@ impl Containers {
         self.containers
             .into_iter()
             .find(|x| x.metadata.name == name.as_ref())
-            .ok_or_else(|| eyre::eyre!("Could not find container for name {}", name.as_ref()))
+            .ok_or_else(|| eyre::eyre!("could not find container for name {}", name.as_ref()))
     }
 }
 
@@ -204,8 +226,8 @@ async fn get_container_images() -> eyre::Result<String> {
         let test_data_dir = PathBuf::from(TEST_DATA_DIR);
 
         std::fs::read_to_string(test_data_dir.join("container_images.json")).map_err(|e| {
-            error!("Could not read container_images.json: {e}");
-            eyre::eyre!("Could not read container_images.json: {}", e)
+            error!(error = %e, "Could not read container_images.json");
+            eyre::eyre!("could not read container_images.json: {}", e)
         })
     } else {
         let result = BashCommand::new("bash")
@@ -213,8 +235,8 @@ async fn get_container_images() -> eyre::Result<String> {
             .run()
             .await
             .map_err(|e| {
-                error!("Could not read container_images.json: {e}");
-                eyre::eyre!("Could not read container_images.json: {}", e)
+                error!(error = %e, "Could not read container_images.json");
+                eyre::eyre!("could not read container_images.json: {}", e)
             })?;
         Ok(result)
     }
@@ -228,8 +250,8 @@ async fn get_containers() -> eyre::Result<String> {
         println!("Path: {}", test_data_dir.join("containers.json").display());
 
         std::fs::read_to_string(test_data_dir.join("containers.json")).map_err(|e| {
-            error!("Could not read containers.json: {e}");
-            eyre::eyre!("Could not read containers.json: {}", e)
+            error!(error = %e, "Could not read containers.json");
+            eyre::eyre!("could not read containers.json: {}", e)
         })
     } else {
         let result = BashCommand::new("bash")
@@ -237,8 +259,8 @@ async fn get_containers() -> eyre::Result<String> {
             .run()
             .await
             .map_err(|e| {
-                error!("Could not read containers.json: {e}");
-                eyre::eyre!("Could not read containers.json: {}", e)
+                error!(error = %e, "Could not read containers.json");
+                eyre::eyre!("could not read containers.json: {}", e)
             })?;
         Ok(result)
     }
@@ -252,8 +274,8 @@ async fn get_pod_containers(pod_id: &str) -> eyre::Result<String> {
         println!("Path: {}", test_data_dir.join("containers.json").display());
 
         std::fs::read_to_string(test_data_dir.join("containers.json")).map_err(|e| {
-            error!("Could not read containers.json: {e}");
-            eyre::eyre!("Could not read containers.json: {}", e)
+            error!(error = %e, "Could not read containers.json");
+            eyre::eyre!("could not read containers.json: {}", e)
         })
     } else {
         let cmd = format!("crictl ps -a --pod {} -o json", pod_id);
@@ -262,8 +284,8 @@ async fn get_pod_containers(pod_id: &str) -> eyre::Result<String> {
             .run()
             .await
             .map_err(|e| {
-                error!("Could not read containers.json: {e}");
-                eyre::eyre!("Could not read containers.json: {}", e)
+                error!(error = %e, "Could not read containers.json");
+                eyre::eyre!("could not read containers.json: {}", e)
             })?;
         Ok(result)
     }
@@ -321,9 +343,9 @@ mod tests {
     #[tokio::test]
     async fn test_find_container_by_name() {
         let containers = Containers::list().await.expect("Could not get containers");
-        tracing::info!("Container: {:?}", containers);
+        tracing::info!(?containers, "Listed containers");
         let container = containers.find_by_name("doca-hbn").unwrap();
-        tracing::info!("Container: {:?}", container);
+        tracing::info!(?container, "Found container by name");
         assert_eq!(container.metadata.name, "doca-hbn");
         assert_eq!(container.state, ContainerState::Running);
     }
@@ -344,5 +366,79 @@ mod tests {
         let container_images = Images::list().await.unwrap();
         let filtered = container_images.find_by_name("doca_hbn").unwrap();
         assert_eq!(filtered.names[0].version(), "2.3.0-doca2.8.0".to_string());
+    }
+
+    #[test]
+    fn test_filter_container_by_latest_attempt() {
+        let old_exited = ContainerSummary {
+            id: "old".to_string(),
+            sandbox_id: "pod1".to_string(),
+            metadata: ContainerMetadata {
+                name: "svc-a".to_string(),
+                attempt: 0,
+            },
+            image: ContainerImage {
+                id: "img".to_string(),
+                annotations: HashMap::new(),
+            },
+            image_ref: Vec::new(),
+            state: ContainerState::Exited,
+            created_at: "1".to_string(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+
+        let new_running = ContainerSummary {
+            id: "new".to_string(),
+            sandbox_id: "pod1".to_string(),
+            metadata: ContainerMetadata {
+                name: "svc-a".to_string(),
+                attempt: 1,
+            },
+            image: ContainerImage {
+                id: "img".to_string(),
+                annotations: HashMap::new(),
+            },
+            image_ref: Vec::new(),
+            state: ContainerState::Running,
+            created_at: "2".to_string(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+
+        let unaffected = ContainerSummary {
+            id: "other".to_string(),
+            sandbox_id: "pod1".to_string(),
+            metadata: ContainerMetadata {
+                name: "svc-b".to_string(),
+                attempt: 0,
+            },
+            image: ContainerImage {
+                id: "img2".to_string(),
+                annotations: HashMap::new(),
+            },
+            image_ref: Vec::new(),
+            state: ContainerState::Running,
+            created_at: "3".to_string(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+
+        let got = Containers {
+            containers: vec![old_exited, new_running, unaffected],
+        }
+        .filter_by_latest_attempt();
+
+        assert_eq!(got.containers.len(), 2);
+        assert!(
+            got.containers
+                .iter()
+                .any(|c| c.metadata.name == "svc-a" && c.metadata.attempt == 1)
+        );
+        assert!(
+            got.containers
+                .iter()
+                .any(|c| c.metadata.name == "svc-b" && c.metadata.attempt == 0)
+        );
     }
 }

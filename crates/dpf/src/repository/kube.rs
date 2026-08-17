@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::traits::*;
 use crate::crds::bfbs_generated::BFB;
+use crate::crds::bluefieldsoftwares_generated::BlueFieldSoftware;
 use crate::crds::dpuclusters_generated::DPUCluster;
 use crate::crds::dpudeployments_generated::DPUDeployment;
 use crate::crds::dpudevices_generated::DPUDevice;
@@ -109,6 +110,36 @@ impl BfbRepository for KubeRepository {
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError> {
         let api: Api<BFB> = self.api(namespace);
+        api.delete(name, &Default::default()).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl BlueFieldSoftwareRepository for KubeRepository {
+    async fn get(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Option<BlueFieldSoftware>, DpfError> {
+        let api = self.api(namespace);
+        Ok(api.get_opt(name).await?)
+    }
+
+    async fn list(&self, namespace: &str) -> Result<Vec<BlueFieldSoftware>, DpfError> {
+        let api = self.api(namespace);
+        let list = api.list(&ListParams::default()).await?;
+        Ok(list.items)
+    }
+
+    async fn create(&self, bfs: &BlueFieldSoftware) -> Result<BlueFieldSoftware, DpfError> {
+        let namespace = bfs.meta().namespace.as_deref().unwrap_or("default");
+        let api = self.api(namespace);
+        Ok(api.create(&PostParams::default(), bfs).await?)
+    }
+
+    async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError> {
+        let api: Api<BlueFieldSoftware> = self.api(namespace);
         api.delete(name, &Default::default()).await?;
         Ok(())
     }
@@ -580,16 +611,13 @@ impl K8sConfigRepository for KubeRepository {
         }
     }
 
-    async fn create_secret(
+    async fn apply_secret(
         &self,
         name: &str,
         namespace: &str,
         data: BTreeMap<String, Vec<u8>>,
     ) -> Result<(), DpfError> {
         let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
-        if api.get_opt(name).await?.is_some() {
-            return Ok(());
-        }
         let secret = Secret {
             metadata: kube::core::ObjectMeta {
                 name: Some(name.to_string()),
@@ -603,7 +631,15 @@ impl K8sConfigRepository for KubeRepository {
             ),
             ..Default::default()
         };
-        api.create(&PostParams::default(), &secret).await?;
+        // Server-side apply, matching `apply_configmap`: creates the Secret when
+        // absent and overwrites the data when present, so a rotated credential
+        // actually reaches the cluster.
+        api.patch(
+            name,
+            &PatchParams::apply("carbide-dpf-sdk").force(),
+            &Patch::Apply(&secret),
+        )
+        .await?;
         Ok(())
     }
 }

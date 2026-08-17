@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::SecretsError;
 use crate::credentials::{
-    CredentialKey, CredentialReader, CredentialType, Credentials, MqttCredentialType,
+    BmcCredentialType, CredentialKey, CredentialReader, CredentialType, Credentials,
+    MqttCredentialType,
 };
 
 mod env;
@@ -69,7 +70,12 @@ pub struct MachineIdentityConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CredentialSnapshot {
+    /// Legacy single DPU BMC factory default (catch-all when no per-model entry exists).
+    /// Kept for backward compatibility; prefer `dpu_redfish_factory_default_by_model`.
     pub dpu_redfish_factory_default: Option<UsernamePassword>,
+    /// Per-model DPU BMC factory defaults, keyed by [`bmc_vendor::DpuModel`].
+    /// Takes precedence over `dpu_redfish_factory_default` when present.
+    pub dpu_redfish_factory_default_by_model: HashMap<bmc_vendor::DpuModel, UsernamePassword>,
     pub dpu_redfish_site_default: Option<UsernamePassword>,
     pub host_redfish_factory_default_by_vendor: HashMap<bmc_vendor::BMCVendor, UsernamePassword>,
     pub host_redfish_site_default: Option<UsernamePassword>,
@@ -80,15 +86,19 @@ pub struct CredentialSnapshot {
     pub nmxm_auth_by_id: HashMap<String, UsernamePassword>,
     pub mqtt_auth_by_credential_type: HashMap<MqttCredentialType, UsernamePassword>,
     pub machine_identity: Option<MachineIdentityConfig>,
+    pub bmc_site_wide_root: Option<UsernamePassword>,
 }
 
 impl CredentialSnapshot {
     pub fn get_credentials(&self, key: &CredentialKey) -> Option<Credentials> {
         match key {
             CredentialKey::DpuRedfish { credential_type } => match credential_type {
-                CredentialType::DpuHardwareDefault => {
-                    self.dpu_redfish_factory_default.clone().map(Into::into)
-                }
+                CredentialType::DpuHardwareDefault { model } => self
+                    .dpu_redfish_factory_default_by_model
+                    .get(model)
+                    .cloned()
+                    .or_else(|| self.dpu_redfish_factory_default.clone())
+                    .map(Into::into),
                 CredentialType::SiteDefault => {
                     self.dpu_redfish_site_default.clone().map(Into::into)
                 }
@@ -103,13 +113,13 @@ impl CredentialSnapshot {
                 CredentialType::SiteDefault => {
                     self.host_redfish_site_default.clone().map(Into::into)
                 }
-                CredentialType::DpuHardwareDefault => None,
+                CredentialType::DpuHardwareDefault { .. } => None,
             },
             CredentialKey::UfmAuth { fabric } => {
                 self.ufm_auth_by_fabric.get(fabric).cloned().map(Into::into)
             }
             CredentialKey::DpuUefi { credential_type } => match credential_type {
-                CredentialType::DpuHardwareDefault => {
+                CredentialType::DpuHardwareDefault { .. } => {
                     self.dpu_uefi_factory_default.clone().map(Into::into)
                 }
                 CredentialType::SiteDefault => self.dpu_uefi_site_default.clone().map(Into::into),
@@ -134,6 +144,9 @@ impl CredentialSnapshot {
                     username: key_id.clone(),
                     password: secret,
                 }),
+            CredentialKey::BmcCredentials {
+                credential_type: BmcCredentialType::SiteWideRoot,
+            } => self.bmc_site_wide_root.clone().map(Into::into),
             _ => None,
         }
     }
@@ -151,8 +164,9 @@ impl CredentialReader for CredentialSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::value_scenarios;
+
     use super::*;
-    use crate::credentials::BmcCredentialType;
 
     fn up(user: &str, pass: &str) -> UsernamePassword {
         UsernamePassword {
@@ -172,6 +186,9 @@ mod tests {
         let mut host_vendors = HashMap::new();
         host_vendors.insert(bmc_vendor::BMCVendor::Dell, up("dell-u", "dell-p"));
 
+        let mut dpu_models = HashMap::new();
+        dpu_models.insert(bmc_vendor::DpuModel::BlueField3, up("bf3-u", "bf3-p"));
+
         let mut ufm = HashMap::new();
         ufm.insert("fabric-1".to_string(), up("ufm-u", "ufm-p"));
 
@@ -180,6 +197,7 @@ mod tests {
 
         CredentialSnapshot {
             dpu_redfish_factory_default: Some(up("drf-u", "drf-p")),
+            dpu_redfish_factory_default_by_model: dpu_models,
             dpu_redfish_site_default: Some(up("drs-u", "drs-p")),
             host_redfish_factory_default_by_vendor: host_vendors,
             host_redfish_site_default: Some(up("hrs-u", "hrs-p")),
@@ -193,159 +211,131 @@ mod tests {
                 up("mqtt-u", "mqtt-p"),
             )]),
             machine_identity: None,
+            bmc_site_wide_root: None,
         }
     }
 
+    // One table over a single `populated_snapshot()`: each row is a
+    // `CredentialKey` and the credentials that snapshot should return for it,
+    // covering the per-variant hits plus the misses (unknown vendor / fabric /
+    // credential type, unsupported keys, and invalid type combinations).
     #[test]
-    fn snapshot_dpu_redfish_factory_default() {
+    fn snapshot_lookups_return_expected_credentials() {
         let snap = populated_snapshot();
-        let key = CredentialKey::DpuRedfish {
-            credential_type: CredentialType::DpuHardwareDefault,
-        };
-        assert_eq!(snap.get_credentials(&key), Some(cred("drf-u", "drf-p")));
+        value_scenarios!(run = |key| snap.get_credentials(&key);
+            "dpu redfish" {
+                // per-model entry takes precedence
+                CredentialKey::DpuRedfish {
+                    credential_type: CredentialType::DpuHardwareDefault {
+                        model: bmc_vendor::DpuModel::BlueField3,
+                    },
+                } => Some(cred("bf3-u", "bf3-p")),
+                // unknown model falls back to legacy dpu_redfish_factory_default
+                CredentialKey::DpuRedfish {
+                    credential_type: CredentialType::DpuHardwareDefault {
+                        model: bmc_vendor::DpuModel::Unknown,
+                    },
+                } => Some(cred("drf-u", "drf-p")),
+                // unconfigured model also falls back to legacy field
+                CredentialKey::DpuRedfish {
+                    credential_type: CredentialType::DpuHardwareDefault {
+                        model: bmc_vendor::DpuModel::BlueField4,
+                    },
+                } => Some(cred("drf-u", "drf-p")),
+                CredentialKey::DpuRedfish {
+                    credential_type: CredentialType::SiteDefault,
+                } => Some(cred("drs-u", "drs-p")),
+            }
+
+            "host redfish" {
+                CredentialKey::HostRedfish {
+                    credential_type: CredentialType::HostHardwareDefault {
+                        vendor: bmc_vendor::BMCVendor::Dell,
+                    },
+                } => Some(cred("dell-u", "dell-p")),
+                CredentialKey::HostRedfish {
+                    credential_type: CredentialType::HostHardwareDefault {
+                        vendor: bmc_vendor::BMCVendor::Lenovo,
+                    },
+                } => None,
+                CredentialKey::HostRedfish {
+                    credential_type: CredentialType::SiteDefault,
+                } => Some(cred("hrs-u", "hrs-p")),
+            }
+
+            "ufm auth" {
+                CredentialKey::UfmAuth {
+                    fabric: "fabric-1".to_string(),
+                } => Some(cred("ufm-u", "ufm-p")),
+                CredentialKey::UfmAuth {
+                    fabric: "no-such-fabric".to_string(),
+                } => None,
+            }
+
+            "dpu uefi" {
+                CredentialKey::DpuUefi {
+                    credential_type: CredentialType::DpuHardwareDefault {
+                        model: bmc_vendor::DpuModel::Unknown,
+                    },
+                } => Some(cred("duf-u", "duf-p")),
+                CredentialKey::DpuUefi {
+                    credential_type: CredentialType::SiteDefault,
+                } => Some(cred("dus-u", "dus-p")),
+            }
+
+            "host uefi" {
+                CredentialKey::HostUefi {
+                    credential_type: CredentialType::SiteDefault,
+                } => Some(cred("hus-u", "hus-p")),
+            }
+
+            "nmxm" {
+                CredentialKey::NmxM {
+                    nmxm_id: "nmxm-1".to_string(),
+                } => Some(cred("nmxm-u", "nmxm-p")),
+            }
+
+            "mqtt auth" {
+                CredentialKey::MqttAuth {
+                    credential_type: MqttCredentialType::Dpa,
+                } => Some(cred("mqtt-u", "mqtt-p")),
+                CredentialKey::MqttAuth {
+                    credential_type: MqttCredentialType::DsxExchangeConsumer,
+                } => None,
+            }
+
+            "unsupported key" {
+                CredentialKey::ExtensionService {
+                    service_id: "svc".to_string(),
+                    version: "1".to_string(),
+                } => None,
+            }
+
+            "invalid type combo" {
+                CredentialKey::DpuRedfish {
+                    credential_type: CredentialType::HostHardwareDefault {
+                        vendor: bmc_vendor::BMCVendor::Dell,
+                    },
+                } => None,
+                CredentialKey::HostRedfish {
+                    credential_type: CredentialType::DpuHardwareDefault {
+                        model: bmc_vendor::DpuModel::Unknown,
+                    },
+                } => None,
+            }
+        );
     }
 
     #[test]
-    fn snapshot_dpu_redfish_site_default() {
-        let snap = populated_snapshot();
-        let key = CredentialKey::DpuRedfish {
-            credential_type: CredentialType::SiteDefault,
+    fn snapshot_bmc_site_wide_root() {
+        let snap = CredentialSnapshot {
+            bmc_site_wide_root: Some(up("bmc-u", "bmc-p")),
+            ..Default::default()
         };
-        assert_eq!(snap.get_credentials(&key), Some(cred("drs-u", "drs-p")));
-    }
-
-    #[test]
-    fn snapshot_host_redfish_vendor() {
-        let snap = populated_snapshot();
-        let key = CredentialKey::HostRedfish {
-            credential_type: CredentialType::HostHardwareDefault {
-                vendor: bmc_vendor::BMCVendor::Dell,
-            },
+        let key = CredentialKey::BmcCredentials {
+            credential_type: BmcCredentialType::SiteWideRoot,
         };
-        assert_eq!(snap.get_credentials(&key), Some(cred("dell-u", "dell-p")));
-    }
-
-    #[test]
-    fn snapshot_host_redfish_unknown_vendor_returns_none() {
-        let snap = populated_snapshot();
-        let key = CredentialKey::HostRedfish {
-            credential_type: CredentialType::HostHardwareDefault {
-                vendor: bmc_vendor::BMCVendor::Lenovo,
-            },
-        };
-        assert_eq!(snap.get_credentials(&key), None);
-    }
-
-    #[test]
-    fn snapshot_host_redfish_site_default() {
-        let snap = populated_snapshot();
-        let key = CredentialKey::HostRedfish {
-            credential_type: CredentialType::SiteDefault,
-        };
-        assert_eq!(snap.get_credentials(&key), Some(cred("hrs-u", "hrs-p")));
-    }
-
-    #[test]
-    fn snapshot_ufm_auth() {
-        let snap = populated_snapshot();
-        let key = CredentialKey::UfmAuth {
-            fabric: "fabric-1".to_string(),
-        };
-        assert_eq!(snap.get_credentials(&key), Some(cred("ufm-u", "ufm-p")));
-    }
-
-    #[test]
-    fn snapshot_ufm_auth_unknown_fabric_returns_none() {
-        let snap = populated_snapshot();
-        let key = CredentialKey::UfmAuth {
-            fabric: "no-such-fabric".to_string(),
-        };
-        assert_eq!(snap.get_credentials(&key), None);
-    }
-
-    #[test]
-    fn snapshot_dpu_uefi_factory_and_site() {
-        let snap = populated_snapshot();
-        let factory = CredentialKey::DpuUefi {
-            credential_type: CredentialType::DpuHardwareDefault,
-        };
-        let site = CredentialKey::DpuUefi {
-            credential_type: CredentialType::SiteDefault,
-        };
-        assert_eq!(snap.get_credentials(&factory), Some(cred("duf-u", "duf-p")));
-        assert_eq!(snap.get_credentials(&site), Some(cred("dus-u", "dus-p")));
-    }
-
-    #[test]
-    fn snapshot_host_uefi_site_default() {
-        let snap = populated_snapshot();
-        let key = CredentialKey::HostUefi {
-            credential_type: CredentialType::SiteDefault,
-        };
-        assert_eq!(snap.get_credentials(&key), Some(cred("hus-u", "hus-p")));
-    }
-
-    #[test]
-    fn snapshot_nmxm() {
-        let snap = populated_snapshot();
-        let key = CredentialKey::NmxM {
-            nmxm_id: "nmxm-1".to_string(),
-        };
-        assert_eq!(snap.get_credentials(&key), Some(cred("nmxm-u", "nmxm-p")));
-    }
-
-    #[test]
-    fn snapshot_mqtt_auth() {
-        let snap = populated_snapshot();
-        let key = CredentialKey::MqttAuth {
-            credential_type: MqttCredentialType::Dpa,
-        };
-        assert_eq!(snap.get_credentials(&key), Some(cred("mqtt-u", "mqtt-p")));
-    }
-
-    #[test]
-    fn snapshot_mqtt_auth_unknown_credential_type_returns_none() {
-        let snap = populated_snapshot();
-        let key = CredentialKey::MqttAuth {
-            credential_type: MqttCredentialType::DsxExchangeConsumer,
-        };
-        assert_eq!(snap.get_credentials(&key), None);
-    }
-
-    #[test]
-    fn snapshot_unsupported_keys_return_none() {
-        let snap = populated_snapshot();
-        let keys: Vec<CredentialKey> = vec![
-            CredentialKey::BmcCredentials {
-                credential_type: BmcCredentialType::SiteWideRoot,
-            },
-            CredentialKey::ExtensionService {
-                service_id: "svc".to_string(),
-                version: "1".to_string(),
-            },
-            CredentialKey::RackFirmware {
-                firmware_id: "fw".to_string(),
-            },
-        ];
-        for key in &keys {
-            assert_eq!(snap.get_credentials(key), None, "expected None for {key:?}");
-        }
-    }
-
-    #[test]
-    fn snapshot_invalid_type_combos_return_none() {
-        let snap = populated_snapshot();
-        let dpu_redfish_host_hw = CredentialKey::DpuRedfish {
-            credential_type: CredentialType::HostHardwareDefault {
-                vendor: bmc_vendor::BMCVendor::Dell,
-            },
-        };
-        assert_eq!(snap.get_credentials(&dpu_redfish_host_hw), None);
-
-        let host_redfish_dpu_hw = CredentialKey::HostRedfish {
-            credential_type: CredentialType::DpuHardwareDefault,
-        };
-        assert_eq!(snap.get_credentials(&host_redfish_dpu_hw), None);
+        assert_eq!(snap.get_credentials(&key), Some(cred("bmc-u", "bmc-p")));
     }
 
     #[test]

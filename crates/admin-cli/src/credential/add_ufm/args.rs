@@ -16,18 +16,25 @@
  */
 
 use clap::Parser;
-use rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use rpc::{CredentialType, forge as forgerpc};
 
 use crate::credential::common::url_validator;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Add a UFM credential with a token:
+    $ nico-admin-cli credential add-ufm --url https://192.0.2.10 --token mypassword
+
+")]
+pub(crate) struct Args {
     #[clap(long, required(true), help = "The UFM url")]
-    pub url: String,
+    url: String,
 
     #[clap(long, default_value(""), help = "The UFM token")]
-    pub token: String,
+    token: String,
 }
 
 impl TryFrom<Args> for forgerpc::CredentialCreationRequest {

@@ -14,22 +14,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use std::fmt::Debug;
 use std::sync::Arc;
 
 use ::rpc::Timestamp;
-use ::rpc::forge::VpcVirtualizationType;
+use ::rpc::forge::{Metadata, VpcVirtualizationType};
 use carbide_uuid::vpc::VpcId;
 
 use crate::config::MachineATronContext;
 use crate::tui::{UiUpdate, VpcDetails};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Vpc {
     pub vpc_id: VpcId,
     pub app_context: Arc<MachineATronContext>,
 
-    pub vpc_name: String,
+    pub metadata: Metadata,
     pub network_virtualization_type: Option<VpcVirtualizationType>,
 
     pub logs: Vec<String>,
@@ -53,7 +52,7 @@ impl Vpc {
         let new_vpc = Vpc {
             vpc_id: vpc.id.expect("VPC must have an ID."),
             app_context,
-            vpc_name: vpc.name,
+            metadata: vpc.metadata.expect("VPC must contain metadata.name"),
             network_virtualization_type,
             logs: Vec::default(),
             _created: vpc.created,
@@ -64,7 +63,12 @@ impl Vpc {
             _ = ui_event_tx
                 .send(UiUpdate::Vpc(details))
                 .await
-                .inspect_err(|e| tracing::warn!("Error sending TUI event: {}", e));
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "Error sending TUI event",
+                    )
+                });
         }
 
         new_vpc

@@ -50,7 +50,13 @@ impl SwitchCreator {
                 .matched_expected_switch(&explored_managed_switch.bmc_ip)
             {
                 Some(expected_switch) => expected_switch,
-                None => continue,
+                None => {
+                    tracing::info!(
+                        bmc_ip_address = %explored_managed_switch.bmc_ip,
+                        "No expected switch found"
+                    );
+                    continue;
+                }
             };
 
             match self
@@ -72,8 +78,8 @@ impl SwitchCreator {
                 Err(error) => {
                     tracing::error!(
                         %error,
-                        "Failed to create managed switch {:#?}",
-                        explored_managed_switch.bmc_ip
+                        bmc_ip_address = %explored_managed_switch.bmc_ip,
+                        "Failed to create managed switch"
                     );
                 }
             }
@@ -122,6 +128,28 @@ impl SwitchCreator {
                 .await?;
             }
         }
+
+        // Defense against the duplicate-switches bug: if a switch already
+        // exists in the database for this BMC MAC, don't make another one.
+        // This catches the case where the chassis serial drifts between
+        // exploration cycles (e.g. "NA" on the first read, a real value on
+        // the second) and produces a different `SwitchId` second time round.
+        if let Some(existing) =
+            db::switch::find_by_bmc_mac_address(txn, expected_switch.bmc_mac_address).await?
+        {
+            tracing::warn!(
+                bmc_mac_address = %expected_switch.bmc_mac_address,
+                existing_switch_id = %existing.id,
+                "Switch already exists for this BMC MAC; skipping discovery",
+            );
+            return Ok(None);
+        }
+
+        // `generate_switch_id` returns `MissingHardwareInfo::Serial` for both
+        // a missing chassis serial and the literal `"NA"` placeholder (see
+        // `switch_id::from_hardware_info_with_type`), so a junk-serial BMC
+        // read fails loudly here and is picked back up on the next
+        // exploration cycle once the real serial is reported.
         let switch_id = explored_managed_switch
             .clone()
             .report
@@ -135,8 +163,7 @@ impl SwitchCreator {
         if let Some(_existing_switch) = existing_switch {
             tracing::warn!(
                 %switch_id,
-                "Switch already exists, skipping. {} for switch id",
-                switch_id.to_string()
+                "Switch already exists, skipping."
             );
             return Ok(None);
         }
@@ -173,6 +200,22 @@ impl SwitchCreator {
         };
 
         _ = db::switch::create(txn, &new_switch).await?;
+
+        // Link the switch's BMC machine_interface back to the switch and mark it
+        // as a `Bmc` interface (mirroring host BMC linking from #1610 and the
+        // power shelf PMC linking). This is what lets the API resolve the
+        // switch's `bmc_info` (MAC/IP + interface id) via the interface link.
+        let bmc_interfaces =
+            db::machine_interface::find_by_mac_address(&mut *txn, expected_switch.bmc_mac_address)
+                .await?;
+        if let Some(interface) = bmc_interfaces.first() {
+            db::machine_interface::associate_bmc_interface(
+                &interface.id,
+                model::machine_interface_address::MachineInterfaceAssociation::Switch(switch_id),
+                &mut *txn,
+            )
+            .await?;
+        }
 
         if let Some(ref rack_id) = expected_switch.rack_id {
             let _ = crate::ensure_rack_exists(&mut *txn, rack_id).await?;

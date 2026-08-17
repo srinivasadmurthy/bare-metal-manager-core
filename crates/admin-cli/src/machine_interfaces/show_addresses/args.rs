@@ -19,7 +19,14 @@ use carbide_uuid::machine::MachineInterfaceId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show the addresses on a machine interface:
+    $ nico-admin-cli machine-interfaces show-addresses 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(help = "The machine interface ID to show addresses for")]
-    pub interface_id: MachineInterfaceId,
+    pub(super) interface_id: MachineInterfaceId,
 }

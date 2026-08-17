@@ -19,7 +19,17 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show rack positions for all machines:
+    $ nico-admin-cli machine positions
+
+Show positions for specific machines:
+    $ nico-admin-cli machine positions --machine 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(
         short = 'm',
         long,
@@ -27,5 +37,5 @@ pub struct Args {
         value_delimiter = ' ',
         help = "The machine(s) to query, leave empty for all (default)"
     )]
-    pub machine: Vec<MachineId>,
+    pub(super) machine: Vec<MachineId>,
 }

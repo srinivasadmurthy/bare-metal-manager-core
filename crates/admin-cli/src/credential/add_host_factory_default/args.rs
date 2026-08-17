@@ -19,13 +19,21 @@ use clap::Parser;
 use rpc::{CredentialType, forge as forgerpc};
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Add the factory-default host BMC credential for a vendor:
+    $ nico-admin-cli credential add-host-factory-default --vendor nvidia \
+    --username admin --password mypassword
+
+")]
+pub(crate) struct Args {
     #[clap(long, required(true), help = "Default username: root, ADMIN, etc")]
-    pub username: String,
+    username: String,
     #[clap(long, required(true), help = "Manufacturer default password")]
-    pub password: String,
+    password: String,
     #[clap(long, required(true))]
-    pub vendor: bmc_vendor::BMCVendor,
+    vendor: bmc_vendor::BMCVendor,
 }
 
 impl From<Args> for forgerpc::CredentialCreationRequest {

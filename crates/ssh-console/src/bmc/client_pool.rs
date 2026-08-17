@@ -40,7 +40,11 @@ use crate::shutdown_handle::{ReadyHandle, ShutdownHandle};
 use crate::ssh_server::ServerMetrics;
 
 /// Spawn a background task that connects to all BMC's in the environment, reconnecting if they fail.
-pub fn spawn(config: Arc<Config>, forge_api_client: ForgeApiClient, meter: &Meter) -> Handle {
+pub(crate) fn spawn(
+    config: Arc<Config>,
+    forge_api_client: ForgeApiClient,
+    meter: &Meter,
+) -> Handle {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (ready_tx, ready_rx) = oneshot::channel();
     let members: Arc<RwLock<HashMap<MachineId, ClientHandle>>> = Default::default();
@@ -65,7 +69,7 @@ pub fn spawn(config: Arc<Config>, forge_api_client: ForgeApiClient, meter: &Mete
 
 /// A owned handle to the entire BMC client pool background task. The pool will shut down when this is
 /// dropped.
-pub struct Handle {
+pub(crate) struct Handle {
     connection_store: BmcConnectionStore,
     shutdown_tx: oneshot::Sender<()>,
     ready_rx: Option<oneshot::Receiver<()>>,
@@ -73,7 +77,7 @@ pub struct Handle {
 }
 
 impl Handle {
-    pub fn connection_store(&self) -> BmcConnectionStore {
+    pub(crate) fn connection_store(&self) -> BmcConnectionStore {
         self.connection_store.clone()
     }
 }
@@ -92,10 +96,10 @@ impl ReadyHandle for Handle {
 
 /// An Arc reference to the available BMC connections in this pool
 #[derive(Clone)]
-pub struct BmcConnectionStore(Arc<RwLock<HashMap<MachineId, ClientHandle>>>);
+pub(crate) struct BmcConnectionStore(Arc<RwLock<HashMap<MachineId, ClientHandle>>>);
 
 impl BmcConnectionStore {
-    pub async fn get_connection(
+    pub(crate) async fn get_connection(
         &self,
         machine_or_instance_id: &str,
         config: &Config,
@@ -167,17 +171,17 @@ impl BmcConnectionStore {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum GetConnectionError {
+pub(crate) enum GetConnectionError {
     #[error("{machine_or_instance_id} is not a valid machine_id or instance ID")]
     InvalidMachineId { machine_or_instance_id: String },
-    #[error("Error looking up instance ID {instance_id}: {tonic_status}")]
+    #[error("error looking up instance ID {instance_id}: {tonic_status}")]
     InstanceIdLookupFailure {
         instance_id: InstanceId,
         tonic_status: tonic::Status,
     },
-    #[error("Could not find instance with id {instance_id}")]
+    #[error("could not find instance with id {instance_id}")]
     CouldNotFindInstanceId { instance_id: InstanceId },
-    #[error("Instance {instance_id} has no machine ID")]
+    #[error("instance {instance_id} has no machine ID")]
     InstanceMissingMachineId { instance_id: InstanceId },
     #[error("no machine with instance_id {instance_id}")]
     NoMachineWithInstanceId { instance_id: InstanceId },
@@ -193,18 +197,18 @@ struct BmcPool {
     metrics: Arc<BmcPoolMetrics>,
 }
 
-pub struct BmcPoolMetrics {
+pub(super) struct BmcPoolMetrics {
     grpc_total_hosts: Gauge<u64>,
     total_machines: Gauge<u64>,
     _failed_machines: ObservableGauge<u64>,
     _healthy_machines: ObservableGauge<u64>,
     _bmc_status: ObservableGauge<u64>,
 
-    // per-BMC metrics (need to be pub, since code outside this module is setting them
-    pub bmc_bytes_received_total: Counter<u64>,
-    pub bmc_rx_errors_total: Counter<u64>,
-    pub bmc_tx_errors_total: Counter<u64>,
-    pub bmc_recovery_attempts: Gauge<u64>,
+    // Updated by the BMC client and connection workers.
+    pub(super) bmc_bytes_received_total: Counter<u64>,
+    pub(super) bmc_rx_errors_total: Counter<u64>,
+    pub(super) bmc_tx_errors_total: Counter<u64>,
+    pub(super) bmc_recovery_attempts: Gauge<u64>,
 }
 
 impl BmcPoolMetrics {
@@ -212,13 +216,13 @@ impl BmcPoolMetrics {
         Self {
             grpc_total_hosts: meter
                 .u64_gauge("ssh_console_grpc_total_machines")
-                .with_description("The total number of hosts reported by the Site Controller to the SSH Console service").build(),
+                .with_description("Number of hosts reported by the Site Controller to the SSH Console service").build(),
             total_machines: meter
                 .u64_gauge("ssh_console_total_machines")
-                .with_description("The total number of host BMCs the SSH Console service has attempted connecting to").build(),
+                .with_description("Number of host BMCs the SSH Console service has attempted to connect to").build(),
             _failed_machines: meter
                 .u64_observable_gauge("ssh_console_failed_machines")
-                .with_description("The number of host BMCs the SSH Console service has encountered multiple errors with")
+                .with_description("Number of host BMCs with connection errors")
                 .with_callback({
                     let members = members.clone();
                     move |observer| {
@@ -233,7 +237,7 @@ impl BmcPoolMetrics {
                 .build(),
             _healthy_machines: meter
                 .u64_observable_gauge("ssh_console_healthy_machines")
-                .with_description("The number of host BMCs the SSH Console service has working connections to")
+                .with_description("Number of host BMCs the SSH Console service has working connections to")
                 .with_callback({
                     let members = members.clone();
                     move |observer| {
@@ -278,6 +282,14 @@ impl BmcPoolMetrics {
                 .with_description("Recovery attempts made for connection or session errors")
                 .build(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test() -> Self {
+        Self::new(
+            &opentelemetry::global::meter("ssh-console-ipmi-test"),
+            Arc::default(),
+        )
     }
 }
 
@@ -426,6 +438,6 @@ impl BmcPool {
 
 #[derive(thiserror::Error, Debug)]
 enum RefreshBmcsError {
-    #[error("Error fetching machine ids: {tonic_status}")]
+    #[error("error fetching machine ids: {tonic_status}")]
     FetchingMachineIdsFailure { tonic_status: tonic::Status },
 }

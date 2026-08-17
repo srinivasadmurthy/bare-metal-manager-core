@@ -15,21 +15,19 @@
  * limitations under the License.
  */
 use std::io;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use hickory_resolver::Name;
-use hickory_resolver::config::{NameServerConfigGroup, ResolverOpts};
+use hickory_resolver::config::{NameServerConfig, ResolverOpts};
+use hickory_resolver::proto::rr::Name;
 
 use crate::forge_resolver::read_resolv_conf;
 
-const DEFAULT_PORT: u16 = 53;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 
 #[derive(Clone, Default)]
 pub struct ForgeResolverConfig {
-    pub inner: NameServerConfigGroup,
+    pub inner: Vec<NameServerConfig>,
     pub search_domain: Vec<Name>,
     pub domain: Option<Name>,
 }
@@ -41,17 +39,17 @@ pub struct ForgeResolveConf {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ResolverError {
-    #[error("Could not read resolv.conf at {path}: {error}")]
+    #[error("could not read resolv.conf at {path}: {error}")]
     CouldNotReadResolvConf { path: PathBuf, error: io::Error },
-    #[error("Could not parse resolv.conf at {path}: {error}")]
+    #[error("could not parse resolv.conf at {path}: {error}")]
     CouldNotParseResolvConf {
         path: PathBuf,
         error: resolv_conf::ParseError,
     },
-    #[error("Error resolving host {string}: {error}")]
+    #[error("error resolving host {string}: {error}")]
     InvalidHostString {
         string: String,
-        error: hickory_resolver::proto::error::ProtoError,
+        error: hickory_resolver::proto::ProtoError,
     },
 }
 
@@ -82,7 +80,7 @@ impl ForgeResolveConf {
 impl ForgeResolverConfig {
     pub fn new() -> Self {
         Self {
-            inner: NameServerConfigGroup::new(),
+            inner: vec![],
             search_domain: vec![],
             domain: None,
         }
@@ -105,15 +103,13 @@ pub fn into_forge_resolver_config(
         frc.domain = None
     }
 
-    let ips: Vec<IpAddr> = parsed_config
+    let nameserver_configs: Vec<NameServerConfig> = parsed_config
         .get_nameservers_or_local()
         .into_iter()
-        .map(|scoped_ip| -> IpAddr { scoped_ip.into() })
+        .map(|scoped_ip| NameServerConfig::udp_and_tcp(scoped_ip.into()))
         .collect();
 
-    let nameservers = NameServerConfigGroup::from_ips_clear(&ips, DEFAULT_PORT, false);
-
-    if nameservers.is_empty() {
+    if nameserver_configs.is_empty() {
         tracing::warn!("no nameservers found in config");
     }
 
@@ -132,7 +128,7 @@ pub fn into_forge_resolver_config(
             })?);
     }
 
-    frc.inner = nameservers;
+    frc.inner = nameserver_configs;
 
     // TODO: Allow passing through Custom ResolverOpts
     Ok((frc, ResolverOpts::default()))

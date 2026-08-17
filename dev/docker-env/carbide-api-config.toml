@@ -23,9 +23,9 @@ enable_route_servers = true
 dpu_ipmi_tool_impl = "test"
 initial_domain_name = "forge.local"
 initial_dpu_agent_upgrade_policy = "off"
-nvue_enabled = true
 attestation_enabled = false
 bypass_rbac = true
+allow_insecure_discovery = true
 
 [site_explorer]
 enabled = true
@@ -86,6 +86,11 @@ iteration_time = "10s"
 [network_segment_state_controller]
 network_segment_drain_time = "60s"
 [network_segment_state_controller.controller]
+iteration_time = "2s"
+
+[vpc_prefix_state_controller]
+vpc_prefix_drain_time = "60s"
+[vpc_prefix_state_controller.controller]
 iteration_time = "2s"
 
 [ib_partition_state_controller.controller]

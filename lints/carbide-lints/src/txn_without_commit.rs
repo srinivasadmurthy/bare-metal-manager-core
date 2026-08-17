@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use rustc_errors::DiagDecorator;
 use rustc_lint_defs::{Lint, LintPass, LintVec};
 use rustc_middle::mir::{self, LocalKind};
 use rustc_middle::ty::{Ty as MiddleTy, TyCtxt};
@@ -43,7 +44,7 @@ use rustc_span::def_id::LocalDefId;
 ///
 /// Any move of the transaction will avoid the lint, whether it's calling .commit(), .rollback(), or
 /// moving it to some other function.
-pub static TXN_WITHOUT_COMMIT: &Lint = &Lint {
+pub(crate) static TXN_WITHOUT_COMMIT: &Lint = &Lint {
     name: "txn_without_commit",
     default_level: ::rustc_lint_defs::Warn,
     desc: "A sqlx::Transaction is owned by this function but dropped without calling commit() or moving it out",
@@ -51,7 +52,7 @@ pub static TXN_WITHOUT_COMMIT: &Lint = &Lint {
     ..Lint::default_fields_for_macro()
 };
 
-pub struct TxnWithoutCommit {
+pub(crate) struct TxnWithoutCommit {
     txn_symbol_paths: Vec<Vec<Symbol>>,
 }
 
@@ -94,7 +95,7 @@ impl TxnWithoutCommit {
     /// Entrypoint for the lint. Runs on the MIR body for the given def_id and emits when a
     /// Transaction local is definitely still initialized at the end of the function *and* was never
     /// moved out along any path.
-    pub fn check_fn_body(&mut self, tcx: TyCtxt, def_id: LocalDefId) {
+    pub(crate) fn check_fn_body(&mut self, tcx: TyCtxt, def_id: LocalDefId) {
         // Only check nodes that actually have a body.
         let Some((_owner_def_id, body_id)) = tcx.hir_node_by_def_id(def_id).associated_body()
         else {
@@ -130,15 +131,15 @@ impl TxnWithoutCommit {
                 continue;
             }
 
-            tcx.node_span_lint(
+            tcx.emit_node_span_lint(
                 TXN_WITHOUT_COMMIT,
                 body_id.hir_id,
                 decl.source_info.span,
-                |diag| {
+                DiagDecorator(|diag| {
                     diag.primary_message(
                         "sqlx::Transaction is dropped by this function without commit()/rollback(), or being moved out",
                     );
-                },
+                }),
             );
         }
     }
@@ -152,7 +153,7 @@ impl TxnWithoutCommit {
     }
 
     /// Check if the given rustc_middle::Ty (ie. output from typeck) resolves to a sqlx::Transaction
-    pub fn is_sqlx_transaction_ty(&self, tcx: TyCtxt<'_>, ty: &MiddleTy) -> bool {
+    fn is_sqlx_transaction_ty(&self, tcx: TyCtxt<'_>, ty: &MiddleTy) -> bool {
         let def_id = match ty.peel_refs().kind() {
             rustc_middle::ty::Adt(adt, _) => adt.did(),
             _ => {

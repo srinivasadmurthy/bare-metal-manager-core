@@ -14,6 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#![cfg_attr(not(test), deny(dead_code_pub_in_binary))]
+
 use std::net::AddrParseError;
 use std::path::PathBuf;
 
@@ -23,7 +25,7 @@ use ssh_console::shutdown_handle::ShutdownHandle;
 use tracing::metadata::LevelFilter;
 
 #[tokio::main(flavor = "multi_thread")]
-pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     setup_logging(&cli);
 
@@ -197,11 +199,11 @@ impl TryInto<Config> for RunCommand {
 
 #[derive(thiserror::Error, Debug)]
 enum CliError {
-    #[error("Invalid listening address {addr}: {error}")]
+    #[error("invalid listening address {addr}: {error}")]
     InvalidListeningAddress { addr: String, error: AddrParseError },
-    #[error("Invalid metrics address {addr}: {error}")]
+    #[error("invalid metrics address {addr}: {error}")]
     InvalidMetricsAddress { addr: String, error: AddrParseError },
-    #[error("Configuration error: {0}")]
+    #[error("configuration error: {0}")]
     Config(#[from] ConfigError),
 }
 

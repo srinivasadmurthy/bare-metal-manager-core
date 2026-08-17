@@ -15,31 +15,44 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliError;
 use carbide_uuid::rack::RackId;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+use crate::errors::CarbideCliError;
+
 #[derive(Parser, Debug, Serialize, Deserialize)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Update an expected rack's rack profile:
+    $ nico-admin-cli expected-rack update 12345678-1234-5678-90ab-cdef01234567 \
+    --rack-profile-id abcdef01-2345-6789-abcd-ef0123456789
+
+Update an expected rack's metadata name:
+    $ nico-admin-cli expected-rack update 12345678-1234-5678-90ab-cdef01234567 \
+    --rack-profile-id abcdef01-2345-6789-abcd-ef0123456789 --meta-name rack-01
+
+")]
+pub(crate) struct Args {
     #[clap(help = "Rack ID of the expected rack")]
-    pub rack_id: RackId,
+    rack_id: RackId,
     #[clap(long, help = "Rack profile ID of the expected rack")]
-    pub rack_profile_id: Option<String>,
+    rack_profile_id: Option<String>,
 
     #[clap(
         long = "meta-name",
         value_name = "META_NAME",
         help = "The name that should be used as part of the Metadata for newly created Rack. If empty, the Rack Id will be used"
     )]
-    pub meta_name: Option<String>,
+    meta_name: Option<String>,
 
     #[clap(
         long = "meta-description",
         value_name = "META_DESCRIPTION",
         help = "The description that should be used as part of the Metadata for newly created Rack"
     )]
-    pub meta_description: Option<String>,
+    meta_description: Option<String>,
 
     #[clap(
         long = "label",
@@ -47,7 +60,7 @@ pub struct Args {
         help = "A label that will be added as metadata for the newly created Rack. The labels key and value must be separated by a : character",
         action = clap::ArgAction::Append
     )]
-    pub labels: Option<Vec<String>>,
+    labels: Option<Vec<String>>,
 }
 
 impl TryFrom<Args> for rpc::forge::ExpectedRack {

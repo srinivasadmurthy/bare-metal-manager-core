@@ -18,16 +18,16 @@
 mod delete_sitewide;
 mod set_sitewide;
 
-use ::rpc::admin_cli::CarbideCliResult;
 use clap::Parser;
 
 use crate::cfg::dispatch::Dispatch;
 use crate::cfg::run::Run;
 use crate::cfg::runtime::RuntimeContext;
+use crate::errors::CarbideCliResult;
 
 #[derive(Parser, Debug, Clone, Dispatch)]
 #[clap(rename_all = "kebab_case")]
-pub enum Cmd {
+pub(crate) enum Cmd {
     #[clap(name = "set-sitewide", about = "Set the site-wide leaf BGP password")]
     Set(set_sitewide::Args),
     #[clap(

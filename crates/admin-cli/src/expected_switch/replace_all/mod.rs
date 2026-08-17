@@ -15,19 +15,19 @@
  * limitations under the License.
  */
 
-pub mod args;
-pub mod cmd;
+mod args;
+mod cmd;
 
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
-pub use args::Args;
+pub(super) use args::Args;
 use serde::{Deserialize, Serialize};
 
 use crate::cfg::run::Run;
 use crate::cfg::runtime::RuntimeContext;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::expected_switch::common::ExpectedSwitchJson;
 
 impl Run for Args {

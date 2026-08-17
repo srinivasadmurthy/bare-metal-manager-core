@@ -20,7 +20,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use color_eyre::eyre::eyre;
+use eyre::eyre;
 use libredfish::model::oem::nvidia_dpu::NicMode;
 use libredfish::model::software_inventory::SoftwareInventory;
 use libredfish::model::task::{Task, TaskState};
@@ -32,45 +32,13 @@ use libredfish::{
 };
 use mac_address::MacAddress;
 use prettytable::{Table, row};
-use serde::Serialize;
 use tracing::warn;
 
 use super::args::{Cmd, DpuOperations, FwCommand, RedfishAction, ShowFw, ShowPort};
-use crate::rpc::ApiClient;
 
-pub async fn handle_browse_command(api_client: &ApiClient, uri: &str) -> color_eyre::Result<()> {
-    let data = api_client.0.redfish_browse(uri.to_string()).await?;
-    #[derive(Serialize, Debug)]
-    struct Output {
-        text: serde_json::Value,
-        headers: HashMap<String, String>,
-    }
-
-    let text = match serde_json::from_str(&data.text) {
-        Ok(text) => text,
-        Err(_) => {
-            println!("{data:?}");
-            return Ok(());
-        }
-    };
-
-    let output = Output {
-        text,
-        headers: data.headers,
-    };
-    println!("{}", serde_json::to_string_pretty(&output).unwrap());
-
-    Ok(())
-}
-
-pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
+pub(crate) async fn action(action: RedfishAction) -> color_eyre::Result<()> {
     let endpoint = libredfish::Endpoint {
-        host: match action.address {
-            Some(a) => a,
-            None => {
-                return Err(eyre!("Missing --address"));
-            }
-        },
+        host: action.address,
         user: action.username,
         password: action.password,
         ..Default::default()
@@ -84,6 +52,7 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
 
     use Cmd::*;
     let pool = libredfish::RedfishClientPool::builder()
+        .danger_accept_invalid_certs()
         .proxy(proxy)
         .build()?;
     let redfish: Box<dyn Redfish> = match &action.command {
@@ -93,7 +62,7 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
     match action.command {
         BiosAttrs => {
             let bios = redfish.bios().await?;
-            println!("{}", serde_json::to_string(&bios).unwrap());
+            println!("{}", serde_json::to_string(&bios)?);
         }
         BootHdd => {
             redfish.boot_first(Boot::HardDisk).await?;
@@ -128,9 +97,16 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
                 .selected_profile
                 .unwrap_or(libredfish::BiosProfileType::Performance);
 
+            let boot_interface = machine_setup_args
+                .boot_interface_mac
+                .as_deref()
+                .map(|m| m.parse::<MacAddress>())
+                .transpose()
+                .map_err(|e| eyre!("invalid boot_interface_mac: {e}"))?
+                .map(libredfish::BootInterfaceRef::Mac);
             redfish
                 .machine_setup(
-                    machine_setup_args.boot_interface_mac.as_deref(),
+                    boot_interface,
                     &bios_profiles,
                     selected_profile,
                     &HashMap::default(),
@@ -138,12 +114,14 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
                 .await?;
         }
         MachineSetupStatus(machine_setup_status_args) => {
-            println!(
-                "{}",
-                redfish
-                    .machine_setup_status(machine_setup_status_args.boot_interface_mac.as_deref())
-                    .await?
-            );
+            let boot_interface = machine_setup_status_args
+                .boot_interface_mac
+                .as_deref()
+                .map(|m| m.parse::<MacAddress>())
+                .transpose()
+                .map_err(|e| eyre!("invalid boot_interface_mac: {e}"))?
+                .map(libredfish::BootInterfaceRef::Mac);
+            println!("{}", redfish.machine_setup_status(boot_interface).await?);
         }
         SetForgePasswordPolicy => {
             redfish.set_machine_password_policy().await?;
@@ -157,8 +135,9 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
             } else {
                 let all = redfish.get_boot_options().await?;
                 for b in all.members {
-                    let id = b.odata_id.split('/').next_back().unwrap();
-                    println!("{:?}", redfish.get_boot_option(id).await?)
+                    if let Some(id) = b.odata_id.split('/').next_back() {
+                        println!("{:?}", redfish.get_boot_option(id).await?)
+                    }
                 }
             }
         }
@@ -191,7 +170,16 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
                 "Status",
             ]);
             for dev in redfish.pcie_devices().await? {
-                let status = dev.status.unwrap();
+                let status = dev
+                    .status
+                    .map(|status| {
+                        format!(
+                            "{} {}",
+                            status.health.unwrap_or_default(),
+                            status.state.unwrap_or("".to_string())
+                        )
+                    })
+                    .unwrap_or_default();
                 table.add_row(row![
                     dev.id.unwrap_or_default(),
                     dev.manufacturer.or(dev.gpu_vendor).unwrap_or_default(),
@@ -199,11 +187,7 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
                     dev.firmware_version.unwrap_or_default(),
                     dev.part_number.unwrap_or_default(),
                     dev.serial_number.unwrap_or_default(),
-                    format!(
-                        "{} {}",
-                        status.health.unwrap_or_default(),
-                        status.state.unwrap_or("".to_string())
-                    ),
+                    status,
                 ]);
             }
             table.set_format(*prettytable::format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
@@ -271,7 +255,8 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
             println!("{pending:#?}");
         }
         PowerMetrics => {
-            println!("{:?}", redfish.get_power_metrics().await?);
+            let power = redfish.get_power_metrics().await?;
+            println!("{}", serde_json::to_string_pretty(&power)?);
         }
         ForceRestart => {
             redfish.power(SystemPowerControl::ForceRestart).await?;
@@ -293,7 +278,8 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
             redfish.power(SystemPowerControl::ACPowercycle).await?;
         }
         ThermalMetrics => {
-            println!("{:?}", redfish.get_thermal_metrics().await?);
+            let thermal = redfish.get_thermal_metrics().await?;
+            println!("{}", serde_json::to_string_pretty(&thermal)?);
         }
         TpmReset => {
             redfish.clear_tpm().await?;
@@ -318,18 +304,12 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
             }
         }
         CreateBmcUser(bmc_user) => {
-            let role: RoleId = match bmc_user
+            // clap has already validated --role-id against the allowed set;
+            // default to Administrator when it is omitted.
+            let role: RoleId = bmc_user
                 .role_id
-                .unwrap_or("Administrator".to_string())
-                .to_lowercase()
-                .as_str()
-            {
-                "administrator" => RoleId::Administrator,
-                "operator" => RoleId::Operator,
-                "readonly" => RoleId::ReadOnly,
-                "noaccess" => RoleId::NoAccess,
-                _ => RoleId::Administrator,
-            };
+                .map(RoleId::from)
+                .unwrap_or(RoleId::Administrator);
             redfish
                 .create_user(&bmc_user.user, &bmc_user.new_password, role)
                 .await?;
@@ -496,14 +476,19 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
         ClearNvram => {
             redfish.clear_nvram().await?;
         }
-        Browse(_) => {
-            unreachable!();
-        }
         SetBios(set_bios) => {
             let attrmap: HashMap<String, serde_json::Value> =
-                serde_json::from_str(set_bios.attributes.as_str()).unwrap();
+                serde_json::from_str(set_bios.attributes.as_str())?;
             redfish.set_bios(attrmap).await?;
             println!("success");
+        }
+        ResetBios(args) => {
+            redfish.reset_bios().await?;
+            if args.reboot {
+                redfish.power(SystemPowerControl::ForceRestart).await?;
+            } else {
+                println!("BIOS changes require a system restart to take effect.");
+            }
         }
         GetNicMode => {
             let is_dpu_in_nic_mode = redfish.get_nic_mode().await?;
@@ -533,17 +518,19 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
                 .await?;
         }
         SetBootOrderDpuFirst(args) => {
-            if let Some(job_id) = redfish
-                .set_boot_order_dpu_first(&args.boot_interface_mac)
-                .await?
-            {
+            let boot_interface = libredfish::BootInterfaceRef::Mac(
+                args.boot_interface_mac
+                    .parse::<MacAddress>()
+                    .map_err(|e| eyre!("invalid boot_interface_mac: {e}"))?,
+            );
+            if let Some(job_id) = redfish.set_boot_order_dpu_first(boot_interface).await? {
                 tracing::info!(
-                    "succesfully configured BIOS job {job_id} to set {} first in the server's boot order",
+                    "successfully configured BIOS job {job_id} to set {} first in the server's boot order",
                     args.boot_interface_mac
                 )
             } else {
                 tracing::info!(
-                    "succesfully set {} first in the server's boot order",
+                    "successfully set {} first in the server's boot order",
                     args.boot_interface_mac
                 )
             }
@@ -568,7 +555,7 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
                 tracing::info!("Did not find BOSS Controller");
             }
         }
-        DecomissionController(args) => {
+        DecommissionController(args) => {
             if let Some(jid) = redfish
                 .decommission_storage_controller(&args.controller_id)
                 .await?
@@ -589,16 +576,19 @@ pub async fn action(action: RedfishAction) -> color_eyre::Result<()> {
             }
         }
         IsBootOrderSetup(args) => {
-            let setup = redfish
-                .is_boot_order_setup(&args.boot_interface_mac)
-                .await?;
+            let boot_interface = libredfish::BootInterfaceRef::Mac(
+                args.boot_interface_mac
+                    .parse::<MacAddress>()
+                    .map_err(|e| eyre!("invalid boot_interface_mac: {e}"))?,
+            );
+            let setup = redfish.is_boot_order_setup(boot_interface).await?;
             tracing::info!(setup);
         }
     }
     Ok(())
 }
 
-pub async fn handle_fw_status(redfish: Box<dyn Redfish>) -> Result<(), RedfishError> {
+async fn handle_fw_status(redfish: Box<dyn Redfish>) -> Result<(), RedfishError> {
     let tasks: Vec<String> = redfish.get_tasks().await?;
     let mut tasks_info: Vec<Task> = Vec::new();
     for task in tasks.iter() {
@@ -612,7 +602,7 @@ pub async fn handle_fw_status(redfish: Box<dyn Redfish>) -> Result<(), RedfishEr
     Ok(())
 }
 
-pub async fn handle_fw_show(redfish: Box<dyn Redfish>, args: ShowFw) -> Result<(), RedfishError> {
+async fn handle_fw_show(redfish: Box<dyn Redfish>, args: ShowFw) -> Result<(), RedfishError> {
     if args.all || args.bmc || args.dpu_os || args.uefi || args.fw.is_empty() {
         let f = FwFilter {
             only_bmc: args.bmc,
@@ -650,10 +640,19 @@ pub async fn handle_fw_show(redfish: Box<dyn Redfish>, args: ShowFw) -> Result<(
 }
 
 #[derive(Debug, Default, Copy, Clone)]
-pub struct FwFilter {
+struct FwFilter {
     only_bmc: bool,
     only_dpu_os: bool,
     only_uefi: bool,
+}
+
+/// True if a firmware-inventory id refers to the BMC firmware. BF3 exposes it
+/// as `"BMC_Firmware"`; BF4 uses exactly `"BlueField_FW_BMC_0"`. Matching the
+/// full BF4 id (via `ends_with`, allowing an optional path prefix) excludes
+/// unrelated components — including `"..._FW_BMC_0_x"` / `"..._FW_BMC_01"` and
+/// any other id that merely ends in `"FW_BMC_0"`.
+fn is_bmc_firmware_id(id: &str) -> bool {
+    id.contains("BMC_Firmware") || id.ends_with("BlueField_FW_BMC_0")
 }
 
 async fn show_all_fws(redfish: Box<dyn Redfish>, f: FwFilter) -> Result<(), RedfishError> {
@@ -669,11 +668,11 @@ async fn show_all_fws(redfish: Box<dyn Redfish>, f: FwFilter) -> Result<(), Redf
     }
 
     if f.only_bmc {
-        if !fws.contains(&"BMC_Firmware".to_string()) {
+        if !fws.iter().any(|id| is_bmc_firmware_id(id)) {
             println!("BMC FW is not found");
             return Err(RedfishError::NoContent);
         }
-        fws_info.retain(|f| f.id.contains("BMC_Firmware"));
+        fws_info.retain(|f| is_bmc_firmware_id(&f.id));
     }
 
     if f.only_dpu_os {
@@ -731,14 +730,11 @@ fn convert_tasks_to_nice_table(tasks: Vec<Task>) -> Box<Table> {
     table.into()
 }
 
-pub async fn handle_port_show(
-    redfish: Box<dyn Redfish>,
-    args: ShowPort,
-) -> Result<(), RedfishError> {
+async fn handle_port_show(redfish: Box<dyn Redfish>, args: ShowPort) -> Result<(), RedfishError> {
     match show_all_ports(redfish).await {
         Ok((mut ports_info, netdev_funcs_info)) => {
             if !args.port.is_empty() {
-                ports_info.retain(|f| *f.id.as_ref().unwrap() == args.port);
+                ports_info.retain(|f| f.id.as_ref().is_some_and(|id| id == &args.port));
             }
             convert_ports_to_nice_table(ports_info, netdev_funcs_info).printstd();
             // TODO(chet): Remove this ~March 2024.
@@ -849,7 +845,7 @@ fn convert_ports_to_nice_table(
                         .as_ref()
                         .and_then(|ethernet| ethernet.mtu_size)
                         .unwrap_or(0),
-                    port.current_speed_gbps.unwrap_or(0),
+                    port.current_speed_gbps.unwrap_or(0.0),
                 ]);
             }
         }
@@ -858,7 +854,7 @@ fn convert_ports_to_nice_table(
     table.into()
 }
 
-pub async fn handle_ethernet_interface_show(
+async fn handle_ethernet_interface_show(
     redfish: Box<dyn Redfish>,
     fetch_system_interfaces: bool,
 ) -> Result<(), RedfishError> {
@@ -947,7 +943,7 @@ fn convert_ethernet_interfaces_to_nice_table(eth_ifs: Vec<EthernetInterface>) ->
     table.into()
 }
 
-pub async fn handle_get_chassis_all(redfish: Box<dyn Redfish>) -> Result<(), RedfishError> {
+async fn handle_get_chassis_all(redfish: Box<dyn Redfish>) -> Result<(), RedfishError> {
     let chassis_vec: Vec<String> = redfish.get_chassis_all().await?;
     let mut chassis_info: Vec<Chassis> = Vec::new();
 
@@ -965,7 +961,7 @@ pub async fn handle_get_chassis_all(redfish: Box<dyn Redfish>) -> Result<(), Red
     Ok(())
 }
 
-pub async fn handle_get_chassis(
+async fn handle_get_chassis(
     redfish: Box<dyn Redfish>,
     chassis_id: String,
 ) -> Result<(), RedfishError> {
@@ -974,7 +970,10 @@ pub async fn handle_get_chassis(
         match redfish.get_chassis(c).await {
             Ok(chassis) => {
                 if *c == chassis_id {
-                    println!("{chassis:?}");
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&chassis).unwrap_or_default()
+                    );
                     return Ok(());
                 }
             }
@@ -1000,4 +999,23 @@ fn convert_chassis_to_nice_table(chassis_vec: Vec<Chassis>) -> Box<Table> {
         ]);
     }
     table.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_bmc_firmware_id;
+
+    #[test]
+    fn is_bmc_firmware_id_matches_bf3_and_bf4_only() {
+        // BF3 id and BF4 id are recognized.
+        assert!(is_bmc_firmware_id("BMC_Firmware"));
+        assert!(is_bmc_firmware_id("BlueField_FW_BMC_0"));
+
+        // Not the BMC firmware: unrelated components, slot/backup variants, or
+        // any id that merely ends in "FW_BMC_0".
+        assert!(!is_bmc_firmware_id("DPU_OS"));
+        assert!(!is_bmc_firmware_id("BlueField_FW_BMC_0_ERoT"));
+        assert!(!is_bmc_firmware_id("BlueField_FW_BMC_01"));
+        assert!(!is_bmc_firmware_id("Something_FW_BMC_0"));
+    }
 }

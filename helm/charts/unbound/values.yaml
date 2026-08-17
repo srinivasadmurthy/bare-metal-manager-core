@@ -15,10 +15,39 @@ exporterImage:
   tag: ""
   pullPolicy: IfNotPresent
 
+## Metrics sidecar (unbound_exporter). It needs unbound remote-control keys and the
+## default image is in a private registry — disable it when running a public/stock
+## unbound image that doesn't set up remote-control.
+exporter:
+  enabled: true
+
+## Optional container command/args override. Leave empty to use the image's own
+## entrypoint (the NVIDIA nvforge image, which loads /etc/unbound/local.conf.d and
+## sets up remote-control). Set these to run a PUBLIC/stock unbound image whose
+## entrypoint wouldn't otherwise include the chart's local.conf.d fragments, e.g.:
+##   command: ["/bin/sh", "-c"]
+##   args:
+##     - |
+##       printf 'server:\n  interface: 0.0.0.0\n  interface: ::0\n  access-control: 0.0.0.0/0 allow\ninclude: "/etc/unbound/local.conf.d/*.conf"\n' > /tmp/unbound.conf
+##       exec unbound -d -c /tmp/unbound.conf
+command: []
+args: []
+
 imagePullSecrets: []
 
 service:
   type: ClusterIP
+
+## External LoadBalancer Service (bare-metal / MetalLB). When enabled, renders two
+## Services (UDP+TCP on 53) sharing one VIP via metallb.universe.tf/allow-shared-ip, so
+## DPUs/hosts can use unbound as their DHCP-advertised resolver for the .forge zone.
+## Set the VIP via annotations, e.g.:
+##   annotations: { metallb.universe.tf/loadBalancerIPs: "10.x.x.x" }
+externalService:
+  enabled: false
+  type: LoadBalancer
+  externalTrafficPolicy: ""
+  annotations: {}
 
 serviceMonitor:
   enabled: false
@@ -31,6 +60,18 @@ env:
   BROKEN_DNSSEC: "1"
   UNBOUND_CONTROL_DIR: /etc/unbound/keys
 
+# Local DNS A records served to managed hosts and DPUs. Rendered into a
+# local_data.conf file that unbound includes from local.conf.d. Names and IPs
+# are environment-specific, so this is empty by default — populate per site.
+localData: []
+# localData:
+#   - name: nico-api.nico
+#     addresses: ["10.0.0.1"]
+#   - name: carbide-api.forge        # legacy alias → same address
+#     addresses: ["10.0.0.1"]
+#   - name: nico-ntp.nico            # multiple addresses are supported
+#     addresses: ["10.0.0.2", "10.0.0.3", "10.0.0.4"]
+
 # Local config files for unbound
 localConfig:
   access_control.conf: |
@@ -42,8 +83,8 @@ localConfig:
   verbosity.conf: |
     server:
         verbosity: 1
-  forge_local_unknowndomain.conf: |
-    # This .unknowndomain value is hardcoded in carbide as a default if a VPC
+  nico_local_unknowndomain.conf: |
+    # This .unknowndomain value is hardcoded in nico as a default if a VPC
     # doesn't have one configured. We shouldn't forward any of these queries further
     # upstream.
     local-zone: "unknowndomain." static

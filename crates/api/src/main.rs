@@ -14,32 +14,31 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#![cfg_attr(not(test), deny(dead_code_pub_in_binary))]
 
 use std::path::Path;
 use std::str::FromStr;
 
 use carbide::{Command, Options};
+use carbide_secrets::CredentialConfig;
 use clap::CommandFactory;
-use forge_secrets::CredentialConfig;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    let config = Options::load();
-    if config.version {
+    let options = Options::load();
+    if options.version {
         println!("{}", carbide_version::version!());
         return Ok(());
     }
-    let debug = config.debug;
+    let debug = options.debug;
 
-    let sub_cmd = match &config.sub_cmd {
-        None => {
-            return Ok(Options::command().print_long_help()?);
-        }
-        Some(s) => s,
+    let Some(sub_cmd) = options.sub_cmd else {
+        return Ok(Options::command().print_long_help()?);
     };
+
     match sub_cmd {
         Command::Migrate(m) => {
             tracing::info!("Running migrations");
@@ -55,24 +54,31 @@ async fn main() -> eyre::Result<()> {
             let pool = PgPool::connect_with(pg_connection_options).await?;
             db::migrations::migrate(&pool).await?;
         }
-        Command::Run(config) => {
+        Command::Run(run) => {
             // THIS SECTION HAS BEEN INTENTIONALLY KEPT SMALL.
             // Nothing should go before the call to carbide::run that isn't already here.
             // Everything that you think might belong here, belongs in carbide::run.
-            let config_str = tokio::fs::read_to_string(&config.config_path).await?;
-            let site_config_str = if let Some(site_path) = &config.site_config_path {
-                Some(tokio::fs::read_to_string(&site_path).await?)
-            } else {
-                None
-            };
-
             let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+            // The server has two separate route trees on one listener: the gRPC API
+            // (always served, lives in `carbide-api-core`) and the admin web UI — the
+            // HTML pages under `/admin`, which live in `carbide-api-web`. Handing the
+            // web pages in here is the one thing only this crate can do: `carbide-api-web`
+            // and `carbide-api-core` can't reference each other without a dependency
+            // cycle, and this top-level binary is the only crate that depends on both.
+            //
+            // We always supply the builder; whether it's actually mounted is decided
+            // downstream from the `enable_admin_ui` config flag (default true) — see
+            // the core runtime. (We can't read config here: it's parsed inside `carbide::run`.)
+            // See the docs on `carbide::AdminUiRoutesBuilder` for the full story.
+            let admin_ui_routes_builder: Option<carbide::AdminUiRoutesBuilder> =
+                Some(Box::new(carbide_api_web::routes));
             carbide::run(
                 debug,
-                config_str,
-                site_config_str,
+                run.config_path,
+                run.site_config_path,
                 CredentialConfig::default(),
                 false,
+                admin_ui_routes_builder,
                 CancellationToken::new(),
                 ready_tx,
             )

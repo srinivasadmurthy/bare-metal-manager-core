@@ -85,14 +85,6 @@ pub struct RedfishActionId {
     pub request_id: i64,
 }
 
-impl From<rpc::forge::RedfishActionId> for RedfishActionId {
-    fn from(id: rpc::forge::RedfishActionId) -> Self {
-        RedfishActionId {
-            request_id: id.request_id,
-        }
-    }
-}
-
 impl From<i64> for RedfishActionId {
     fn from(request_id: i64) -> Self {
         RedfishActionId { request_id }
@@ -104,14 +96,6 @@ pub struct RedfishListActionsFilter {
     pub machine_ip: Option<String>,
 }
 
-impl From<rpc::forge::RedfishListActionsRequest> for RedfishListActionsFilter {
-    fn from(req: rpc::forge::RedfishListActionsRequest) -> Self {
-        RedfishListActionsFilter {
-            machine_ip: req.machine_ip,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct RedfishCreateAction {
     pub target: String,
@@ -119,61 +103,43 @@ pub struct RedfishCreateAction {
     pub parameters: String,
 }
 
-impl From<rpc::forge::RedfishCreateActionRequest> for RedfishCreateAction {
-    fn from(req: rpc::forge::RedfishCreateActionRequest) -> Self {
-        RedfishCreateAction {
-            target: req.target,
-            action: req.action,
-            parameters: req.parameters,
-        }
-    }
-}
-
-impl From<ActionRequest> for rpc::forge::RedfishAction {
-    fn from(value: ActionRequest) -> Self {
-        Self {
-            request_id: value.request_id,
-            requester: value.requester,
-            approvers: value.approvers,
-            approver_dates: value.approver_dates.into_iter().map(|d| d.into()).collect(),
-            machine_ips: value.machine_ips,
-            board_serials: value.board_serials,
-            target: value.target,
-            action: value.action,
-            parameters: value.parameters,
-            applied_at: value.applied_at.map(|t| t.into()),
-            applier: value.applier,
-            results: value
-                .results
-                .into_iter()
-                .map(|r| rpc::forge::OptionalRedfishActionResult {
-                    result: r.map(|r| rpc::forge::RedfishActionResult {
-                        headers: r.headers,
-                        status: r.status,
-                        body: r.body,
-                        completed_at: Some(r.completed_at.into()),
-                    }),
-                })
-                .collect(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{scenarios, value_scenarios};
+
     use super::*;
 
+    /// `From<i64>` is a plain field move; enumerate the integer boundaries it must
+    /// carry through unchanged.
     #[test]
-    fn redfish_action_id_from_rpc() {
-        let rpc_id = rpc::forge::RedfishActionId { request_id: 42 };
-        let id = RedfishActionId::from(rpc_id);
-        assert_eq!(id.request_id, 42);
-    }
+    fn redfish_action_id_from_i64_carries_the_value() {
+        value_scenarios!(
+            run = |n| RedfishActionId::from(n).request_id;
+            "positive" {
+                99i64 => 99i64,
+            }
 
-    #[test]
-    fn redfish_action_id_from_i64() {
-        let id = RedfishActionId::from(99i64);
-        assert_eq!(id.request_id, 99);
+            "zero" {
+                0 => 0,
+            }
+
+            "one" {
+                1 => 1,
+            }
+
+            "negative" {
+                -1 => -1,
+            }
+
+            "i64::MAX" {
+                i64::MAX => i64::MAX,
+            }
+
+            "i64::MIN" {
+                i64::MIN => i64::MIN,
+            }
+        );
     }
 
     #[test]
@@ -184,25 +150,82 @@ mod tests {
     }
 
     #[test]
-    fn redfish_list_actions_filter_from_rpc() {
-        let rpc_req = rpc::forge::RedfishListActionsRequest {
-            machine_ip: Some("10.0.0.1".to_string()),
-        };
-        let filter = RedfishListActionsFilter::from(rpc_req);
-        assert_eq!(filter.machine_ip, Some("10.0.0.1".to_string()));
+    fn redfish_list_actions_filter_default_is_empty() {
+        value_scenarios!(
+            run = |filter| filter.machine_ip;
+            "default leaves machine_ip unset" {
+                RedfishListActionsFilter::default() => None,
+            }
+        );
     }
 
+    fn bmc_response(status: &str, body: &str) -> BMCResponse {
+        BMCResponse {
+            headers: HashMap::new(),
+            status: status.to_string(),
+            body: body.to_string(),
+            completed_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+        }
+    }
+
+    /// `BMCResponse` is round-tripped through JSON when persisted; assert the
+    /// serialized form survives a deserialize back to the same fields. The error
+    /// type (`serde_json::Error`) isn't `PartialEq`, so map it away.
     #[test]
-    fn redfish_create_action_from_rpc() {
-        let rpc_req = rpc::forge::RedfishCreateActionRequest {
-            ips: vec!["10.0.0.1".to_string()],
-            action: "Reset".to_string(),
-            target: "/redfish/v1/Systems/1/Actions".to_string(),
-            parameters: r#"{"ResetType":"ForceRestart"}"#.to_string(),
-        };
-        let action = RedfishCreateAction::from(rpc_req);
-        assert_eq!(action.action, "Reset");
-        assert_eq!(action.target, "/redfish/v1/Systems/1/Actions");
-        assert_eq!(action.parameters, r#"{"ResetType":"ForceRestart"}"#);
+    fn bmc_response_round_trips_through_json() {
+        scenarios!(
+            run = |response| {
+                let json = serde_json::to_string(&response).map_err(drop)?;
+                let back: BMCResponse = serde_json::from_str(&json).map_err(drop)?;
+                Ok::<_, ()>((back.status, back.body))
+            };
+            "ok with empty body" {
+                bmc_response("200 OK", "") => Yields(("200 OK".to_string(), String::new())),
+            }
+
+            "ok with json body" {
+                bmc_response("200 OK", r#"{"k":"v"}"#) => Yields(("200 OK".to_string(), r#"{"k":"v"}"#.to_string())),
+            }
+
+            "error status" {
+                bmc_response("500 Internal Server Error", "boom") => Yields(("500 Internal Server Error".to_string(), "boom".to_string())),
+            }
+
+            "unicode body" {
+                bmc_response("202 Accepted", "café ☕") => Yields(("202 Accepted".to_string(), "café ☕".to_string())),
+            }
+        );
+    }
+
+    /// Headers are an arbitrary map; assert the serialized form preserves a chosen
+    /// key after the JSON round-trip.
+    #[test]
+    fn bmc_response_round_trip_preserves_headers() {
+        scenarios!(
+            run = |(key, value): (&str, &str)| {
+                let mut headers = HashMap::new();
+                headers.insert(key.to_string(), value.to_string());
+                let response = BMCResponse {
+                    headers,
+                    status: "200 OK".to_string(),
+                    body: String::new(),
+                    completed_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+                };
+                let json = serde_json::to_string(&response).map_err(drop)?;
+                let back: BMCResponse = serde_json::from_str(&json).map_err(drop)?;
+                Ok::<_, ()>(back.headers.get(key).cloned())
+            };
+            "single header" {
+                ("Content-Type", "application/json") => Yields(Some("application/json".to_string())),
+            }
+
+            "header value with spaces" {
+                ("ETag", "W/\"abc 123\"") => Yields(Some("W/\"abc 123\"".to_string())),
+            }
+
+            "empty header value" {
+                ("X-Empty", "") => Yields(Some(String::new())),
+            }
+        );
     }
 }

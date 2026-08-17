@@ -19,7 +19,14 @@ use carbide_uuid::vpc_peering::VpcPeeringId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Delete a VPC peering:
+    $ nico-admin-cli vpc-peering delete --id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(long, required(true), help = "The ID of the VPC peering to delete")]
-    pub id: VpcPeeringId,
+    pub(super) id: VpcPeeringId,
 }

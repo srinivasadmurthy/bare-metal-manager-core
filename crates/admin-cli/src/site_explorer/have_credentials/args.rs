@@ -23,7 +23,14 @@ use super::super::common::ExploreOptions;
 // specific newtype to allow sharing of ExploreOptions, and still
 // providing a subcommand-specific Run trait implementation.
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Check whether carbide has working credentials for a BMC:
+    $ nico-admin-cli site-explorer have-credentials 192.0.2.10
+
+")]
+pub(crate) struct Args {
     #[clap(flatten)]
-    pub inner: ExploreOptions,
+    pub(super) inner: ExploreOptions,
 }

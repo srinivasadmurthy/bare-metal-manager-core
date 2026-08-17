@@ -14,10 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use std::error::Error;
-use std::fmt;
 
 pub mod compute_allocation;
+pub mod device;
 pub mod domain;
 pub mod dpa_interface;
 pub mod dpu_remediations;
@@ -27,6 +26,7 @@ pub mod instance;
 pub mod instance_type;
 pub mod ipxe_template;
 pub mod machine;
+pub mod machine_validation;
 pub mod measured_boot;
 pub mod network;
 pub mod network_security_group;
@@ -34,20 +34,13 @@ pub mod nvlink;
 pub mod operating_system;
 pub mod power_shelf;
 pub mod rack;
+pub mod secret;
+pub mod site_prefix;
+pub mod spx;
 pub mod switch;
 pub mod typed_uuids;
 pub mod vpc;
 pub mod vpc_peering;
-#[derive(Debug)]
-pub struct UuidEmptyStringError;
-
-impl fmt::Display for UuidEmptyStringError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "input UUID string cannot be empty",)
-    }
-}
-
-impl Error for UuidEmptyStringError {}
 
 /// DbPrimaryUuid is a trait intended for primary keys which
 /// derive the sqlx UUID type. The intent is the db_primary_uuid_name
@@ -73,11 +66,11 @@ pub trait DbTable {
 
 #[derive(thiserror::Error, Debug)]
 pub enum UuidConversionError {
-    #[error("Invalid UUID for {ty}: {value}")]
+    #[error("invalid UUID for {ty}: {value}")]
     InvalidUuid { ty: &'static str, value: String },
-    #[error("Missing ID for {0}")]
+    #[error("missing ID for {0}")]
     MissingId(&'static str),
-    #[error("Invalid MachineId: {0}")]
+    #[error("invalid MachineId: {0}")]
     InvalidMachineId(String),
     #[error("UUID parse error: {0}")]
     UuidError(#[from] uuid::Error),

@@ -18,13 +18,14 @@
 use std::fs;
 use std::time::Duration;
 
+use carbide_libmlx_model::device::info::MlxDeviceInfo;
 use prettytable::{Cell, Row, Table};
 use regex::Regex;
-use {serde_json, tracing};
+use serde_json;
+use tracing;
 
 use crate::device::cmd::device::args::DeviceArgs;
 use crate::device::cmd::device::cmds::handle as handle_device;
-use crate::device::info::MlxDeviceInfo;
 use crate::embedded::cmd::args::{
     Cli, Commands, FirmwareAction, OutputFormat, ProfileCommands, RegistryAction, RunnerCommands,
 };
@@ -1167,5 +1168,76 @@ fn build_credentials(
         Ok(Some(Credentials::ssh_key(key_path.to_string_lossy())))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{scenarios, value_scenarios};
+
+    use super::*;
+
+    // parse_assignments splits each "VAR=value" on the first '=', trims and skips
+    // blank entries, and reports precise errors for malformed input.
+    #[test]
+    fn parse_assignments_cases() {
+        fn run(args: &[&str]) -> Result<Vec<(String, String)>, String> {
+            parse_assignments(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        }
+        scenarios!(
+            run = run;
+            "single assignment" {
+                &["SRIOV_EN=1"][..] => Yields(vec![("SRIOV_EN".to_string(), "1".to_string())]),
+            }
+
+            "value with '=' splits on the first only" {
+                &["KEY=a=b"][..] => Yields(vec![("KEY".to_string(), "a=b".to_string())]),
+            }
+
+            "whitespace trimmed and blank entries skipped" {
+                &["  X=1  ", "", "   ", "Y=2"][..] => Yields(vec![
+                    ("X".to_string(), "1".to_string()),
+                    ("Y".to_string(), "2".to_string()),
+                ]),
+            }
+
+            "missing '=' is rejected" {
+                &["NOEQUALS"][..] => FailsWith(
+                    "Invalid assignment format: 'NOEQUALS'. Expected 'variable=value'"
+                        .to_string(),
+                ),
+            }
+
+            "empty variable name is rejected" {
+                &["=value"][..] => FailsWith("Variable name cannot be empty".to_string()),
+            }
+
+            "all-blank input yields no assignments" {
+                &["", "   "][..] => FailsWith("No valid assignments found".to_string()),
+            }
+        );
+    }
+
+    // parse_mlx_show_confs pulls `VAR=<TYPE> description` definitions out of mlxconfig
+    // show-confs text, skipping the header and section lines.
+    #[test]
+    fn parse_mlx_show_confs_extracts_variable_names() {
+        value_scenarios!(
+            run = |content| {
+                parse_mlx_show_confs(content)
+                    .variable_names()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()
+            };
+            "two variables under a section" {
+                "List of configurations:\n   POWER SETTINGS:\n       SRIOV_EN=<BOOLEAN> Enable SR-IOV\n       NUM_OF_VFS=<INTEGER> Number of virtual functions\n" => vec!["SRIOV_EN".to_string(), "NUM_OF_VFS".to_string()],
+            }
+
+            "header only yields no variables" {
+                "List of configurations:\n" => Vec::<String>::new(),
+            }
+        );
     }
 }

@@ -19,13 +19,27 @@ use clap::{ArgGroup, Parser};
 
 #[derive(Parser, Debug)]
 #[clap(group(ArgGroup::new("group").required(true).multiple(true).args(&["description", "device_type"])))]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Update a SKU's description:
+    $ nico-admin-cli sku update-metadata DGX-H100-640GB --description \"DGX H100 640GB\"
+
+Update a SKU's device type:
+    $ nico-admin-cli sku update-metadata DGX-H100-640GB --device-type gpu-server
+
+Update both at once:
+    $ nico-admin-cli sku update-metadata DGX-H100-640GB \
+    --description \"DGX H100 640GB\" --device-type gpu-server
+
+")]
+pub(crate) struct Args {
     #[clap(help = "SKU ID of the SKU to update")]
-    pub sku_id: String,
+    pub(in crate::sku) sku_id: String,
     #[clap(help = "Update the SKU's description", long, group("group"))]
-    pub description: Option<String>,
+    pub(in crate::sku) description: Option<String>,
     #[clap(help = "Update the SKU's device type", long, group("group"))]
-    pub device_type: Option<String>,
+    pub(in crate::sku) device_type: Option<String>,
 }
 
 impl From<Args> for ::rpc::forge::SkuUpdateMetadataRequest {

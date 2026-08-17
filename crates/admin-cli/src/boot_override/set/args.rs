@@ -15,18 +15,35 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use ::rpc::forge::MachineBootOverride;
 use carbide_uuid::machine::MachineInterfaceId;
 use clap::Parser;
 
+use crate::errors::{CarbideCliError, CarbideCliResult};
+
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
-    pub interface_id: MachineInterfaceId,
+#[command(after_long_help = "\
+EXAMPLES:
+
+Set a custom iPXE script for a machine interface:
+    $ nico-admin-cli boot-override set 12345678-1234-5678-90ab-cdef01234567 \
+    --custom-pxe ./boot.ipxe
+
+Set custom user-data for a machine interface:
+    $ nico-admin-cli boot-override set 12345678-1234-5678-90ab-cdef01234567 \
+    --custom-user-data ./user-data.yaml
+
+Set both a custom iPXE script and custom user-data:
+    $ nico-admin-cli boot-override set 12345678-1234-5678-90ab-cdef01234567 \
+    --custom-pxe ./boot.ipxe --custom-user-data ./user-data.yaml
+
+")]
+pub(crate) struct Args {
+    interface_id: MachineInterfaceId,
     #[clap(short = 'p', long)]
-    pub custom_pxe: Option<String>,
+    custom_pxe: Option<String>,
     #[clap(short = 'u', long)]
-    pub custom_user_data: Option<String>,
+    custom_user_data: Option<String>,
 }
 
 impl TryFrom<Args> for MachineBootOverride {

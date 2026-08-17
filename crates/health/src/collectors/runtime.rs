@@ -23,21 +23,16 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use http::header::InvalidHeaderValue;
-use http::{HeaderMap, StatusCode, header};
 use nv_redfish::ServiceRoot;
-use nv_redfish::bmc_http::reqwest::{BmcError, Client as ReqwestClient};
-use nv_redfish::bmc_http::{CacheSettings, HttpBmc};
 use nv_redfish::core::Bmc;
 use nv_redfish::event_service::EventStreamPayload;
 use prometheus::{Counter, Gauge, Histogram, HistogramOpts, IntCounter, IntGauge, Opts};
-use rand::Rng;
+use rand::RngExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::HealthError;
-use crate::config::Config as AppConfig;
-use crate::discovery::BmcClient;
+use crate::bmc::BmcClient;
 use crate::endpoint::BmcEndpoint;
 use crate::limiter::RateLimiter;
 use crate::metrics::{
@@ -73,9 +68,29 @@ pub trait PeriodicCollector<B: Bmc>: Send + 'static {
 
     /// Returns the type identifier for this collector
     fn collector_type(&self) -> &'static str;
+
+    fn stop(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 pub type EventStream<'a> = BoxStream<'a, Result<CollectorEvent, HealthError>>;
+
+/// Result of opening a streaming collector connection.
+pub enum StreamingConnectResult<'a> {
+    /// The stream is accepted and should be treated as connected.
+    Connected(EventStream<'a>),
+
+    /// The connection failed before it should be marked connected, but the
+    /// collector produced events that still need to reach sinks.
+    Failed {
+        /// Events to emit before surfacing the connection failure.
+        events: Vec<CollectorEvent>,
+
+        /// Error that should drive reconnect/backoff behavior.
+        error: HealthError,
+    },
+}
 
 /// Trait for collectors that maintain a long-lived stream (SSE, gRPC, etc.)
 /// runtime.rs creates the BMC client and injects it, the collector opens the stream and maps payloads to events
@@ -92,7 +107,7 @@ pub trait StreamingCollector<B: Bmc>: Send + 'static {
         Self: Sized;
 
     /// Open or reopen the streaming connection using the injected BMC.
-    async fn connect(&mut self) -> Result<EventStream<'_>, HealthError>;
+    async fn connect(&mut self) -> Result<StreamingConnectResult<'_>, HealthError>;
 
     fn collector_type(&self) -> &'static str;
 }
@@ -138,7 +153,7 @@ impl ExponentialBackoff {
     }
 }
 
-pub type SseStream = Pin<
+type SseStream = Pin<
     Box<
         dyn futures::TryStream<
                 Ok = EventStreamPayload,
@@ -149,7 +164,9 @@ pub type SseStream = Pin<
 >;
 
 /// Open a Redfish SSE event stream from a BMC.
-pub async fn open_sse_stream<B: Bmc + 'static>(bmc: Arc<B>) -> Result<SseStream, HealthError> {
+pub(crate) async fn open_sse_stream<B: Bmc + 'static>(
+    bmc: Arc<B>,
+) -> Result<SseStream, HealthError> {
     let root = ServiceRoot::new(bmc)
         .await
         .map_err(|e| HealthError::BmcError(Box::new(e)))?;
@@ -230,18 +247,18 @@ impl StreamMetrics {
     }
 }
 
-/// RAII guard: increments `active_sse_connections` on construction, decrements on drop.
+/// RAII guard: increments the passed IntGauge on construction, decrements on drop.
 /// Ensures every exit path from a connected stream (cancel, error, end, reconnect) dec's.
-struct SseConnectionGuard(IntGauge);
+pub(crate) struct StreamingConnectionGuard(IntGauge);
 
-impl SseConnectionGuard {
-    fn inc(gauge: IntGauge) -> Self {
+impl StreamingConnectionGuard {
+    pub(crate) fn inc(gauge: IntGauge) -> Self {
         gauge.inc();
         Self(gauge)
     }
 }
 
-impl Drop for SseConnectionGuard {
+impl Drop for StreamingConnectionGuard {
     fn drop(&mut self) {
         self.0.dec();
     }
@@ -252,61 +269,22 @@ pub struct Collector {
     cancel_token: CancellationToken,
 }
 
-fn create_bmc(
-    client: ReqwestClient,
-    endpoint: &BmcEndpoint,
-    health_options: &AppConfig,
-) -> Result<Arc<BmcClient>, HealthError> {
-    let bmc_url = match &health_options.bmc_proxy_url {
-        Some(url) => url.clone(),
-        None => endpoint
-            .addr
-            .to_url()
-            .map_err(|e| HealthError::GenericError(e.to_string()))?,
-    };
-
-    let headers = if health_options.bmc_proxy_url.is_some() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::FORWARDED,
-            format!("host={}", endpoint.addr.ip)
-                .parse()
-                .map_err(|e: InvalidHeaderValue| HealthError::GenericError(e.to_string()))?,
-        );
-        headers
-    } else {
-        HeaderMap::new()
-    };
-
-    let initial_credentials = endpoint.credentials();
-    Ok(Arc::new(HttpBmc::with_custom_headers(
-        client,
-        bmc_url,
-        initial_credentials.into(),
-        CacheSettings::with_capacity(health_options.cache_size),
-        headers,
-    )))
-}
-
 pub struct CollectorStartContext {
     pub limiter: Arc<dyn RateLimiter>,
     pub iteration_interval: Duration,
     pub collector_registry: Arc<CollectorRegistry>,
     pub metrics_manager: Arc<MetricsManager>,
-    pub client: ReqwestClient,
-    pub health_options: Arc<AppConfig>,
 }
 
 pub struct StreamingCollectorStartContext {
     pub backoff_config: BackoffConfig,
     pub collector_registry: Arc<CollectorRegistry>,
-    pub client: ReqwestClient,
-    pub health_options: Arc<AppConfig>,
 }
 
 impl Collector {
     pub fn start<C: PeriodicCollector<BmcClient>>(
         endpoint: Arc<BmcEndpoint>,
+        bmc: Arc<BmcClient>,
         config: C::Config,
         start_context: CollectorStartContext,
     ) -> Result<Self, HealthError> {
@@ -315,18 +293,14 @@ impl Collector {
             iteration_interval,
             collector_registry,
             metrics_manager,
-            client,
-            health_options,
         } = start_context;
 
         let cancel_token = CancellationToken::new();
         let cancel_token_clone = cancel_token.clone();
 
-        let bmc = create_bmc(client, &endpoint, &health_options)?;
+        let mut runner = C::new_runner(bmc, endpoint.clone(), config)?;
 
-        let mut runner = C::new_runner(bmc.clone(), endpoint.clone(), config)?;
-
-        let endpoint_key = endpoint.hash_key().to_string();
+        let endpoint_key = endpoint.key();
         let const_labels = HashMap::from([
             (
                 "collector_type".to_string(),
@@ -353,7 +327,7 @@ impl Collector {
         let refresh_counter = Counter::with_opts(
             Opts::new(
                 format!("{}_collector_refresh_total", collector_registry.prefix()),
-                "Count of collector refreshes",
+                "Number of collector refreshes",
             )
             .const_labels(const_labels.clone()),
         )?;
@@ -374,7 +348,7 @@ impl Collector {
                     "{}_collector_fetch_failures_total",
                     collector_registry.prefix()
                 ),
-                "Count of partial collector fetch failures",
+                "Number of partial collector fetch failures",
             )
             .const_labels(const_labels),
         )?;
@@ -389,17 +363,14 @@ impl Collector {
                 tokio::select! {
                     _ = cancel_token_clone.cancelled() => {
                         tracing::info!(endpoint = ?endpoint.addr, "collector cancelled");
+                        runner.stop().await;
                         break;
                     }
                     _ = async {
                         limiter.acquire().await;
 
                         let start = Instant::now();
-                        let iteration_result = run_iteration_with_auth_refresh(
-                            &mut runner,
-                            &endpoint,
-                            &bmc,
-                        ).await;
+                        let iteration_result = runner.run_iteration().await;
                         let duration = start.elapsed();
 
                         iteration_histogram.observe(duration.as_secs_f64());
@@ -448,28 +419,30 @@ impl Collector {
         })
     }
 
-    pub fn start_streaming<S: StreamingCollector<BmcClient>>(
+    pub fn start_streaming<S, F>(
         endpoint: Arc<BmcEndpoint>,
+        bmc: Arc<BmcClient>,
         config: S::Config,
         data_sink: Arc<dyn DataSink>,
         start_context: StreamingCollectorStartContext,
-    ) -> Result<Self, HealthError> {
+        mut on_connect_result: F,
+    ) -> Result<Self, HealthError>
+    where
+        S: StreamingCollector<BmcClient>,
+        F: FnMut(Result<(), &HealthError>) -> bool + Send + 'static,
+    {
         let StreamingCollectorStartContext {
             backoff_config,
             collector_registry,
-            client,
-            health_options,
         } = start_context;
 
         let cancel_token = CancellationToken::new();
         let cancel_clone = cancel_token.clone();
 
-        let bmc = create_bmc(client, &endpoint, &health_options)?;
-
-        let mut collector = S::new_runner(bmc, endpoint.clone(), config)?;
+        let mut collector = S::new_runner(Arc::clone(&bmc), endpoint.clone(), config)?;
         let event_context = EventContext::from_endpoint(&endpoint, collector.collector_type());
 
-        let endpoint_key = endpoint.hash_key().to_string();
+        let endpoint_key = endpoint.key();
         let const_labels = HashMap::from([
             (
                 "collector_type".to_string(),
@@ -508,12 +481,35 @@ impl Collector {
                             endpoint = ?endpoint.addr,
                             "streaming collector connection failed"
                         );
+                        if !on_connect_result(Err(&e)) {
+                            return;
+                        }
                     }
-                    Ok(mut stream) => {
+                    Ok(StreamingConnectResult::Failed { events, error }) => {
+                        metrics.reconnections_total.inc();
+
+                        for event in events {
+                            metrics.items_processed_total.inc();
+                            data_sink.handle_event(&event_context, &event);
+                        }
+
+                        tracing::error!(
+                            error = ?error,
+                            collector_type,
+                            endpoint = ?endpoint.addr,
+                            "streaming collector connection failed"
+                        );
+
+                        if !on_connect_result(Err(&error)) {
+                            return;
+                        }
+                    }
+                    Ok(StreamingConnectResult::Connected(mut stream)) => {
                         // the guard lives exactly as long as we hold an open stream; Drop
                         // handles dec for every exit path (shutdown, error, stream end).
-                        let _conn_guard = SseConnectionGuard::inc(metrics.connected.clone());
+                        let _conn_guard = StreamingConnectionGuard::inc(metrics.connected.clone());
                         backoff.reset();
+                        on_connect_result(Ok(()));
                         tracing::info!(
                             collector_type,
                             endpoint = ?endpoint.addr,
@@ -577,64 +573,145 @@ impl Collector {
         })
     }
 
+    /// spawn helper for streaming collectors that don't fit `StreamingCollector`
+    /// (e.g. gNMI bidi subscribe with in-loop multiplexing). The closure gets a
+    /// CancellationToken and should return once it's cancelled.
+    pub fn spawn_task<F, Fut>(task_fn: F) -> Self
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+        let handle = tokio::spawn(task_fn(cancel_clone));
+        Self {
+            handle,
+            cancel_token,
+        }
+    }
+
     pub async fn stop(self) {
         self.cancel_token.cancel();
         let _ = self.handle.await;
     }
-}
 
-async fn run_iteration_with_auth_refresh<C: PeriodicCollector<BmcClient>>(
-    runner: &mut C,
-    endpoint: &Arc<BmcEndpoint>,
-    bmc: &Arc<BmcClient>,
-) -> Result<IterationResult, HealthError> {
-    match runner.run_iteration().await {
-        Ok(result) => Ok(result),
-        Err(error) if is_auth_error(&error) => {
-            tracing::warn!(
-                error = ?error,
-                endpoint = ?endpoint.addr,
-                "Authentication failed, refreshing BMC credentials and retrying once"
-            );
-
-            let credentials = endpoint.refresh().await.map_err(|refresh_error| {
-                HealthError::GenericError(format!(
-                    "Failed to refresh credentials after auth error: {refresh_error}"
-                ))
-            })?;
-
-            // We set credentials and wait till next iteration, to avoid credential fetch loop.
-            bmc.set_credentials(credentials.into());
-            Err(error)
-        }
-        Err(error) => Err(error),
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
     }
 }
 
-fn is_auth_error(error: &HealthError) -> bool {
-    match error {
-        HealthError::HttpError(message) => {
-            message.contains("HTTP 401") || message.contains("HTTP 403")
-        }
-        HealthError::BmcError(inner) => {
-            inner
-                .downcast_ref::<BmcError>()
-                .is_some_and(is_auth_bmc_error)
-                || inner
-                    .downcast_ref::<nv_redfish::Error<BmcClient>>()
-                    .is_some_and(|err| match err {
-                        nv_redfish::Error::Bmc(bmc_error) => is_auth_bmc_error(bmc_error),
-                        _ => false,
-                    })
-        }
-        _ => false,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
-fn is_auth_bmc_error(error: &BmcError) -> bool {
-    matches!(
-        error,
-        BmcError::InvalidResponse { status, .. }
-            if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN
-    )
+    use super::*;
+    use crate::endpoint::test_support::{mac, test_endpoint};
+    use crate::metrics::MetricsManager;
+    use crate::sink::{LogRecord, LogSeverity};
+
+    #[derive(Default)]
+    struct CountingSink(AtomicUsize);
+
+    impl CountingSink {
+        fn log_count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DataSink for CountingSink {
+        fn sink_type(&self) -> &'static str {
+            "counting_sink"
+        }
+
+        fn try_handle_event(
+            &self,
+            _context: &EventContext,
+            event: &CollectorEvent,
+        ) -> Result<(), crate::HealthError> {
+            if matches!(event, CollectorEvent::Log(_)) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    struct TestStreamingCollector;
+
+    #[async_trait]
+    impl StreamingCollector<BmcClient> for TestStreamingCollector {
+        type Config = ();
+
+        fn new_runner(
+            _bmc: Arc<BmcClient>,
+            _endpoint: Arc<BmcEndpoint>,
+            _config: Self::Config,
+        ) -> Result<Self, HealthError> {
+            Ok(Self)
+        }
+
+        async fn connect(&mut self) -> Result<StreamingConnectResult<'_>, HealthError> {
+            let event = CollectorEvent::Log(Box::new(LogRecord {
+                body: "pre-connected rejection".to_string(),
+                severity: LogSeverity::Error,
+                attributes: Vec::new(),
+                diagnostic_record: None,
+            }));
+
+            Ok(StreamingConnectResult::Failed {
+                events: vec![event],
+                error: HealthError::GenericError("pre-connected failure".to_string()),
+            })
+        }
+
+        fn collector_type(&self) -> &'static str {
+            "test_streaming_collector"
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_collector_emits_pre_connected_failure_events_without_connected_callback()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let endpoint = Arc::new(test_endpoint(mac("00:11:22:33:44:66")));
+        let bmc = Arc::clone(endpoint.bmc());
+        let metrics_manager = MetricsManager::new("test_streaming_runtime_preconnect_failure")?;
+
+        let collector_registry = Arc::new(metrics_manager.create_collector_registry(
+            "streaming_collector_preconnect_failure_test".to_string(),
+            "test_streaming_runtime_preconnect_failure",
+        )?);
+
+        let sink = Arc::new(CountingSink::default());
+        let data_sink: Arc<dyn DataSink> = sink.clone();
+        let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
+        let mut callback_tx = Some(callback_tx);
+
+        let collector = Collector::start_streaming::<TestStreamingCollector, _>(
+            endpoint,
+            bmc,
+            (),
+            data_sink,
+            StreamingCollectorStartContext {
+                backoff_config: BackoffConfig::default(),
+                collector_registry,
+            },
+            move |result| {
+                if let Some(tx) = callback_tx.take() {
+                    let _ = tx.send(result.is_ok());
+                }
+
+                false
+            },
+        )?;
+
+        let connected_callback =
+            tokio::time::timeout(Duration::from_secs(1), callback_rx).await??;
+
+        collector.stop().await;
+
+        assert!(!connected_callback);
+        assert_eq!(sink.log_count(), 1);
+
+        Ok(())
+    }
 }

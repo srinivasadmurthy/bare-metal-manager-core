@@ -17,8 +17,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use carbide_secrets::CredentialConfig;
 use carbide_utils::HostPortPair;
-use forge_secrets::CredentialConfig;
 use tokio::sync::oneshot::Sender;
 use tokio_util::sync::CancellationToken;
 
@@ -35,8 +35,9 @@ pub struct StartArgs {
     pub bmc_proxy: Option<HostPortPair>,
     pub firmware_directory: PathBuf,
     pub cancel_token: CancellationToken,
-    pub ready_channel: Sender<()>,
+    pub ready_channel: Sender<carbide::ApiServerAddresses>,
     pub credential_config: CredentialConfig,
+    pub insecure_discovery: bool,
 }
 
 pub async fn start(
@@ -51,6 +52,7 @@ pub async fn start(
         cancel_token,
         ready_channel,
         credential_config,
+        insecure_discovery,
     }: StartArgs,
 ) -> eyre::Result<()> {
     let firmware_directory_str = firmware_directory.to_string_lossy();
@@ -91,6 +93,7 @@ pub async fn start(
         max_find_by_ids = 100
         internet_l3_vni = 1337
         bypass_rbac = true
+        allow_insecure_discovery = {insecure_discovery}
 
         [ib_config]
         max_partition_per_tenant = 31
@@ -134,17 +137,19 @@ pub async fn start(
         prefix = "10.180.62.1/26"
         type = "ipv4"
 
-        [pools.secondary-vtep-ip]
-        ranges = []
-        prefix = "10.181.62.1/26"
-        type = "ipv4"
-
         [pools.vni]
         type = "integer"
 
         [[pools.vni.ranges]]
         start = "1024500"
         end = "1024550"
+
+        [pools.dpa-vni]
+        type = "integer"
+
+        [[pools.dpa-vni.ranges]]
+        start = "1024600"
+        end = "1024650"
 
         [pools.vpc-dpu-lo]
         type = "ipv4"
@@ -185,13 +190,6 @@ pub async fn start(
         mtu = 1490
         reserve_first = 0
 
-        [dpu_nic_firmware_update_version]
-        product_x = "v1"
-
-        [ib_fabric_monitor]
-        enabled = true
-        run_interval = "10s"
-
         [site_explorer]
         enabled = true
         run_interval = "1s"
@@ -199,8 +197,6 @@ pub async fn start(
         explorations_per_run = 90
         create_machines = true
         machines_created_per_run = 30
-        allow_zero_dpu_hosts = true
-        allow_proxy_to_unknown_host = false
         {bmc_proxy_cfg}
         reset_rate_limit = "3600s"
 
@@ -239,11 +235,39 @@ pub async fn start(
 
         [host_models]
 
+        [rack_profiles.NVL72]
+        product_family = "gb200"
+
+        [rack_profiles.NVL72.rack_capabilities.compute]
+        name = "GB200"
+        count = 18
+        vendor = "NVIDIA"
+
+        [rack_profiles.NVL72.rack_capabilities.switch]
+        count = 0
+
+        [rack_profiles.NVL72.rack_capabilities.power_shelf]
+        count = 0
+
+        [rack_profiles.NVL72_GB300]
+        product_family = "gb300"
+
+        [rack_profiles.NVL72_GB300.rack_capabilities.compute]
+        name = "GB300"
+        count = 18
+        vendor = "Lenovo"
+
+        [rack_profiles.NVL72_GB300.rack_capabilities.switch]
+        count = 0
+
+        [rack_profiles.NVL72_GB300.rack_capabilities.power_shelf]
+        count = 0
+
         [firmware_global]
         autoupdate = true
         host_enable_autoupdate = []
         host_disable_autoupdate = []
-        run_interval = "5s"
+        run_interval = "1s"
         max_uploads = 4
         concurrency_limit = 16
         firmware_directory = "{firmware_directory_str}"
@@ -260,9 +284,6 @@ pub async fn start(
         [fnn.admin_vpc]
         enabled = true
         vpc_vni = 60100
-
-        [multi_dpu]
-        enabled = false
 
         [host_health]
         hardware_health_reports = "Disabled"
@@ -281,12 +302,16 @@ pub async fn start(
         )
     };
 
+    let mut tmp = tempfile::NamedTempFile::new()?;
+    std::io::Write::write_all(&mut tmp, carbide_config_str.as_bytes())?;
     carbide::run(
         0,
-        carbide_config_str,
+        tmp.path().to_path_buf(),
         None,
         credential_config,
         true,
+        // The in-process test server does not serve the admin web UI.
+        None,
         cancel_token,
         ready_channel,
     )

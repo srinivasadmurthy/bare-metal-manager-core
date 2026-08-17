@@ -15,29 +15,37 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliError;
 use clap::Parser;
 use mac_address::MacAddress;
 use uuid::Uuid;
 
+use crate::errors::CarbideCliError;
+
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Delete an expected machine by BMC MAC address:
+    $ nico-admin-cli expected-machine delete 00:11:22:33:44:55
+
+Delete an expected machine by id:
+    $ nico-admin-cli expected-machine delete --id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(help = "BMC MAC address of the expected machine to delete.")]
-    pub bmc_mac_address: Option<MacAddress>,
+    bmc_mac_address: Option<MacAddress>,
 
     #[clap(long, help = "ID (UUID) of the expected machine to delete.")]
-    pub id: Option<Uuid>,
+    id: Option<Uuid>,
 }
 
 impl TryFrom<Args> for ::rpc::forge::ExpectedMachineRequest {
     type Error = CarbideCliError;
     fn try_from(args: Args) -> Result<Self, Self::Error> {
         match (args.bmc_mac_address, args.id) {
-            (Some(_), Some(_)) => Err(CarbideCliError::ChooseOneError("--bmc-mac-address", "--id")),
-            (None, None) => Err(CarbideCliError::RequireOneError(
-                "--bmc-mac-address",
-                "--id",
-            )),
+            (Some(_), Some(_)) => Err(CarbideCliError::ChooseOneError("bmc-mac-address", "--id")),
+            (None, None) => Err(CarbideCliError::RequireOneError("bmc-mac-address", "--id")),
             (None, Some(id)) => Ok(Self {
                 bmc_mac_address: String::new(),
                 id: Some(::rpc::common::Uuid {

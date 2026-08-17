@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 use std::fmt;
+use std::net::IpAddr;
 use std::str::FromStr;
 
 use carbide_uuid::domain::DomainId;
@@ -22,9 +23,7 @@ use carbide_uuid::network::NetworkSegmentId;
 use carbide_uuid::vpc::VpcId;
 use chrono::{DateTime, Utc};
 use config_version::{ConfigVersion, Versioned};
-use itertools::Itertools;
-use rpc::TenantState;
-use rpc::errors::RpcDataConversionError;
+use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::{Column, FromRow, Row};
@@ -37,19 +36,13 @@ use crate::state_history::StateHistoryRecord;
 
 mod slas;
 
+pub const MTU_MIN: i32 = 576;
+pub const MTU_MAX: i32 = 9000;
+
 #[derive(Clone, Debug, Default)]
 pub struct NetworkSegmentSearchFilter {
     pub name: Option<String>,
     pub tenant_org_id: Option<String>,
-}
-
-impl From<rpc::forge::NetworkSegmentSearchFilter> for NetworkSegmentSearchFilter {
-    fn from(filter: rpc::forge::NetworkSegmentSearchFilter) -> Self {
-        NetworkSegmentSearchFilter {
-            name: filter.name,
-            tenant_org_id: filter.tenant_org_id,
-        }
-    }
 }
 
 /// State of a network segment as tracked by the controller
@@ -84,13 +77,21 @@ pub enum NetworkSegmentDeletionState {
 
 // How we specifiy a network segment in the config file
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkDefinition {
     #[serde(rename = "type")]
     pub segment_type: NetworkDefinitionSegmentType,
     /// CIDR notation
-    pub prefix: String,
+    pub prefix: IpNetwork,
+    /// Optional IPv6 CIDR for dual-stack config-seeded segments.
+    #[serde(default)]
+    pub prefix_v6: Option<IpNetwork>,
     /// Usually the first IP in the prefix range
-    pub gateway: String,
+    pub gateway: IpAddr,
+    /// DHCPv6 relay link-address used to identify this segment. It may
+    /// be outside `prefix_v6`, so it is modeled separately from gateway.
+    #[serde(default)]
+    pub dhcpv6_link_address: Option<IpAddr>,
     /// Typically 9000 for admin network, 1500 for underlay
     pub mtu: i32,
     /// How many addresses to skip before allocating
@@ -103,14 +104,58 @@ pub struct NetworkDefinition {
     /// behavior of Carbide + carbide-dhcp.
     #[serde(default)]
     pub allocation_strategy: AllocationStrategy,
+    /// Allows NICo to infer modified EUI-64 SLAAC addresses for clients making
+    /// stateless DHCPv6 requests and add them to interface address state.
+    /// Inference also requires dynamic allocation, exactly one IPv6 `/64`, and
+    /// an interface without an existing IPv6 address.
+    ///
+    /// This defaults to `false`. Set it only when clients on this segment
+    /// derive SLAAC addresses from their MAC addresses using modified EUI-64.
+    /// The value is applied when the segment is first seeded; later config
+    /// edits do not update the stored segment.
+    #[serde(default)]
+    pub infer_slaac_eui64_addresses: bool,
+    /// Set to the name of a VPC to attach this network segment to a VPC on creation. Will fail if
+    /// the VPC is not defined. You probably want to add a vpc with a corresponding name to the
+    /// config via `[vpcs.<name>]` for this to work when data is initially being seeded.
+    pub vpc_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+impl NetworkDefinition {
+    pub fn validate(&self, name: &str) -> Result<(), crate::ConfigValidationError> {
+        if self.mtu < MTU_MIN || self.mtu > MTU_MAX {
+            return Err(crate::ConfigValidationError::InvalidValue(format!(
+                "network \"{name}\": mtu {} is out of range ({MTU_MIN}-{MTU_MAX})",
+                self.mtu
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Copy, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkDefinitionSegmentType {
     Admin,
     Underlay,
+    HostInband,
     // Tenant networks are created via the API, not the config file
+}
+
+impl From<NetworkDefinitionSegmentType> for crate::network_segment::NetworkSegmentType {
+    fn from(value: NetworkDefinitionSegmentType) -> Self {
+        match value {
+            NetworkDefinitionSegmentType::Admin => {
+                crate::network_segment::NetworkSegmentType::Admin
+            }
+            NetworkDefinitionSegmentType::Underlay => {
+                crate::network_segment::NetworkSegmentType::Underlay
+            }
+            NetworkDefinitionSegmentType::HostInband => {
+                crate::network_segment::NetworkSegmentType::HostInband
+            }
+        }
+    }
 }
 
 /// Returns the SLA for the current state
@@ -137,227 +182,90 @@ pub fn state_sla(state: &NetworkSegmentControllerState, state_version: &ConfigVe
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn serialize_controller_state() {
-        let state = NetworkSegmentControllerState::Provisioning {};
-        let serialized = serde_json::to_string(&state).unwrap();
-        assert_eq!(serialized, "{\"state\":\"provisioning\"}");
-        assert_eq!(
-            serde_json::from_str::<NetworkSegmentControllerState>(&serialized).unwrap(),
-            state
-        );
-
-        let state = NetworkSegmentControllerState::Ready {};
-        let serialized = serde_json::to_string(&state).unwrap();
-        assert_eq!(serialized, "{\"state\":\"ready\"}");
-        assert_eq!(
-            serde_json::from_str::<NetworkSegmentControllerState>(&serialized).unwrap(),
-            state
-        );
-
-        let deletion_time: DateTime<Utc> = "2022-12-13T04:41:38Z".parse().unwrap();
-        let state = NetworkSegmentControllerState::Deleting {
-            deletion_state: NetworkSegmentDeletionState::DrainAllocatedIps {
-                delete_at: deletion_time,
-            },
-        };
-        let serialized = serde_json::to_string(&state).unwrap();
-        assert_eq!(
-            serialized,
-            "{\"state\":\"deleting\",\"deletion_state\":{\"state\":\"drainallocatedips\",\"delete_at\":\"2022-12-13T04:41:38Z\"}}"
-        );
-        assert_eq!(
-            serde_json::from_str::<NetworkSegmentControllerState>(&serialized).unwrap(),
-            state
-        );
-    }
-
-    fn make_test_creation_request(
-        prefixes: Vec<rpc::forge::NetworkPrefix>,
-        segment_type: NetworkSegmentType,
-    ) -> rpc::forge::NetworkSegmentCreationRequest {
-        rpc::forge::NetworkSegmentCreationRequest {
-            id: None,
-            mtu: Some(1500),
-            name: "TEST_SEGMENT".to_string(),
-            prefixes,
-            subdomain_id: None,
-            vpc_id: None,
-            segment_type: match segment_type {
-                NetworkSegmentType::Admin => rpc::forge::NetworkSegmentType::Admin as i32,
-                NetworkSegmentType::Tenant => rpc::forge::NetworkSegmentType::Tenant as i32,
-                NetworkSegmentType::Underlay => rpc::forge::NetworkSegmentType::Underlay as i32,
-                NetworkSegmentType::HostInband => rpc::forge::NetworkSegmentType::HostInband as i32,
-            },
-        }
-    }
-
-    fn ipv4_prefix(prefix: &str, gateway: Option<&str>) -> rpc::forge::NetworkPrefix {
-        rpc::forge::NetworkPrefix {
-            id: None,
-            prefix: prefix.to_string(),
-            gateway: gateway.map(|g| g.to_string()),
-            reserve_first: 1,
-            free_ip_count: 0,
-            svi_ip: None,
-        }
-    }
-
-    fn ipv6_prefix(prefix: &str) -> rpc::forge::NetworkPrefix {
-        rpc::forge::NetworkPrefix {
-            id: None,
-            prefix: prefix.to_string(),
-            gateway: None,
-            reserve_first: 0,
-            free_ip_count: 0,
-            svi_ip: None,
-        }
-    }
-
-    #[test]
-    fn test_ipv6_prefix_accepted() {
-        let request = make_test_creation_request(
-            vec![ipv6_prefix("2001:db8::/64")],
-            NetworkSegmentType::Admin,
-        );
-        let result = NewNetworkSegment::try_from(request);
-        assert!(result.is_ok(), "IPv6 prefix should be accepted: {result:?}");
-        let segment = result.unwrap();
-        assert_eq!(segment.prefixes.len(), 1);
-        assert!(segment.prefixes[0].prefix.is_ipv6());
-    }
-
-    #[test]
-    fn test_dual_stack_prefixes_accepted() {
-        let request = make_test_creation_request(
-            vec![
-                ipv4_prefix("192.0.2.0/24", Some("192.0.2.1")),
-                ipv6_prefix("2001:db8::/64"),
-            ],
-            NetworkSegmentType::Admin,
-        );
-        let result = NewNetworkSegment::try_from(request);
-        assert!(result.is_ok(), "Dual-stack should be accepted: {result:?}");
-        let segment = result.unwrap();
-        assert_eq!(segment.prefixes.len(), 2);
-    }
-
-    #[test]
-    fn test_ipv6_tenant_prefix_size_validation() {
-        // /64 should be allowed for tenant segments
-        let request = make_test_creation_request(
-            vec![ipv6_prefix("2001:db8::/64")],
-            NetworkSegmentType::Tenant,
-        );
-        assert!(
-            NewNetworkSegment::try_from(request).is_ok(),
-            "/64 IPv6 prefix should be allowed for tenant segments"
-        );
-
-        // /127 should be rejected for tenant segments
-        let request = make_test_creation_request(
-            vec![ipv6_prefix("2001:db8::1/127")],
-            NetworkSegmentType::Tenant,
-        );
-        assert!(
-            NewNetworkSegment::try_from(request).is_err(),
-            "/127 IPv6 prefix should be rejected for tenant segments"
-        );
-
-        // /128 should be rejected for tenant segments
-        let request = make_test_creation_request(
-            vec![ipv6_prefix("2001:db8::1/128")],
-            NetworkSegmentType::Tenant,
-        );
-        assert!(
-            NewNetworkSegment::try_from(request).is_err(),
-            "/128 IPv6 prefix should be rejected for tenant segments"
-        );
-    }
-
-    #[test]
-    fn test_ipv4_tenant_prefix_size_validation_unchanged() {
-        // /24 should be allowed
-        let request = make_test_creation_request(
-            vec![ipv4_prefix("192.0.2.0/24", Some("192.0.2.1"))],
-            NetworkSegmentType::Tenant,
-        );
-        assert!(NewNetworkSegment::try_from(request).is_ok());
-
-        // /31 should be rejected
-        let request = make_test_creation_request(
-            vec![ipv4_prefix("192.0.2.0/31", Some("192.0.2.1"))],
-            NetworkSegmentType::Tenant,
-        );
-        assert!(NewNetworkSegment::try_from(request).is_err());
-
-        // /32 should be rejected
-        let request = make_test_creation_request(
-            vec![ipv4_prefix("192.0.2.0/32", None)],
-            NetworkSegmentType::Tenant,
-        );
-        assert!(NewNetworkSegment::try_from(request).is_err());
-    }
-}
-
-const DEFAULT_MTU_TENANT: i32 = 9000;
-const DEFAULT_MTU_OTHER: i32 = 1500;
-
 #[derive(Debug, Copy, Clone, Default)]
 pub struct NetworkSegmentSearchConfig {
     pub include_history: bool,
     pub include_num_free_ips: bool,
 }
 
-impl From<rpc::forge::NetworkSegmentSearchConfig> for NetworkSegmentSearchConfig {
-    fn from(value: rpc::forge::NetworkSegmentSearchConfig) -> Self {
-        NetworkSegmentSearchConfig {
-            include_history: value.include_history,
-            include_num_free_ips: value.include_num_free_ips,
-        }
-    }
+/// User-controlled configuration for a network segment.
+#[derive(Debug, Clone)]
+pub struct NetworkSegmentConfig {
+    pub name: String,
+    pub subdomain_id: Option<DomainId>,
+    pub mtu: i32,
+    pub segment_type: NetworkSegmentType,
+    pub allocation_strategy: AllocationStrategy,
+    /// Whether NICo may infer modified EUI-64 SLAAC addresses for clients
+    /// making stateless DHCPv6 requests and add them to interface address
+    /// state. Inference also requires dynamic allocation, exactly one IPv6
+    /// `/64`, and an interface without an IPv6 address.
+    pub infer_slaac_eui64_addresses: bool,
+    pub vpc_id: Option<VpcId>,
+}
+
+/// System-observed status for a network segment.
+#[derive(Debug, Clone)]
+pub struct NetworkSegmentStatus {
+    pub controller_state: Versioned<NetworkSegmentControllerState>,
+    /// The result of the last attempt to change state
+    pub controller_state_outcome: Option<PersistentStateHandlerOutcome>,
+    /// History of state changes.
+    pub history: Vec<StateHistoryRecord>,
+    pub vlan_id: Option<i16>, // vlan_id are [0-4096) range, enforced via DB constraint
+    pub vni: Option<i32>,
+    pub can_stretch: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NetworkSegment {
     pub id: NetworkSegmentId,
     pub version: ConfigVersion,
-    pub name: String,
-    pub subdomain_id: Option<DomainId>,
-    pub vpc_id: Option<VpcId>,
-    pub mtu: i32,
+    pub config: NetworkSegmentConfig,
+    pub status: NetworkSegmentStatus,
 
-    pub controller_state: Versioned<NetworkSegmentControllerState>,
-
-    /// The result of the last attempt to change state
-    pub controller_state_outcome: Option<PersistentStateHandlerOutcome>,
+    /// Prefixes are kept top-level because each NetworkPrefix contains both
+    /// user-specified fields (CIDR, gateway, reserve_first) and system-populated
+    /// fields (id, svi_ip, free_ip_count).
+    pub prefixes: Vec<NetworkPrefix>,
 
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
     pub deleted: Option<DateTime<Utc>>,
-
-    pub prefixes: Vec<NetworkPrefix>,
-    /// History of state changes.
-    pub history: Vec<StateHistoryRecord>,
-
-    pub vlan_id: Option<i16>, // vlan_id are [0-4096) range, enforced via DB constraint
-    pub vni: Option<i32>,
-
-    pub segment_type: NetworkSegmentType,
-
-    pub can_stretch: Option<bool>,
-
-    pub allocation_strategy: AllocationStrategy,
 }
 
 impl NetworkSegment {
     /// Returns whether the segment was deleted by the user
     pub fn is_marked_as_deleted(&self) -> bool {
         self.deleted.is_some()
+    }
+
+    /// Returns the IPv6 `/64` prefix NICo may use to infer a modified EUI-64
+    /// SLAAC address for this segment.
+    ///
+    /// This is a segment-only predicate: relay context, requested addresses, and
+    /// client identity must not influence it. Per-interface address ownership is
+    /// checked at the DHCP call site.
+    pub fn slaac_eui64_inference_prefix(&self) -> Option<&IpNetwork> {
+        if !self.config.infer_slaac_eui64_addresses
+            || self.config.allocation_strategy == AllocationStrategy::Reserved
+        {
+            return None;
+        }
+
+        // The DB currently enforces one prefix per family per segment; keep this
+        // defensive guard so non-DB callers or future schema changes cannot infer
+        // an address when v6 prefix selection is ambiguous.
+        let mut v6_prefixes = self
+            .prefixes
+            .iter()
+            .filter(|prefix| prefix.prefix.is_ipv6());
+        let prefix = &v6_prefixes.next()?.prefix;
+        if v6_prefixes.next().is_some() || prefix.prefix() != 64 {
+            return None;
+        }
+
+        Some(prefix)
     }
 }
 
@@ -413,25 +321,7 @@ pub struct NewNetworkSegment {
     pub segment_type: NetworkSegmentType,
     pub can_stretch: Option<bool>,
     pub allocation_strategy: AllocationStrategy,
-}
-
-impl TryFrom<i32> for NetworkSegmentType {
-    type Error = RpcDataConversionError;
-    fn try_from(value: i32) -> Result<Self, Self::Error> {
-        Ok(match value {
-            x if x == rpc::forge::NetworkSegmentType::Tenant as i32 => NetworkSegmentType::Tenant,
-            x if x == rpc::forge::NetworkSegmentType::Admin as i32 => NetworkSegmentType::Admin,
-            x if x == rpc::forge::NetworkSegmentType::Underlay as i32 => {
-                NetworkSegmentType::Underlay
-            }
-            x if x == rpc::forge::NetworkSegmentType::HostInband as i32 => {
-                NetworkSegmentType::HostInband
-            }
-            _ => {
-                return Err(RpcDataConversionError::InvalidNetworkSegmentType(value));
-            }
-        })
-    }
+    pub infer_slaac_eui64_addresses: bool,
 }
 
 impl FromStr for NetworkSegmentType {
@@ -486,165 +376,30 @@ impl<'r> FromRow<'r, PgRow> for NetworkSegment {
         Ok(NetworkSegment {
             id: row.try_get("id")?,
             version: row.try_get("version")?,
-            name: row.try_get("name")?,
-            subdomain_id: row.try_get("subdomain_id")?,
-            vpc_id: row.try_get("vpc_id")?,
-            controller_state: Versioned::new(
-                controller_state.0,
-                row.try_get("controller_state_version")?,
-            ),
-            controller_state_outcome: state_outcome.map(|x| x.0),
+            config: NetworkSegmentConfig {
+                name: row.try_get("name")?,
+                subdomain_id: row.try_get("subdomain_id")?,
+                mtu: row.try_get("mtu")?,
+                segment_type: row.try_get("network_segment_type")?,
+                allocation_strategy: row.try_get("allocation_strategy").unwrap_or_default(),
+                infer_slaac_eui64_addresses: row.try_get("infer_slaac_eui64_addresses")?,
+                vpc_id: row.try_get("vpc_id")?,
+            },
+            status: NetworkSegmentStatus {
+                controller_state: Versioned::new(
+                    controller_state.0,
+                    row.try_get("controller_state_version")?,
+                ),
+                controller_state_outcome: state_outcome.map(|x| x.0),
+                history,
+                vlan_id: row.try_get("vlan_id").unwrap_or_default(),
+                vni: row.try_get("vni_id").unwrap_or_default(),
+                can_stretch: row.try_get("can_stretch")?,
+            },
+            prefixes,
             created: row.try_get("created")?,
             updated: row.try_get("updated")?,
             deleted: row.try_get("deleted")?,
-            mtu: row.try_get("mtu")?,
-            prefixes,
-            history,
-            vlan_id: row.try_get("vlan_id").unwrap_or_default(),
-            vni: row.try_get("vni_id").unwrap_or_default(),
-            segment_type: row.try_get("network_segment_type")?,
-            can_stretch: row.try_get("can_stretch")?,
-            allocation_strategy: row.try_get("allocation_strategy").unwrap_or_default(),
-        })
-    }
-}
-
-/// Converts from Protobuf NetworkSegmentCreationRequest into NewNetworkSegment
-///
-/// subdomain_id - Converting from Protobuf UUID(String) to Rust UUID type can fail.
-/// Use try_from in order to return a Result where Result is an error if the conversion
-/// from String -> UUID fails
-impl TryFrom<rpc::forge::NetworkSegmentCreationRequest> for NewNetworkSegment {
-    type Error = RpcDataConversionError;
-
-    fn try_from(value: rpc::forge::NetworkSegmentCreationRequest) -> Result<Self, Self::Error> {
-        if value.prefixes.is_empty() {
-            return Err(RpcDataConversionError::InvalidArgument(
-                "Prefixes are empty.".to_string(),
-            ));
-        }
-
-        let prefixes = value
-            .prefixes
-            .into_iter()
-            .map(NewNetworkPrefix::try_from)
-            .collect::<Result<Vec<NewNetworkPrefix>, RpcDataConversionError>>()?;
-
-        let id = value.id.unwrap_or_else(|| uuid::Uuid::new_v4().into());
-
-        let segment_type: NetworkSegmentType = value.segment_type.try_into()?;
-        if segment_type == NetworkSegmentType::Tenant
-            && prefixes.iter().any(|ip| match ip.prefix {
-                ipnetwork::IpNetwork::V4(v4) => v4.prefix() >= 31,
-                ipnetwork::IpNetwork::V6(v6) => v6.prefix() >= 127,
-            })
-        {
-            return Err(RpcDataConversionError::InvalidArgument(
-                "IPv4 prefix /31 and /32 (or IPv6 /127 and /128) are not allowed for tenant segments.".to_string(),
-            ));
-        }
-
-        // This TryFrom implementation is part of the API handler logic for
-        // network segment creation, and is not used by FNN. Therefore, the only
-        // type of tenant segment we could be creating is a stretchable one.
-        let can_stretch = matches!(segment_type, NetworkSegmentType::Tenant).then_some(true);
-
-        Ok(NewNetworkSegment {
-            id,
-            name: value.name,
-            subdomain_id: value.subdomain_id,
-            vpc_id: value.vpc_id,
-            mtu: value.mtu.unwrap_or(match segment_type {
-                NetworkSegmentType::Tenant => DEFAULT_MTU_TENANT,
-                _ => DEFAULT_MTU_OTHER,
-            }),
-            prefixes,
-            vlan_id: None,
-            vni: None,
-            segment_type,
-            can_stretch,
-            allocation_strategy: AllocationStrategy::Dynamic,
-        })
-    }
-}
-
-///
-/// Marshal a Data Object (NetworkSegment) into an RPC NetworkSegment
-///
-/// subdomain_id - Rust UUID -> ProtoBuf UUID(String) cannot fail, so convert it or return None
-impl TryFrom<NetworkSegment> for rpc::NetworkSegment {
-    type Error = RpcDataConversionError;
-    fn try_from(src: NetworkSegment) -> Result<Self, Self::Error> {
-        // Note that even thought the segment might already be ready,
-        // we only return `Ready` after
-        // the state machine also noticed that. Otherwise we would need to also
-        // allow address allocation before the controller state is ready, which
-        // spreads out the state mismatch to a lot more places.
-        let mut state = match &src.controller_state.value {
-            NetworkSegmentControllerState::Provisioning => TenantState::Provisioning,
-            NetworkSegmentControllerState::Ready => TenantState::Ready,
-            NetworkSegmentControllerState::Deleting { .. } => TenantState::Terminating,
-        };
-        // If deletion is requested, we immediately overwrite the state to terminating.
-        // Even though the state controller hasn't caught up - it eventually will
-        if src.is_marked_as_deleted() {
-            state = TenantState::Terminating;
-        }
-
-        let mut history = Vec::with_capacity(src.history.len());
-
-        for state in src.history {
-            history.push(state.into());
-        }
-
-        let flags: Vec<i32> = {
-            use rpc::forge::NetworkSegmentFlag::*;
-
-            let mut flags = vec![];
-
-            let can_stretch = src.can_stretch.unwrap_or_else(|| {
-                // If the segment's can_stretch flag is NULL in the database,
-                // we're going to have to go off of what an FNN-created
-                // segment's prefixes would look like, and then assume any such
-                // FNN segment is _not_ stretchable.
-                src.prefixes.iter().all(|p| !p.smells_like_fnn())
-            });
-            if can_stretch {
-                flags.push(CanStretch);
-            }
-
-            // Just so a gRPC client can tell the difference between a missing
-            // `flags` field and an empty one.
-            if flags.is_empty() {
-                flags.push(NoOp);
-            }
-
-            flags.into_iter().map(|flag| flag as i32).collect()
-        };
-
-        Ok(rpc::NetworkSegment {
-            id: Some(src.id),
-            version: src.version.version_string(),
-            name: src.name,
-            subdomain_id: src.subdomain_id,
-            mtu: Some(src.mtu),
-            created: Some(src.created.into()),
-            updated: Some(src.updated.into()),
-            deleted: src.deleted.map(|t| t.into()),
-            prefixes: src
-                .prefixes
-                .into_iter()
-                .map(rpc::forge::NetworkPrefix::from)
-                .collect_vec(),
-            vpc_id: src.vpc_id,
-            state: state as i32,
-            state_reason: src.controller_state_outcome.map(|r| r.into()),
-            state_sla: Some(
-                state_sla(&src.controller_state.value, &src.controller_state.version).into(),
-            ),
-            history,
-            segment_type: src.segment_type as i32,
-            flags,
         })
     }
 }
@@ -654,30 +409,619 @@ impl NewNetworkSegment {
         name: &str,
         domain_id: DomainId,
         value: &NetworkDefinition,
-    ) -> Result<Self, RpcDataConversionError> {
-        let prefix =
-            NewNetworkPrefix {
-                prefix: value.prefix.parse()?,
-                gateway: Some(value.gateway.parse().map_err(|_| {
-                    RpcDataConversionError::InvalidIpAddress(value.gateway.clone())
-                })?),
+    ) -> Result<Self, ModelError> {
+        // Validate the optional IPv6-specific config before expanding it
+        // into persisted prefix rows.
+        if let Some(prefix_v6) = value.prefix_v6
+            && !prefix_v6.is_ipv6()
+        {
+            return Err(ModelError::InvalidArgument(
+                "NetworkDefinition.prefix_v6 must be an IPv6 prefix.".to_string(),
+            ));
+        }
+
+        if let Some(link_address) = value.dhcpv6_link_address
+            && !link_address.is_ipv6()
+        {
+            return Err(ModelError::InvalidArgument(
+                "NetworkDefinition.dhcpv6_link_address must be an IPv6 address.".to_string(),
+            ));
+        }
+
+        // Keep the one-prefix-per-family invariant explicit before the
+        // database unique index has to reject the insert.
+        if let Some(prefix_v6) = value.prefix_v6
+            && value.prefix.is_ipv6() == prefix_v6.is_ipv6()
+        {
+            return Err(ModelError::InvalidArgument(
+                "NetworkDefinition cannot contain more than one prefix from the same address family."
+                    .to_string(),
+            ));
+        }
+
+        // A DHCPv6 link-address only has meaning when there is a v6 prefix row
+        // to carry it.
+        if value.prefix.is_ipv4()
+            && value.prefix_v6.is_none()
+            && value.dhcpv6_link_address.is_some()
+        {
+            return Err(ModelError::InvalidArgument(
+                "NetworkDefinition.dhcpv6_link_address requires an IPv6 prefix.".to_string(),
+            ));
+        }
+
+        // Expand the config definition into one row for the primary prefix and
+        // an optional second row for the dual-stack IPv6 prefix.
+        let mut prefixes = vec![NewNetworkPrefix {
+            prefix: value.prefix,
+            gateway: value.prefix.is_ipv4().then_some(value.gateway),
+            dhcpv6_link_address: if value.prefix.is_ipv6() {
+                value.dhcpv6_link_address
+            } else {
+                None
+            },
+            num_reserved: value.reserve_first,
+        }];
+        if let Some(prefix_v6) = value.prefix_v6 {
+            prefixes.push(NewNetworkPrefix {
+                prefix: prefix_v6,
+                gateway: None,
+                dhcpv6_link_address: value.dhcpv6_link_address,
                 num_reserved: value.reserve_first,
-            };
+            });
+        }
+
         Ok(NewNetworkSegment {
             id: uuid::Uuid::new_v4().into(),
             name: name.to_string(), // Set by the caller later
             subdomain_id: Some(domain_id),
             vpc_id: None,
             mtu: value.mtu,
-            prefixes: vec![prefix],
+            prefixes,
             vlan_id: None,
             vni: None,
-            segment_type: match value.segment_type {
-                NetworkDefinitionSegmentType::Admin => NetworkSegmentType::Admin,
-                NetworkDefinitionSegmentType::Underlay => NetworkSegmentType::Underlay,
-            },
+            segment_type: value.segment_type.into(),
             can_stretch: None,
             allocation_strategy: value.allocation_strategy,
+            infer_slaac_eui64_addresses: value.infer_slaac_eui64_addresses,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{scenarios, value_scenarios};
+    use carbide_uuid::network::NetworkPrefixId;
+
+    use super::*;
+
+    fn drain_state() -> NetworkSegmentControllerState {
+        let delete_at: DateTime<Utc> = "2022-12-13T04:41:38Z".parse().unwrap();
+        NetworkSegmentControllerState::Deleting {
+            deletion_state: NetworkSegmentDeletionState::DrainAllocatedIps { delete_at },
+        }
+    }
+
+    fn dbdelete_state() -> NetworkSegmentControllerState {
+        NetworkSegmentControllerState::Deleting {
+            deletion_state: NetworkSegmentDeletionState::DBDelete,
+        }
+    }
+
+    /// Builds a minimal network segment fixture for segment-level predicate tests.
+    fn test_segment(
+        infer_slaac_eui64_addresses: bool,
+        allocation_strategy: AllocationStrategy,
+        prefixes: &[&str],
+    ) -> NetworkSegment {
+        let segment_id = NetworkSegmentId::new();
+        let now = Utc::now();
+
+        NetworkSegment {
+            id: segment_id,
+            version: ConfigVersion::initial(),
+            config: NetworkSegmentConfig {
+                name: "test-segment".to_string(),
+                subdomain_id: None,
+                mtu: 1500,
+                segment_type: NetworkSegmentType::Admin,
+                allocation_strategy,
+                infer_slaac_eui64_addresses,
+                vpc_id: None,
+            },
+            status: NetworkSegmentStatus {
+                controller_state: Versioned::new(
+                    NetworkSegmentControllerState::Ready,
+                    ConfigVersion::initial(),
+                ),
+                controller_state_outcome: None,
+                history: Vec::new(),
+                vlan_id: None,
+                vni: None,
+                can_stretch: None,
+            },
+            prefixes: prefixes
+                .iter()
+                .map(|prefix| NetworkPrefix {
+                    id: NetworkPrefixId::new(),
+                    segment_id,
+                    prefix: prefix.parse().unwrap(),
+                    gateway: None,
+                    dhcpv6_link_address: None,
+                    num_reserved: 0,
+                    vpc_prefix_id: None,
+                    vpc_prefix: None,
+                    svi_ip: None,
+                    num_free_ips: None,
+                })
+                .collect(),
+            created: now,
+            updated: now,
+            deleted: None,
+        }
+    }
+
+    #[test]
+    fn slaac_eui64_inference_requires_opt_in_and_one_dynamic_v6_64_prefix() {
+        // `slaac_eui64_inference_prefix` is the segment-level gate for inferring
+        // an address. Keep the opt-in beside the prefix and allocation checks so
+        // the DHCP handler cannot accidentally bypass one of them.
+        value_scenarios!(
+            run = |segment: NetworkSegment| segment.slaac_eui64_inference_prefix().copied();
+            "opted-in dynamic segment with one v6 /64" {
+                test_segment(true, AllocationStrategy::Dynamic, &["2001:db8::/64"]) => Some("2001:db8::/64".parse().unwrap()),
+            }
+
+            "opted-in dynamic dual-stack segment with one v6 /64" {
+                test_segment(true, AllocationStrategy::Dynamic, &["192.0.2.0/24", "2001:db8::/64"]) => Some("2001:db8::/64".parse().unwrap()),
+            }
+
+            "default-off dynamic segment with one v6 /64" {
+                test_segment(false, AllocationStrategy::Dynamic, &["2001:db8::/64"]) => None,
+            }
+
+            "opted-in reserved segment with one v6 /64" {
+                test_segment(true, AllocationStrategy::Reserved, &["2001:db8::/64"]) => None,
+            }
+
+            "opted-in dynamic segment with no v6 prefix" {
+                test_segment(true, AllocationStrategy::Dynamic, &["192.0.2.0/24"]) => None,
+            }
+
+            "opted-in dynamic segment with non-64 v6 prefix" {
+                test_segment(true, AllocationStrategy::Dynamic, &["2001:db8::/80"]) => None,
+            }
+
+            "opted-in dynamic segment with ambiguous v6 prefixes" {
+                test_segment(true, AllocationStrategy::Dynamic, &["2001:db8::/64", "2001:db8:1::/80"]) => None,
+            }
+        );
+    }
+
+    #[test]
+    fn controller_state_serializes_to_tagged_json() {
+        scenarios!(
+            run = |state| serde_json::to_string(&state).map_err(drop);
+            "provisioning" {
+                NetworkSegmentControllerState::Provisioning => Yields(r#"{"state":"provisioning"}"#.to_string()),
+            }
+
+            "ready" {
+                NetworkSegmentControllerState::Ready => Yields(r#"{"state":"ready"}"#.to_string()),
+            }
+
+            "deleting / drain allocated ips" {
+                drain_state() => Yields(
+                    r#"{"state":"deleting","deletion_state":{"state":"drainallocatedips","delete_at":"2022-12-13T04:41:38Z"}}"#
+                        .to_string(),
+                ),
+            }
+
+            "deleting / db delete" {
+                dbdelete_state() => Yields(
+                    r#"{"state":"deleting","deletion_state":{"state":"dbdelete"}}"#.to_string(),
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn controller_state_round_trips_through_json() {
+        scenarios!(
+            run = |state| {
+                let json = serde_json::to_string(&state).map_err(drop)?;
+                serde_json::from_str::<NetworkSegmentControllerState>(&json).map_err(drop)
+            };
+            "provisioning" {
+                NetworkSegmentControllerState::Provisioning => Yields(NetworkSegmentControllerState::Provisioning),
+            }
+
+            "ready" {
+                NetworkSegmentControllerState::Ready => Yields(NetworkSegmentControllerState::Ready),
+            }
+
+            "deleting / drain allocated ips" {
+                drain_state() => Yields(drain_state()),
+            }
+
+            "deleting / db delete" {
+                dbdelete_state() => Yields(dbdelete_state()),
+            }
+        );
+    }
+
+    #[test]
+    fn segment_type_parses_from_db_string() {
+        scenarios!(
+            run = |s| NetworkSegmentType::from_str(s).map_err(drop);
+            "tenant" {
+                "tenant" => Yields(NetworkSegmentType::Tenant),
+            }
+
+            "admin" {
+                "admin" => Yields(NetworkSegmentType::Admin),
+            }
+
+            "tor maps to underlay" {
+                "tor" => Yields(NetworkSegmentType::Underlay),
+            }
+
+            "host_inband" {
+                "host_inband" => Yields(NetworkSegmentType::HostInband),
+            }
+
+            "unknown token" {
+                "bogus" => Fails,
+            }
+
+            "empty string" {
+                "" => Fails,
+            }
+
+            "wrong-case admin" {
+                "Admin" => Fails,
+            }
+
+            "display name underlay, not parse name" {
+                "underlay" => Fails,
+            }
+
+            "whitespace padded" {
+                " tenant " => Fails,
+            }
+        );
+    }
+
+    #[test]
+    fn segment_type_parse_error_names_the_input() {
+        scenarios!(
+            run = |(s, tokens)| {
+                let msg = NetworkSegmentType::from_str(s)
+                    .map(|_| String::new())
+                    .unwrap_or_else(|e| e.to_string());
+                Ok::<_, ()>(tokens.iter().all(|t| msg.contains(t)))
+            };
+            "error mentions the offending token" {
+                ("bogus", &["Invalid segment type", "bogus"][..]) => Yields(true),
+            }
+
+            "error mentions an empty token" {
+                ("", &["Invalid segment type"][..]) => Yields(true),
+            }
+        );
+    }
+
+    #[test]
+    fn segment_type_round_trips_through_display_and_parse() {
+        scenarios!(
+            run = |ty| NetworkSegmentType::from_str(&ty.to_string()).map_err(drop);
+            "tenant" {
+                NetworkSegmentType::Tenant => Yields(NetworkSegmentType::Tenant),
+            }
+
+            "admin" {
+                NetworkSegmentType::Admin => Yields(NetworkSegmentType::Admin),
+            }
+
+            "underlay" {
+                NetworkSegmentType::Underlay => Yields(NetworkSegmentType::Underlay),
+            }
+
+            "host_inband" {
+                NetworkSegmentType::HostInband => Yields(NetworkSegmentType::HostInband),
+            }
+        );
+    }
+
+    #[test]
+    fn segment_type_displays_its_db_token() {
+        value_scenarios!(
+            run = |ty| ty.to_string();
+            "tenant" {
+                NetworkSegmentType::Tenant => "tenant".to_string(),
+            }
+
+            "admin" {
+                NetworkSegmentType::Admin => "admin".to_string(),
+            }
+
+            "underlay renders as tor" {
+                NetworkSegmentType::Underlay => "tor".to_string(),
+            }
+
+            "host_inband" {
+                NetworkSegmentType::HostInband => "host_inband".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn is_tenant_is_true_for_tenant_facing_segments() {
+        value_scenarios!(
+            run = |ty| ty.is_tenant();
+            "tenant is tenant-facing" {
+                NetworkSegmentType::Tenant => true,
+            }
+
+            "host_inband is tenant-facing" {
+                NetworkSegmentType::HostInband => true,
+            }
+
+            "admin is not tenant-facing" {
+                NetworkSegmentType::Admin => false,
+            }
+
+            "underlay is not tenant-facing" {
+                NetworkSegmentType::Underlay => false,
+            }
+        );
+    }
+
+    #[test]
+    fn segment_type_converts_from_definition_type() {
+        value_scenarios!(
+            run = NetworkSegmentType::from;
+            "admin" {
+                NetworkDefinitionSegmentType::Admin => NetworkSegmentType::Admin,
+            }
+
+            "underlay" {
+                NetworkDefinitionSegmentType::Underlay => NetworkSegmentType::Underlay,
+            }
+
+            "host_inband" {
+                NetworkDefinitionSegmentType::HostInband => NetworkSegmentType::HostInband,
+            }
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct BuiltPrefix {
+        prefix: String,
+        gateway: Option<String>,
+        dhcpv6_link_address: Option<String>,
+        num_reserved: i32,
+    }
+
+    /// Builds a config network definition for segment expansion tests.
+    fn definition(
+        prefix: &str,
+        prefix_v6: Option<&str>,
+        dhcpv6_link_address: Option<&str>,
+    ) -> NetworkDefinition {
+        NetworkDefinition {
+            segment_type: NetworkDefinitionSegmentType::Admin,
+            prefix: prefix.parse().unwrap(),
+            prefix_v6: prefix_v6.map(|prefix| prefix.parse().unwrap()),
+            gateway: prefix.parse::<IpNetwork>().unwrap().network(),
+            dhcpv6_link_address: dhcpv6_link_address.map(|addr| addr.parse().unwrap()),
+            mtu: 1500,
+            reserve_first: 5,
+            allocation_strategy: AllocationStrategy::Dynamic,
+            infer_slaac_eui64_addresses: false,
+            vpc_name: None,
+        }
+    }
+
+    /// Expands a network definition and returns the persisted prefix shape.
+    fn build_definition_prefixes(value: NetworkDefinition) -> Result<Vec<BuiltPrefix>, String> {
+        NewNetworkSegment::build_from("test-segment", uuid::Uuid::new_v4().into(), &value)
+            .map(|segment| {
+                segment
+                    .prefixes
+                    .into_iter()
+                    .map(|prefix| BuiltPrefix {
+                        prefix: prefix.prefix.to_string(),
+                        gateway: prefix.gateway.map(|addr| addr.to_string()),
+                        dhcpv6_link_address: prefix
+                            .dhcpv6_link_address
+                            .map(|addr| addr.to_string()),
+                        num_reserved: prefix.num_reserved,
+                    })
+                    .collect()
+            })
+            .map_err(|err| err.to_string())
+    }
+
+    /// Verifies config-seeded segments expand to at most one prefix per family.
+    #[test]
+    fn build_from_network_definition_expands_dual_stack_prefixes() {
+        scenarios!(
+            // Build the config-seeded segment and project the prefix rows that
+            // will be persisted.
+            run = build_definition_prefixes;
+            "v4-only keeps the legacy gateway row" {
+                definition("192.0.2.0/24", None, None) => Yields(vec![
+                    BuiltPrefix {
+                        prefix: "192.0.2.0/24".to_string(),
+                        gateway: Some("192.0.2.0".to_string()),
+                        dhcpv6_link_address: None,
+                        num_reserved: 5,
+                    },
+                ]),
+            }
+
+            "v6-only has no gateway and carries the dhcpv6 link-address" {
+                definition("2001:db8::/64", None, Some("2001:db8:ffff::1")) => Yields(vec![
+                    BuiltPrefix {
+                        prefix: "2001:db8::/64".to_string(),
+                        gateway: None,
+                        dhcpv6_link_address: Some("2001:db8:ffff::1".to_string()),
+                        num_reserved: 5,
+                    },
+                ]),
+            }
+
+            "dual-stack builds one row per family" {
+                definition("192.0.2.0/24", Some("2001:db8::/64"), Some("2001:db8:ffff::1")) => Yields(vec![
+                    BuiltPrefix {
+                        prefix: "192.0.2.0/24".to_string(),
+                        gateway: Some("192.0.2.0".to_string()),
+                        dhcpv6_link_address: None,
+                        num_reserved: 5,
+                    },
+                    BuiltPrefix {
+                        prefix: "2001:db8::/64".to_string(),
+                        gateway: None,
+                        dhcpv6_link_address: Some("2001:db8:ffff::1".to_string()),
+                        num_reserved: 5,
+                    },
+                ]),
+            }
+
+            "prefix_v6 must be IPv6" {
+                definition("192.0.2.0/24", Some("198.51.100.0/24"), None) => Fails,
+            }
+
+            "two IPv6 prefixes are rejected" {
+                definition("2001:db8:1::/64", Some("2001:db8:2::/64"), None) => Fails,
+            }
+
+            "dhcpv6 link-address must be IPv6" {
+                definition("192.0.2.0/24", Some("2001:db8::/64"), Some("192.0.2.1")) => Fails,
+            }
+
+            "dhcpv6 link-address requires a v6 prefix" {
+                definition("192.0.2.0/24", None, Some("2001:db8::1")) => Fails,
+            }
+        );
+    }
+
+    #[test]
+    fn build_from_network_definition_keeps_slaac_inference_setting() {
+        value_scenarios!(
+            run = |infer_slaac_eui64_addresses| {
+                let mut definition = definition("2001:db8::/64", None, None);
+                definition.infer_slaac_eui64_addresses = infer_slaac_eui64_addresses;
+
+                NewNetworkSegment::build_from(
+                    "test-segment",
+                    uuid::Uuid::new_v4().into(),
+                    &definition,
+                )
+                .unwrap()
+                .infer_slaac_eui64_addresses
+            };
+            "inference disabled" {
+                false => false,
+            }
+
+            "inference enabled" {
+                true => true,
+            }
+        );
+    }
+
+    #[test]
+    fn allocation_strategy_round_trips_through_json() {
+        scenarios!(
+            run = |s| serde_json::to_string(&s).map_err(drop);
+            "dynamic serializes to its snake-case token" {
+                AllocationStrategy::Dynamic => Yields(r#""dynamic""#.to_string()),
+            }
+
+            "reserved serializes to its snake-case token" {
+                AllocationStrategy::Reserved => Yields(r#""reserved""#.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn allocation_strategy_defaults_to_dynamic() {
+        value_scenarios!(
+            run = |()| AllocationStrategy::default();
+            "default" {
+                () => AllocationStrategy::Dynamic,
+            }
+        );
+    }
+
+    #[test]
+    fn is_marked_as_deleted_follows_the_deleted_timestamp() {
+        let stamp: DateTime<Utc> = "2022-12-13T04:41:38Z".parse().unwrap();
+        value_scenarios!(
+            run = |deleted| deleted.is_some();
+            "no timestamp means live" {
+                None => false,
+            }
+
+            "timestamp means deleted" {
+                Some(stamp) => true,
+            }
+        );
+    }
+
+    fn network_definition_with_mtu(mtu: i32) -> NetworkDefinition {
+        NetworkDefinition {
+            segment_type: NetworkDefinitionSegmentType::Admin,
+            prefix: "10.0.0.0/24".parse().unwrap(),
+            prefix_v6: None,
+            gateway: "10.0.0.1".parse().unwrap(),
+            dhcpv6_link_address: None,
+            mtu,
+            reserve_first: 0,
+            allocation_strategy: AllocationStrategy::default(),
+            infer_slaac_eui64_addresses: false,
+            vpc_name: None,
+        }
+    }
+
+    #[test]
+    fn network_definition_validate_rejects_out_of_range_mtu() {
+        value_scenarios!(
+            run = |mtu: i32| network_definition_with_mtu(mtu).validate("test-net").is_err();
+            "MTU below minimum is rejected" {
+                575 => true,
+            }
+            "MTU above maximum is rejected" {
+                9001 => true,
+            }
+            "minimum boundary MTU is accepted" {
+                576 => false,
+            }
+            "maximum boundary MTU is accepted" {
+                9000 => false,
+            }
+            "typical standard MTU is accepted" {
+                1500 => false,
+            }
+        );
+    }
+
+    #[test]
+    fn network_definition_validate_error_names_the_network_and_mtu() {
+        let err = network_definition_with_mtu(9214)
+            .validate("test-inband")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("test-inband"),
+            "error should name the network: {err}"
+        );
+        assert!(
+            err.contains("9214"),
+            "error should include the bad MTU value: {err}"
+        );
     }
 }

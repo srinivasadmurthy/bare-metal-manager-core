@@ -22,9 +22,16 @@ use clap::{ArgGroup, Parser};
         ArgGroup::new("grow")
         .required(true)
         .args(&["filename"])))]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Add capacity to resource pools from a TOML file:
+    $ nico-admin-cli resource-pool grow --filename ./grow-pools.toml
+
+")]
+pub(crate) struct Args {
     #[clap(short, long)]
-    pub filename: String,
+    filename: String,
 }
 
 impl TryFrom<Args> for ::rpc::forge::GrowResourcePoolRequest {

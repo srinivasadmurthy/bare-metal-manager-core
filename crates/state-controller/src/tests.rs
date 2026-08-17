@@ -29,6 +29,7 @@ use model::controller_outcome::PersistentStateHandlerOutcome;
 use serde::{self, Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::{FromRow, PgConnection, Row};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -395,27 +396,21 @@ async fn test_queue_objects(pool: sqlx::PgPool) -> sqlx::Result<()> {
 struct TestStateControllerIO {}
 
 #[derive(Debug, Clone)]
-pub struct TestObject {
-    pub id: String,
-    pub controller_state: Versioned<TestObjectControllerState>,
-    #[allow(dead_code)]
-    pub controller_state_outcome: Option<PersistentStateHandlerOutcome>,
+struct TestObject {
+    id: String,
+    controller_state: Versioned<TestObjectControllerState>,
 }
 
 impl<'r> FromRow<'r, PgRow> for TestObject {
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let controller_state: sqlx::types::Json<TestObjectControllerState> =
             row.try_get("controller_state")?;
-        let state_outcome: Option<sqlx::types::Json<PersistentStateHandlerOutcome>> =
-            row.try_get("controller_state_outcome")?;
-
         Ok(TestObject {
             id: row.try_get("id")?,
             controller_state: Versioned::new(
                 controller_state.0,
                 row.try_get("controller_state_version")?,
             ),
-            controller_state_outcome: state_outcome.map(|x| x.0),
         })
     }
 }
@@ -423,13 +418,13 @@ impl<'r> FromRow<'r, PgRow> for TestObject {
 /// State of a IB subnet as tracked by the controller
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
-pub enum TestObjectControllerState {
+enum TestObjectControllerState {
     A,
     B,
     C,
 }
 
-pub struct TestStateControllerContextObjects {}
+struct TestStateControllerContextObjects {}
 
 impl StateHandlerContextObjects for TestStateControllerContextObjects {
     type Services = ();
@@ -743,11 +738,245 @@ async fn test_state_controller_handle_set_wait_all_propagates_panic(
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct TestConcurrencyStateHandler {
+struct TestConcurrencyStateHandler {
     /// The total count for the handler
-    pub count: Arc<AtomicUsize>,
+    count: Arc<AtomicUsize>,
     /// We count for every object ID how often the handler was called
-    pub counts_per_id: Arc<Mutex<HashMap<String, usize>>>,
+    counts_per_id: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+#[derive(Debug)]
+struct DrainingStateHandler {
+    started: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+    completed: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct TimeoutDuringDrainStateHandler {
+    started: Arc<Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl StateHandler for TimeoutDuringDrainStateHandler {
+    type ObjectId = String;
+    type State = TestObject;
+    type ControllerState = TestObjectControllerState;
+    type ContextObjects = TestStateControllerContextObjects;
+
+    async fn handle_object_state(
+        &self,
+        _object_id: &String,
+        _state: &mut TestObject,
+        _controller_state: &Self::ControllerState,
+        _ctx: &mut StateHandlerContext<Self::ContextObjects>,
+    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
+        self.started.add_permits(1);
+        std::future::pending().await
+    }
+}
+
+#[async_trait::async_trait]
+impl StateHandler for DrainingStateHandler {
+    type ObjectId = String;
+    type State = TestObject;
+    type ControllerState = TestObjectControllerState;
+    type ContextObjects = TestStateControllerContextObjects;
+
+    async fn handle_object_state(
+        &self,
+        object_id: &String,
+        _state: &mut TestObject,
+        _controller_state: &Self::ControllerState,
+        _ctx: &mut StateHandlerContext<Self::ContextObjects>,
+    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
+        self.started.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("Release semaphore should remain open")
+            .forget();
+        self.completed.fetch_add(1, Ordering::SeqCst);
+
+        if object_id == "transition" {
+            Ok(StateHandlerOutcome::transition(
+                TestObjectControllerState::B,
+            ))
+        } else {
+            Ok(StateHandlerOutcome::do_nothing())
+        }
+    }
+}
+
+#[carbide_macros::sqlx_test]
+async fn test_state_controller_drains_claimed_work_on_shutdown(
+    pool: sqlx::PgPool,
+) -> eyre::Result<()> {
+    create_test_state_controller_tables(&pool).await;
+    let mut join_set = JoinSet::new();
+    let cancel_token = CancellationToken::new();
+    let work_lock_manager_handle =
+        db::work_lock_manager::start(&mut join_set, pool.clone(), Default::default()).await?;
+
+    let mut txn = pool.begin().await?;
+    create_test_object("stationary".to_string(), &mut txn).await;
+    create_test_object("transition".to_string(), &mut txn).await;
+    txn.commit().await?;
+
+    let started = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let processor_id = uuid::Uuid::new_v4().to_string();
+    let handler = Arc::new(DrainingStateHandler {
+        started: started.clone(),
+        release: release.clone(),
+        completed: completed.clone(),
+    });
+
+    StateController::<TestStateControllerIO>::builder()
+        .iteration_config(IterationConfig {
+            iteration_time: Duration::from_secs(60),
+            processor_dispatch_interval: Duration::from_millis(10),
+            max_object_handling_time: Duration::from_secs(5),
+            max_concurrency: 2,
+            ..Default::default()
+        })
+        .database(pool.clone(), work_lock_manager_handle.clone())
+        .processor_id(processor_id.clone())
+        .services(Arc::new(()))
+        .state_handler(handler)
+        .build_and_spawn(&mut join_set, cancel_token.clone())?;
+    drop(work_lock_manager_handle);
+
+    tokio::time::timeout(Duration::from_secs(5), started.acquire_many(2))
+        .await
+        .expect("State handlers did not start")?
+        .forget();
+
+    let mut txn = pool.begin().await?;
+    let mut queued = controller::db::fetch_queued_objects(
+        &mut txn,
+        TestStateControllerIO::DB_QUEUED_OBJECTS_TABLE_NAME,
+    )
+    .await?;
+    txn.commit().await?;
+    queued.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+    assert_eq!(queued.len(), 2);
+    assert!(
+        queued
+            .iter()
+            .all(|object| object.processed_by.as_deref() == Some(processor_id.as_str()))
+    );
+
+    // Queue another object while the processor is at capacity. Cancellation
+    // must prevent it from claiming this work after the two running handlers
+    // complete.
+    let mut txn = pool.begin().await?;
+    create_test_object("pending".to_string(), &mut txn).await;
+    txn.commit().await?;
+    Enqueuer::<TestStateControllerIO>::new(pool.clone())
+        .enqueue_object(&"pending".to_string())
+        .await?;
+
+    cancel_token.cancel();
+    let mut shutdown = tokio::spawn(async move { join_set.join_all().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
+        "Controller shut down before claimed work completed"
+    );
+
+    release.add_permits(2);
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("Controller did not finish draining")
+        .expect("Controller task panicked");
+    assert_eq!(completed.load(Ordering::SeqCst), 2);
+
+    let mut txn = pool.begin().await?;
+    let mut queued = controller::db::fetch_queued_objects(
+        &mut txn,
+        TestStateControllerIO::DB_QUEUED_OBJECTS_TABLE_NAME,
+    )
+    .await?;
+    let transition_state: sqlx::types::Json<TestObjectControllerState> =
+        sqlx::query_scalar("SELECT controller_state FROM test_objects WHERE id = 'transition'")
+            .fetch_one(&mut *txn)
+            .await?;
+    txn.commit().await?;
+    queued.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+
+    assert_eq!(
+        queued,
+        vec![
+            QueuedObject {
+                object_id: "pending".to_string(),
+                processed_by: None,
+            },
+            QueuedObject {
+                object_id: "transition".to_string(),
+                processed_by: None,
+            },
+        ]
+    );
+    assert_eq!(transition_state.0, TestObjectControllerState::B);
+
+    Ok(())
+}
+
+#[carbide_macros::sqlx_test]
+async fn test_state_controller_handler_timeout_bounds_shutdown_drain(
+    pool: sqlx::PgPool,
+) -> eyre::Result<()> {
+    create_test_state_controller_tables(&pool).await;
+    let mut join_set = JoinSet::new();
+    let cancel_token = CancellationToken::new();
+    let work_lock_manager_handle =
+        db::work_lock_manager::start(&mut join_set, pool.clone(), Default::default()).await?;
+
+    let mut txn = pool.begin().await?;
+    create_test_object("timeout".to_string(), &mut txn).await;
+    txn.commit().await?;
+
+    let started = Arc::new(Semaphore::new(0));
+    StateController::<TestStateControllerIO>::builder()
+        .iteration_config(IterationConfig {
+            iteration_time: Duration::from_secs(60),
+            processor_dispatch_interval: Duration::from_millis(10),
+            max_object_handling_time: Duration::from_millis(100),
+            max_concurrency: 1,
+            ..Default::default()
+        })
+        .database(pool.clone(), work_lock_manager_handle.clone())
+        .processor_id(uuid::Uuid::new_v4().to_string())
+        .services(Arc::new(()))
+        .state_handler(Arc::new(TimeoutDuringDrainStateHandler {
+            started: started.clone(),
+        }))
+        .build_and_spawn(&mut join_set, cancel_token.clone())?;
+    drop(work_lock_manager_handle);
+
+    tokio::time::timeout(Duration::from_secs(5), started.acquire())
+        .await
+        .expect("State handler did not start")?
+        .forget();
+    cancel_token.cancel();
+
+    tokio::time::timeout(Duration::from_secs(5), join_set.join_all())
+        .await
+        .expect("Handler timeout did not bound shutdown drain");
+
+    let mut txn = pool.begin().await?;
+    let queued = controller::db::fetch_queued_objects(
+        &mut txn,
+        TestStateControllerIO::DB_QUEUED_OBJECTS_TABLE_NAME,
+    )
+    .await?;
+    txn.commit().await?;
+    assert!(queued.is_empty());
+
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -849,7 +1078,7 @@ async fn test_multiple_state_controllers_schedule_object_only_once(
 
 /// A state handler that transitions from A -> B -> C
 #[derive(Debug, Default, Clone)]
-pub struct TestTransitionStateHandler;
+struct TestTransitionStateHandler;
 
 #[async_trait::async_trait]
 impl StateHandler for TestTransitionStateHandler {
@@ -879,7 +1108,7 @@ impl StateHandler for TestTransitionStateHandler {
 
 /// A state handler that transitions from A -> B -> A
 #[derive(Debug, Default, Clone)]
-pub struct CyclicTransitionStateHandler;
+struct CyclicTransitionStateHandler;
 
 #[async_trait::async_trait]
 impl StateHandler for CyclicTransitionStateHandler {
@@ -979,7 +1208,7 @@ struct CapturedStateChange {
 }
 
 /// A hook that sends events through a channel for deterministic test verification
-pub struct ChannelHook {
+struct ChannelHook {
     sender: tokio::sync::mpsc::UnboundedSender<CapturedStateChange>,
 }
 
@@ -1127,6 +1356,530 @@ async fn test_state_controller_manual_enqueuing(pool: sqlx::PgPool) -> eyre::Res
         },]
     );
     txn.commit().await.unwrap();
+
+    Ok(())
+}
+
+/// A state handler that fails with `ManualInterventionRequired` on its first
+/// invocation, a transient error on its second, and succeeds afterwards.
+#[derive(Debug, Default, Clone)]
+struct TestManualInterventionStateHandler {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl StateHandler for TestManualInterventionStateHandler {
+    type State = TestObject;
+    type ControllerState = TestObjectControllerState;
+    type ObjectId = String;
+    type ContextObjects = TestStateControllerContextObjects;
+
+    async fn handle_object_state(
+        &self,
+        _object_id: &String,
+        _state: &mut TestObject,
+        _controller_state: &Self::ControllerState,
+        _ctx: &mut StateHandlerContext<Self::ContextObjects>,
+    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Err(StateHandlerError::ManualInterventionRequired(
+                "operator needed".to_string(),
+            )),
+            1 => Err(StateHandlerError::GenericError(eyre::eyre!(
+                "transient failure"
+            ))),
+            _ => Ok(StateHandlerOutcome::do_nothing()),
+        }
+    }
+}
+
+fn per_object_state_recorder(
+    prometheus_registry: &prometheus::Registry,
+) -> crate::per_object::PerObjectStateRecorder {
+    let registry =
+        carbide_health_metrics::PerObjectMetricsRegistry::new(Vec::new(), Duration::from_secs(60));
+    crate::per_object::PerObjectStateRecorder::new(
+        "test_object",
+        crate::per_object::PerObjectStateMetrics::new(
+            &registry,
+            prometheus_registry,
+            Duration::from_secs(60),
+        )
+        .unwrap(),
+    )
+}
+
+/// Boilerplate shared by the per-object metrics tests: tables, one
+/// `test-obj-1` object, and a controller wired with the given handler and a
+/// per-object state recorder whose series land on the returned registry.
+/// The `JoinSet` keeps the work-lock manager alive for the test's duration.
+async fn per_object_test_controller<IO>(
+    pool: &sqlx::PgPool,
+    handler: Arc<
+        dyn StateHandler<
+                State = TestObject,
+                ControllerState = TestObjectControllerState,
+                ObjectId = String,
+                ContextObjects = TestStateControllerContextObjects,
+            >,
+    >,
+) -> eyre::Result<(StateController<IO>, prometheus::Registry, JoinSet<()>)>
+where
+    IO: StateControllerIO<
+            ObjectId = String,
+            State = TestObject,
+            ControllerState = TestObjectControllerState,
+            ContextObjects = TestStateControllerContextObjects,
+        >,
+{
+    create_test_state_controller_tables(pool).await;
+    let mut join_set = JoinSet::new();
+    let work_lock_manager_handle =
+        db::work_lock_manager::start(&mut join_set, pool.clone(), Default::default()).await?;
+
+    let mut txn = pool.begin().await?;
+    create_test_object("test-obj-1".to_string(), &mut txn).await;
+    txn.commit().await?;
+
+    let prometheus_registry = prometheus::Registry::new();
+    let controller = StateController::<IO>::builder()
+        .iteration_config(IterationConfig {
+            iteration_time: Duration::from_millis(50),
+            ..Default::default()
+        })
+        .database(pool.clone(), work_lock_manager_handle)
+        .processor_id(uuid::Uuid::new_v4().to_string())
+        .services(Arc::new(()))
+        .state_handler(handler)
+        .per_object_state_metrics(Some(per_object_state_recorder(&prometheus_registry)))
+        .build_for_manual_iterations(CancellationToken::new())?;
+
+    Ok((controller, prometheus_registry, join_set))
+}
+
+/// `(sorted attribute block, value)` rows for the named metric, parsed from
+/// the registry's Prometheus text exposition.
+fn parsed_prometheus_metrics(
+    registry: &prometheus::Registry,
+    metric_name: &str,
+) -> Vec<(String, String)> {
+    use prometheus::Encoder;
+    let mut buffer = Vec::new();
+    prometheus::TextEncoder::new()
+        .encode(&registry.gather(), &mut buffer)
+        .unwrap();
+    let formatted = String::from_utf8(buffer).unwrap();
+    let mut rows = Vec::new();
+    for line in formatted.lines() {
+        let Some(rest) = line.strip_prefix(metric_name) else {
+            continue;
+        };
+        if let Some(rest) = rest.strip_prefix('{') {
+            let Some((attrs, value)) = rest.split_once("} ") else {
+                continue;
+            };
+            rows.push((format!("{{{attrs}}}"), value.to_string()));
+        } else if let Some(value) = rest.strip_prefix(' ') {
+            rows.push((String::new(), value.to_string()));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+#[carbide_macros::sqlx_test]
+async fn test_per_object_state_metrics_record_observed_state(
+    pool: sqlx::PgPool,
+) -> eyre::Result<()> {
+    let (mut controller, prometheus_registry, _join_set) =
+        per_object_test_controller::<TestStateControllerIO>(
+            &pool,
+            Arc::new(TestManualInterventionStateHandler::default()),
+        )
+        .await?;
+
+    // First iteration: the handler requires manual intervention.
+    controller.run_single_iteration().await;
+
+    let entered = parsed_prometheus_metrics(
+        &prometheus_registry,
+        "carbide_object_state_entered_timestamp_seconds",
+    );
+    assert_eq!(entered.len(), 1);
+    let (attrs, value) = &entered[0];
+    for expected in [
+        r#"object_type="test_object""#,
+        r#"object_id="test-obj-1""#,
+        r#"state="a""#,
+        r#"substate="""#,
+    ] {
+        assert!(attrs.contains(expected), "{expected} not in {attrs}");
+    }
+    let entered_at = value.parse::<f64>().unwrap();
+    let now = chrono::Utc::now().timestamp() as f64;
+    assert!(
+        (now - entered_at).abs() < 60.0,
+        "entered timestamp {entered_at} not close to now {now}"
+    );
+
+    // The test IO has no SLA for any state: no SLA series may exist.
+    assert!(
+        parsed_prometheus_metrics(&prometheus_registry, "carbide_object_state_sla_seconds")
+            .is_empty()
+    );
+
+    let intervention = parsed_prometheus_metrics(
+        &prometheus_registry,
+        "carbide_object_manual_intervention_required",
+    );
+    assert_eq!(intervention.len(), 1);
+    let (attrs, value) = &intervention[0];
+    assert!(
+        attrs.contains(r#"reason="manual_intervention_required""#),
+        "reason not in {attrs}"
+    );
+    assert_eq!(value, "1");
+
+    // Second iteration: a transient (non-intervention) error leaves the
+    // status undetermined — the series must survive, not flap.
+    controller.run_single_iteration().await;
+    assert_eq!(
+        parsed_prometheus_metrics(
+            &prometheus_registry,
+            "carbide_object_manual_intervention_required"
+        )
+        .len(),
+        1
+    );
+
+    // Third iteration: the handler recovered, so the fact stops being true
+    // and the series disappears.
+    controller.run_single_iteration().await;
+    assert!(
+        parsed_prometheus_metrics(
+            &prometheus_registry,
+            "carbide_object_manual_intervention_required"
+        )
+        .is_empty()
+    );
+
+    Ok(())
+}
+
+/// Delegates to [`TestStateControllerIO`] but resolves an SLA for every state
+/// and flags state C as requiring manual intervention.
+#[derive(Debug, Default)]
+struct SlaTestStateControllerIO {
+    inner: TestStateControllerIO,
+}
+
+#[async_trait::async_trait]
+impl StateControllerIO for SlaTestStateControllerIO {
+    type ObjectId = String;
+    type State = TestObject;
+    type ControllerState = TestObjectControllerState;
+    type MetricsEmitter = NoopMetricsEmitter;
+    type ContextObjects = TestStateControllerContextObjects;
+
+    const DB_ITERATION_ID_TABLE_NAME: &'static str = "test_state_controller_iteration_ids";
+    const DB_QUEUED_OBJECTS_TABLE_NAME: &'static str = "test_state_controller_queued_objects";
+
+    const LOG_SPAN_CONTROLLER_NAME: &'static str = "test_state_controller";
+
+    async fn list_objects(
+        &self,
+        txn: &mut PgConnection,
+    ) -> Result<Vec<Self::ObjectId>, DatabaseError> {
+        self.inner.list_objects(txn).await
+    }
+
+    async fn load_object_state(
+        &self,
+        txn: &mut PgConnection,
+        object_id: &Self::ObjectId,
+    ) -> Result<Option<Self::State>, DatabaseError> {
+        self.inner.load_object_state(txn, object_id).await
+    }
+
+    async fn load_controller_state(
+        &self,
+        txn: &mut PgConnection,
+        object_id: &Self::ObjectId,
+        state: &Self::State,
+    ) -> Result<Versioned<Self::ControllerState>, DatabaseError> {
+        self.inner
+            .load_controller_state(txn, object_id, state)
+            .await
+    }
+
+    async fn persist_controller_state(
+        &self,
+        txn: &mut PgConnection,
+        object_id: &Self::ObjectId,
+        old_version: ConfigVersion,
+        new_version: ConfigVersion,
+        new_state: &Self::ControllerState,
+    ) -> Result<bool, DatabaseError> {
+        self.inner
+            .persist_controller_state(txn, object_id, old_version, new_version, new_state)
+            .await
+    }
+
+    async fn persist_state_history(
+        &self,
+        txn: &mut PgConnection,
+        object_id: &Self::ObjectId,
+        new_version: ConfigVersion,
+        new_state: &Self::ControllerState,
+    ) -> Result<(), DatabaseError> {
+        self.inner
+            .persist_state_history(txn, object_id, new_version, new_state)
+            .await
+    }
+
+    async fn persist_outcome(
+        &self,
+        txn: &mut PgConnection,
+        object_id: &Self::ObjectId,
+        outcome: PersistentStateHandlerOutcome,
+    ) -> Result<(), DatabaseError> {
+        self.inner.persist_outcome(txn, object_id, outcome).await
+    }
+
+    fn metric_state_names(state: &TestObjectControllerState) -> (&'static str, &'static str) {
+        TestStateControllerIO::metric_state_names(state)
+    }
+
+    fn manual_intervention_reason(state: &Self::ControllerState) -> Option<&'static str> {
+        match state {
+            TestObjectControllerState::C => Some("test_stuck"),
+            _ => None,
+        }
+    }
+
+    fn state_sla(
+        &self,
+        state: &Versioned<Self::ControllerState>,
+        _object_state: &Self::State,
+    ) -> StateSla {
+        StateSla::with_sla(
+            Duration::from_secs(1800),
+            chrono::Utc::now()
+                .signed_duration_since(state.version.timestamp())
+                .to_std()
+                .unwrap_or_default(),
+        )
+    }
+}
+
+#[carbide_macros::sqlx_test]
+async fn test_per_object_state_metrics_sla_and_state_based_intervention(
+    pool: sqlx::PgPool,
+) -> eyre::Result<()> {
+    let (mut controller, prometheus_registry, _join_set) =
+        per_object_test_controller::<SlaTestStateControllerIO>(
+            &pool,
+            Arc::new(TestTransitionStateHandler),
+        )
+        .await?;
+
+    // First iteration transitions A -> B and records the committed state B
+    // immediately, including B's resolved SLA; B needs no manual intervention.
+    controller.run_single_iteration().await;
+    let entered = parsed_prometheus_metrics(
+        &prometheus_registry,
+        "carbide_object_state_entered_timestamp_seconds",
+    );
+    assert_eq!(entered.len(), 1);
+    assert!(entered[0].0.contains(r#"state="b""#), "{}", entered[0].0);
+    let sla = parsed_prometheus_metrics(&prometheus_registry, "carbide_object_state_sla_seconds");
+    assert_eq!(sla.len(), 1);
+    assert!(sla[0].0.contains(r#"state="b""#), "{}", sla[0].0);
+    assert_eq!(sla[0].1, "1800");
+    assert!(
+        parsed_prometheus_metrics(
+            &prometheus_registry,
+            "carbide_object_manual_intervention_required"
+        )
+        .is_empty()
+    );
+
+    // B -> C: the committed state C is flagged by the IO as requiring
+    // intervention as soon as it is entered.
+    controller.run_single_iteration().await;
+    let entered = parsed_prometheus_metrics(
+        &prometheus_registry,
+        "carbide_object_state_entered_timestamp_seconds",
+    );
+    assert_eq!(entered.len(), 1);
+    assert!(entered[0].0.contains(r#"state="c""#), "{}", entered[0].0);
+    let intervention = parsed_prometheus_metrics(
+        &prometheus_registry,
+        "carbide_object_manual_intervention_required",
+    );
+    assert_eq!(intervention.len(), 1);
+    let (attrs, value) = &intervention[0];
+    for expected in [r#"state="c""#, r#"reason="test_stuck""#] {
+        assert!(attrs.contains(expected), "{expected} not in {attrs}");
+    }
+    assert_eq!(value, "1");
+
+    // A further iteration without a transition keeps emitting C's SLA.
+    controller.run_single_iteration().await;
+    let sla = parsed_prometheus_metrics(&prometheus_registry, "carbide_object_state_sla_seconds");
+    assert_eq!(sla.len(), 1);
+    let (attrs, value) = &sla[0];
+    assert!(attrs.contains(r#"state="c""#), "state not in {attrs}");
+    assert_eq!(value, "1800");
+
+    Ok(())
+}
+
+/// A state handler that reports the object as deleted on its second
+/// invocation.
+#[derive(Debug, Default, Clone)]
+struct TestDeletionStateHandler {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl StateHandler for TestDeletionStateHandler {
+    type State = TestObject;
+    type ControllerState = TestObjectControllerState;
+    type ObjectId = String;
+    type ContextObjects = TestStateControllerContextObjects;
+
+    async fn handle_object_state(
+        &self,
+        _object_id: &String,
+        _state: &mut TestObject,
+        _controller_state: &Self::ControllerState,
+        _ctx: &mut StateHandlerContext<Self::ContextObjects>,
+    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(StateHandlerOutcome::do_nothing())
+        } else {
+            Ok(StateHandlerOutcome::deleted())
+        }
+    }
+}
+
+#[carbide_macros::sqlx_test]
+async fn test_per_object_state_metrics_cleared_on_deletion(pool: sqlx::PgPool) -> eyre::Result<()> {
+    let (mut controller, prometheus_registry, _join_set) =
+        per_object_test_controller::<TestStateControllerIO>(
+            &pool,
+            Arc::new(TestDeletionStateHandler::default()),
+        )
+        .await?;
+
+    controller.run_single_iteration().await;
+    assert_eq!(
+        parsed_prometheus_metrics(
+            &prometheus_registry,
+            "carbide_object_state_entered_timestamp_seconds"
+        )
+        .len(),
+        1
+    );
+
+    // The deletion iteration must remove the object's series instead of
+    // leaving them to assert a deleted object's state until eviction.
+    controller.run_single_iteration().await;
+    assert!(
+        parsed_prometheus_metrics(
+            &prometheus_registry,
+            "carbide_object_state_entered_timestamp_seconds"
+        )
+        .is_empty()
+    );
+
+    Ok(())
+}
+
+/// Simulates a concurrent writer: on its first invocation it bumps the
+/// object's controller-state version out from under the processor and then
+/// returns a transition, which must lose the optimistic version check.
+#[derive(Debug, Clone)]
+struct TestLockLossStateHandler {
+    pool: sqlx::PgPool,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl StateHandler for TestLockLossStateHandler {
+    type State = TestObject;
+    type ControllerState = TestObjectControllerState;
+    type ObjectId = String;
+    type ContextObjects = TestStateControllerContextObjects;
+
+    async fn handle_object_state(
+        &self,
+        object_id: &String,
+        state: &mut TestObject,
+        _controller_state: &Self::ControllerState,
+        _ctx: &mut StateHandlerContext<Self::ContextObjects>,
+    ) -> Result<StateHandlerOutcome<Self::ControllerState>, StateHandlerError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            sqlx::query("UPDATE test_objects SET controller_state_version=$1 WHERE id=$2")
+                .bind(state.controller_state.version.increment())
+                .bind(object_id)
+                .execute(&self.pool)
+                .await
+                .unwrap();
+            Ok(StateHandlerOutcome::transition(
+                TestObjectControllerState::B,
+            ))
+        } else {
+            Ok(StateHandlerOutcome::do_nothing())
+        }
+    }
+}
+
+#[carbide_macros::sqlx_test]
+async fn test_lock_loss_requeues_without_publishing_the_transition(
+    pool: sqlx::PgPool,
+) -> eyre::Result<()> {
+    let (mut controller, prometheus_registry, _join_set) =
+        per_object_test_controller::<TestStateControllerIO>(
+            &pool,
+            Arc::new(TestLockLossStateHandler {
+                pool: pool.clone(),
+                calls: Default::default(),
+            }),
+        )
+        .await?;
+
+    controller.run_single_iteration().await;
+
+    // The transition lost the version check: the state this iteration
+    // observed is provably outdated, so nothing may be published (existing
+    // series would only be kept alive, and here there are none)...
+    assert!(
+        parsed_prometheus_metrics(
+            &prometheus_registry,
+            "carbide_object_state_entered_timestamp_seconds",
+        )
+        .is_empty()
+    );
+
+    // ...but the object must be requeued to promptly re-read the state the
+    // concurrent writer committed.
+    let mut txn = pool.begin().await?;
+    let queued = controller::db::fetch_queued_objects(
+        &mut txn,
+        TestStateControllerIO::DB_QUEUED_OBJECTS_TABLE_NAME,
+    )
+    .await
+    .unwrap();
+    txn.commit().await?;
+    assert_eq!(
+        queued,
+        vec![QueuedObject {
+            object_id: "test-obj-1".to_string(),
+            processed_by: None,
+        }]
+    );
 
     Ok(())
 }

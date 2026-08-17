@@ -20,9 +20,10 @@ use std::sync::Arc;
 
 use bmc_mock::HostnameQuerying;
 use eyre::Context;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use russh::keys::PublicKeyBase64;
-use russh::keys::signature::rand_core::OsRng;
-use russh::server::{Auth, Config, Msg, Server as _, Session, run_stream};
+use russh::server::{Auth, ChannelOpenHandle, Config, Msg, Server as _, Session, run_stream};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty, server};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -44,6 +45,7 @@ pub struct Credentials {
 pub enum PromptBehavior {
     Dell,
     Dpu,
+    LenovoSr650,
 }
 
 pub async fn spawn(
@@ -53,8 +55,9 @@ pub async fn spawn(
     require_credentials: Option<Credentials>,
     prompt_behavior: PromptBehavior,
 ) -> eyre::Result<MockSshServerHandle> {
-    let mut rng = OsRng;
-    let host_key = russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)?;
+    let mut rng = SysRng;
+    let host_key =
+        russh::keys::PrivateKey::random(&mut UnwrapErr(&mut rng), russh::keys::Algorithm::Ed25519)?;
     let host_pubkey = host_key.public_key_base64();
     let server = Server {
         prompt_hostname,
@@ -116,7 +119,10 @@ impl Server {
                             tokio::spawn(async move {
                                 if config.nodelay
                                     && let Err(e) = socket.set_nodelay(true) {
-                                        tracing::warn!("set_nodelay() failed: {e:?}");
+                                        tracing::warn!(
+                                            error = ?e,
+                                            "set_nodelay failed",
+                                        );
                                     }
 
                                 let session = match run_stream(config, socket, handler).await {
@@ -197,12 +203,13 @@ impl MockSshHandler {
             ConsoleState::SystemConsole => {
                 session.data(
                     channel,
-                    format!("\r\nroot@{} # ", self.prompt_hostname.get_hostname()).into(),
+                    format!("\r\nroot@{} # ", self.prompt_hostname.get_hostname()),
                 )?;
             }
-            ConsoleState::Bmc => {
-                session.data(channel, "\nracadm>>".into())?;
-            }
+            ConsoleState::Bmc => match self.prompt_behavior {
+                PromptBehavior::LenovoSr650 => session.data(channel, "\nsystem>")?,
+                _ => session.data(channel, "\nracadm>>")?,
+            },
             ConsoleState::NoShell => {
                 // Do nothing
             }
@@ -225,10 +232,12 @@ impl server::Handler for MockSshHandler {
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> StdResult<bool, Self::Error> {
+    ) -> StdResult<(), Self::Error> {
         tracing::debug!("channel_open_session");
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn pty_request(
@@ -254,7 +263,7 @@ impl server::Handler for MockSshHandler {
     ) -> StdResult<(), Self::Error> {
         tracing::debug!("shell_request");
         match self.prompt_behavior {
-            PromptBehavior::Dell => {
+            PromptBehavior::Dell | PromptBehavior::LenovoSr650 => {
                 self.console_state = ConsoleState::Bmc;
             }
             PromptBehavior::Dpu => {
@@ -279,7 +288,8 @@ impl server::Handler for MockSshHandler {
                 Ok(server::Auth::Accept)
             } else {
                 tracing::info!(
-                    "got incorrect auth_password, rejecting. user={user}, password={password}"
+                    user = %user,
+                    "Incorrect SSH password; rejecting authentication",
                 );
                 Ok(server::Auth::Reject {
                     proceed_with_methods: None,
@@ -288,7 +298,8 @@ impl server::Handler for MockSshHandler {
             }
         } else {
             tracing::info!(
-                "configured to accept any credentials, accepting user={user}, password={password}"
+                user = %user,
+                "Accepting SSH credentials because any credentials are allowed",
             );
             Ok(server::Auth::Accept)
         }
@@ -312,16 +323,38 @@ impl server::Handler for MockSshHandler {
             ConsoleState::Bmc => {
                 if data == b"\n" || data == b"\r\n" || data == b"\r" {
                     let command = std::mem::take(&mut self.buffer);
-                    if command.starts_with(b"connect com2") {
-                        tracing::info!(
-                            "Got `connect com2` in bmc propmt, simulating system console"
-                        );
-                        self.console_state = ConsoleState::SystemConsole;
+                    match self.prompt_behavior {
+                        PromptBehavior::Dell if command.starts_with(b"connect com2") => {
+                            tracing::info!(
+                                "Got `connect com2` in bmc prompt, simulating system console"
+                            );
+                            self.console_state = ConsoleState::SystemConsole;
+                        }
+                        PromptBehavior::LenovoSr650 if command.starts_with(b"console kill 1") => {
+                            tracing::info!(
+                                "Got unsupported Lenovo `console kill 1`, simulating BMC error"
+                            );
+                            session.data(
+                                channel,
+                                "\r\nThe command line contains extraneous arguments\r\n",
+                            )?;
+                        }
+                        PromptBehavior::LenovoSr650 if command.starts_with(b"console kill") => {
+                            tracing::info!(
+                                "Got Lenovo `console kill`, simulating terminated SOL session"
+                            );
+                            session.data(channel, "\r\nSession on channel 1 is terminated\r\n")?;
+                        }
+                        PromptBehavior::LenovoSr650 if command.starts_with(b"console start") => {
+                            tracing::info!("Got Lenovo `console start`, simulating system console");
+                            self.console_state = ConsoleState::SystemConsole;
+                        }
+                        _ => {}
                     }
                     self.print_prompt(session, channel)?;
                 } else {
                     self.buffer = [&self.buffer, data].concat();
-                    session.data(channel, data.into())?;
+                    session.data(channel, data.to_owned())?;
                 }
             }
             ConsoleState::SystemConsole => {
@@ -341,15 +374,15 @@ impl server::Handler for MockSshHandler {
                         (b"\x1c", PromptBehavior::Dell) => {
                             // ssh-console should have prevented this, make it a warning.
                             tracing::warn!(
-                                "Got ctrl+\\ in system console, dropping to BMC prompt {:?}",
-                                self.console_state
+                                console_state = ?self.console_state,
+                                "Got ctrl+\\ in system console, dropping to BMC prompt",
                             );
                             // ctrl+\
                             self.console_state = ConsoleState::Bmc;
                         }
                         (data, _) => {
                             self.buffer = [&self.buffer, data].concat();
-                            session.data(channel, data.into())?;
+                            session.data(channel, data.to_owned())?;
                         }
                     }
                 }

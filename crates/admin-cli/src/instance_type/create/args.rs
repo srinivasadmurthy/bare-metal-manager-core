@@ -16,37 +16,55 @@
  */
 
 use clap::Parser;
-use rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use rpc::forge::{self as forgerpc, CreateInstanceTypeRequest, InstanceTypeAttributes};
 
+use crate::errors::{CarbideCliError, CarbideCliResult};
+
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Create an instance type with a name and description:
+    $ nico-admin-cli instance-type create --name dgx-h100 \
+    --description \"DGX H100 640GB\"
+
+Create with labels and desired-capability filters:
+    $ nico-admin-cli instance-type create --name dgx-h100 \
+    --labels '{\"tier\":\"premium\"}' \
+    --desired-capabilities '[{\"key\":\"gpu_count\",\"value\":\"8\"}]'
+
+Create with an explicit id:
+    $ nico-admin-cli instance-type create --id 12345678-1234-5678-90ab-cdef01234567 \
+    --name dgx-h100
+
+")]
+pub(crate) struct Args {
     #[clap(
         short = 'i',
         long,
         help = "Optional, unique ID to use when creating the instance type"
     )]
-    pub id: Option<String>,
+    id: Option<String>,
 
     #[clap(short = 'n', long, help = "Name of the instance type")]
-    pub name: Option<String>,
+    name: Option<String>,
 
     #[clap(short = 'd', long, help = "Description of the instance type")]
-    pub description: Option<String>,
+    description: Option<String>,
 
     #[clap(
         short = 'l',
         long,
         help = "JSON map of simple key:value pairs to be applied as labels to the instance type"
     )]
-    pub labels: Option<String>,
+    labels: Option<String>,
 
     #[clap(
         short = 'f',
         long,
         help = "Optional, JSON array containing a set of instance type capability filters"
     )]
-    pub desired_capabilities: Option<String>,
+    desired_capabilities: Option<String>,
 }
 
 impl TryFrom<Args> for CreateInstanceTypeRequest {

@@ -21,7 +21,23 @@ use rpc::forge::dpu_reprovisioning_request::Mode;
 use rpc::forge::{DpuReprovisioningRequest, UpdateInitiator};
 
 #[derive(Parser, Debug)]
-pub enum Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all DPUs pending reprovisioning:
+    $ nico-admin-cli dpu reprovision list
+
+Set a DPU into reprovisioning mode:
+    $ nico-admin-cli dpu reprovision set --id 12345678-1234-5678-90ab-cdef01234567
+
+Clear reprovisioning mode for a DPU:
+    $ nico-admin-cli dpu reprovision clear --id 12345678-1234-5678-90ab-cdef01234567
+
+Restart reprovisioning for a host:
+    $ nico-admin-cli dpu reprovision restart --id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) enum Args {
     #[clap(about = "Set the DPU in reprovisioning mode.")]
     Set(DpuReprovisionSet),
     #[clap(about = "Clear the reprovisioning mode.")]
@@ -33,23 +49,37 @@ pub enum Args {
 }
 
 #[derive(Parser, Debug)]
-pub struct DpuReprovisionSet {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Set a single DPU into reprovisioning mode:
+    $ nico-admin-cli dpu reprovision set --id 12345678-1234-5678-90ab-cdef01234567
+
+Reprovision all DPUs on a host by passing the host machine id:
+    $ nico-admin-cli dpu reprovision set --id abcdef01-2345-6789-abcd-ef0123456789
+
+Reprovision and update DPU firmware, recording a maintenance message:
+    $ nico-admin-cli dpu reprovision set --id 12345678-1234-5678-90ab-cdef01234567 \
+    --update-firmware --update-message \"scheduled firmware refresh\"
+
+")]
+pub(crate) struct DpuReprovisionSet {
     #[clap(
         short,
         long,
         help = "DPU Machine ID for which reprovisioning is needed, or host machine id if all DPUs should be reprovisioned."
     )]
-    pub id: MachineId,
+    pub(super) id: MachineId,
 
     #[clap(short, long, action)]
-    pub update_firmware: bool,
+    update_firmware: bool,
 
     #[clap(
         long,
         alias = "maintenance_reference",
         help = "If set, a HostUpdateInProgress health alert will be applied to the host"
     )]
-    pub update_message: Option<String>,
+    pub(super) update_message: Option<String>,
 }
 
 impl From<&DpuReprovisionSet> for DpuReprovisioningRequest {
@@ -65,16 +95,26 @@ impl From<&DpuReprovisionSet> for DpuReprovisioningRequest {
 }
 
 #[derive(Parser, Debug)]
-pub struct DpuReprovisionClear {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Clear reprovisioning mode for a single DPU:
+    $ nico-admin-cli dpu reprovision clear --id 12345678-1234-5678-90ab-cdef01234567
+
+Clear reprovisioning for all DPUs on a host by passing the host machine id:
+    $ nico-admin-cli dpu reprovision clear --id abcdef01-2345-6789-abcd-ef0123456789
+
+")]
+pub(crate) struct DpuReprovisionClear {
     #[clap(
         short,
         long,
         help = "DPU Machine ID for which reprovisioning should be cleared, or host machine id if all DPUs should be cleared."
     )]
-    pub id: MachineId,
+    id: MachineId,
 
     #[clap(short, long, action)]
-    pub update_firmware: bool,
+    update_firmware: bool,
 }
 
 impl From<&DpuReprovisionClear> for DpuReprovisioningRequest {
@@ -90,16 +130,27 @@ impl From<&DpuReprovisionClear> for DpuReprovisioningRequest {
 }
 
 #[derive(Parser, Debug)]
-pub struct DpuReprovisionRestart {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Restart reprovisioning for a host:
+    $ nico-admin-cli dpu reprovision restart --id 12345678-1234-5678-90ab-cdef01234567
+
+Restart reprovisioning and update DPU firmware:
+    $ nico-admin-cli dpu reprovision restart --id 12345678-1234-5678-90ab-cdef01234567 \
+    --update-firmware
+
+")]
+pub(crate) struct DpuReprovisionRestart {
     #[clap(
         short,
         long,
         help = "Host Machine ID for which reprovisioning should be restarted."
     )]
-    pub id: MachineId,
+    id: MachineId,
 
     #[clap(short, long, action)]
-    pub update_firmware: bool,
+    update_firmware: bool,
 }
 
 impl From<&DpuReprovisionRestart> for DpuReprovisioningRequest {

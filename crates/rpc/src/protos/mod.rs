@@ -15,62 +15,129 @@
  * limitations under the License.
  */
 
-#[allow(non_snake_case, unknown_lints, clippy::all)]
-#[rustfmt::skip]
-pub mod common;
+// Each module's body is loaded from OUT_DIR, where build.rs writes the generated code.
+// Using `include!` with concat/env lets us keep generated files out of the source tree
+// entirely.
 
 #[allow(non_snake_case, unknown_lints, clippy::all)]
 #[rustfmt::skip]
-pub mod forge;
+pub mod common {
+    include!(concat!(env!("OUT_DIR"), "/common.rs"));
+}
 
 #[allow(non_snake_case, unknown_lints, clippy::all)]
 #[rustfmt::skip]
-pub mod health;
+pub mod scout_firmware_upgrade {
+    include!(concat!(env!("OUT_DIR"), "/scout_firmware_upgrade.rs"));
+}
 
 #[allow(non_snake_case, unknown_lints, clippy::all)]
 #[rustfmt::skip]
-pub mod machine_discovery;
+pub mod forge {
+    include!(concat!(env!("OUT_DIR"), "/forge.rs"));
+
+    /// Expected-interface Rust name for the legacy protobuf
+    /// `ExpectedHostNic` boundary.
+    ///
+    /// The protobuf descriptor keeps its existing message and field names so
+    /// deployed clients remain protobuf wire- and ProtoJSON-compatible. New
+    /// Rust callers should use this alias and the accessors below.
+    pub type ExpectedInterface = ExpectedHostNic;
+
+    impl ExpectedMachine {
+        /// Return the interfaces from the legacy `host_nics` protobuf field.
+        pub fn interfaces(&self) -> &[ExpectedInterface] {
+            &self.host_nics
+        }
+
+        /// Return mutable interfaces from the legacy `host_nics` protobuf
+        /// field.
+        pub fn interfaces_mut(&mut self) -> &mut Vec<ExpectedInterface> {
+            &mut self.host_nics
+        }
+    }
+}
 
 #[allow(non_snake_case, unknown_lints, clippy::all)]
 #[rustfmt::skip]
-pub mod measured_boot;
+pub mod health {
+    include!(concat!(env!("OUT_DIR"), "/health.rs"));
+}
 
 #[allow(non_snake_case, unknown_lints, clippy::all)]
 #[rustfmt::skip]
-pub mod mlx_device;
+pub mod machine_discovery {
+    include!(concat!(env!("OUT_DIR"), "/machine_discovery.rs"));
+}
 
 #[allow(non_snake_case, unknown_lints, clippy::all)]
 #[rustfmt::skip]
-pub mod site_explorer;
+pub mod measured_boot {
+    include!(concat!(env!("OUT_DIR"), "/measured_boot.rs"));
+}
 
 #[allow(non_snake_case, unknown_lints, clippy::all)]
 #[rustfmt::skip]
-pub mod dns;
+pub mod mlx_device {
+    include!(concat!(env!("OUT_DIR"), "/mlx_device.rs"));
+}
 
 #[allow(non_snake_case, unknown_lints, clippy::all)]
 #[rustfmt::skip]
-pub mod fmds;
+pub mod site_explorer {
+    include!(concat!(env!("OUT_DIR"), "/site_explorer.rs"));
+
+    /// Observed-state Rust name for the legacy protobuf `NicMode` boundary.
+    ///
+    /// The protobuf descriptor retains `NicMode` for compatibility with
+    /// existing generated clients. New Rust callers should use this alias.
+    pub type BlueFieldOperatingMode = NicMode;
+}
+
+#[allow(non_snake_case, unknown_lints, clippy::all)]
+#[rustfmt::skip]
+pub mod dns {
+    include!(concat!(env!("OUT_DIR"), "/dns.rs"));
+}
+
+#[allow(non_snake_case, unknown_lints, clippy::all)]
+#[rustfmt::skip]
+pub mod fmds {
+    include!(concat!(env!("OUT_DIR"), "/fmds.rs"));
+}
+
+#[allow(non_snake_case, unknown_lints, clippy::all)]
+#[rustfmt::skip]
+pub mod agent_local {
+    include!(concat!(env!("OUT_DIR"), "/agent_local.rs"));
+}
 
 #[allow(clippy::all, deprecated)]
 #[rustfmt::skip]
-pub mod forge_api_client;
+pub mod forge_api_client {
+    include!(concat!(env!("OUT_DIR"), "/forge_api_client.rs"));
+}
 
 #[allow(clippy::all)]
 #[rustfmt::skip]
-pub mod convenience_converters;
-
-#[allow(non_snake_case, unknown_lints, clippy::all)]
-#[rustfmt::skip]
-pub mod dpa_rpc;
+pub mod convenience_converters {
+    include!(concat!(env!("OUT_DIR"), "/convenience_converters.rs"));
+}
 
 #[allow(clippy::all)]
 #[rustfmt::skip]
-pub mod nmx_c;
+pub mod nmx_c {
+    include!(concat!(env!("OUT_DIR"), "/nmx_c.rs"));
+}
 
 #[allow(clippy::all)]
 #[rustfmt::skip]
-pub mod nmx_c_client;
+pub mod nmx_c_client {
+    include!(concat!(env!("OUT_DIR"), "/nmx_c_client.rs"));
+}
 
 #[allow(clippy::all)]
 #[rustfmt::skip]
-pub mod nmx_c_converters;
+pub mod nmx_c_converters {
+    include!(concat!(env!("OUT_DIR"), "/nmx_c_converters.rs"));
+}

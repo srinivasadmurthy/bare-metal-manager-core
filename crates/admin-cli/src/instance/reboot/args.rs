@@ -19,13 +19,28 @@ use carbide_uuid::instance::InstanceId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Reboot an instance:
+    $ nico-admin-cli instance reboot --instance 12345678-1234-5678-90ab-cdef01234567
+
+Reboot and apply any pending firmware updates:
+    $ nico-admin-cli instance reboot --instance 12345678-1234-5678-90ab-cdef01234567 \
+    --apply-updates-on-reboot
+
+Reboot into the custom PXE flow:
+    $ nico-admin-cli instance reboot --instance 12345678-1234-5678-90ab-cdef01234567 \
+    --custom-pxe
+
+")]
+pub(crate) struct Args {
     #[clap(short, long)]
-    pub instance: InstanceId,
+    pub(super) instance: InstanceId,
 
     #[clap(short, long, action)]
-    pub custom_pxe: bool,
+    pub(super) custom_pxe: bool,
 
     #[clap(short, long, action)]
-    pub apply_updates_on_reboot: bool,
+    pub(super) apply_updates_on_reboot: bool,
 }

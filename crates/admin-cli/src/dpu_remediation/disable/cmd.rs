@@ -15,12 +15,11 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliError;
-
 use super::args::Args;
+use crate::errors::CarbideCliError;
 use crate::rpc::ApiClient;
 
-pub async fn disable_dpu_remediation(
+pub(super) async fn disable_dpu_remediation(
     data: Args,
     api_client: &ApiClient,
 ) -> Result<(), CarbideCliError> {

@@ -37,10 +37,11 @@ pub mod address_selection_strategy;
 pub mod allocation_type;
 pub mod attestation;
 pub mod bmc_info;
+pub mod bmc_redfish_session;
+pub mod bmc_suppression;
 pub mod component_manager;
 pub mod compute_allocation;
 pub mod controller_outcome;
-pub mod dhcp_entry;
 pub mod dhcp_record;
 pub mod dns;
 pub mod dpa_interface;
@@ -63,8 +64,11 @@ pub mod instance;
 pub mod instance_address;
 pub mod instance_type;
 pub mod machine;
+pub mod machine_boot_interface;
 pub mod machine_boot_override;
+pub mod machine_interface;
 pub mod machine_interface_address;
+pub mod machine_pending_action;
 pub mod machine_update_module;
 pub mod machine_validation;
 pub mod metadata;
@@ -72,6 +76,7 @@ pub mod network_devices;
 pub mod network_prefix;
 pub mod network_security_group;
 pub mod network_segment;
+pub mod nmxc;
 pub mod nvl_logical_partition;
 pub mod nvl_partition;
 pub mod operating_system_definition;
@@ -79,86 +84,96 @@ pub mod os;
 pub mod power_manager;
 pub mod power_shelf;
 pub mod predicted_machine_interface;
-pub mod pxe;
 pub mod rack;
-pub mod rack_firmware;
 pub mod rack_type;
 pub mod redfish;
 pub mod resource_pool;
 pub mod route_server;
+pub mod secrets;
 pub mod site_explorer;
+pub mod site_prefix;
 pub mod sku;
+pub mod spx_partition;
 pub mod state_history;
 pub mod storage;
 pub mod switch;
 pub mod tenant;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod trim_table;
 pub mod vpc;
 pub mod vpc_prefix;
 
-/// Converts a `Vec<T>` of any type `T` that is convertible to a type `R`
-/// into a `Vec<R>`.
-pub fn try_convert_vec<T, R, E>(source: Vec<T>) -> Result<Vec<R>, E>
-where
-    R: TryFrom<T, Error = E>,
-{
-    source.into_iter().map(R::try_from).collect()
-}
+// Lets the database round-trip tests use `#[crate::sqlx_test]` to get a per-test
+// Postgres pool from the shared harness (DATABASE_URL via .envrc).
+#[cfg(test)]
+pub(crate) use carbide_macros::sqlx_test;
 
 /// Error that is returned when we validate various configurations that are obtained
 /// from Forge users.
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum ConfigValidationError {
     /// A configuration value is invalid
-    #[error("Invalid value: {0}")]
+    #[error("invalid value: {0}")]
     InvalidValue(String),
 
-    #[error("Found unknown segments.")]
+    #[error(
+        "initial VPC `{name}` cannot define `routing_profile_overrides`; inline routing-profile \
+         overrides are only supported by VPC creation requests"
+    )]
+    InitialVpcRoutingProfileOverridesUnsupported { name: String },
+
+    #[error("found unknown segments")]
     UnknownSegments,
 
-    #[error("Segment is still not updated for {0:?}.")]
+    #[error("segment is still not updated for {0:?}")]
     MissingSegment(InterfaceFunctionId),
 
-    #[error("No Vpc is attached to segment {0}.")]
+    #[error("no vpc is attached to segment {0}")]
     VpcNotAttachedToSegment(NetworkSegmentId),
 
-    #[error("Found segments attached to multiple VPCs.")]
+    #[error("found segments attached to multiple VPCs")]
     MultipleVpcFound,
 
-    #[error("IP addresses / IP networks not configured for the same prefixes.")]
+    #[error("IP addresses / IP networks not configured for the same prefixes")]
     NetworkPrefixAllocationMismatch,
 
-    #[error("Segment {0} is not yet ready. Current state: {1}")]
+    #[error("segment {0} is not yet ready. current state: {1}")]
     NetworkSegmentNotReady(NetworkSegmentId, String),
 
-    #[error("Segment {0} is requested to be deleted.")]
+    #[error("segment {0} is requested to be deleted")]
     NetworkSegmentToBeDeleted(NetworkSegmentId),
 
-    #[error("Configuration value cannot be modified: {0}")]
+    #[error("configuration value cannot be modified: {0}")]
     ConfigCanNotBeModified(String),
 
-    #[error("Duplicate Tenant KeySet ID found: {0}")]
+    #[error("duplicate tenant KeySet ID found: {0}")]
     DuplicateTenantKeysetId(String),
 
-    #[error("More than {0} Tenant KeySet IDs are not allowed")]
+    #[error("more than {0} tenant KeySet IDs are not allowed")]
     TenantKeysetIdsOverMax(usize),
 
-    #[error("Storage Volumes defined {0} > 8")]
+    #[error("storage volumes defined {0} > 8")]
     StorageVolumeCountExceeded(usize),
 
-    #[error("Instance cannot connect to multiple storage clusters")]
+    #[error("instance cannot connect to multiple storage clusters")]
     StorageClusterInvalid,
 
-    #[error("Specified network is not available on the requested host")]
+    #[error("specified network is not available on the requested host")]
     NetworkSegmentUnavailableOnHost,
 
-    #[error("Another instance network config update is already in progress.")]
+    #[error("another instance network config update is already in progress")]
     InstanceNetworkConfigUpdateAlreadyInProgress,
 
-    #[error("Instance deletion request is already received.")]
+    #[error("instance deletion request is already received")]
     InstanceDeletionIsRequested,
 
-    #[error("Instance is not Ready yet. Can't apply the config.")]
+    #[error(
+        "instance release is blocked: aggregate health includes a PreventInstanceDeletion alert. remove the alert or the health override that carries it, then retry"
+    )]
+    InstanceReleaseBlockedByPreventInstanceDeletion,
+
+    #[error("instance is not ready yet. can't apply the config")]
     InvalidState,
 }
 
@@ -174,7 +189,7 @@ impl ConfigValidationError {
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum StatusValidationError {
     /// A configuration value is invalid
-    #[error("Invalid value: {0}")]
+    #[error("invalid value: {0}")]
     InvalidValue(String),
 }
 
@@ -295,21 +310,12 @@ impl StateSla {
     }
 }
 
-impl From<StateSla> for rpc::forge::StateSla {
-    fn from(value: StateSla) -> Self {
-        rpc::forge::StateSla {
-            sla: value.sla.map(|sla| sla.into()),
-            time_in_state_above_sla: value.time_in_state_above_sla,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    pub fn serialize_mac_address() {
+    fn serialize_mac_address() {
         let mac = MacAddress::new([1, 2, 3, 4, 5, 6]);
         let serialized = serde_json::to_string(&SerializableMacAddress::from(mac)).unwrap();
         assert_eq!(serialized, "\"01:02:03:04:05:06\"");

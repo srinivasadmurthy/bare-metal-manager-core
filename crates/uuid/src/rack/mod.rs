@@ -23,12 +23,7 @@ use prost::bytes::{Buf, BufMut};
 use prost::encoding::{DecodeContext, WireType};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "sqlx")]
-use sqlx::{
-    encode::IsNull,
-    error::BoxDynError,
-    postgres::{PgHasArrayType, PgTypeInfo},
-    {Database, Postgres, Row},
-};
+use sqlx::Row;
 
 use crate::DbPrimaryUuid;
 
@@ -39,7 +34,9 @@ use crate::DbPrimaryUuid;
 /// that the DCIM uses (e.g. "P20", "rack-42-us-west", or the legacy
 /// `ps100...` encoded format).
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(transparent)]
+#[cfg_attr(feature = "sqlx", sqlx(transparent))]
 pub struct RackId(String);
 
 impl RackId {
@@ -101,63 +98,11 @@ impl DbPrimaryUuid for RackId {
     }
 }
 
-// Make RackId bindable directly into a sqlx query.
-#[cfg(feature = "sqlx")]
-impl sqlx::Encode<'_, sqlx::Postgres> for RackId {
-    fn encode_by_ref(
-        &self,
-        buf: &mut <Postgres as Database>::ArgumentBuffer<'_>,
-    ) -> Result<IsNull, BoxDynError> {
-        buf.extend(self.0.as_bytes());
-        Ok(sqlx::encode::IsNull::No)
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl<'r, DB> sqlx::Decode<'r, DB> for RackId
-where
-    DB: sqlx::database::Database,
-    String: sqlx::Decode<'r, DB>,
-{
-    fn decode(
-        value: <DB as sqlx::database::Database>::ValueRef<'r>,
-    ) -> Result<Self, sqlx::error::BoxDynError> {
-        let str_id: String = String::decode(value)?;
-        Ok(RackId(str_id))
-    }
-}
-
 #[cfg(feature = "sqlx")]
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for RackId {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         let id: RackId = row.try_get::<RackId, _>(0)?;
         Ok(id)
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl<DB> sqlx::Type<DB> for RackId
-where
-    DB: sqlx::Database,
-    String: sqlx::Type<DB>,
-{
-    fn type_info() -> <DB as sqlx::Database>::TypeInfo {
-        String::type_info()
-    }
-
-    fn compatible(ty: &DB::TypeInfo) -> bool {
-        String::compatible(ty)
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl PgHasArrayType for RackId {
-    fn array_type_info() -> PgTypeInfo {
-        <&str as PgHasArrayType>::array_type_info()
-    }
-
-    fn array_compatible(ty: &PgTypeInfo) -> bool {
-        <&str as PgHasArrayType>::array_compatible(ty)
     }
 }
 
@@ -212,9 +157,9 @@ mod legacy_rpc {
     /// }
     /// ```
     #[derive(prost::Message)]
-    pub struct RackId {
+    pub(super) struct RackId {
         #[prost(string, tag = "1")]
-        pub id: String,
+        pub(super) id: String,
     }
 
     impl From<super::RackId> for RackId {
@@ -231,7 +176,9 @@ mod legacy_rpc {
 /// in the `[rack_profiles.<id>]` configuration section (e.g. "NVL72",
 /// "NVL36").
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(transparent)]
+#[cfg_attr(feature = "sqlx", sqlx(transparent))]
 pub struct RackProfileId(String);
 
 impl RackProfileId {
@@ -285,57 +232,6 @@ impl AsRef<str> for RackProfileId {
     }
 }
 
-#[cfg(feature = "sqlx")]
-impl sqlx::Encode<'_, sqlx::Postgres> for RackProfileId {
-    fn encode_by_ref(
-        &self,
-        buf: &mut <Postgres as Database>::ArgumentBuffer<'_>,
-    ) -> Result<IsNull, BoxDynError> {
-        buf.extend(self.0.as_bytes());
-        Ok(sqlx::encode::IsNull::No)
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl<'r, DB> sqlx::Decode<'r, DB> for RackProfileId
-where
-    DB: sqlx::database::Database,
-    String: sqlx::Decode<'r, DB>,
-{
-    fn decode(
-        value: <DB as sqlx::database::Database>::ValueRef<'r>,
-    ) -> Result<Self, sqlx::error::BoxDynError> {
-        let str_id: String = String::decode(value)?;
-        Ok(RackProfileId(str_id))
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl<DB> sqlx::Type<DB> for RackProfileId
-where
-    DB: sqlx::Database,
-    String: sqlx::Type<DB>,
-{
-    fn type_info() -> <DB as sqlx::Database>::TypeInfo {
-        String::type_info()
-    }
-
-    fn compatible(ty: &DB::TypeInfo) -> bool {
-        String::compatible(ty)
-    }
-}
-
-#[cfg(feature = "sqlx")]
-impl PgHasArrayType for RackProfileId {
-    fn array_type_info() -> PgTypeInfo {
-        <&str as PgHasArrayType>::array_type_info()
-    }
-
-    fn array_compatible(ty: &PgTypeInfo) -> bool {
-        <&str as PgHasArrayType>::array_compatible(ty)
-    }
-}
-
 impl prost::Message for RackProfileId {
     fn encode_raw(&self, buf: &mut impl BufMut)
     where
@@ -371,9 +267,9 @@ impl prost::Message for RackProfileId {
 
 mod rack_profile_id_rpc {
     #[derive(prost::Message)]
-    pub struct RackProfileId {
+    pub(super) struct RackProfileId {
         #[prost(string, tag = "1")]
-        pub id: String,
+        pub(super) id: String,
     }
 
     impl From<super::RackProfileId> for RackProfileId {
@@ -391,54 +287,126 @@ pub enum RackIdParseError {
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::scenarios;
+
     use super::*;
 
-    #[test]
-    fn test_rack_id_round_trip_legacy() {
-        // Legacy ps100-encoded rack IDs should still work.
-        let rack_id_str = "ps100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg";
-        let rack_id = RackId::from_str(rack_id_str)
-            .expect("Should have successfully converted from a valid string");
-        let round_tripped = rack_id.to_string();
-        assert_eq!(rack_id_str, round_tripped);
+    #[derive(Debug, PartialEq, Eq)]
+    enum ParseFailure {
+        Empty,
+    }
+
+    // RackId and RackProfileId are parallel `serde(transparent)` newtypes with the
+    // same `FromStr` (rejecting only the empty string with `RackIdParseError::Empty`)
+    // and the same JSON behavior. The parse and serde tables run one generic helper
+    // over both types, so each type only supplies its own distinct inputs.
+
+    // Parse a string into the newtype `T`, projecting success to the recovered inner
+    // string and the one parse error to `ParseFailure` so rows stay comparable.
+    fn parse_as<T>(input: &str) -> Result<String, ParseFailure>
+    where
+        T: FromStr<Err = RackIdParseError> + Display,
+    {
+        T::from_str(input)
+            .map(|id| id.to_string())
+            .map_err(|RackIdParseError::Empty| ParseFailure::Empty)
+    }
+
+    // Deserialize JSON into the newtype `T`, projecting success to the recovered
+    // inner string. `serde_json::Error` is not `PartialEq`, so rejected rows use
+    // `Fails` with the error discarded.
+    fn deserialize_as<T>(input: &str) -> Result<String, ()>
+    where
+        T: serde::de::DeserializeOwned + Display,
+    {
+        serde_json::from_str::<T>(input)
+            .map(|id| id.to_string())
+            .map_err(|_| ())
     }
 
     #[test]
-    fn test_rack_id_arbitrary_string() {
-        // DCIM-provided rack IDs can be any non-empty string.
-        let rack_id = RackId::from_str("P20").unwrap();
-        assert_eq!(rack_id.to_string(), "P20");
+    fn rack_id_types_parse() {
+        scenarios!(
+            run = parse_as::<RackId>;
+            "legacy ps100-encoded rack ID" {
+                "ps100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg" => Yields(
+                    "ps100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg".to_string(),
+                ),
+            }
 
-        let rack_id = RackId::from_str("rack-42-us-west-2").unwrap();
-        assert_eq!(rack_id.to_string(), "rack-42-us-west-2");
+            "DCIM rack name" {
+                "P20" => Yields("P20".to_string()),
+            }
 
-        let rack_id = RackId::from_str("i-am-just-a-rack-id").unwrap();
-        assert_eq!(rack_id.to_string(), "i-am-just-a-rack-id");
+            "regional rack name" {
+                "rack-42-us-west-2" => Yields("rack-42-us-west-2".to_string()),
+            }
+
+            "descriptive rack name" {
+                "i-am-just-a-rack-id" => Yields("i-am-just-a-rack-id".to_string()),
+            }
+
+            "empty rack ID" {
+                "" => FailsWith(ParseFailure::Empty),
+            }
+        );
+
+        scenarios!(
+            run = parse_as::<RackProfileId>;
+            "rack profile name" {
+                "NVL72" => Yields("NVL72".to_string()),
+            }
+
+            "lowercase rack profile name" {
+                "nvl36" => Yields("nvl36".to_string()),
+            }
+
+            "empty rack profile ID" {
+                "" => FailsWith(ParseFailure::Empty),
+            }
+        );
     }
 
     #[test]
-    fn test_rack_id_empty_fails() {
-        assert!(RackId::from_str("").is_err());
-    }
+    fn rack_id_types_serde() {
+        scenarios!(
+            run = deserialize_as::<RackId>;
+            "valid string" {
+                "\"my-custom-rack\"" => Yields("my-custom-rack".to_string()),
+            }
 
-    #[test]
-    fn test_rack_id_serde_round_trip() {
-        let rack_id = RackId::new("my-custom-rack");
-        let json = serde_json::to_string(&rack_id).unwrap();
-        assert_eq!(json, "\"my-custom-rack\"");
-        let deserialized: RackId = serde_json::from_str(&json).unwrap();
-        assert_eq!(rack_id, deserialized);
-    }
+            "empty string" {
+                "\"\"" => Yields(String::new()),
+            }
 
-    #[test]
-    fn test_rack_id_from_str_impls() {
-        let rack_id: RackId = "test-rack".into();
-        assert_eq!(rack_id.as_str(), "test-rack");
+            "non-string JSON" {
+                "42" => Fails,
+            }
+        );
 
-        let rack_id = RackId::from("another-rack");
-        assert_eq!(rack_id.as_str(), "another-rack");
+        scenarios!(
+            run = deserialize_as::<RackProfileId>;
+            "valid string" {
+                "\"NVL72\"" => Yields("NVL72".to_string()),
+            }
 
-        let rack_id = RackId::from(String::from("string-rack"));
-        assert_eq!(rack_id.as_str(), "string-rack");
+            "empty string" {
+                "\"\"" => Yields(String::new()),
+            }
+
+            "non-string JSON" {
+                "42" => Fails,
+            }
+        );
+
+        // serde(transparent) serializes each newtype as the bare inner string.
+        let serialized = serde_json::to_string(&RackId::new("my-custom-rack"))
+            .expect("failed to serialize rack ID");
+        assert_eq!(serialized, "\"my-custom-rack\"");
+
+        let serialized = serde_json::to_string(&RackProfileId::new("NVL72"))
+            .expect("failed to serialize rack profile ID");
+        assert_eq!(serialized, "\"NVL72\"");
     }
 }

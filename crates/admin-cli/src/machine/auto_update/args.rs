@@ -20,28 +20,41 @@ use clap::{ArgGroup, Parser};
 
 #[derive(Parser, Debug, Clone)]
 #[clap(group(ArgGroup::new("autoupdate_action").required(true).args(&["enable", "disable", "clear"])))]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Force-enable firmware auto-update for a host:
+    $ nico-admin-cli machine auto-update --machine 12345678-1234-5678-90ab-cdef01234567 --enable
+
+Force-disable it:
+    $ nico-admin-cli machine auto-update --machine 12345678-1234-5678-90ab-cdef01234567 --disable
+
+Clear the per-machine override (fall back to global/config):
+    $ nico-admin-cli machine auto-update --machine 12345678-1234-5678-90ab-cdef01234567 --clear
+
+")]
+pub(crate) struct Args {
     #[clap(long, help = "Machine ID of the host to change")]
-    pub machine: MachineId,
+    pub(crate) machine: MachineId,
     #[clap(
         short = 'e',
         long,
         action,
         help = "Enable auto updates even if globally disabled or individually disabled by config files"
     )]
-    pub enable: bool,
+    pub(crate) enable: bool,
     #[clap(
         short = 'd',
         long,
         action,
         help = "Disable auto updates even if globally enabled or individually enabled by config files"
     )]
-    pub disable: bool,
+    pub(crate) disable: bool,
     #[clap(
         short = 'c',
         long,
         action,
         help = "Perform auto updates according to config files"
     )]
-    pub clear: bool,
+    clear: bool,
 }

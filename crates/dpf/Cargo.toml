@@ -4,6 +4,7 @@ version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [lib]
 name = "carbide_dpf"
@@ -20,6 +21,7 @@ default = []
 driver = ["dep:clap", "dep:tracing-subscriber", "dep:libredfish"]
 
 [dependencies]
+hex = { workspace = true }
 kube = { default-features = false, features = [
   "runtime",
   "derive",
@@ -45,6 +47,7 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 
 carbide-uuid = { path = "../uuid", features = ["sqlx"] }
+carbide-utils = { path = "../utils" }
 
 # Optional dependencies for carbide-dpf-api-harness binary
 clap = { workspace = true, features = ["derive"], optional = true }
@@ -54,6 +57,7 @@ tracing-subscriber = { workspace = true, features = [
 libredfish = { workspace = true, optional = true }
 
 [dev-dependencies]
+carbide-test-support = { path = "../test-support" }
 dashmap = { workspace = true }
 tower-test = { workspace = true }
 hyper = { features = ["client", "http1"], workspace = true }

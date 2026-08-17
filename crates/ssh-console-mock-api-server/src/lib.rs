@@ -25,6 +25,7 @@ use std::sync::Arc;
 use api_test_helper::utils::LOCALHOST_CERTS;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use uuid::Uuid;
 
@@ -45,15 +46,23 @@ pub struct MockHost {
     pub bmc_password: String,
 }
 
+#[allow(deprecated)]
 impl From<MockHost> for forge::Machine {
     fn from(value: MockHost) -> Self {
+        let discovery_info = Some(machine_discovery::DiscoveryInfo {
+            dmi_data: Some(machine_discovery::DmiData {
+                sys_vendor: value.sys_vendor.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
         Self {
             id: Some(value.machine_id),
-            discovery_info: Some(machine_discovery::DiscoveryInfo {
-                dmi_data: Some(machine_discovery::DmiData {
-                    sys_vendor: value.sys_vendor.to_string(),
-                    ..Default::default()
-                }),
+            // Deprecated flat field kept for backwards-compat with callers that haven't
+            // migrated to status.discovery_info yet.
+            discovery_info: discovery_info.clone(),
+            status: Some(forge::MachineStatus {
+                discovery_info,
                 ..Default::default()
             }),
             ..Default::default()
@@ -92,18 +101,18 @@ impl MockApiServer {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .inspect_err(|crypto_provider| {
-                tracing::warn!("Crypto provider already configured: {crypto_provider:?}")
+                tracing::warn!(?crypto_provider, "Crypto provider already configured")
             })
             .ok(); // if something else is already default, ignore.
 
-        let addr = {
-            // Pick an open port
-            let l = TcpListener::bind("127.0.0.1:0").await?;
-            l.local_addr()?
-                .to_socket_addrs()?
-                .next()
-                .expect("No socket available")
-        };
+        // Serve on the listener we just bound, so its port is held continuously and no other
+        // concurrent test can claim it before the server starts accepting.
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener
+            .local_addr()?
+            .to_socket_addrs()?
+            .next()
+            .expect("No socket available");
 
         println!("Mock gRPC server listening on {addr}");
 
@@ -113,7 +122,7 @@ impl MockApiServer {
             Server::builder()
                 .tls_config(tls)?
                 .add_service(ForgeServer::new(self))
-                .serve_with_shutdown(addr, async move {
+                .serve_with_incoming_shutdown(TcpIncoming::from(listener), async move {
                     shutdown_rx.await.ok();
                 }),
         );

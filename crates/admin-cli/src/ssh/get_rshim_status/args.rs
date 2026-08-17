@@ -23,7 +23,14 @@ use super::super::common::SshArgs;
 // specific newtype to allow sharing of SshArgs, and still
 // providing a subcommand-specific Run trait implementation.
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Query the RSHIM status on a DPU BMC:
+    $ nico-admin-cli ssh get-rshim-status 192.0.2.10:22 admin mypassword
+
+")]
+pub(crate) struct Args {
     #[clap(flatten)]
-    pub inner: SshArgs,
+    pub(super) inner: SshArgs,
 }

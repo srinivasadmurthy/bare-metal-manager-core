@@ -23,16 +23,15 @@ use axum::extract::State;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use carbide_axum_utils::router::call_router_with_new_request;
 use futures::future::join_all;
 use itertools::Itertools;
 use serde_json::Value;
 
-use crate::http::call_router_with_new_request;
-
 // Add support of `$expand=.($levels=N)` per the redfish spec
 //
 // https://www.dmtf.org/sites/default/files/standards/documents/DSP0268_2024.2.pdf
-pub fn append(router: Router) -> Router {
+pub(crate) fn append(router: Router) -> Router {
     Router::new()
         .route("/{*all}", get(process).fallback(fallback))
         .with_state(Expander { inner: router })
@@ -93,7 +92,10 @@ async fn process(State(mut state): State<Expander>, request: Request<Body>) -> R
         .filter_map(|member| match member {
             Value::Object(object) => Some(object),
             _ => {
-                tracing::warn!("Invalid member JSON, expected Object: {:?}", member);
+                tracing::warn!(
+                    member = ?member,
+                    "Invalid member JSON, expected Object",
+                );
                 None
             }
         })
@@ -101,8 +103,8 @@ async fn process(State(mut state): State<Expander>, request: Request<Body>) -> R
             Some(Value::String(id)) => Some(id.to_owned()),
             _ => {
                 tracing::warn!(
-                    "Invalid member JSON, expected @odata.id string: {:?}",
-                    object
+                    object = ?object,
+                    "Invalid member JSON, expected @odata.id string",
                 );
                 None
             }
@@ -214,11 +216,11 @@ struct Expander {
 
 #[derive(thiserror::Error, Debug)]
 enum MemberRequestError {
-    #[error("Inner request to URI {0} returned failure: {1:?}, body: {2}")]
+    #[error("inner request to URI {0} returned failure: {1:?}, body: {2}")]
     UnsuccessfulResponse(String, axum::http::response::Parts, String),
-    #[error("Inner request to URI {0} returned a malformed response: {1}")]
+    #[error("inner request to URI {0} returned a malformed response: {1}")]
     MalformedResponse(String, String),
-    #[error("Error reading bytes from inner request to {0}")]
+    #[error("error reading bytes from inner request to {0}")]
     Axum(String, axum::Error),
 }
 
@@ -239,6 +241,7 @@ mod tests {
     use serde_json::Value;
     use tower::Service;
 
+    use crate::test_support::TEST_MAC_POOL;
     use crate::*;
 
     #[derive(Debug)]
@@ -256,13 +259,24 @@ mod tests {
 
     fn test_host_mock() -> Router {
         let callbacks = Arc::new(TestCallbacks {});
+        let mut mac_pool = TEST_MAC_POOL.lock().unwrap();
+        let hw_type = HardwareType::DellPowerEdgeR750;
+        let ranges_config = mac_pool.allocate_range_config().unwrap();
         crate::machine_router(
-            MachineInfo::Host(HostMachineInfo::new(
-                HostHardwareType::DellPowerEdgeR750,
-                vec![DpuMachineInfo::default()],
+            &MachineInfo::Host(HostMachineInfo::new(
+                hw_type,
+                vec![DpuMachineInfo::new(
+                    hw_type,
+                    &mut mac_pool,
+                    DpuSettings::default(),
+                )],
+                &mut mac_pool,
+                ranges_config,
             )),
             callbacks,
             String::default(),
+            false,
+            MachineRouterOptions::default(),
         )
         .0
     }
@@ -307,7 +321,6 @@ mod tests {
             else {
                 panic!("Network adapter must contain @odata.id");
             };
-            println!("{odata_id}");
             let upstream_network_adapter_body = subject
                 .call(
                     Request::builder()

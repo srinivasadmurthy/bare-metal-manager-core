@@ -1,3 +1,20 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package fileresourceprocessor
 
 import (
@@ -31,7 +48,7 @@ func NewFactory() processor.Factory {
 
 func createTracesProcessor(
 	ctx context.Context,
-	settings processor.CreateSettings,
+	settings processor.Settings,
 	cfg component.Config,
 	nextConsumer consumer.Traces,
 ) (processor.Traces, error) {
@@ -40,7 +57,7 @@ func createTracesProcessor(
 		return nil, err
 	}
 
-	return processorhelper.NewTracesProcessor(
+	return processorhelper.NewTraces(
 		ctx,
 		settings,
 		cfg,
@@ -66,7 +83,7 @@ func (p *fileResourceProcessor) processTraces(
 
 func createMetricsProcessor(
 	ctx context.Context,
-	settings processor.CreateSettings,
+	settings processor.Settings,
 	cfg component.Config,
 	nextConsumer consumer.Metrics,
 ) (processor.Metrics, error) {
@@ -75,7 +92,7 @@ func createMetricsProcessor(
 		return nil, err
 	}
 
-	return processorhelper.NewMetricsProcessor(
+	return processorhelper.NewMetrics(
 		ctx,
 		settings,
 		cfg,
@@ -101,7 +118,7 @@ func (p *fileResourceProcessor) processMetrics(
 
 func createLogsProcessor(
 	ctx context.Context,
-	settings processor.CreateSettings,
+	settings processor.Settings,
 	cfg component.Config,
 	nextConsumer consumer.Logs,
 ) (processor.Logs, error) {
@@ -110,7 +127,7 @@ func createLogsProcessor(
 		return nil, err
 	}
 
-	return processorhelper.NewLogsProcessor(
+	return processorhelper.NewLogs(
 		ctx,
 		settings,
 		cfg,

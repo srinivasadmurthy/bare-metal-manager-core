@@ -20,9 +20,25 @@ use clap::Parser;
 use crate::component_manager::common::DeviceTargetArgs;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List available firmware versions for switches:
+    $ nico-admin-cli component-manager get-firmware-versions switch \
+    --switch-id 12345678-1234-5678-90ab-cdef01234567
+
+List versions for power shelves:
+    $ nico-admin-cli component-manager get-firmware-versions power-shelf \
+    --power-shelf-id 12345678-1234-5678-90ab-cdef01234567
+
+List versions for an entire rack:
+    $ nico-admin-cli component-manager get-firmware-versions rack \
+    --rack-id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(subcommand)]
-    pub target: DeviceTargetArgs,
+    target: DeviceTargetArgs,
 }
 
 impl From<Args> for rpc::forge::ListComponentFirmwareVersionsRequest {

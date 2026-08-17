@@ -23,6 +23,7 @@ use futures_util::FutureExt;
 use lazy_static::lazy_static;
 use russh::ChannelMsg;
 use russh::keys::PrivateKeyWithHashAlg;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
@@ -32,7 +33,7 @@ use ::ssh_console::shutdown_handle::ShutdownHandle;
 use api_test_helper::utils::REPO_ROOT;
 use util::ssh_console_test_helper;
 
-use crate::util::ssh_client::PermissiveSshClient;
+use crate::util::ssh_client::{ConnectionConfig, PermissiveSshClient};
 use crate::util::{BaselineTestAssertion, MockBmcType, run_baseline_test_environment};
 
 static TENANT_SSH_PUBKEY: &str = include_str!("fixtures/tenant_ssh_key.pub");
@@ -160,6 +161,142 @@ async fn test_ssh_console() -> eyre::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_ipmi_sol_conflict_does_not_evict_existing_session_by_default() -> eyre::Result<()> {
+    if std::env::var("REPO_ROOT").is_err() {
+        tracing::info!("Skipping running ssh-console integration tests, as REPO_ROOT is not set");
+        return Ok(());
+    }
+    let Some(env) = run_baseline_test_environment(vec![MockBmcType::Ipmi]).await? else {
+        return Ok(());
+    };
+    let mock_host = &env.mock_hosts[0];
+    let active_sol_session = util::ipmi_sim::activate_sol(
+        mock_host
+            .ipmi_port
+            .expect("IPMI mock should provide an IPMI port"),
+    )
+    .await?;
+
+    let handle = ssh_console_test_helper::spawn(
+        env.mock_api_server.addr.port(),
+        Some(ssh_console_test_helper::ConfigOverrides {
+            reconnect_interval_base: Some(Duration::from_secs(1)),
+            reconnect_interval_max: Some(Duration::from_secs(1)),
+            successful_connection_minimum_duration: Some(Duration::from_secs(60)),
+            ..Default::default()
+        }),
+    )
+    .await?;
+
+    let machine_id = mock_host.machine_id.to_string();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(metrics) = ssh_console_test_helper::get_metrics(handle.metrics_address).await
+                && metrics.lines().any(|line| {
+                    line.starts_with("ssh_console_bmc_status{")
+                        && line.contains(&machine_id)
+                        && line.contains("ConnectionError")
+                })
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("ssh-console did not report the expected conflicting SOL connection error")?;
+
+    let expected_prompt = format!("root@{} # ", mock_host.machine_id).into_bytes();
+    active_sol_session
+        .assert_console_works(&expected_prompt)
+        .await?;
+
+    handle.spawn_handle.shutdown_and_wait().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ipmi_sol_conflict_recovery_when_enabled() -> eyre::Result<()> {
+    if std::env::var("REPO_ROOT").is_err() {
+        tracing::info!("Skipping running ssh-console integration tests, as REPO_ROOT is not set");
+        return Ok(());
+    }
+    let Some(env) = run_baseline_test_environment(vec![MockBmcType::Ipmi]).await? else {
+        return Ok(());
+    };
+    let mock_host = &env.mock_hosts[0];
+    let active_sol_session = util::ipmi_sim::activate_sol(
+        mock_host
+            .ipmi_port
+            .expect("IPMI mock should provide an IPMI port"),
+    )
+    .await?;
+
+    let handle = ssh_console_test_helper::spawn(
+        env.mock_api_server.addr.port(),
+        Some(ssh_console_test_helper::ConfigOverrides {
+            reconnect_interval_base: Some(Duration::from_secs(30)),
+            reconnect_interval_max: Some(Duration::from_secs(30)),
+            successful_connection_minimum_duration: Some(Duration::from_secs(60)),
+            force_deactivate_conflicting_ipmi_sol_sessions: Some(true),
+        }),
+    )
+    .await?;
+
+    let user = mock_host.machine_id.to_string();
+    let expected_prompt = format!("root@{} # ", mock_host.machine_id).into_bytes();
+    // Connecting within twenty seconds proves the stale holder was evicted and retried immediately,
+    // rather than waiting for the configured 30-second normal reconnect delay. Keep the holder
+    // process alive until then so dropping its local PTY cannot make the conflict disappear.
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        util::ssh_client::assert_connection_works_with_retries_and_timeout(
+            &ConnectionConfig {
+                connection_name: "ssh-console after conflicting IPMI SOL session recovery",
+                user: &user,
+                private_key_path: &ADMIN_SSH_KEY_PATH,
+                addr: handle.addr,
+                expected_prompt: &expected_prompt,
+            },
+            5,
+            Duration::from_secs(10),
+        ),
+    )
+    .await
+    .context("ssh-console did not recover the conflicting SOL session before normal backoff")??;
+
+    drop(active_sol_session);
+
+    handle.spawn_handle.shutdown_and_wait().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ssh_console_lenovo_sr650_sol_fallback() -> eyre::Result<()> {
+    if std::env::var("REPO_ROOT").is_err() {
+        tracing::info!("Skipping running ssh-console integration tests, as REPO_ROOT is not set");
+        return Ok(());
+    }
+    let Some(env) = run_baseline_test_environment(vec![MockBmcType::LenovoSr650Ssh]).await? else {
+        return Ok(());
+    };
+
+    let handle = ssh_console_test_helper::spawn(env.mock_api_server.addr.port(), None).await?;
+
+    env.run_baseline_assertions(
+        handle.addr,
+        "new-ssh-console Lenovo SR650",
+        &[BaselineTestAssertion::ConnectAsMachineId],
+        || None,
+        false,
+    )
+    .await?;
+
+    handle.spawn_handle.shutdown_and_wait().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_ssh_console_reconnect() -> eyre::Result<()> {
     if std::env::var("REPO_ROOT").is_err() {
         tracing::info!("Skipping running ssh-console integration tests, as REPO_ROOT is not set");
@@ -168,15 +305,18 @@ async fn test_ssh_console_reconnect() -> eyre::Result<()> {
     let Some(env) = run_baseline_test_environment(vec![MockBmcType::Ssh]).await? else {
         return Ok(());
     };
+    let reconnect_interval_max = Duration::from_secs(5);
 
     // Run new ssh-console
     let handle = ssh_console_test_helper::spawn(
         env.mock_api_server.addr.port(),
-        // Try to max out the reconnect interval without having to wait too long
+        // Exercise reconnect backoff without letting randomized exponential delays exceed the
+        // prompt wait below.
         Some(ssh_console_test_helper::ConfigOverrides {
             reconnect_interval_base: Some(Duration::from_secs(3)),
-            reconnect_interval_max: None,
+            reconnect_interval_max: Some(reconnect_interval_max),
             successful_connection_minimum_duration: Some(Duration::from_secs(60)),
+            ..Default::default()
         }),
     )
     .await?;
@@ -204,7 +344,7 @@ async fn test_ssh_console_reconnect() -> eyre::Result<()> {
                 ),
             )
             .await
-            .context("Error authenticating with public key")?;
+            .context("error authenticating with public key")?;
 
         Ok::<_, eyre::Error>(session)
     }?;
@@ -213,13 +353,13 @@ async fn test_ssh_console_reconnect() -> eyre::Result<()> {
     let channel = session
         .channel_open_session()
         .await
-        .context("Error opening session")?;
+        .context("error opening session")?;
 
     // Request PTY
     channel
         .request_pty(false, "xterm", 80, 24, 0, 0, &[])
         .await
-        .context("Error requesting PTY")?;
+        .context("error requesting PTY")?;
 
     // Request Shell
     channel.request_shell(false).await?;
@@ -228,28 +368,27 @@ async fn test_ssh_console_reconnect() -> eyre::Result<()> {
 
     // Read from the BMC output in the background, sending a message to prompt_seen_tx every time we
     // see a prompt, until we're done.
-    let timeout = Instant::now() + Duration::from_secs(30);
+    let prompt = format!("root@{} # ", env.mock_hosts[0].machine_id).into_bytes();
     let (prompt_seen_tx, mut prompt_seen_rx) = mpsc::channel(1);
     let (done_tx, mut done_rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
+    let prompt_reader_handle = tokio::spawn(async move {
         let mut buf = Vec::new();
         loop {
             tokio::select! {
                 _ = &mut done_rx => {
                     break;
                 }
-                _ = tokio::time::sleep_until(timeout) => {
-                    eprintln!("Timed out without seeing expected prompt");
-                    break; // prompt_seen_tx will drop, failing the test.
-                }
                 res = channel_rx.wait() => match res {
                     Some(ChannelMsg::Data { data }) => {
                         buf.extend_from_slice(&data);
-                        let prompt = format!("root@{} # ", env.mock_hosts[0].machine_id).into_bytes();
                         if buf.windows(prompt.len()).any(|w| w == prompt) {
                             buf.clear();
-                            // Use try_send to avoid blocking this reader task
-                            prompt_seen_tx.try_send(())?;
+                            // Coalesce prompt notifications so repeated newlines cannot make the
+                            // reader task block or exit before the test consumes the current prompt.
+                            match prompt_seen_tx.try_send(()) {
+                                Ok(()) | Err(TrySendError::Full(())) => {}
+                                Err(TrySendError::Closed(())) => break,
+                            }
                         }
                     }
                     Some(_) => {},
@@ -264,8 +403,11 @@ async fn test_ssh_console_reconnect() -> eyre::Result<()> {
 
     // Send ctrl+c (break) multiple times, waiting for reconnection after each time
     for _ in 0..5 {
+        while prompt_seen_rx.try_recv().is_ok() {}
+
         let mut newline_interval = tokio::time::interval(Duration::from_secs(1));
-        let wait_for_prompt_timeout = Instant::now() + Duration::from_secs(10);
+        let wait_for_prompt_timeout =
+            Instant::now() + reconnect_interval_max + Duration::from_secs(5);
         // Send newlines to wait for prompt to appear
         'wait_for_prompt: loop {
             tokio::select! {
@@ -291,6 +433,9 @@ async fn test_ssh_console_reconnect() -> eyre::Result<()> {
     }
 
     done_tx.send(()).ok();
+    prompt_reader_handle
+        .await
+        .expect("prompt reader task panicked")?;
 
     Ok(())
 }
@@ -382,7 +527,7 @@ async fn test_ssh_console_log_rotation() -> eyre::Result<()> {
     Ok(())
 }
 
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn setup_test_logging() {
     api_test_helper::setup_logging()
 }

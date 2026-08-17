@@ -15,30 +15,54 @@
  * limitations under the License.
  */
 
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use carbide_secrets::credentials::{CredentialKey, CredentialReader, Credentials};
 use carbide_utils::HostPortPair;
 use carbide_uuid::machine::MachineId;
 use eyre::eyre;
-use forge_secrets::credentials::CredentialKey;
 
 use crate::IPMITool;
+use crate::metrics::{IpmiCommand, count_ipmi_command};
 
 /// HTTP-based IPMI implementation for testing with bmc-mock.
 /// Sends JSON requests to bmc_proxy which routes to appropriate machine.
-pub struct IPMIToolHttpImpl {
+pub(super) struct IPMIToolHttpImpl {
     bmc_proxy: Arc<ArcSwap<Option<HostPortPair>>>,
+    credential_reader: Arc<dyn CredentialReader>,
 }
 
 impl IPMIToolHttpImpl {
-    pub fn new(bmc_proxy: Arc<ArcSwap<Option<HostPortPair>>>) -> Self {
-        Self { bmc_proxy }
+    pub(super) fn new(
+        bmc_proxy: Arc<ArcSwap<Option<HostPortPair>>>,
+        credential_reader: Arc<dyn CredentialReader>,
+    ) -> Self {
+        Self {
+            bmc_proxy,
+            credential_reader,
+        }
     }
 
-    async fn execute_action(&self, action: &str, bmc_ip: IpAddr) -> Result<(), eyre::Report> {
+    /// The wire action string bmc-mock's `/ipmi` endpoint expects for each
+    /// command -- the counterpart of the real runner's `command_args`.
+    fn wire_action(command: IpmiCommand) -> &'static str {
+        match command {
+            IpmiCommand::ChassisPowerReset => "chassis_power_reset",
+            IpmiCommand::DpuLegacyPowerReset => "dpu_legacy_boot",
+            IpmiCommand::BmcColdReset => "bmc_cold_reset",
+        }
+    }
+
+    async fn execute_action(
+        &self,
+        command: IpmiCommand,
+        bmc_address: SocketAddr,
+        credential_key: &CredentialKey,
+    ) -> Result<(), eyre::Report> {
+        let action = Self::wire_action(command);
         let proxy = self.bmc_proxy.load();
 
         // Determine the target URL and headers based on whether a proxy is configured
@@ -52,14 +76,24 @@ impl IPMIToolHttpImpl {
                 };
                 (
                     format!("{}/ipmi", proxy_url),
-                    Some(format!("host={}", bmc_ip)),
+                    Some(format!("host={}", bmc_address.ip())),
                 )
             }
             None => {
                 // No proxy - send directly to BMC
-                (format!("https://{}/ipmi", bmc_ip), None)
+                (format!("https://{}/ipmi", bmc_address.ip()), None)
             }
         };
+
+        let credentials = self
+            .credential_reader
+            .get_credentials(credential_key)
+            .await
+            .map_err(|e| {
+                eyre!("secret engine getting credentials for key {credential_key:#?}: {e:#?}")
+            })?
+            .ok_or_else(|| eyre!("no credentials for key {credential_key:#?} found"))?;
+        let Credentials::UsernamePassword { username, password } = credentials;
 
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -68,40 +102,50 @@ impl IPMIToolHttpImpl {
 
         let mut request = client
             .post(&url)
+            .basic_auth(username, Some(password))
             .json(&serde_json::json!({"action": action}));
 
         if let Some(header) = forwarded_header {
             request = request.header("Forwarded", header);
         }
 
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| eyre!("HTTP request to {} failed: {}", url, e))?;
+        // Everything from here on is a dispatched command: the counter covers
+        // the wire attempt and its response, not the credential lookup or
+        // client construction above (a command that was never sent must not
+        // move the metric).
+        let result = async {
+            let resp = request
+                .send()
+                .await
+                .map_err(|e| eyre!("HTTP request to {} failed: {}", url, e))?;
 
-        if !resp.status().is_success() {
-            return Err(eyre!("HTTP error: {}", resp.status()));
+            if !resp.status().is_success() {
+                return Err(eyre!("HTTP error: {}", resp.status()));
+            }
+
+            #[derive(serde::Deserialize)]
+            struct IpmiHttpResponse {
+                success: bool,
+                error: Option<String>,
+            }
+
+            let body: IpmiHttpResponse = resp
+                .json()
+                .await
+                .map_err(|e| eyre!("failed to parse response: {}", e))?;
+
+            if !body.success {
+                return Err(eyre!(
+                    "IPMI action failed: {}",
+                    body.error.unwrap_or_else(|| "unknown error".to_string())
+                ));
+            }
+
+            Ok(())
         }
-
-        #[derive(serde::Deserialize)]
-        struct IpmiHttpResponse {
-            success: bool,
-            error: Option<String>,
-        }
-
-        let body: IpmiHttpResponse = resp
-            .json()
-            .await
-            .map_err(|e| eyre!("failed to parse response: {}", e))?;
-
-        if !body.success {
-            return Err(eyre!(
-                "IPMI action failed: {}",
-                body.error.unwrap_or_else(|| "unknown error".to_string())
-            ));
-        }
-
-        Ok(())
+        .await;
+        count_ipmi_command(command, &result);
+        result
     }
 }
 
@@ -109,23 +153,34 @@ impl IPMIToolHttpImpl {
 impl IPMITool for IPMIToolHttpImpl {
     async fn bmc_cold_reset(
         &self,
-        bmc_ip: IpAddr,
-        _credential_key: &CredentialKey,
+        bmc_address: SocketAddr,
+        credential_key: &CredentialKey,
     ) -> Result<(), eyre::Report> {
-        self.execute_action("bmc_cold_reset", bmc_ip).await
+        self.execute_action(IpmiCommand::BmcColdReset, bmc_address, credential_key)
+            .await
     }
 
     async fn restart(
         &self,
         _machine_id: &MachineId,
-        bmc_ip: IpAddr,
+        bmc_address: SocketAddr,
         legacy_boot: bool,
-        _credential_key: &CredentialKey,
+        credential_key: &CredentialKey,
     ) -> Result<(), eyre::Report> {
-        if legacy_boot && self.execute_action("dpu_legacy_boot", bmc_ip).await.is_ok() {
+        if legacy_boot
+            && self
+                .execute_action(
+                    IpmiCommand::DpuLegacyPowerReset,
+                    bmc_address,
+                    credential_key,
+                )
+                .await
+                .is_ok()
+        {
             return Ok(());
         }
         // Fall through to chassis_power_reset if legacy_boot fails or is false
-        self.execute_action("chassis_power_reset", bmc_ip).await
+        self.execute_action(IpmiCommand::ChassisPowerReset, bmc_address, credential_key)
+            .await
     }
 }

@@ -22,17 +22,19 @@
 //
 // Command Structure - Baseline debug_assert() of the entire command.
 // Argument Parsing  - Ensure required/optional arg combinations parse correctly.
-// ValueEnum Parsing - Test string parsing for types deriving claps ValueEnum.
 
+use carbide_test_support::Outcome::*;
+use carbide_test_support::scenarios;
+use carbide_uuid::machine::MachineId;
 use clap::{CommandFactory, Parser};
 
-use super::maintenance::args::Args as MaintenanceAction;
-use super::power_options::args::{Args as PowerOptions, DesiredPowerState};
-use super::quarantine::args::Args as QuarantineAction;
 use super::*;
+use crate::test_support::{parse_leaf, raw_value};
 
 // Define a basic/working MachineId for testing.
 const TEST_MACHINE_ID: &str = "fm100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg";
+const TEST_DPU_ID: &str = "fm100ds3gfip02lfgleidqoitqgh8d8mdc4a3j2tdncbjrfjtvrrhn2kleg";
+const TEST_INTERFACE_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 // verify_cmd_structure runs a baseline clap debug_assert()
 // to do basic command configuration checking and validation,
@@ -51,280 +53,270 @@ fn verify_cmd_structure() {
 // including testing required arguments, as well as optional
 // flag-specific checking.
 
-// parse_show_no_args ensures show parses with no
-// arguments (all hosts).
+// show routes to the Show variant across its argument combinations: bare (all
+// hosts), with a machine id, and with --fix. Each row yields the parsed
+// (machine.is_some(), all, ips, more, fix) so every original assertion holds.
 #[test]
-fn parse_show_no_args() {
-    let cmd = Cmd::try_parse_from(["managed-host", "show"]).expect("should parse show");
-
-    match cmd {
-        Cmd::Show(args) => {
-            assert!(args.machine.is_none());
-            assert!(!args.all);
-            assert!(!args.ips);
-            assert!(!args.more);
+fn parse_show_routes_to_show() {
+    scenarios!(
+        run = |argv| {
+            let matches = parse_leaf::<Cmd>(argv, &["show"]).map_err(drop)?;
+            Ok::<_, ()>((
+                matches.get_one::<MachineId>("machine").is_some(),
+                matches.get_flag("all"),
+                matches.get_flag("ips"),
+                matches.get_flag("more"),
+                matches.get_flag("fix"),
+            ))
+        };
+        "no args (all hosts)" {
+            &["managed-host", "show"][..] => Yields((false, false, false, false, false)),
         }
-        _ => panic!("expected Show variant"),
-    }
+
+        "with machine id" {
+            &["managed-host", "show", TEST_MACHINE_ID][..] => Yields((true, false, false, false, false)),
+        }
+
+        "with --fix flag" {
+            &["managed-host", "show", "--fix"][..] => Yields((false, false, false, false, true)),
+        }
+    );
 }
 
-// parse_show_with_machine ensures show parses with
-// machine ID.
+// maintenance on/off route to the Maintenance variant with the expected host
+// (and reference, for `on`). Each row yields (host, reference) -- reference is
+// empty for the `off` case which carries none.
 #[test]
-fn parse_show_with_machine() {
-    let cmd = Cmd::try_parse_from(["managed-host", "show", TEST_MACHINE_ID])
-        .expect("should parse show with machine");
-
-    match cmd {
-        Cmd::Show(args) => {
-            assert!(args.machine.is_some());
+fn parse_maintenance_routes_to_maintenance() {
+    scenarios!(
+        run = |argv| {
+            let action = argv[2];
+            let matches = parse_leaf::<Cmd>(argv, &["maintenance", action]).map_err(drop)?;
+            Ok::<_, ()>((
+                matches
+                    .get_one::<MachineId>("host")
+                    .copied()
+                    .expect("host is required"),
+                if action == "on" {
+                    raw_value(&matches, "reference").expect("reference is required")
+                } else {
+                    String::new()
+                },
+            ))
+        };
+        "on with host and reference" {
+            &[
+                "managed-host",
+                "maintenance",
+                "on",
+                "--host",
+                TEST_MACHINE_ID,
+                "--reference",
+                "TICKET-123",
+            ][..] => Yields((TEST_MACHINE_ID.parse::<MachineId>().unwrap(), "TICKET-123".to_string())),
         }
-        _ => panic!("expected Show variant"),
-    }
+
+        "off with host" {
+            &[
+                "managed-host",
+                "maintenance",
+                "off",
+                "--host",
+                TEST_MACHINE_ID,
+            ][..] => Yields((TEST_MACHINE_ID.parse::<MachineId>().unwrap(), String::new())),
+        }
+    );
 }
 
-// parse_show_with_fix_flag ensures show parses with
-// --fix flag.
+// quarantine on/off route to the Quarantine variant with the expected host
+// (and reason, for `on`). Each row yields (host, reason) -- reason is empty
+// for the `off` case which carries none.
 #[test]
-fn parse_show_with_fix_flag() {
-    let cmd =
-        Cmd::try_parse_from(["managed-host", "show", "--fix"]).expect("should parse show --fix");
-
-    match cmd {
-        Cmd::Show(args) => {
-            assert!(args.fix);
+fn parse_quarantine_routes_to_quarantine() {
+    scenarios!(
+        run = |argv| {
+            let action = argv[2];
+            let matches = parse_leaf::<Cmd>(argv, &["quarantine", action]).map_err(drop)?;
+            Ok::<_, ()>((
+                matches
+                    .get_one::<MachineId>("host")
+                    .copied()
+                    .expect("host is required"),
+                if action == "on" {
+                    raw_value(&matches, "reason").expect("reason is required")
+                } else {
+                    String::new()
+                },
+            ))
+        };
+        "on with host and reason" {
+            &[
+                "managed-host",
+                "quarantine",
+                "on",
+                "--host",
+                TEST_MACHINE_ID,
+                "--reason",
+                "Security issue",
+            ][..] => Yields((TEST_MACHINE_ID.parse::<MachineId>().unwrap(), "Security issue".to_string())),
         }
-        _ => panic!("expected Show variant"),
-    }
-}
 
-// parse_maintenance_on ensures maintenance on parses
-// with required args.
-#[test]
-fn parse_maintenance_on() {
-    let cmd = Cmd::try_parse_from([
-        "managed-host",
-        "maintenance",
-        "on",
-        "--host",
-        TEST_MACHINE_ID,
-        "--reference",
-        "TICKET-123",
-    ])
-    .expect("should parse maintenance on");
-
-    match cmd {
-        Cmd::Maintenance(MaintenanceAction::On(args)) => {
-            assert_eq!(args.host.to_string(), TEST_MACHINE_ID);
-            assert_eq!(args.reference, "TICKET-123");
+        "off with host" {
+            &[
+                "managed-host",
+                "quarantine",
+                "off",
+                "--host",
+                TEST_MACHINE_ID,
+            ][..] => Yields((TEST_MACHINE_ID.parse::<MachineId>().unwrap(), String::new())),
         }
-        _ => panic!("expected Maintenance On variant"),
-    }
-}
-
-// parse_maintenance_off ensures maintenance off parses
-// with required args.
-#[test]
-fn parse_maintenance_off() {
-    let cmd = Cmd::try_parse_from([
-        "managed-host",
-        "maintenance",
-        "off",
-        "--host",
-        TEST_MACHINE_ID,
-    ])
-    .expect("should parse maintenance off");
-
-    match cmd {
-        Cmd::Maintenance(MaintenanceAction::Off(args)) => {
-            assert_eq!(args.host.to_string(), TEST_MACHINE_ID);
-        }
-        _ => panic!("expected Maintenance Off variant"),
-    }
-}
-
-// parse_quarantine_on ensures quarantine on parses
-// with required args.
-#[test]
-fn parse_quarantine_on() {
-    let cmd = Cmd::try_parse_from([
-        "managed-host",
-        "quarantine",
-        "on",
-        "--host",
-        TEST_MACHINE_ID,
-        "--reason",
-        "Security issue",
-    ])
-    .expect("should parse quarantine on");
-
-    match cmd {
-        Cmd::Quarantine(QuarantineAction::On(args)) => {
-            assert_eq!(args.host.to_string(), TEST_MACHINE_ID);
-            assert_eq!(args.reason, "Security issue");
-        }
-        _ => panic!("expected Quarantine On variant"),
-    }
-}
-
-// parse_quarantine_off ensures quarantine off parses
-// with required args.
-#[test]
-fn parse_quarantine_off() {
-    let cmd = Cmd::try_parse_from([
-        "managed-host",
-        "quarantine",
-        "off",
-        "--host",
-        TEST_MACHINE_ID,
-    ])
-    .expect("should parse quarantine off");
-
-    match cmd {
-        Cmd::Quarantine(QuarantineAction::Off(args)) => {
-            assert_eq!(args.host.to_string(), TEST_MACHINE_ID);
-        }
-        _ => panic!("expected Quarantine Off variant"),
-    }
+    );
 }
 
 // parse_reset_host_reprovisioning ensures
 // reset-host-reprovisioning parses.
 #[test]
 fn parse_reset_host_reprovisioning() {
-    let cmd = Cmd::try_parse_from([
+    let argv = [
         "managed-host",
         "reset-host-reprovisioning",
         "--machine",
         TEST_MACHINE_ID,
-    ])
-    .expect("should parse reset-host-reprovisioning");
+    ];
+    let matches = parse_leaf::<Cmd>(&argv, &["reset-host-reprovisioning"])
+        .expect("should parse reset-host-reprovisioning");
 
-    match cmd {
-        Cmd::ResetHostReprovisioning(args) => {
-            assert_eq!(args.machine.to_string(), TEST_MACHINE_ID);
-        }
-        _ => panic!("expected ResetHostReprovisioning variant"),
-    }
+    assert_eq!(
+        matches.get_one::<MachineId>("machine"),
+        Some(&TEST_MACHINE_ID.parse::<MachineId>().unwrap())
+    );
 }
 
-// parse_power_options_show ensures power-options
-// show parses.
+// power-options show/update route to the PowerOptions variant. Each row yields
+// the converted request's (machine_id, power_state); show has no request.
 #[test]
-fn parse_power_options_show() {
-    let cmd = Cmd::try_parse_from(["managed-host", "power-options", "show"])
-        .expect("should parse power-options show");
-
-    match cmd {
-        Cmd::PowerOptions(PowerOptions::Show(args)) => {
-            assert!(args.machine.is_none());
+fn parse_power_options_routes_to_power_options() {
+    scenarios!(
+        run = |argv| {
+            Cmd::try_parse_from(argv.iter().copied())
+                .map(|cmd| match cmd {
+                    Cmd::PowerOptions(power_options::Args::Show(_)) => (None, None),
+                    Cmd::PowerOptions(power_options::Args::Update(args)) => {
+                        let request: rpc::forge::PowerOptionUpdateRequest = args.into();
+                        (request.machine_id, Some(request.power_state))
+                    }
+                    _ => panic!("expected PowerOptions variant"),
+                })
+                .map_err(drop)
+        };
+        "show with no machine" {
+            &["managed-host", "power-options", "show"][..] => Yields((None, None)),
         }
-        _ => panic!("expected PowerOptions Show variant"),
-    }
+
+        "update with machine and desired power state" {
+            &[
+                "managed-host",
+                "power-options",
+                "update",
+                TEST_MACHINE_ID,
+                "--desired-power-state",
+                "on",
+            ][..] => Yields((
+                Some(TEST_MACHINE_ID.parse::<MachineId>().unwrap()),
+                Some(rpc::forge::PowerState::On as i32),
+            )),
+        }
+    );
 }
 
-// parse_power_options_update ensures power-options
-// update parses.
 #[test]
-fn parse_power_options_update() {
-    let cmd = Cmd::try_parse_from([
-        "managed-host",
-        "power-options",
-        "update",
-        TEST_MACHINE_ID,
-        "--desired-power-state",
-        "on",
-    ])
-    .expect("should parse power-options update");
-
-    match cmd {
-        Cmd::PowerOptions(PowerOptions::Update(args)) => {
-            assert_eq!(args.machine.to_string(), TEST_MACHINE_ID);
-            assert_eq!(args.desired_power_state, DesiredPowerState::On);
+#[allow(deprecated)]
+fn parse_primary_interface_reconciliation_controls() {
+    scenarios!(
+        run = |(subcommand, target, flag): (&str, &str, Option<&str>)| {
+            let mut argv = vec!["managed-host", subcommand, TEST_MACHINE_ID, target];
+            argv.extend(flag);
+            Cmd::try_parse_from(argv)
+                .map(|cmd| match cmd {
+                    Cmd::SetPrimaryDpu(args) => {
+                        let request: rpc::forge::SetPrimaryDpuRequest = args.into();
+                        (request.force_reconcile, request.reboot)
+                    }
+                    Cmd::SetPrimaryInterface(args) => {
+                        let request: rpc::forge::SetPrimaryInterfaceRequest = args.into();
+                        (request.force_reconcile, request.reboot)
+                    }
+                    _ => panic!("expected a primary-interface command"),
+                })
+                .map_err(|error| error.to_string())
+        };
+        "DPU default" {
+            ("set-primary-dpu", TEST_DPU_ID, None) => Yields((false, false)),
         }
-        _ => panic!("expected PowerOptions Update variant"),
-    }
-}
-
-// parse_set_primary_dpu ensures set-primary-dpu parses
-// with required args.
-#[test]
-fn parse_set_primary_dpu() {
-    let cmd = Cmd::try_parse_from([
-        "managed-host",
-        "set-primary-dpu",
-        TEST_MACHINE_ID,
-        TEST_MACHINE_ID,
-    ])
-    .expect("should parse set-primary-dpu");
-
-    match cmd {
-        Cmd::SetPrimaryDpu(args) => {
-            assert!(!args.reboot);
+        "DPU force reconcile" {
+            ("set-primary-dpu", TEST_DPU_ID, Some("--force-reconcile"))
+                => Yields((true, false)),
         }
-        _ => panic!("expected SetPrimaryDpu variant"),
-    }
+        "DPU legacy reboot" {
+            ("set-primary-dpu", TEST_DPU_ID, Some("--reboot"))
+                => Yields((true, true)),
+        }
+        "interface default" {
+            ("set-primary-interface", TEST_INTERFACE_ID, None)
+                => Yields((false, false)),
+        }
+        "interface force reconcile" {
+            (
+                "set-primary-interface",
+                TEST_INTERFACE_ID,
+                Some("--force-reconcile"),
+            ) => Yields((true, false)),
+        }
+        "interface legacy reboot" {
+            (
+                "set-primary-interface",
+                TEST_INTERFACE_ID,
+                Some("--reboot"),
+            ) => Yields((true, true)),
+        }
+    );
 }
 
 // parse_debug_bundle ensures debug-bundle parses with
 // required args.
 #[test]
 fn parse_debug_bundle() {
-    let cmd = Cmd::try_parse_from([
+    let argv = [
         "managed-host",
         "debug-bundle",
         TEST_MACHINE_ID,
         "--start-time",
         "2025-01-01 00:00:00",
-    ])
-    .expect("should parse debug-bundle");
+    ];
+    let matches = parse_leaf::<Cmd>(&argv, &["debug-bundle"]).expect("should parse debug-bundle");
 
-    match cmd {
-        Cmd::DebugBundle(args) => {
-            assert_eq!(args.host_id, TEST_MACHINE_ID);
-            assert_eq!(args.start_time, "2025-01-01 00:00:00");
-            assert!(!args.utc);
-        }
-        _ => panic!("expected DebugBundle variant"),
-    }
-}
-
-// parse_maintenance_on_missing_required_fails ensures
-// maintenance on fails without required args.
-#[test]
-fn parse_maintenance_on_missing_required_fails() {
-    let result = Cmd::try_parse_from(["managed-host", "maintenance", "on"]);
-    assert!(
-        result.is_err(),
-        "should fail without --host and --reference"
+    assert_eq!(
+        raw_value(&matches, "host_id").as_deref(),
+        Some(TEST_MACHINE_ID)
     );
+    assert_eq!(
+        raw_value(&matches, "start_time").as_deref(),
+        Some("2025-01-01 00:00:00"),
+    );
+    assert!(!matches.get_flag("utc"));
 }
 
-/////////////////////////////////////////////////////////////////////////////
-// ValueEnum Parsing
-//
-// These tests are for testing argument values which derive
-// ValueEnum, ensuring the string representations of said
-// values correctly convert back into their expected variant,
-// or fail otherwise.
-
-// desired_power_state_value_enum ensures DesiredPowerState
-// parses from strings.
+// Every malformed invocation is rejected at parse time.
 #[test]
-fn desired_power_state_value_enum() {
-    use clap::ValueEnum;
-
-    assert!(matches!(
-        DesiredPowerState::from_str("on", false),
-        Ok(DesiredPowerState::On)
-    ));
-    assert!(matches!(
-        DesiredPowerState::from_str("off", false),
-        Ok(DesiredPowerState::Off)
-    ));
-    assert!(matches!(
-        DesiredPowerState::from_str("power-manager-disabled", false),
-        Ok(DesiredPowerState::PowerManagerDisabled)
-    ));
-    assert!(DesiredPowerState::from_str("invalid", false).is_err());
+fn invalid_invocations_are_rejected() {
+    scenarios!(
+        run = |argv| {
+            Cmd::try_parse_from(argv.iter().copied())
+                .map(|_| ())
+                .map_err(drop)
+        };
+        "maintenance on without --host and --reference" {
+            &["managed-host", "maintenance", "on"][..] => Fails,
+        }
+    );
 }

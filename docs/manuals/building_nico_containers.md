@@ -4,33 +4,125 @@ This section provides instructions for building the containers for NVIDIA Infra 
 
 ## Installing Prerequisite Software
 
-Before you begin, ensure you have the following prerequisites:
+An Ubuntu 24.04 host or VM with at least 150GB of free disk space is required, and git and make must also be installed (macOS is not supported).
 
-* An Ubuntu 24.04 Host or VM with 150GB+ of disk space (MacOS is not supported)
+Clone the repo and run the build-host bootstrap. It installs everything needed to build
+the containers and boot artifacts -- system packages, rustup, the mkosi/ipxe git
+submodules, Docker with cross-architecture emulation, and the cargo build tooling --
+in one idempotent step:
 
-Use the following steps to install the prerequisite software on the Ubuntu Host or VM. These instructions
-assume an `apt`-based distribution such as Ubuntu 24.04.
+```sh
+git clone git@github.com:NVIDIA/infra-controller.git
+cd infra-controller
+make bootstrap          # or: ./scripts/setup-build-host.sh
+```
+
+Reboot (or log out and back in) afterwards so the `docker` group membership and the
+userns sysctl change take effect.
+
+### Manual setup (what `make bootstrap` does)
+
+`make bootstrap` runs `scripts/setup-build-host.sh`, which is equivalent to the following
+steps on an `apt`-based distribution such as Ubuntu 24.04:
 
 1. `apt-get install build-essential cpio direnv mkosi uidmap curl file fakeroot git docker.io docker-buildx sccache protobuf-compiler libopenipmi-dev libudev-dev libboost-dev libgrpc-dev libprotobuf-dev libssl-dev libtss2-dev kea-dev systemd-boot systemd-ukify jq zip`
 2. [Add the correct hook for your shell](https://direnv.net/docs/hook.html)
 3. Install rustup: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` (select Option 1)
 4. Start a new shell to pick up changes made from direnv and rustup.
-5. Clone NICo - `git clone git@github.com:NVIDIA/infra-controller-core.git infra-controller`
+5. Clone NICo - `git clone git@github.com:NVIDIA/infra-controller.git infra-controller`
 6. `cd infra-controller`
 7. `direnv allow`
-8. `cd $REPO_ROOT/pxe`
-9. `git clone https://github.com/systemd/mkosi.git`
-10. `cd mkosi && git checkout 26673f6`
-11. `cd $REPO_ROOT/pxe/ipxe`
-12. `git clone https://github.com/ipxe/ipxe.git upstream`
-13. `cd upstream && git checkout d7e58c5`
-14. `sudo systemctl enable docker.socket`
-15. `cd $REPO_ROOT`
-16. `cargo install cargo-make cargo-cache`
-17. `echo "kernel.apparmor_restrict_unprivileged_userns=0" | sudo tee /etc/sysctl.d/99-userns.conf`
-18. `sudo usermod -aG docker <username>`
-19. `reboot`
+8. `git submodule update --init --recursive`
+9. Start Docker and register cross-architecture support:
+   `sudo systemctl enable --now docker.socket`, then
+   `sudo docker run --privileged --rm tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 --install all`
+10. `cargo install cargo-make cargo-cache`
+11. `echo "kernel.apparmor_restrict_unprivileged_userns=0" | sudo tee /etc/sysctl.d/99-userns.conf`
+12. `sudo usermod -aG docker $(id -un)`
+13. `reboot`
 
+
+## Build all images with one command
+
+Once the prerequisites above are installed, build the NICo container images from the
+top of the repo with a single `make` command:
+
+```sh
+make images          # deployable stack: NICo Core (nico) + the REST service images
+make images-all      # the above plus machine-validation and both boot-artifact images
+```
+
+Images are pushed as `linux/amd64` and `linux/arm64` manifests at
+`localhost:5000/<name>:latest` by default. The Makefile starts a local registry named
+`nico-build-registry` when that default is used. Override the registry and tag to publish
+under your own registry; authenticate Docker to that registry before running the build:
+
+```sh
+make images IMAGE_REGISTRY=my-registry.example.com/nico IMAGE_TAG=v1.0.0
+```
+
+Each architecture is built separately before the bare tag is assembled. This matches CI
+and is required for the REST Dockerfiles: a single combined Buildx invocation would reuse
+one builder stage and could copy an amd64 binary into the arm64 image. Building the
+non-native architecture uses the platforms configured on the active Docker Buildx builder.
+
+Run `make help` from the repo root to list the individual image targets (`images-core`,
+`images-rest`, `images-machine-validation`, `images-boot-artifacts`, `images-bfb`). The
+sections below document the per-image build commands that these targets wrap, for when you
+need to build or debug a single image.
+
+### Verifying the build
+
+After `make images-all` completes, verify that all 14 deployable image tags contain both
+platforms:
+
+```bash
+images=(
+  nico nico-rest-api nico-rest-workflow nico-rest-site-manager
+  nico-rest-site-agent nico-rest-db nico-rest-cert-manager nico-flow
+  nico-psm nico-nsm nico-mcp machine-validation
+  boot-artifacts-x86_64 boot-artifacts-aarch64
+)
+for image in "${images[@]}"; do
+  platforms="$(docker buildx imagetools inspect --raw \
+    "${IMAGE_REGISTRY}/${image}:${IMAGE_TAG}" | \
+    jq -r '[.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | unique | sort | join(",")')"
+  if [ "${platforms}" != "linux/amd64,linux/arm64" ]; then
+    printf 'FAIL %s: %s\n' "${image}" "${platforms}" >&2
+    exit 1
+  fi
+  printf 'PASS %s: %s\n' "${image}" "${platforms}"
+done
+```
+
+The loop should print exactly 14 successful checks:
+
+| Image | Target |
+|---|---|
+| `nico` | `images-core` |
+| `nico-rest-api` | `images-rest` |
+| `nico-rest-workflow` | `images-rest` |
+| `nico-rest-site-manager` | `images-rest` |
+| `nico-rest-site-agent` | `images-rest` |
+| `nico-rest-db` | `images-rest` |
+| `nico-rest-cert-manager` | `images-rest` |
+| `nico-flow` | `images-rest` |
+| `nico-psm` | `images-rest` |
+| `nico-nsm` | `images-rest` |
+| `nico-mcp` | `images-rest` |
+| `machine-validation` | `images-machine-validation` |
+| `boot-artifacts-x86_64` | `images-boot-artifacts` |
+| `boot-artifacts-aarch64` | `images-bfb` |
+
+If the loop exits early, the `FAIL` line identifies which image has an incomplete
+manifest. The three boot/validation images (`machine-validation`,
+`boot-artifacts-x86_64`, `boot-artifacts-aarch64`) require the full mkosi + Rust
+toolchain. Use `make images` instead of `make images-all` to build only the 11-image
+deployable stack.
+
+The architecture-specific Core base images and `-amd64`/`-arm64` service tags are build
+inputs for the bare multi-arch tags. `machine-validation-runner` is the only local-only
+intermediate image.
 
 ## Building X86_64 Containers
 
@@ -63,7 +155,7 @@ docker build --build-arg CONTAINER_RUNTIME_X86_64=nico-runtime-container-x86_64 
 docker save --output crates/machine-validation/images/machine-validation-runner.tar machine-validation-runner:latest 
 
 // This copies `machine-validation-runner.tar` into the `/images` directory on the `machine-validation-config` container.  When using a kubernetes deployment model
-// this is the only `machine-validation` container you need to configure on the `carbide-pxe` pod.
+// this is the only `machine-validation` container you need to configure on the `nico-pxe` pod.
 
 docker build --build-arg CONTAINER_RUNTIME_X86_64=nico-runtime-container-x86_64 -t machine-validation-config -f dev/docker/Dockerfile.machine-validation-config .
 
@@ -86,7 +178,7 @@ docker build --file dev/docker/Dockerfile.build-artifacts-container-cross-aarch6
 ## Building the admin-cli
 The `admin-cli` build does not produce a container. It produces a binary:
 
-`$REPO_ROOT/target/release/carbide-admin-cli`
+`$REPO_ROOT/target/release/nico-admin-cli`
 
 ```
 BUILD_CONTAINER_X86_URL="nico-buildcontainer-x86_64" cargo make build-cli

@@ -17,11 +17,13 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::site_explorer::{ExploredEndpoint, ExploredManagedHost, SiteExplorationReport};
+use carbide_utils::none_if_empty::NoneIfEmpty;
 use prettytable::{Cell, Row, Table, format, row};
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 use crate::{async_write, async_writeln};
 
@@ -183,10 +185,11 @@ async fn get_exploration_report_for_bmc_address(
     Ok(::rpc::site_explorer::SiteExplorationReport {
         endpoints: endpoints.endpoints,
         managed_hosts: managed_host,
+        last_run: None,
     })
 }
 
-pub async fn show_discovered_managed_host(
+pub(crate) async fn show_discovered_managed_host(
     api_client: &ApiClient,
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
     output_format: OutputFormat,
@@ -343,17 +346,14 @@ fn filter_endpoints(
                     .report
                     .as_ref()
                     .map(|x| {
-                        if let Some(error) = &x.last_exploration_error {
-                            if erroronly {
-                                !error.is_empty()
-                            } else if successonly {
-                                error.is_empty()
-                            } else {
-                                // Don't filter
-                                true
-                            }
+                        let has_error = x.has_last_exploration_error();
+                        if erroronly {
+                            has_error
+                        } else if successonly {
+                            !has_error
                         } else {
-                            !erroronly
+                            // Don't filter
+                            true
                         }
                     })
                     .unwrap_or_default()
@@ -440,7 +440,7 @@ fn convert_endpoints_to_nice_table(endpoints: &[ExploredEndpoint]) -> Box<Table>
         "BMC Mac Address",
         "Vendor",
         "MachineId",
-        "Preingt State",
+        "Pre-ingestion State",
         "Serial Number",
         "Last Exploration Error",
     ];
@@ -466,7 +466,7 @@ fn endpoint_to_row(endpoint: &ExploredEndpoint) -> Row {
                 .map(|a| {
                     let mac = a.mac_address.as_deref().unwrap_or_default();
                     if a.interface_enabled() {
-                        if let Some(ls) = a.link_status.as_deref().filter(|v| !v.is_empty()) {
+                        if let Some(ls) = a.link_status.as_deref().none_if_empty() {
                             format!("{mac} [{}]", ls)
                         } else {
                             mac.to_string()
@@ -481,7 +481,7 @@ fn endpoint_to_row(endpoint: &ExploredEndpoint) -> Row {
 
     let last_error = report
         .as_ref()
-        .map(|x| x.last_exploration_error())
+        .map(|report| report.last_exploration_error_display())
         .unwrap_or_default();
 
     let error_segmented = last_error
@@ -558,7 +558,7 @@ async fn display_endpoint(
     table.add_row(row!["Preingestion State", endpoint.preingestion_state]);
     let last_error = report
         .as_ref()
-        .map(|x| x.last_exploration_error())
+        .map(|report| report.last_exploration_error_display())
         .unwrap_or_default();
 
     let error_segmented = last_error
@@ -671,4 +671,77 @@ async fn display_endpoint(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ::rpc::site_explorer::{EndpointExplorationReport, ExploredEndpoint, OperatorErrorSchema};
+    use carbide_test_support::{Check, check_values};
+
+    use super::{convert_endpoints_to_nice_table, filter_endpoints};
+
+    fn operator_error_schema() -> OperatorErrorSchema {
+        OperatorErrorSchema {
+            error_code: "NICO-SITEEXPLORER-122".to_string(),
+            mitigation: Some("Check the HCL".to_string()),
+            text: "BMC vendor missing".to_string(),
+        }
+    }
+
+    fn endpoint(address: &str, report: EndpointExplorationReport) -> ExploredEndpoint {
+        ExploredEndpoint {
+            address: address.to_string(),
+            report: Some(report),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn endpoint_error_filter_and_table_rendering_use_structured_errors() {
+        let error = endpoint(
+            "192.0.2.10",
+            EndpointExplorationReport {
+                last_exploration_error_schema: Some(operator_error_schema()),
+                ..Default::default()
+            },
+        );
+        let clear = endpoint("192.0.2.11", EndpointExplorationReport::default());
+        let endpoints = vec![error.clone(), clear];
+
+        check_values(
+            [
+                Check {
+                    scenario: "error-only",
+                    input: (true, false),
+                    expect: vec!["192.0.2.10".to_string()],
+                },
+                Check {
+                    scenario: "success-only",
+                    input: (false, true),
+                    expect: vec!["192.0.2.11".to_string()],
+                },
+                Check {
+                    scenario: "all endpoints",
+                    input: (false, false),
+                    expect: vec!["192.0.2.10".to_string(), "192.0.2.11".to_string()],
+                },
+            ],
+            |(error_only, success_only)| {
+                filter_endpoints(
+                    endpoints.clone(),
+                    error_only,
+                    success_only,
+                    Vec::new(),
+                    None,
+                )
+                .into_iter()
+                .map(|endpoint| endpoint.address)
+                .collect::<Vec<_>>()
+            },
+        );
+
+        let rendered = convert_endpoints_to_nice_table(&[error]).to_string();
+        assert!(rendered.contains("NICO-SITEEXPLORER-122"));
+        assert!(rendered.contains("BMC vendor missing"));
+    }
 }

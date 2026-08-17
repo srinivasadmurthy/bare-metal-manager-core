@@ -17,24 +17,18 @@
 
 use std::collections::VecDeque;
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
-
 use super::args::Args;
-use crate::instance::common::GlobalOptions;
+use crate::cfg::runtime::RuntimeContext;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::machine;
 use crate::rpc::ApiClient;
 
-pub async fn allocate(
+pub(super) async fn allocate(
     api_client: &ApiClient,
     allocate_request: Args,
-    opts: GlobalOptions<'_>,
+    ctx: &RuntimeContext,
 ) -> CarbideCliResult<()> {
-    if opts.cloud_unsafe_op.is_none() {
-        return Err(CarbideCliError::GenericError(
-            "Operation not allowed due to potential inconsistencies with cloud database."
-                .to_owned(),
-        ));
-    }
+    let unsafe_op_msg = ctx.assert_cloud_unsafe_op_message()?;
 
     let number = allocate_request.number.unwrap_or(1);
 
@@ -69,9 +63,13 @@ pub async fn allocate(
         // Batch mode: all-or-nothing
         let mut requests = Vec::new();
         for i in 0..number {
-            let Some(machine) =
-                machine::get_next_free_machine(api_client, &mut machine_ids, min_interface_count)
-                    .await
+            let Some(machine) = machine::get_next_free_machine(
+                api_client,
+                &mut machine_ids,
+                min_interface_count,
+                allocate_request.flat_vpc_id,
+            )
+            .await
             else {
                 return Err(CarbideCliError::GenericError(format!(
                     "Need {} machines but only {} available.",
@@ -84,7 +82,7 @@ pub async fn allocate(
                     machine,
                     &allocate_request,
                     &format!("{}_{}", allocate_request.prefix_name, i),
-                    opts.cloud_unsafe_op.clone(),
+                    Some(unsafe_op_msg.to_string()),
                 )
                 .await?;
             requests.push(request);
@@ -107,9 +105,13 @@ pub async fn allocate(
     } else {
         // Sequential mode: partial success allowed
         for i in 0..number {
-            let Some(machine) =
-                machine::get_next_free_machine(api_client, &mut machine_ids, min_interface_count)
-                    .await
+            let Some(machine) = machine::get_next_free_machine(
+                api_client,
+                &mut machine_ids,
+                min_interface_count,
+                allocate_request.flat_vpc_id,
+            )
+            .await
             else {
                 tracing::error!("No available machines.");
                 break;
@@ -120,7 +122,7 @@ pub async fn allocate(
                     machine,
                     &allocate_request,
                     &format!("{}_{}", allocate_request.prefix_name, i),
-                    opts.cloud_unsafe_op.clone(),
+                    Some(unsafe_op_msg.to_string()),
                 )
                 .await
             {

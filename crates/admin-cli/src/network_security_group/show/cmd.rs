@@ -15,16 +15,17 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::network_security_group::common::convert_nsgs_to_table;
 use crate::rpc::ApiClient;
 
 /// Show one or more NSGs.
 /// If only a single NSG is found, verbose output is used
 /// automatically.
-pub async fn show(
+pub(super) async fn show(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,

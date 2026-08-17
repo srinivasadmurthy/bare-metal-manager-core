@@ -27,7 +27,6 @@ use futures::future::join_all;
 use futures_util::future::BoxFuture;
 use machine_a_tron::{MockSshServerHandle, PromptBehavior};
 use ssh_console_mock_api_server::{MockApiServerHandle, MockHost};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use uuid::Uuid;
 
 use crate::util::ipmi_sim::IpmiSimHandle;
@@ -35,98 +34,77 @@ use crate::util::metrics::assert_metrics;
 use crate::util::ssh_client::ConnectionConfig;
 use crate::{ADMIN_SSH_KEY_PATH, TENANT_SSH_KEY_PATH, TENANT_SSH_PUBKEY};
 
-pub mod ipmi_sim;
+pub(super) mod ipmi_sim;
 mod metrics;
-pub mod ssh_client;
-pub mod ssh_console_test_helper;
+pub(super) mod ssh_client;
+pub(super) mod ssh_console_test_helper;
 
-pub mod fixtures {
+mod fixtures {
     use std::path::PathBuf;
 
     use api_test_helper::utils::REPO_ROOT;
 
     lazy_static::lazy_static! {
-        pub static ref BMC_MOCK_CERTS_DIR: PathBuf = REPO_ROOT
+        pub(super) static ref BMC_MOCK_CERTS_DIR: PathBuf = REPO_ROOT
             .join("crates/bmc-mock")
             .canonicalize()
             .unwrap();
-        pub static ref LOCALHOST_CERTS_DIR: PathBuf = REPO_ROOT
+        pub(super) static ref LOCALHOST_CERTS_DIR: PathBuf = REPO_ROOT
             .join("dev/certs/localhost")
             .canonicalize()
             .unwrap();
-        pub static ref SSH_HOST_PUBKEY: PathBuf = REPO_ROOT
+        pub(super) static ref SSH_HOST_PUBKEY: PathBuf = REPO_ROOT
             .join("crates/ssh-console/tests/fixtures/ssh_host_ed25519_key.pub")
             .canonicalize()
             .unwrap();
-        pub static ref AUTHORIZED_KEYS_PATH: PathBuf = REPO_ROOT
+        pub(super) static ref AUTHORIZED_KEYS_PATH: PathBuf = REPO_ROOT
             .join("crates/ssh-console/tests/fixtures/authorized_keys")
             .canonicalize()
             .unwrap();
-        pub static ref SSH_HOST_KEY: PathBuf = REPO_ROOT
+        pub(super) static ref SSH_HOST_KEY: PathBuf = REPO_ROOT
             .join("crates/ssh-console/tests/fixtures/ssh_host_ed25519_key")
             .canonicalize()
             .unwrap();
-        pub static ref API_CA_CERT: PathBuf = REPO_ROOT
+        pub(super) static ref API_CA_CERT: PathBuf = REPO_ROOT
             .join("dev/certs/localhost/ca.crt")
             .canonicalize()
             .unwrap();
-        pub static ref API_CLIENT_CERT: PathBuf = REPO_ROOT
+        pub(super) static ref API_CLIENT_CERT: PathBuf = REPO_ROOT
             .join("dev/certs/localhost/client.crt")
             .canonicalize()
             .unwrap();
-        pub static ref API_CLIENT_KEY: PathBuf = REPO_ROOT
+        pub(super) static ref API_CLIENT_KEY: PathBuf = REPO_ROOT
             .join("dev/certs/localhost/client.key")
             .canonicalize()
             .unwrap();
     }
 }
 
-pub fn log_stdout_and_stderr(process: &mut tokio::process::Child, prefix: &str) {
-    let stdout = process.stdout.take().unwrap();
-    let stderr = process.stderr.take().unwrap();
-    let prefix = prefix.to_string();
-
-    tokio::spawn(async move {
-        let stdout_reader = BufReader::new(stdout);
-        let stderr_reader = BufReader::new(stderr);
-        let mut stdout_lines = stdout_reader.lines();
-        let mut stderr_lines = stderr_reader.lines();
-        loop {
-            tokio::select! {
-                Ok(Some(line)) = stdout_lines.next_line() => {
-                    tracing::info!("[{prefix} STDOUT] {line}")
-                }
-                Ok(Some(line)) = stderr_lines.next_line() => {
-                    // stderr can be logged as info, because in practice ssh-console logs everything to stderr.
-                    tracing::info!("[{prefix} STDERR] {line}")
-                }
-                else => break,
-            }
-        }
-    });
-}
-
 /// Runs a baseline test environment for comparing results for leagacy ssh-console and (soon) new
 /// ssh-console. Adds to api_test_helper's IntegrationTestEnvironment by running an ipmi_sim and a
 /// machine-a-tron environment with 2 machines. Also creates tenants/orgs/instances.
-pub async fn run_baseline_test_environment(
+pub(crate) async fn run_baseline_test_environment(
     machines: Vec<MockBmcType>,
 ) -> eyre::Result<Option<BaselineTestEnvironment>> {
-    let mock_bmc_handles: Vec<(MockBmcHandle, MachineId)> =
+    let mock_bmc_handles: Vec<(MockBmcHandle, MachineId, MockBmcType)> =
         join_all(machines.iter().map(|bmc_type| {
             // Generate random machine ID's for each mocked host
             let machine_id = carbide_uuid::machine::MachineId::new(
                 MachineIdSource::Tpm,
                 rand::random(),
                 match bmc_type {
-                    MockBmcType::Ssh | MockBmcType::Ipmi => MachineType::Host,
+                    MockBmcType::Ssh | MockBmcType::LenovoSr650Ssh | MockBmcType::Ipmi => {
+                        MachineType::Host
+                    }
                     MockBmcType::DpuSsh => MachineType::Dpu,
                 },
             );
 
             async move {
                 let bmc_handle = match bmc_type {
-                    ssh_type @ MockBmcType::Ssh | ssh_type @ MockBmcType::DpuSsh => {
+                    ssh_type @ MockBmcType::Ssh
+                    | ssh_type @ MockBmcType::LenovoSr650Ssh
+                    | ssh_type @ MockBmcType::DpuSsh => {
                         Ok::<MockBmcHandle, eyre::Error>(MockBmcHandle::Ssh(
                             machine_a_tron::spawn_mock_ssh_server(
                                 IpAddr::from_str("127.0.0.1").unwrap(),
@@ -138,6 +116,7 @@ pub async fn run_baseline_test_environment(
                                 }),
                                 match ssh_type {
                                     MockBmcType::Ssh => PromptBehavior::Dell,
+                                    MockBmcType::LenovoSr650Ssh => PromptBehavior::LenovoSr650,
                                     MockBmcType::DpuSsh => PromptBehavior::Dpu,
                                     MockBmcType::Ipmi => unreachable!(),
                                 },
@@ -146,27 +125,30 @@ pub async fn run_baseline_test_environment(
                         ))
                     }
                     MockBmcType::Ipmi => Ok(MockBmcHandle::Ipmi(
-                        ipmi_sim::run(format!("root@{machine_id} # ")).await?,
+                        ipmi_sim::run(format!("root@{machine_id} # ")).await?.into(),
                     )),
                 }?;
 
-                Ok::<_, eyre::Error>((bmc_handle, machine_id))
+                Ok::<_, eyre::Error>((bmc_handle, machine_id, *bmc_type))
             }
         }))
         .await
         .into_iter()
         .collect::<Result<_, _>>()
-        .context("Error spawning mock SSH server")?;
+        .context("error spawning mock SSH server")?;
 
     let mock_hosts: Arc<Vec<MockHost>> = Arc::new(
         mock_bmc_handles
             .iter()
-            .map(|(bmc_handle, machine_id)| MockHost {
+            .map(|(bmc_handle, machine_id, bmc_type)| MockHost {
                 machine_id: *machine_id,
                 instance_id: Uuid::new_v4(),
                 tenant_public_key: TENANT_SSH_PUBKEY.to_string(),
                 sys_vendor: match &bmc_handle {
-                    MockBmcHandle::Ssh(_) => "Dell",
+                    MockBmcHandle::Ssh(_) => match bmc_type {
+                        MockBmcType::LenovoSr650Ssh => "Lenovo",
+                        _ => "Dell",
+                    },
                     MockBmcHandle::Ipmi(_) => "Supermicro",
                 },
                 bmc_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -176,7 +158,7 @@ pub async fn run_baseline_test_environment(
                 },
                 ipmi_port: match &bmc_handle {
                     MockBmcHandle::Ssh(_) => None,
-                    MockBmcHandle::Ipmi(i) => Some(i.port),
+                    MockBmcHandle::Ipmi(i) => Some(i.endpoint.listen_port),
                 },
                 bmc_user: "root".to_string(),
                 bmc_password: "password".to_string(),
@@ -184,7 +166,10 @@ pub async fn run_baseline_test_environment(
             .collect(),
     );
 
-    tracing::debug!("baseline test mock hosts: {mock_hosts:?}");
+    tracing::debug!(
+        mock_host_count = mock_hosts.len(),
+        "Configured baseline test mock hosts"
+    );
 
     let api_server_handle = ssh_console_mock_api_server::MockApiServer {
         mock_hosts: mock_hosts.clone(),
@@ -197,22 +182,23 @@ pub async fn run_baseline_test_environment(
         mock_api_server: api_server_handle,
         _mock_bmc_handles: mock_bmc_handles
             .into_iter()
-            .map(|(handle, _machine_id)| handle)
+            .map(|(handle, _machine_id, _bmc_type)| handle)
             .collect(),
         mock_hosts,
     }))
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum MockBmcType {
+pub(crate) enum MockBmcType {
     Ssh,
+    LenovoSr650Ssh,
     DpuSsh,
     Ipmi,
 }
 
-pub enum MockBmcHandle {
+enum MockBmcHandle {
     Ssh(MockSshServerHandle),
-    Ipmi(IpmiSimHandle),
+    Ipmi(Box<IpmiSimHandle>),
 }
 
 #[derive(Debug)]
@@ -224,14 +210,14 @@ impl HostnameQuerying for KnownHostname {
     }
 }
 
-pub struct BaselineTestEnvironment {
-    pub mock_api_server: MockApiServerHandle,
-    pub mock_hosts: Arc<Vec<MockHost>>,
+pub(crate) struct BaselineTestEnvironment {
+    pub(crate) mock_api_server: MockApiServerHandle,
+    pub(crate) mock_hosts: Arc<Vec<MockHost>>,
     _mock_bmc_handles: Vec<MockBmcHandle>,
 }
 
 impl BaselineTestEnvironment {
-    pub async fn run_baseline_assertions<MetricsFn>(
+    pub(crate) async fn run_baseline_assertions<MetricsFn>(
         &self,
         addr: SocketAddr,
         connection_name: &str,
@@ -293,7 +279,7 @@ impl BaselineTestEnvironment {
 
                         if result_as_tenant.is_ok() {
                             return Err(eyre::format_err!(
-                                "Connection directly to machine_id succeeded as tenant, it should have failed"
+                                "connection directly to machine_id succeeded as tenant, it should have failed"
                             ));
                         }
                     }
@@ -345,7 +331,7 @@ impl BaselineTestEnvironment {
         if let Some(metrics_fut) = get_metrics() {
             let metrics = Box::pin(metrics_fut)
                 .await
-                .context("Error getting metrics")?;
+                .context("error getting metrics")?;
             assert_metrics(metrics, self.mock_hosts.as_slice()).await?;
         }
 
@@ -354,7 +340,7 @@ impl BaselineTestEnvironment {
 }
 
 #[allow(clippy::enum_variant_names)]
-pub enum BaselineTestAssertion {
+pub(crate) enum BaselineTestAssertion {
     ConnectAsMachineId,
     ConnectAsInstanceId,
     FillLogsAsMachineId(usize),

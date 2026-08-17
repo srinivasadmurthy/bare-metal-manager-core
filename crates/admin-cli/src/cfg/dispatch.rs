@@ -15,9 +15,8 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliResult;
-
 use crate::cfg::runtime::RuntimeContext;
+use crate::errors::CarbideCliResult;
 
 // Dispatch is a trait implemented by all CLI command types.
 // It provides a unified interface for executing commands with
@@ -33,13 +32,35 @@ pub(crate) trait Dispatch {
 // trait and derive with: use crate::cfg::dispatch::Dispatch;
 pub(crate) use carbide_macros::Dispatch;
 
+/// Bridge a subcommand-less top-level command from `Run` to `Dispatch`, so
+/// `main` can dispatch every top-level command the same way.
+///
+/// Command *groups* derive `Dispatch` (the derive routes each variant to a
+/// `Run` leaf, or to a nested `#[dispatch]` group). A top-level command with
+/// no subcommands -- `ping`, `version`, `inventory`, `jump`, the `generate-*`
+/// trio -- is itself a leaf, so it implements `Run`; this gives it the trivial
+/// `Dispatch` impl that just runs it. Reach for this instead of hand-writing
+/// the same `self.run(&mut ctx)` wrapper on each one.
+macro_rules! dispatch_via_run {
+    ($ty:ty) => {
+        impl $crate::cfg::dispatch::Dispatch for $ty {
+            async fn dispatch(
+                self,
+                mut ctx: $crate::cfg::runtime::RuntimeContext,
+            ) -> $crate::errors::CarbideCliResult<()> {
+                $crate::cfg::run::Run::run(self, &mut ctx).await
+            }
+        }
+    };
+}
+pub(crate) use dispatch_via_run;
+
 #[cfg(test)]
 mod tests {
-    use ::rpc::admin_cli::CarbideCliResult;
-
     use super::Dispatch;
     use crate::cfg::run::Run;
     use crate::cfg::runtime::RuntimeContext;
+    use crate::errors::CarbideCliResult;
 
     // Stub leaf command type that implements Run for the purpose
     // of testing our Dispatch + Run trait handling flow.
@@ -61,8 +82,11 @@ mod tests {
         }
     }
 
-    // Verify the derive generates a valid Dispatch impl when
-    // all variants are "leaf" commands (i.e. the Run trait).
+    // Deriving `Dispatch` on these enums is itself the test: the derive only
+    // compiles if it generates a valid `Dispatch` impl. `AllRunCmd` covers the
+    // all-leaf case (every variant is a `Run` command); `MixedCmd` covers mixing
+    // a leaf command with a nested `#[dispatch]` group. If either impl failed to
+    // generate, this module would not compile.
     #[derive(Dispatch)]
     #[allow(dead_code)]
     enum AllRunCmd {
@@ -71,26 +95,11 @@ mod tests {
         CmdC(StubRunArgs),
     }
 
-    // Verify the derive generates a valid Dispatch impl when
-    // mixing "leaf" commands (the `Run` trait) with nested command
-    // groups (which we annotate inline with `#[dispatch]`).
     #[derive(Dispatch)]
     #[allow(dead_code)]
     enum MixedCmd {
         SimpleRunCommand(StubRunArgs),
         #[dispatch]
         NestedCommandGroup(StubNestedCmd),
-    }
-
-    fn assert_dispatch<T: Dispatch>() {}
-
-    #[test]
-    fn all_run_variants_derive_dispatch() {
-        assert_dispatch::<AllRunCmd>();
-    }
-
-    #[test]
-    fn mixed_run_and_dispatch_variants_derive_dispatch() {
-        assert_dispatch::<MixedCmd>();
     }
 }

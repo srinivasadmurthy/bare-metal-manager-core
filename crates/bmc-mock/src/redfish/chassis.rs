@@ -19,7 +19,6 @@ use std::borrow::Cow;
 
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
 use serde_json::json;
@@ -29,7 +28,7 @@ use crate::json::{JsonExt, JsonPatch};
 use crate::redfish::Builder;
 use crate::{http, redfish};
 
-pub fn resource<'a>(chassis_id: &'a str) -> redfish::Resource<'a> {
+pub(super) fn resource<'a>(chassis_id: &'a str) -> redfish::Resource<'a> {
     let odata_id = format!("{}/{chassis_id}", collection().odata_id);
     redfish::Resource {
         odata_id: Cow::Owned(odata_id),
@@ -39,7 +38,7 @@ pub fn resource<'a>(chassis_id: &'a str) -> redfish::Resource<'a> {
     }
 }
 
-pub fn collection() -> redfish::Collection<'static> {
+pub(super) fn collection() -> redfish::Collection<'static> {
     redfish::Collection {
         odata_id: Cow::Borrowed("/redfish/v1/Chassis"),
         odata_type: Cow::Borrowed("#ChassisCollection.ChassisCollection"),
@@ -47,19 +46,20 @@ pub fn collection() -> redfish::Collection<'static> {
     }
 }
 
-pub fn builder(resource: &redfish::Resource) -> ChassisBuilder {
+fn builder(resource: &redfish::Resource) -> ChassisBuilder {
     ChassisBuilder {
         value: resource.json_patch(),
     }
 }
 
-pub fn add_routes(r: Router<BmcState>) -> Router<BmcState> {
+pub(crate) fn add_routes(r: Router<BmcState>) -> Router<BmcState> {
     const CHASSIS_ID: &str = "{chassis_id}";
     const NET_ADAPTER_ID: &str = "{network_adapter_id}";
     const NET_FUNC_ID: &str = "{function_id}";
     const PCIE_DEVICE_ID: &str = "{pcie_device_id}";
     const SENSOR_ID: &str = "{sensor_id}";
     const POWER_SUPPLY_ID: &str = "{power_supply_id}";
+    const LEAK_DETECTOR_ID: &str = "{leak_detector_id}";
     r.route(&collection().odata_id, get(get_chassis_collection))
         .route(&resource(CHASSIS_ID).odata_id, get(get_chassis))
         .route(
@@ -116,27 +116,45 @@ pub fn add_routes(r: Router<BmcState>) -> Router<BmcState> {
             &redfish::power_supply::resource(CHASSIS_ID, POWER_SUPPLY_ID).odata_id,
             get(get_chassis_power_supply),
         )
+        .route(
+            &redfish::thermal_subsystem::resource(CHASSIS_ID).odata_id,
+            get(get_chassis_thermal_subsystem),
+        )
+        .route(
+            &redfish::thermal_subsystem::leak_detection_resource(CHASSIS_ID).odata_id,
+            get(get_chassis_leak_detection),
+        )
+        .route(
+            &redfish::leak_detector::collection(CHASSIS_ID).odata_id,
+            get(get_chassis_leak_detector_collection),
+        )
+        .route(
+            &redfish::leak_detector::resource(CHASSIS_ID, LEAK_DETECTOR_ID).odata_id,
+            get(get_chassis_leak_detector),
+        )
 }
 
-pub struct SingleChassisConfig {
-    pub id: Cow<'static, str>,
-    pub serial_number: Option<Cow<'static, str>>,
-    pub manufacturer: Option<Cow<'static, str>>,
-    pub model: Option<Cow<'static, str>>,
-    pub part_number: Option<Cow<'static, str>>,
-    pub network_adapters: Option<Vec<redfish::network_adapter::NetworkAdapter>>,
-    pub pcie_devices: Option<Vec<redfish::pcie_device::PCIeDevice>>,
-    pub sensors: Option<Vec<redfish::sensor::Sensor>>,
-    pub chassis_type: Cow<'static, str>,
-    pub assembly: Option<serde_json::Value>,
-    pub power_supplies: Option<Vec<redfish::power_supply::PowerSupply>>,
-    pub oem: Option<serde_json::Value>,
+pub(crate) struct SingleChassisConfig {
+    pub(crate) id: Cow<'static, str>,
+    pub(crate) serial_number: Option<Cow<'static, str>>,
+    pub(crate) manufacturer: Option<Cow<'static, str>>,
+    pub(crate) model: Option<Cow<'static, str>>,
+    pub(crate) part_number: Option<Cow<'static, str>>,
+    pub(crate) sku: Option<Cow<'static, str>>,
+    pub(crate) network_adapters: Option<Vec<redfish::network_adapter::NetworkAdapter>>,
+    pub(crate) pcie_devices: Option<Vec<redfish::pcie_device::PCIeDevice>>,
+    pub(crate) sensors: Option<Vec<redfish::sensor::Sensor>>,
+    pub(crate) leak_detectors: Option<Vec<redfish::leak_detector::LeakDetector>>,
+    pub(crate) chassis_type: Cow<'static, str>,
+    pub(crate) assembly: Option<serde_json::Value>,
+    pub(crate) power_supplies: Option<Vec<redfish::power_supply::PowerSupply>>,
+    pub(crate) oem: Option<serde_json::Value>,
 }
 
 impl SingleChassisConfig {
     // To use with ..SingleChassisConfig::defaults() to fill config
     // with defaults.
-    pub fn defaults() -> SingleChassisConfig {
+    pub(crate) fn defaults() -> SingleChassisConfig {
         Self {
             id: "".into(),
             chassis_type: "".into(),
@@ -144,9 +162,11 @@ impl SingleChassisConfig {
             manufacturer: None,
             model: None,
             part_number: None,
+            sku: None,
             network_adapters: None,
             pcie_devices: None,
             sensors: None,
+            leak_detectors: None,
             assembly: None,
             power_supplies: None,
             oem: None,
@@ -154,16 +174,16 @@ impl SingleChassisConfig {
     }
 }
 
-pub struct ChassisConfig {
-    pub chassis: Vec<SingleChassisConfig>,
+pub(crate) struct ChassisConfig {
+    pub(crate) chassis: Vec<SingleChassisConfig>,
 }
 
-pub struct ChassisState {
+pub(crate) struct ChassisState {
     chassis: Vec<SingleChassisState>,
 }
 
 impl ChassisState {
-    pub fn from_config(config: ChassisConfig) -> Self {
+    pub(crate) fn from_config(config: ChassisConfig) -> Self {
         let chassis = config
             .chassis
             .into_iter()
@@ -172,15 +192,19 @@ impl ChassisState {
         Self { chassis }
     }
 
-    pub fn find(&self, chassis_id: &str) -> Option<&SingleChassisState> {
+    pub(crate) fn find(&self, chassis_id: &str) -> Option<&SingleChassisState> {
         self.chassis
             .iter()
             .find(|c| c.config.id.as_ref() == chassis_id)
     }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SingleChassisState> {
+        self.chassis.iter()
+    }
 }
 
-pub struct SingleChassisState {
-    pub config: SingleChassisConfig,
+pub(crate) struct SingleChassisState {
+    pub(crate) config: SingleChassisConfig,
 }
 
 impl SingleChassisState {
@@ -188,7 +212,7 @@ impl SingleChassisState {
         Self { config }
     }
 
-    pub fn pcie_devices_resources(&self) -> Vec<redfish::Resource<'static>> {
+    pub(crate) fn pcie_devices_resources(&self) -> Vec<redfish::Resource<'static>> {
         self.config
             .pcie_devices
             .iter()
@@ -223,6 +247,21 @@ impl SingleChassisState {
             .power_supplies
             .as_ref()
             .and_then(|v| v.iter().find(|v| v.id == id))
+    }
+
+    fn leak_detectors(&self) -> Vec<redfish::leak_detector::LeakDetector> {
+        self.config.leak_detectors.clone().unwrap_or_default()
+    }
+
+    fn find_leak_detector(&self, id: &str) -> Option<&redfish::leak_detector::LeakDetector> {
+        self.config
+            .leak_detectors
+            .as_ref()
+            .and_then(|leak_detectors| {
+                leak_detectors
+                    .iter()
+                    .find(|detector| detector.id.as_ref() == id)
+            })
     }
 }
 
@@ -266,6 +305,11 @@ async fn get_chassis(State(state): State<BmcState>, Path(chassis_id): Path<Strin
         .is_some()
         .then_some(redfish::power_subsystem::resource(&chassis_id));
 
+    let thermal_subsystem = config
+        .leak_detectors
+        .is_some()
+        .then_some(redfish::thermal_subsystem::resource(&chassis_id));
+
     let mut b = builder(&resource(&chassis_id))
         .chassis_type(&config.chassis_type)
         .maybe_with(ChassisBuilder::assembly, &assembly)
@@ -275,7 +319,9 @@ async fn get_chassis(State(state): State<BmcState>, Path(chassis_id): Path<Strin
         .maybe_with(ChassisBuilder::serial_number, &config.serial_number)
         .maybe_with(ChassisBuilder::manufacturer, &config.manufacturer)
         .maybe_with(ChassisBuilder::part_number, &config.part_number)
+        .maybe_with(ChassisBuilder::sku, &config.sku)
         .maybe_with(ChassisBuilder::power_subsystem, &power_subsystem)
+        .maybe_with(ChassisBuilder::thermal_subsystem, &thermal_subsystem)
         .maybe_with(ChassisBuilder::model, &config.model);
 
     if let Some(oem) = &config.oem {
@@ -316,11 +362,6 @@ async fn get_chassis_network_adapter(
     let Some(chassis_state) = state.chassis_state.find(&chassis_id) else {
         return http::not_found();
     };
-    if let Some(helper) = state.injected_bugs.all_dpu_lost_on_host() {
-        return helper
-            .network_adapter(&chassis_id, &network_adapter_id)
-            .into_ok_response();
-    }
     chassis_state
         .find_network_adapter(&network_adapter_id)
         .map(|eth| eth.to_json().into_ok_response())
@@ -376,13 +417,7 @@ async fn get_pcie_device(
         .chassis_state
         .find(&chassis_id)
         .and_then(|chassis_state| chassis_state.find_pcie_device(&pcie_device_id))
-        .map(|pcie_device| {
-            if pcie_device.is_mat_dpu && state.injected_bugs.all_dpu_lost_on_host().is_some() {
-                json!("All DPU lost bug injected").into_response(StatusCode::NOT_FOUND)
-            } else {
-                pcie_device.to_json().into_ok_response()
-            }
-        })
+        .map(|pcie_device| pcie_device.to_json().into_ok_response())
         .unwrap_or_else(http::not_found)
 }
 
@@ -509,7 +544,79 @@ async fn get_chassis_power_supply(
         .unwrap_or_else(http::not_found)
 }
 
-pub struct ChassisBuilder {
+async fn get_chassis_thermal_subsystem(
+    State(state): State<BmcState>,
+    Path(chassis_id): Path<String>,
+) -> Response {
+    state
+        .chassis_state
+        .find(&chassis_id)
+        .map(|_| {
+            redfish::thermal_subsystem::builder(&redfish::thermal_subsystem::resource(&chassis_id))
+                .leak_detection(&redfish::thermal_subsystem::leak_detection_resource(
+                    &chassis_id,
+                ))
+                .build()
+                .into_ok_response()
+        })
+        .unwrap_or_else(http::not_found)
+}
+
+async fn get_chassis_leak_detection(
+    State(state): State<BmcState>,
+    Path(chassis_id): Path<String>,
+) -> Response {
+    state
+        .chassis_state
+        .find(&chassis_id)
+        .map(|_| {
+            redfish::thermal_subsystem::leak_detection_builder(
+                &redfish::thermal_subsystem::leak_detection_resource(&chassis_id),
+            )
+            .leak_detectors(&redfish::leak_detector::collection(&chassis_id))
+            .build()
+            .into_ok_response()
+        })
+        .unwrap_or_else(http::not_found)
+}
+
+async fn get_chassis_leak_detector_collection(
+    State(state): State<BmcState>,
+    Path(chassis_id): Path<String>,
+) -> Response {
+    state
+        .chassis_state
+        .find(&chassis_id)
+        .map(SingleChassisState::leak_detectors)
+        .map(|leak_detectors| {
+            leak_detectors
+                .iter()
+                .map(|detector| {
+                    redfish::leak_detector::resource(&chassis_id, &detector.id).entity_ref()
+                })
+                .collect::<Vec<_>>()
+        })
+        .map(|members| {
+            redfish::leak_detector::collection(&chassis_id)
+                .with_members(&members)
+                .into_ok_response()
+        })
+        .unwrap_or_else(http::not_found)
+}
+
+async fn get_chassis_leak_detector(
+    State(state): State<BmcState>,
+    Path((chassis_id, leak_detector_id)): Path<(String, String)>,
+) -> Response {
+    state
+        .chassis_state
+        .find(&chassis_id)
+        .and_then(|chassis_state| chassis_state.find_leak_detector(&leak_detector_id))
+        .map(|detector| detector.to_json(&chassis_id).into_ok_response())
+        .unwrap_or_else(http::not_found)
+}
+
+struct ChassisBuilder {
     value: serde_json::Value,
 }
 
@@ -522,51 +629,59 @@ impl Builder for ChassisBuilder {
 }
 
 impl ChassisBuilder {
-    pub fn serial_number(self, v: &str) -> Self {
+    fn serial_number(self, v: &str) -> Self {
         self.add_str_field("SerialNumber", v)
     }
 
-    pub fn chassis_type(self, v: &str) -> Self {
+    fn chassis_type(self, v: &str) -> Self {
         self.add_str_field("ChassisType", v)
     }
 
-    pub fn manufacturer(self, v: &str) -> Self {
+    fn manufacturer(self, v: &str) -> Self {
         self.add_str_field("Manufacturer", v)
     }
 
-    pub fn part_number(self, v: &str) -> Self {
+    fn part_number(self, v: &str) -> Self {
         self.add_str_field("PartNumber", v)
     }
 
-    pub fn model(self, v: &str) -> Self {
+    fn model(self, v: &str) -> Self {
         self.add_str_field("Model", v)
     }
 
-    pub fn assembly(self, v: &redfish::Resource<'_>) -> Self {
+    fn sku(self, v: &str) -> Self {
+        self.add_str_field("SKU", v)
+    }
+
+    fn assembly(self, v: &redfish::Resource<'_>) -> Self {
         self.apply_patch(v.nav_property("Assembly"))
     }
 
-    pub fn network_adapters(self, v: &redfish::Collection<'_>) -> Self {
+    fn network_adapters(self, v: &redfish::Collection<'_>) -> Self {
         self.apply_patch(v.nav_property("NetworkAdapters"))
     }
 
-    pub fn pcie_devices(self, v: &redfish::Collection<'_>) -> Self {
+    fn pcie_devices(self, v: &redfish::Collection<'_>) -> Self {
         self.apply_patch(v.nav_property("PCIeDevices"))
     }
 
-    pub fn sensors(self, v: &redfish::Collection<'_>) -> Self {
+    fn sensors(self, v: &redfish::Collection<'_>) -> Self {
         self.apply_patch(v.nav_property("Sensors"))
     }
 
-    pub fn power_subsystem(self, v: &redfish::Resource<'_>) -> Self {
+    fn power_subsystem(self, v: &redfish::Resource<'_>) -> Self {
         self.apply_patch(v.nav_property("PowerSubsystem"))
     }
 
-    pub fn oem(self, v: &serde_json::Value) -> Self {
+    fn thermal_subsystem(self, v: &redfish::Resource<'_>) -> Self {
+        self.apply_patch(v.nav_property("ThermalSubsystem"))
+    }
+
+    fn oem(self, v: &serde_json::Value) -> Self {
         self.apply_patch(json!({"Oem": v}))
     }
 
-    pub fn build(self) -> serde_json::Value {
+    fn build(self) -> serde_json::Value {
         self.value
     }
 }

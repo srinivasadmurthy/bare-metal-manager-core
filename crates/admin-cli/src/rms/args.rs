@@ -18,26 +18,44 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct RmsAction {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Get the full RMS inventory (RMS URL taken from --url or config):
+    $ nico-admin-cli rms --url https://rms.example.com:8443 inventory
+
+Get a rack's power-on sequence (URL from config):
+    $ nico-admin-cli rms power-on-sequence rack-1
+
+Talk to RMS over mTLS with explicit certs:
+    $ nico-admin-cli rms --url https://rms.example.com:8443 \
+    --root-ca /etc/rms/ca.crt --client-cert /etc/rms/client.crt \
+    --client-key /etc/rms/client.key inventory
+
+The --url, --root-ca, --client-cert and --client-key flags are global and
+may be given before or after the subcommand.
+
+")]
+pub(crate) struct RmsAction {
     #[clap(subcommand)]
-    pub command: Cmd,
+    pub(super) command: Cmd,
 
     #[clap(long, global = true, help = "URL of RMS API endpoint (required).")]
-    pub url: Option<String>,
+    pub(super) url: Option<String>,
 
     #[clap(long, global = true, help = "Root CA path")]
-    pub root_ca: Option<String>,
+    pub(super) root_ca: Option<String>,
 
     #[clap(long, global = true, help = "Client certificate path")]
-    pub client_cert: Option<String>,
+    pub(super) client_cert: Option<String>,
 
     #[clap(long, global = true, help = "Client key path")]
-    pub client_key: Option<String>,
+    pub(super) client_key: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
 #[clap(rename_all = "kebab_case")]
-pub enum Cmd {
+pub(super) enum Cmd {
     #[clap(about = "Get the full RMS inventory")]
     Inventory,
     #[clap(about = "Get the power on sequence")]
@@ -49,32 +67,44 @@ pub enum Cmd {
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct PowerOnSequence {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Get the power-on sequence for a rack:
+    $ nico-admin-cli rms power-on-sequence rack-1
+
+")]
+pub(super) struct PowerOnSequence {
     #[clap(help = "Rack ID to get power sequence for")]
-    pub rack_id: String,
+    rack_id: String,
 }
 
 impl From<PowerOnSequence> for librms::protos::rack_manager::GetRackPowerOnSequenceRequest {
     fn from(args: PowerOnSequence) -> Self {
         Self {
-            metadata: None,
             rack_id: args.rack_id,
         }
     }
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct PowerState {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Get the power state of a node in a rack:
+    $ nico-admin-cli rms power-state rack-1 node-1
+
+")]
+pub(super) struct PowerState {
     #[clap(help = "Rack ID to get power sequence for")]
-    pub rack_id: String,
+    rack_id: String,
     #[clap(help = "Node ID to get power state for")]
-    pub node_id: String,
+    node_id: String,
 }
 
 impl From<PowerState> for librms::protos::rack_manager::GetPowerStateRequest {
     fn from(args: PowerState) -> Self {
         Self {
-            metadata: None,
             node_id: args.node_id,
             rack_id: args.rack_id,
         }
@@ -82,17 +112,23 @@ impl From<PowerState> for librms::protos::rack_manager::GetPowerStateRequest {
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct FirmwareInventory {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Get the firmware inventory for a node in a rack:
+    $ nico-admin-cli rms firmware-inventory rack-1 node-1
+
+")]
+pub(super) struct FirmwareInventory {
     #[clap(help = "Rack ID to get power sequence for")]
-    pub rack_id: String,
+    rack_id: String,
     #[clap(help = "Node ID to get firmware inventory for")]
-    pub node_id: String,
+    node_id: String,
 }
 
 impl From<FirmwareInventory> for librms::protos::rack_manager::GetNodeFirmwareInventoryRequest {
     fn from(args: FirmwareInventory) -> Self {
         Self {
-            metadata: None,
             node_id: args.node_id,
             rack_id: args.rack_id,
         }

@@ -67,11 +67,18 @@ test_selection_mode = "EnableAll"
 [machine_state_controller]
 dpu_wait_time = "24h"
 power_down_wait = "24h"
+
+[machine_state_controller.controller]
 iteration_time = "24h"
 
 [network_segment_state_controller]
 network_segment_drain_time = "24h"
 [network_segment_state_controller.controller]
+iteration_time = "24h"
+
+[vpc_prefix_state_controller]
+vpc_prefix_drain_time = "24h"
+[vpc_prefix_state_controller.controller]
 iteration_time = "24h"
 
 [ib_partition_state_controller.controller]
@@ -83,4 +90,3 @@ create_machines = false
 allow_changing_bmc_proxy = false
 bmc_proxy = ":2000"
 run_interval = "600s"
-allow_zero_dpu_hosts = true

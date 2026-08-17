@@ -117,7 +117,7 @@ impl K8sConfigRepository for RebootAnnotationMock {
     ) -> Result<Option<BTreeMap<String, Vec<u8>>>, DpfError> {
         Ok(None)
     }
-    async fn create_secret(
+    async fn apply_secret(
         &self,
         _: &str,
         _: &str,
@@ -145,9 +145,9 @@ async fn test_reboot_annotation_set_check_clear() {
     // Register a DPU node
     let node_info = DpuNodeInfo {
         node_id: "host-001".to_string(),
-        host_bmc_ip: "192.168.1.1".to_string(),
+        host_bmc_ip: "192.168.1.1".parse().unwrap(),
         device_ids: vec!["dpu-001".to_string()],
-        host_machine_id: "host-001-id".to_string(),
+        deployment_type: DpuDeploymentType::Bf3,
     };
     sdk.register_dpu_node(node_info).await.unwrap();
 

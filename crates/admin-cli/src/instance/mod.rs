@@ -16,19 +16,19 @@
  */
 
 mod allocate;
-pub(crate) mod common;
 mod reboot;
 mod release;
 mod show;
 mod update_ib_config;
 mod update_nvlink_config;
 mod update_os;
+mod update_spx_config;
 
 // Cross-module re-exports for jump module
 // Cross-module re-export for rpc module
-pub use allocate::args::Args as AllocateInstance;
-pub use show::args::Args as ShowInstance;
-pub use show::cmd::handle_show;
+pub(crate) use allocate::args::Args as AllocateInstance;
+pub(crate) use show::args::Args as ShowInstance;
+pub(crate) use show::cmd::handle_show;
 
 #[cfg(test)]
 mod tests;
@@ -38,7 +38,7 @@ use clap::Parser;
 use crate::cfg::dispatch::Dispatch;
 
 #[derive(Parser, Debug, Dispatch)]
-pub enum Cmd {
+pub(crate) enum Cmd {
     #[clap(about = "Display instance information")]
     Show(show::Args),
     #[clap(about = "Reboot instance, potentially applying firmware updates")]
@@ -53,4 +53,6 @@ pub enum Cmd {
     UpdateIbConfig(update_ib_config::Args),
     #[clap(about = "Update instance NVLink configuration")]
     UpdateNvLinkConfig(update_nvlink_config::Args),
+    #[clap(about = "Update instance SPX configuration")]
+    UpdateSpxConfig(update_spx_config::Args),
 }

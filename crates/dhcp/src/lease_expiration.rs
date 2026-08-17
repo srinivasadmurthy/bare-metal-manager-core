@@ -28,8 +28,9 @@ use crate::{CONFIG, CarbideDhcpContext, tls};
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum LeaseExpirationResult {
     Success = 0,
-    InvalidAddress = 1,
-    ApiError = 2,
+    FeatureDisabled = 1,
+    InvalidAddress = 2,
+    ApiError = 3,
 }
 
 /// Called from the C++ lease4_expire / lease6_expire callouts to release
@@ -38,8 +39,14 @@ pub enum LeaseExpirationResult {
 /// # Safety
 ///
 /// `ip_address` must be a valid, null-terminated C string.
+/// `mac_address`, if non-null, must be a valid, null-terminated C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn carbide_expire_lease(ip_address: *const c_char) -> LeaseExpirationResult {
+pub unsafe extern "C" fn carbide_expire_lease(
+    ip_address: *const c_char,
+    mac_address: *const c_char,
+) -> LeaseExpirationResult {
+    // SAFETY: Kea keeps the required IP C string readable and NUL-terminated
+    // through this synchronous call, including its nested `block_on`.
     let ip_str = unsafe {
         match CStr::from_ptr(ip_address).to_str() {
             Ok(s) => s,
@@ -47,13 +54,28 @@ pub unsafe extern "C" fn carbide_expire_lease(ip_address: *const c_char) -> Leas
         }
     };
 
+    let mac_str = if mac_address.is_null() {
+        None
+    } else {
+        // SAFETY: A non-null optional MAC is a NUL-terminated Kea string that
+        // remains readable through this synchronous call.
+        unsafe {
+            match CStr::from_ptr(mac_address).to_str() {
+                Ok(s) if !s.is_empty() => Some(s),
+                Ok(_) => None,
+                Err(_) => return LeaseExpirationResult::InvalidAddress,
+            }
+        }
+    };
+
     let url = &CONFIG.read().unwrap().api_endpoint;
     let forge_client_config = tls::build_forge_client_config();
-    expire_lease_at(ip_str, url, &forge_client_config)
+    expire_lease_at(ip_str, mac_str, url, &forge_client_config)
 }
 
 fn expire_lease_at(
     ip_str: &str,
+    mac_str: Option<&str>,
     url: &str,
     client_config: &ForgeClientConfig,
 ) -> LeaseExpirationResult {
@@ -67,6 +89,7 @@ fn expire_lease_at(
         client
             .expire_dhcp_lease(tonic::Request::new(rpc::ExpireDhcpLeaseRequest {
                 ip_address: ip_str.to_string(),
+                mac_address: mac_str.map(|m| m.to_string()),
             }))
             .await
             .map_err(|e| format!("expire_dhcp_lease RPC failed: {e:?}"))
@@ -83,6 +106,10 @@ fn expire_lease_at(
                 }
                 rpc::ExpireDhcpLeaseStatus::NotFound => {
                     log::info!("No allocation found for expired lease {ip_str}");
+                }
+                rpc::ExpireDhcpLeaseStatus::FeatureDisabled => {
+                    log::info!("Feature is disabled at NICo");
+                    return LeaseExpirationResult::FeatureDisabled;
                 }
             }
             LeaseExpirationResult::Success
@@ -105,7 +132,12 @@ mod tests {
         let api_server = rt.block_on(mock_api_server::MockAPIServer::start());
         let client_config = tls::build_forge_client_config();
 
-        let result = expire_lease_at("10.0.0.1", api_server.local_http_addr(), &client_config);
+        let result = expire_lease_at(
+            "10.0.0.1",
+            None,
+            api_server.local_http_addr(),
+            &client_config,
+        );
 
         assert_eq!(result, LeaseExpirationResult::Success);
         assert_eq!(
@@ -120,8 +152,18 @@ mod tests {
         let api_server = rt.block_on(mock_api_server::MockAPIServer::start());
         let client_config = tls::build_forge_client_config();
 
-        let result1 = expire_lease_at("10.0.0.1", api_server.local_http_addr(), &client_config);
-        let result2 = expire_lease_at("10.0.0.1", api_server.local_http_addr(), &client_config);
+        let result1 = expire_lease_at(
+            "10.0.0.1",
+            None,
+            api_server.local_http_addr(),
+            &client_config,
+        );
+        let result2 = expire_lease_at(
+            "10.0.0.1",
+            None,
+            api_server.local_http_addr(),
+            &client_config,
+        );
 
         assert_eq!(result1, LeaseExpirationResult::Success);
         assert_eq!(result2, LeaseExpirationResult::Success);
@@ -137,7 +179,28 @@ mod tests {
         let api_server = rt.block_on(mock_api_server::MockAPIServer::start());
         let client_config = tls::build_forge_client_config();
 
-        let result = expire_lease_at("fd00::42", api_server.local_http_addr(), &client_config);
+        let result = expire_lease_at(
+            "fd00::42",
+            None,
+            api_server.local_http_addr(),
+            &client_config,
+        );
+
+        assert_eq!(result, LeaseExpirationResult::Success);
+    }
+
+    #[test]
+    fn test_expire_lease_with_mac() {
+        let rt = CarbideDhcpContext::get_tokio_runtime();
+        let api_server = rt.block_on(mock_api_server::MockAPIServer::start());
+        let client_config = tls::build_forge_client_config();
+
+        let result = expire_lease_at(
+            "10.0.0.1",
+            Some("aa:bb:cc:dd:ee:ff"),
+            api_server.local_http_addr(),
+            &client_config,
+        );
 
         assert_eq!(result, LeaseExpirationResult::Success);
     }

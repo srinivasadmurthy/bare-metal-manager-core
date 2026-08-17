@@ -1,4 +1,4 @@
-# Carbide DPF SDK
+# NICo DPF SDK
 
 Rust SDK for managing NVIDIA BlueField DPUs through the DPF (DOCA Platform Framework) Kubernetes operator. The flow we implement follows the official [DPF Component Description](https://docs.nvidia.com/networking/display/dpf25101/component-description) and [DPF Overview](https://docs.nvidia.com/networking/display/dpf25101/overview).
 
@@ -13,12 +13,14 @@ User-facing CRDs include: **BFB** (BlueField Boot image), **DPUFlavor** (hardwar
 
 ## What This SDK Does
 
-This SDK provides a Rust interface for Carbide to interact with the DPF operator. It maps to the four provisioning user flows from the [Component Description](https://docs.nvidia.com/networking/display/dpf25101/component-description). Details: `design-docs/DPF Carbide SDK - DPF background.md`.
+This SDK provides a Rust interface for NICo to interact with the DPF operator. It maps to the four provisioning user flows from the [Component Description](https://docs.nvidia.com/networking/display/dpf25101/component-description). Details: `design-docs/DPF NICo SDK - DPF background.md`.
 
 1. **Provision a DPU** (Component Description steps 2-5 + manual discovery + external node effect and reboot):
-   - Steps 2-5: `create_initialization_objects` creates BFB, DPUFlavor, and DPUDeployment (with `dpu_sets` referencing BFB and DPUFlavor).
-   - Manual discovery: `register_dpu_device` and `register_dpu_node` register DPUDevice/DPUNode CRDs (Carbide uses manual registration instead of NFD auto-discovery).
-   - Monitor flow (per design): watcher fires **MaintenanceNeeded** (DPU in NodeEffect) -> Carbide calls `release_maintenance_hold`; then **RebootRequired** -> Carbide reboots the host and calls `reboot_complete`; then **Ready**.
+   - Steps 2-5: `create_initialization_objects` creates a BFB or
+     BlueFieldSoftware provisioning source, a DPUFlavor, and a DPUDeployment
+     referencing that source and flavor.
+   - Manual discovery: `register_dpu_device` and `register_dpu_node` register DPUDevice/DPUNode CRDs (NICo uses manual registration instead of NFD auto-discovery).
+   - Monitor flow (per design): watcher fires **MaintenanceNeeded** (DPU in NodeEffect) -> NICo calls `release_maintenance_hold`; then **RebootRequired** -> NICo reboots the host and calls `reboot_complete`; then **Ready**.
 
 2. **Reprovision a DPU**: Delete the DPU CR (`reprovision_dpu`), watch for the new DPU (creation timestamp after delete), then run the same monitor flow as provisioning (maintenance -> release hold; reboot -> reboot + clear annotation; ready).
 
@@ -35,7 +37,7 @@ This SDK provides a Rust interface for Carbide to interact with the DPF operator
 
 ## API harness CLI
 
-The `carbide-dpf-api-harness` binary exercises the DPF SDK (same surface as Carbide API) against a real DPF operator for integration testing. Build with the `driver` feature:
+The `carbide-dpf-api-harness` binary exercises the DPF SDK (same surface as NICo API) against a real DPF operator for integration testing. Build with the `driver` feature:
 
 ```bash
 cargo build -p carbide-dpf --features driver --bin carbide-dpf-api-harness

@@ -18,11 +18,21 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Delete a rack by ID:
+    $ nico-admin-cli rack delete 12345678-1234-5678-90ab-cdef01234567
+
+Delete a rack by name:
+    $ nico-admin-cli rack delete rack-01
+
+")]
+pub(crate) struct Args {
     #[clap(
         help = "Rack ID or name to delete (should not have any associated compute trays, nvlink switches or power shelves)"
     )]
-    pub identifier: String,
+    identifier: String,
 }
 
 impl From<Args> for ::rpc::forge::DeleteRackRequest {

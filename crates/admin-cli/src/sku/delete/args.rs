@@ -18,6 +18,13 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
-    pub sku_id: String,
+#[command(after_long_help = "\
+EXAMPLES:
+
+Delete a SKU by ID:
+    $ nico-admin-cli sku delete DGX-H100-640GB
+
+")]
+pub(crate) struct Args {
+    pub(super) sku_id: String,
 }

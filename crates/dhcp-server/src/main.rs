@@ -14,43 +14,48 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#![cfg_attr(not(test), deny(dead_code_pub_in_binary))]
 
 mod cache;
 mod command_line;
 mod errors;
 mod grpc_server;
+mod metrics;
 mod modes;
 mod packet_handler;
 mod rpc;
 mod util;
-mod vendor_class;
 
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ::rpc::forge::{DhcpDiscovery, DhcpRecord};
+use ::rpc::forge_tls_client::ForgeClientConfig;
 use cache::CacheEntry;
-use carbide_utils::models::dhcp::{DhcpConfig, DhcpTimestamps, DhcpTimestampsFilePath, HostConfig};
+use carbide_instrument::emit;
+use carbide_rpc_utils::dhcp::{DhcpConfig, DhcpTimestamps, DhcpTimestampsFilePath, HostConfig};
 use chrono::Utc;
 use command_line::{Args, ServerMode};
 use errors::DhcpError;
+use forge_tls::client_config::ClientCert;
+use forge_tls::default::{default_client_cert, default_client_key, default_root_ca};
 use grpc_server::{ControlRequest, run_grpc_server};
 use lru::LruCache;
+use metrics::{DhcpPacketDropped, DhcpTimestampFileFailed, DropReason};
+use metrics_endpoint::{MetricsEndpointConfig, new_metrics_setup, run_metrics_endpoint};
 use modes::DhcpMode;
 use modes::controller::Controller;
 use modes::dpu::{Dpu, get_host_config};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tonic::async_trait;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::util::get_socket;
 
-pub struct Server {
+struct Server {
     socket: Arc<UdpSocket>,
 }
 
@@ -65,17 +70,19 @@ async fn run_dhcp_server(args: Args, cancel_token: CancellationToken) {
     let config__ = match init(args.clone()).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("Failed to initialise DHCP server config: {}", e);
+            tracing::error!(error = %e, "Failed to initialise DHCP server config");
             return;
         }
     };
 
     let dhcp_timestamps = Arc::new(Mutex::new({
-        let d = DhcpTimestamps::new(if let ServerMode::Dpu = args.mode {
+        let dhcp_timestamps_path = if let ServerMode::Dpu = args.mode {
             DhcpTimestampsFilePath::HbnTmp
         } else {
             DhcpTimestampsFilePath::NotSet
-        });
+        };
+        let dhcp_timestamps_path_context = dhcp_timestamps_path.path_str().to_string();
+        let d = DhcpTimestamps::new(dhcp_timestamps_path);
 
         // It looks like we can only expect the file to be present
         // if something has successfully DHCP'ed, after write() has been
@@ -84,7 +91,10 @@ async fn run_dhcp_server(args: Args, cancel_token: CancellationToken) {
         // and pollute the logs. We could have read() skip NotFound errors, but that
         // could be misleading in other scenarios.  Let's just "init" the file.
         if let Err(e) = d.write() {
-            tracing::error!("Failed to init DHCP timestamps file: {}", e);
+            emit(DhcpTimestampFileFailed::Initialization {
+                dhcp_timestamps_path: dhcp_timestamps_path_context,
+                error: e.to_string(),
+            });
             return;
         }
         d
@@ -102,20 +112,20 @@ async fn run_dhcp_server(args: Args, cancel_token: CancellationToken) {
     for interface in args.interfaces {
         let config_ = config__.clone();
         let args_mode = args.mode.clone();
+        let listen_address = args.listen_addr;
         let dhcp_timestamps_ = dhcp_timestamps.clone();
         let rate_limiter = rate_limiter_.clone();
         let cancel = cancel_token.clone();
 
         let handle = tokio::spawn(async move {
             let handler: Arc<Box<dyn DhcpMode>> = Arc::new(get_mode(&args_mode));
-            let listen_address = SocketAddr::new(std::net::IpAddr::from([0, 0, 0, 0]), 67);
 
             let socket = get_socket(listen_address, interface.clone()).await;
             tracing::info!(
-                "Listening on {:?} on interface: {}, mode: {:?}",
-                listen_address,
-                interface,
-                handler
+                %listen_address,
+                interface_name = interface.as_str(),
+                mode = ?handler,
+                "DHCP server listening"
             );
 
             let mut server = Server {
@@ -136,8 +146,8 @@ async fn run_dhcp_server(args: Args, cancel_token: CancellationToken) {
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         tracing::info!(
-                            "DHCP server on interface {} received cancellation, shutting down",
-                            interface
+                            interface_name = interface.as_str(),
+                            "DHCP server received cancellation, shutting down"
                         );
                         break;
                     }
@@ -148,10 +158,19 @@ async fn run_dhcp_server(args: Args, cancel_token: CancellationToken) {
                                 // We don't know after this read is failed, will we be able to read again
                                 // from this socket? Mostly no. In this case, recreate the socket.
                                 // We observed this fluctuation during admin to tenant network switch.
-                                tracing::error!("Socket recv failed with error: {err}");
+                                tracing::error!(
+                                    %listen_address,
+                                    interface_name = interface.as_str(),
+                                    error = %err,
+                                    "Socket receive failed"
+                                );
                                 // Try to close the existing socket.
                                 drop(server.socket);
-                                tracing::info!("Recreating the socket on {listen_address}, {interface}");
+                                tracing::info!(
+                                    %listen_address,
+                                    interface_name = interface.as_str(),
+                                    "Recreating the socket"
+                                );
                                 server.socket =
                                     Arc::new(get_socket(listen_address, interface.clone()).await);
                                 continue;
@@ -162,13 +181,21 @@ async fn run_dhcp_server(args: Args, cancel_token: CancellationToken) {
                         // TryAcquireError::NoPermits; Not checking explicitly.
                         let Ok(permit) = rate_limiter.clone().try_acquire_owned() else {
                             // drop packet.
-                            tracing::error!("Dropping packet because of rate limiting.");
+                            emit(DhcpPacketDropped {
+                                reason: DropReason::RateLimited,
+                                error: "parallel packet handling limit reached".to_string(),
+                            });
                             continue;
                         };
 
                         // Not a valid packet.
                         if len < MINIMUM_DHCP_PKT_SIZE {
-                            tracing::error!("Dropping packet because it is smaller than min length.");
+                            emit(DhcpPacketDropped {
+                                reason: DropReason::TooShort,
+                                error: format!(
+                                    "{len} bytes is below the {MINIMUM_DHCP_PKT_SIZE}-byte minimum"
+                                ),
+                            });
                             continue;
                         }
 
@@ -220,8 +247,18 @@ fn setup_tracing() -> Result<(), Box<dyn Error>> {
         .add_directive("hickory_resolver::name_server=info".parse().unwrap())
         .add_directive("hickory_proto=info".parse().unwrap());
 
+    // Counts every log line into carbide_log_events_total from startup; the
+    // counts are exposed once main() installs the meter provider. The env
+    // filter sits on the registry as a global filter so the counting layer
+    // and the logfmt output see exactly the same events.
+    let log_events = carbide_instrument::LogEventsMetric::new("nico-dhcp");
     tracing_subscriber::registry()
-        .with(logfmt::layer().with_filter(env_filter))
+        .with(log_events.layer())
+        .with(
+            logfmt::layer()
+                .with_event_fields([logfmt::EventField::with_default("component", "nico-dhcp")]),
+        )
+        .with(env_filter)
         .try_init()?;
     Ok(())
 }
@@ -244,7 +281,7 @@ async fn handle_update_config(
         tokio::fs::write(&new_dhcp, &dhcp_yaml)
             .await
             .map_err(|e| -> Box<dyn Error> { format!("write {new_dhcp}: {e}").into() })?;
-        tracing::info!("dhcp_config changed – staged at {new_dhcp}");
+        tracing::info!(path = new_dhcp.as_str(), "dhcp_config changed – staged");
     }
 
     if let (Some(yaml), Some(path)) = (host_yaml, &args.host_config) {
@@ -254,7 +291,7 @@ async fn handle_update_config(
             tokio::fs::write(&new_host, &yaml)
                 .await
                 .map_err(|e| -> Box<dyn Error> { format!("write {new_host}: {e}").into() })?;
-            tracing::info!("host_config changed – staged at {new_host}");
+            tracing::info!(path = new_host.as_str(), "host_config changed – staged");
         }
     }
     Ok(())
@@ -360,7 +397,7 @@ async fn run_with_grpc_control(
             .map_err(|e| -> Box<dyn Error> {
                 format!("create_dir_all {}: {e}", dir.display()).into()
             })?;
-        tracing::info!("Created config directory {}", dir.display());
+        tracing::info!(path = %dir.display(), "Created config directory");
     }
 
     // Channel through which the gRPC handlers deliver control requests.
@@ -402,7 +439,13 @@ async fn run_with_grpc_control(
                     None => std::future::pending().await,
                 }
             } => {
-                tracing::error!("DHCP server exited unexpectedly: {:?}", result);
+                match result {
+                    Ok(()) => tracing::error!("DHCP server exited unexpectedly"),
+                    Err(error) => tracing::error!(
+                        error = ?error,
+                        "DHCP server exited unexpectedly"
+                    ),
+                }
                 return Ok(());
             }
 
@@ -462,6 +505,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
+    // Install the global meter provider before the first packet is processed
+    // so every emitted event exports, whether or not the scrape endpoint is
+    // served below.
+    let metrics_setup = new_metrics_setup("carbide-dhcp-server", "forge-system", true)
+        .map_err(|e| format!("Failed to set up metrics: {e}"))?;
+    carbide_instrument::log_events::register(&metrics_setup.meter);
+
+    // Must keep meter_provider alive for the lifetime of the server;
+    // dropping it shuts down the Prometheus exporter.
+    let _metrics_guard = metrics_setup.meter_provider;
+
+    if let Some(ref addr_str) = args.metrics_listen_addr {
+        let metrics_listen_addr: SocketAddr = addr_str
+            .parse()
+            .map_err(|e| format!("Invalid --metrics-listen-addr '{}': {}", addr_str, e))?;
+        let metrics_config = MetricsEndpointConfig {
+            address: metrics_listen_addr,
+            registry: metrics_setup.registry,
+            health_controller: Some(metrics_setup.health_controller),
+            additional_prefix: None,
+        };
+        // The endpoint's /health and /ready report process liveness (the
+        // default HealthController state), not packet-serving readiness --
+        // don't point a DHCP-serving probe at them.
+        tokio::spawn(async move {
+            tracing::info!(metrics_address = %metrics_config.address, "Spawning metrics endpoint");
+            if let Err(e) = run_metrics_endpoint(&metrics_config).await {
+                tracing::error!(error = %e, "Metrics endpoint error");
+            }
+        });
+    }
+
     if let Some(ref addr_str) = args.grpc_listen_addr {
         let grpc_listen_addr: SocketAddr = addr_str
             .parse()
@@ -485,12 +560,15 @@ fn get_mode(args_mode: &ServerMode) -> Box<dyn DhcpMode> {
 }
 
 #[derive(Debug, Clone)]
-pub struct Config {
+struct Config {
     dhcp_config: DhcpConfig,
     host_config: Option<HostConfig>, // Valid only for Dpu mode.
+    relay_response_port: u16,
+    forge_client_config: ForgeClientConfig,
 }
 
 async fn init(args: Args) -> Result<Config, DhcpError> {
+    let forge_client_config = forge_client_config(&args)?;
     let f = tokio::fs::read_to_string(args.dhcp_config).await?;
     let dhcp_config: DhcpConfig = serde_yaml::from_str(&f)?;
 
@@ -504,69 +582,33 @@ async fn init(args: Args) -> Result<Config, DhcpError> {
     Ok(Config {
         dhcp_config,
         host_config,
+        relay_response_port: args.relay_response_port,
+        forge_client_config,
     })
 }
 
-#[derive(Debug)]
-pub struct TestArm {}
+fn forge_client_config(args: &Args) -> Result<ForgeClientConfig, DhcpError> {
+    let root_ca_path = args
+        .forge_root_ca_path
+        .clone()
+        .unwrap_or_else(|| default_root_ca().to_string());
+    let client_cert = match (&args.client_cert_path, &args.client_key_path) {
+        (Some(cert_path), Some(key_path)) => ClientCert {
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+        },
+        (None, None) => ClientCert {
+            cert_path: default_client_cert().to_string(),
+            key_path: default_client_key().to_string(),
+        },
+        _ => {
+            return Err(DhcpError::MissingArgument(
+                "client_cert_path and client_key_path must be configured together".to_string(),
+            ));
+        }
+    };
 
-#[async_trait]
-impl DhcpMode for TestArm {
-    async fn discover_dhcp(
-        &self,
-        _discovery_request: DhcpDiscovery,
-        _config: &Config,
-        _machine_cache: &mut Arc<Mutex<LruCache<String, CacheEntry>>>,
-    ) -> Result<DhcpRecord, DhcpError> {
-        Test::dhcp_record()
-    }
-
-    // Packets received from DPU to API must be relayed.
-    fn should_be_relayed(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Debug)]
-pub struct Test {}
-
-impl Test {
-    pub fn dhcp_record() -> Result<DhcpRecord, DhcpError> {
-        Ok(DhcpRecord {
-            machine_id: Some(
-                "fm100dsbiu5ckus880v8407u0mkcensa39cule26im5gnpvmuufckacguc0"
-                    .parse()
-                    .unwrap(),
-            ),
-            machine_interface_id: Some("0fd6e9a3-06fc-4a22-ad29-aca299677b00".parse().unwrap()),
-            segment_id: Some("55a2d74e-f9e1-49d5-bf99-be05171a5d75".parse().unwrap()),
-            subdomain_id: Some("56a2d74e-f9e1-49d5-bf99-be05171a5d75".parse().unwrap()),
-            fqdn: "seventeen-connecticut.dev3.frg.nvidia.com".to_string(),
-            mac_address: "b8:3f:d2:90:9a:12".to_string(),
-            address: "10.217.132.204".to_string(),
-            mtu: 6000,
-            prefix: "10.217.132.192/26".to_string(),
-            gateway: Some("10.217.132.193".to_string()),
-            booturl: None,
-            last_invalidation_time: None,
-        })
-    }
-}
-
-#[async_trait]
-impl DhcpMode for Test {
-    async fn discover_dhcp(
-        &self,
-        _discovery_request: DhcpDiscovery,
-        _config: &Config,
-        _machine_cache: &mut Arc<Mutex<LruCache<String, CacheEntry>>>,
-    ) -> Result<DhcpRecord, DhcpError> {
-        Test::dhcp_record()
-    }
-
-    fn should_be_relayed(&self) -> bool {
-        false
-    }
+    Ok(ForgeClientConfig::new(root_ca_path, Some(client_cert)))
 }
 
 const MINIMUM_DHCP_PKT_SIZE: usize = 236;
@@ -584,14 +626,28 @@ async fn process(
     dhcp_timestamps: Arc<Mutex<DhcpTimestamps>>,
 ) {
     if !addr.is_ipv4() {
-        tracing::error!("Dropping ivp6 packet.");
+        emit(DhcpPacketDropped {
+            reason: DropReason::NotIpv4,
+            error: format!("source address {addr} is not IPv4"),
+        });
         return;
     }
 
-    tracing::info!("Received packet [{}] from {}", buf[0], addr);
+    let Some(&bootp_op) = buf.first() else {
+        emit(DhcpPacketDropped {
+            reason: DropReason::TooShort,
+            error: format!("0 bytes is below the {MINIMUM_DHCP_PKT_SIZE}-byte minimum"),
+        });
+        return;
+    };
+
+    // Keep raw source/opcode visibility when validation or decoding fails
+    // before the structured request Event can be emitted.
+    tracing::debug!(bootp_op, source_address = %addr, "Received DHCP packet");
 
     let packet = match packet_handler::process_packet(
         buf,
+        addr,
         &config,
         circuit_id,
         handler,
@@ -601,17 +657,20 @@ async fn process(
     {
         Ok(packet) => packet,
         Err(err) => {
-            tracing::error!("Dropping packet because of error: {}", err);
+            emit(DhcpPacketDropped {
+                reason: DropReason::from(&err),
+                error: err.to_string(),
+            });
             return;
         }
     };
 
     let dest_address = handler.get_destination_address(&packet);
-    match packet.send(dest_address, socket).await {
-        Ok(_) => {}
-        Err(err) => {
-            tracing::error!("Packet sending failed because of error: {}", err);
-        }
+    if let Err(err) = packet.send(dest_address, socket).await {
+        emit(DhcpPacketDropped {
+            reason: DropReason::SendFailed,
+            error: err,
+        });
     }
 
     // Tell forge-dpu-agent that an IP has been requested for this interface.
@@ -619,10 +678,11 @@ async fn process(
         let mut dhcp_timestamps = dhcp_timestamps.lock().await;
         dhcp_timestamps.add_timestamp(host_config.host_interface_id, Utc::now().to_rfc3339());
         if let Err(e) = dhcp_timestamps.write() {
-            tracing::error!(
-                "Failed writing to {}: {e}",
-                DhcpTimestampsFilePath::HbnTmp.path_str()
-            );
+            emit(DhcpTimestampFileFailed::Write {
+                dhcp_timestamps_path: DhcpTimestampsFilePath::HbnTmp.path_str().to_string(),
+                host_interface_id: host_config.host_interface_id.to_string(),
+                error: e.to_string(),
+            });
         }
     }
 }
@@ -630,32 +690,110 @@ async fn process(
 #[cfg(test)]
 mod test {
     use std::env;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::PathBuf;
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use carbide_utils::models::dhcp::{DhcpTimestamps, DhcpTimestampsFilePath};
+    use carbide_instrument::testing::capture_logs_async;
+    use carbide_rpc_utils::dhcp::{DhcpTimestamps, DhcpTimestampsFilePath};
     use chrono::{DateTime, Utc};
     use dhcproto::v4::{DhcpOption, Message, MessageType, OptionCode};
     use dhcproto::{Decodable, Decoder, Encodable};
     use lru::LruCache;
+    use rpc::forge::{DhcpDiscovery, DhcpRecord};
     use tempfile::TempDir;
     use tokio::net::UdpSocket;
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
+    use tonic::async_trait;
 
+    use crate::cache::CacheEntry;
     use crate::command_line::{Args, ServerMode};
     use crate::errors::DhcpError;
-    use crate::{DhcpMode, Test, TestArm, cache, handle_reload, init, packet_handler, process};
+    use crate::{
+        Config, DhcpMode, cache, forge_client_config, handle_reload, init, packet_handler, process,
+    };
+
+    const TEST_SOURCE_ADDRESS: SocketAddr =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 68));
+
+    #[derive(Debug)]
+    struct TestArm {}
+
+    #[async_trait]
+    impl DhcpMode for TestArm {
+        async fn discover_dhcp(
+            &self,
+            _discovery_request: DhcpDiscovery,
+            _config: &Config,
+            _machine_cache: &mut Arc<Mutex<LruCache<String, CacheEntry>>>,
+        ) -> Result<DhcpRecord, DhcpError> {
+            Test::dhcp_record()
+        }
+
+        // Packets received from DPU to API must be relayed.
+        fn should_be_relayed(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct Test {}
+
+    impl Test {
+        fn dhcp_record() -> Result<DhcpRecord, DhcpError> {
+            Ok(DhcpRecord {
+                machine_id: Some(
+                    "fm100dsbiu5ckus880v8407u0mkcensa39cule26im5gnpvmuufckacguc0"
+                        .parse()
+                        .unwrap(),
+                ),
+                machine_interface_id: Some("0fd6e9a3-06fc-4a22-ad29-aca299677b00".parse().unwrap()),
+                segment_id: Some("55a2d74e-f9e1-49d5-bf99-be05171a5d75".parse().unwrap()),
+                subdomain_id: Some("56a2d74e-f9e1-49d5-bf99-be05171a5d75".parse().unwrap()),
+                fqdn: "seventeen-connecticut.dev3.frg.nvidia.com".to_string(),
+                mac_address: "b8:3f:d2:90:9a:12".to_string(),
+                address: "10.217.132.204".to_string(),
+                mtu: 6000,
+                prefix: "10.217.132.192/26".to_string(),
+                gateway: Some("10.217.132.193".to_string()),
+                booturl: None,
+                last_invalidation_time: None,
+                ntp_servers: vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()],
+            })
+        }
+    }
+
+    #[async_trait]
+    impl DhcpMode for Test {
+        async fn discover_dhcp(
+            &self,
+            _discovery_request: DhcpDiscovery,
+            _config: &Config,
+            _machine_cache: &mut Arc<Mutex<LruCache<String, CacheEntry>>>,
+        ) -> Result<DhcpRecord, DhcpError> {
+            Test::dhcp_record()
+        }
+
+        fn should_be_relayed(&self) -> bool {
+            false
+        }
+    }
 
     fn make_reload_args(td: &TempDir, interfaces: Vec<String>) -> Args {
         Args {
             interfaces,
+            listen_addr: "0.0.0.0:67".parse().unwrap(),
+            relay_response_port: 67,
             dhcp_config: td.path().join("dhcp.yaml").display().to_string(),
             host_config: Some(td.path().join("host.yaml").display().to_string()),
+            forge_root_ca_path: None,
+            client_cert_path: None,
+            client_key_path: None,
             mode: ServerMode::Dpu,
             grpc_listen_addr: None,
+            metrics_listen_addr: None,
         }
     }
 
@@ -816,6 +954,8 @@ mod test {
 
         Args {
             interfaces: vec!["eth0".to_string()],
+            listen_addr: "0.0.0.0:67".parse().unwrap(),
+            relay_response_port: 67,
             dhcp_config: base_path.join("conf/conf.yaml").display().to_string(),
             host_config: Some(
                 base_path
@@ -823,8 +963,12 @@ mod test {
                     .display()
                     .to_string(),
             ),
+            forge_root_ca_path: None,
+            client_cert_path: None,
+            client_key_path: None,
             mode: crate::command_line::ServerMode::Dpu,
             grpc_listen_addr: None,
+            metrics_listen_addr: None,
         }
     }
 
@@ -833,9 +977,32 @@ mod test {
         init(get_test_args()).await.unwrap();
     }
 
+    #[test]
+    fn forge_client_tls_paths_are_configurable() {
+        let defaults = forge_client_config(&get_test_args()).unwrap();
+        assert_eq!(defaults.root_ca_path, forge_tls::default::ROOT_CA);
+        let default_identity = defaults.client_cert.unwrap();
+        assert_eq!(default_identity.cert_path, forge_tls::default::CLIENT_CERT);
+        assert_eq!(default_identity.key_path, forge_tls::default::CLIENT_KEY);
+
+        let mut explicit = get_test_args();
+        explicit.forge_root_ca_path = Some("/local/ca.crt".to_string());
+        explicit.client_cert_path = Some("/local/client.crt".to_string());
+        explicit.client_key_path = Some("/local/client.key".to_string());
+        let configured = forge_client_config(&explicit).unwrap();
+        assert_eq!(configured.root_ca_path, "/local/ca.crt");
+        let configured_identity = configured.client_cert.unwrap();
+        assert_eq!(configured_identity.cert_path, "/local/client.crt");
+        assert_eq!(configured_identity.key_path, "/local/client.key");
+
+        explicit.client_key_path = None;
+        assert!(forge_client_config(&explicit).is_err());
+    }
+
     #[tokio::test]
     async fn test_arm_non_relayed_packet() {
-        let byte_stream = get_byte_stream(Ipv4Addr::new(0, 0, 0, 0), None, MessageType::Request);
+        let byte_stream =
+            get_byte_stream(Ipv4Addr::new(0, 0, 0, 0), None, MessageType::Request, None);
         let handler: Box<dyn DhcpMode> = Box::new(TestArm {});
         let config = init(get_test_args()).await.unwrap();
         let mut machine_cache = Arc::new(Mutex::new(LruCache::new(
@@ -844,6 +1011,7 @@ mod test {
         assert!(matches!(
             packet_handler::process_packet(
                 &byte_stream,
+                TEST_SOURCE_ADDRESS,
                 &config,
                 "vlan200",
                 &*handler,
@@ -860,6 +1028,7 @@ mod test {
             Ipv4Addr::new(0, 0, 0, 0),
             Some(Ipv4Addr::from_str("10.217.5.41").unwrap()),
             MessageType::Request,
+            None,
         );
         let handler: Box<dyn DhcpMode> = Box::new(TestArm {});
         let config = init(get_test_args()).await.unwrap();
@@ -869,6 +1038,7 @@ mod test {
         assert!(
             packet_handler::process_packet(
                 &byte_stream,
+                TEST_SOURCE_ADDRESS,
                 &config,
                 "vlan200",
                 &*handler,
@@ -879,20 +1049,27 @@ mod test {
         );
     }
 
+    /// A raw HTTP-client option 60 reaches the shared vendor-class parser
+    /// before the standalone server builds its reply. The reply keeps the
+    /// canonical client ID and uses the parsed architecture for option 67.
     #[tokio::test]
-    async fn test_complete_flow() {
+    async fn test_complete_http_boot_flow() {
         let byte_stream = get_byte_stream(
             Ipv4Addr::new(0, 0, 0, 0),
             Some(Ipv4Addr::from_str("10.217.5.41").unwrap()),
             MessageType::Request,
+            Some(b"HTTPClient::7::"),
         );
         let handler: Box<dyn DhcpMode> = Box::new(Test {});
-        let config = init(get_test_args()).await.unwrap();
+        let mut args = get_test_args();
+        args.relay_response_port = 6768;
+        let config = init(args).await.unwrap();
         let mut machine_cache = Arc::new(Mutex::new(LruCache::new(
             std::num::NonZeroUsize::new(cache::MACHINE_CACHE_SIZE).unwrap(),
         )));
         let packet = packet_handler::process_packet(
             &byte_stream,
+            TEST_SOURCE_ADDRESS,
             &config,
             "vlan200",
             &*handler,
@@ -903,11 +1080,249 @@ mod test {
 
         assert_eq!(
             packet.dst_address(),
-            SocketAddrV4::new(Ipv4Addr::from([0x0a, 0xd9, 0x05, 0x29]), 67)
+            SocketAddrV4::new(Ipv4Addr::from([0x0a, 0xd9, 0x05, 0x29]), 6768)
         );
         let packet = Message::decode(&mut dhcproto::Decoder::new(packet.encoded_packet())).unwrap();
 
         assert_eq!(packet.yiaddr(), Ipv4Addr::from([10, 217, 132, 204]));
+        assert_eq!(
+            packet.opts().get(OptionCode::ClassIdentifier),
+            Some(&DhcpOption::ClassIdentifier(b"HTTPClient".to_vec()))
+        );
+        assert_eq!(
+            packet.opts().get(OptionCode::BootfileName),
+            Some(&DhcpOption::BootfileName(
+                b"http://10.217.126.17:8080/public/blobs/internal/x86_64/ipxe.efi".to_vec()
+            ))
+        );
+    }
+
+    /// A decoded packet writes bounded request details at INFO, the complete
+    /// packet at DEBUG, and ticks the counter even when later processing fails.
+    #[tokio::test]
+    async fn process_packet_logs_and_counts_the_decoded_request() {
+        // No other test in this binary processes an Inform, so this label's
+        // delta is immune to tests running in parallel.
+        let byte_stream =
+            get_byte_stream(Ipv4Addr::new(0, 0, 0, 0), None, MessageType::Inform, None);
+        let handler: Box<dyn DhcpMode> = Box::new(Test {});
+        let config = init(get_test_args()).await.unwrap();
+        let mut machine_cache = Arc::new(Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(cache::MACHINE_CACHE_SIZE).unwrap(),
+        )));
+        let expected_received_packet = Message::decode(&mut Decoder::new(&byte_stream)).unwrap();
+        let expected_received_packet_text = expected_received_packet.to_string();
+
+        let metrics = carbide_instrument::testing::MetricsCapture::start();
+        let (result, logs) = capture_logs_async(packet_handler::process_packet(
+            &byte_stream,
+            TEST_SOURCE_ADDRESS,
+            &config,
+            "vlan200",
+            &*handler,
+            &mut machine_cache,
+        ))
+        .await;
+
+        assert!(matches!(result, Err(DhcpError::UnhandledMessageType(..))));
+        let request_log_index = logs
+            .iter()
+            .position(|entry| entry.metadata_name == "dhcp_server_request_received")
+            .expect("the decoded request Event should write an INFO record");
+        let request_log = &logs[request_log_index];
+        assert_eq!(request_log.level, tracing::Level::INFO);
+        assert_eq!(request_log.field("bootp_op"), Some("1"));
+        assert_eq!(request_log.field("source_address"), Some("192.0.2.10:68"));
+        assert_eq!(
+            request_log.field("xid"),
+            Some(expected_received_packet.xid().to_string().as_str())
+        );
+        assert_eq!(
+            request_log.field("broadcast_flag"),
+            Some(
+                expected_received_packet
+                    .flags()
+                    .broadcast()
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            request_log.field("ciaddr"),
+            Some(expected_received_packet.ciaddr().to_string().as_str())
+        );
+        assert_eq!(
+            request_log.field("yiaddr"),
+            Some(expected_received_packet.yiaddr().to_string().as_str())
+        );
+        assert_eq!(
+            request_log.field("siaddr"),
+            Some(expected_received_packet.siaddr().to_string().as_str())
+        );
+        assert_eq!(
+            request_log.field("giaddr"),
+            Some(expected_received_packet.giaddr().to_string().as_str())
+        );
+        assert_eq!(
+            request_log.field("chaddr"),
+            Some(crate::util::u8_to_mac(expected_received_packet.chaddr()).as_str())
+        );
+        assert_eq!(request_log.field("received_packet"), None);
+
+        let debug_log = logs
+            .get(request_log_index + 1)
+            .expect("the full-packet DEBUG record should immediately follow the Event");
+        assert_eq!(debug_log.level, tracing::Level::DEBUG);
+        assert_eq!(debug_log.message, "Received Packet");
+        assert_eq!(
+            debug_log.field("packet.received"),
+            Some(expected_received_packet_text.as_str())
+        );
+        assert_eq!(
+            metrics.counter_delta("carbide_dhcp_requests_total", &[("message_type", "inform")]),
+            1.0
+        );
+    }
+
+    /// A wire-provided hardware-address length cannot make the structured INFO
+    /// field or full-packet DEBUG formatter index beyond BOOTP's fixed field.
+    #[tokio::test]
+    async fn process_packet_rejects_oversized_hardware_address_length() {
+        let mut byte_stream =
+            get_byte_stream(Ipv4Addr::new(0, 0, 0, 0), None, MessageType::Request, None);
+        byte_stream[2] = 17;
+        let handler: Box<dyn DhcpMode> = Box::new(Test {});
+        let config = init(get_test_args()).await.unwrap();
+        let mut machine_cache = Arc::new(Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(cache::MACHINE_CACHE_SIZE).unwrap(),
+        )));
+
+        let result = packet_handler::process_packet(
+            &byte_stream,
+            TEST_SOURCE_ADDRESS,
+            &config,
+            "vlan200",
+            &*handler,
+            &mut machine_cache,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(DhcpError::InvalidInput(error))
+                if error == "DHCP hardware address length 17 exceeds the 16-byte BOOTP field"
+        ));
+    }
+
+    #[tokio::test]
+    async fn process_packet_rejects_an_empty_buffer() {
+        let handler: Box<dyn DhcpMode> = Box::new(Test {});
+        let config = init(get_test_args()).await.unwrap();
+        let mut machine_cache = Arc::new(Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(cache::MACHINE_CACHE_SIZE).unwrap(),
+        )));
+
+        let result = packet_handler::process_packet(
+            &[],
+            TEST_SOURCE_ADDRESS,
+            &config,
+            "vlan200",
+            &*handler,
+            &mut machine_cache,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(DhcpError::PacketDecodeFailure(
+                dhcproto::error::DecodeError::NotEnoughBytes
+            ))
+        ));
+    }
+
+    /// A successful send writes bounded reply details at INFO and immediately
+    /// follows them with the complete packet at DEBUG.
+    #[tokio::test]
+    async fn send_logs_bounded_reply_details_before_the_full_packet() {
+        let byte_stream =
+            get_byte_stream(Ipv4Addr::new(0, 0, 0, 0), None, MessageType::Request, None);
+        let handler: Box<dyn DhcpMode> = Box::new(Test {});
+        let config = init(get_test_args()).await.unwrap();
+        let mut machine_cache = Arc::new(Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(cache::MACHINE_CACHE_SIZE).unwrap(),
+        )));
+        let packet = packet_handler::process_packet(
+            &byte_stream,
+            TEST_SOURCE_ADDRESS,
+            &config,
+            "vlan200",
+            &*handler,
+            &mut machine_cache,
+        )
+        .await
+        .unwrap();
+        let expected_reply = Message::decode(&mut Decoder::new(packet.encoded_packet())).unwrap();
+        let expected_reply_text = expected_reply.to_string();
+
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let SocketAddr::V4(destination_address) = receiver.local_addr().unwrap() else {
+            panic!("the IPv4 loopback receiver should have an IPv4 address");
+        };
+        let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+
+        let (result, logs) = capture_logs_async(packet.send(destination_address, socket)).await;
+        result.unwrap();
+
+        let reply_log_index = logs
+            .iter()
+            .position(|entry| entry.metadata_name == "dhcp_server_reply_sent")
+            .expect("the successful send should write an INFO Event");
+        let reply_log = &logs[reply_log_index];
+        assert_eq!(reply_log.level, tracing::Level::INFO);
+        assert_eq!(reply_log.field("message_type"), Some("ack"));
+        assert_eq!(
+            reply_log.field("destination_address"),
+            Some(destination_address.to_string().as_str())
+        );
+        assert_eq!(
+            reply_log.field("xid"),
+            Some(expected_reply.xid().to_string().as_str())
+        );
+        assert_eq!(
+            reply_log.field("broadcast_flag"),
+            Some(expected_reply.flags().broadcast().to_string().as_str())
+        );
+        assert_eq!(
+            reply_log.field("ciaddr"),
+            Some(expected_reply.ciaddr().to_string().as_str())
+        );
+        assert_eq!(
+            reply_log.field("yiaddr"),
+            Some(expected_reply.yiaddr().to_string().as_str())
+        );
+        assert_eq!(
+            reply_log.field("siaddr"),
+            Some(expected_reply.siaddr().to_string().as_str())
+        );
+        assert_eq!(
+            reply_log.field("giaddr"),
+            Some(expected_reply.giaddr().to_string().as_str())
+        );
+        assert_eq!(
+            reply_log.field("chaddr"),
+            Some(crate::util::u8_to_mac(expected_reply.chaddr()).as_str())
+        );
+        assert_eq!(reply_log.field("sent_packet"), None);
+
+        let debug_log = logs
+            .get(reply_log_index + 1)
+            .expect("the full-packet DEBUG record should immediately follow the Event");
+        assert_eq!(debug_log.level, tracing::Level::DEBUG);
+        assert_eq!(debug_log.message, "Sent DHCP packet");
+        assert_eq!(
+            debug_log.field("packet.send"),
+            Some(expected_reply_text.as_str())
+        );
     }
 
     #[tokio::test]
@@ -916,6 +1331,7 @@ mod test {
             Ipv4Addr::new(10, 217, 132, 204),
             Some(Ipv4Addr::from_str("10.217.5.41").unwrap()),
             MessageType::Request,
+            None,
         );
         let handler: Box<dyn DhcpMode> = Box::new(Test {});
         let config = init(get_test_args()).await.unwrap();
@@ -924,6 +1340,7 @@ mod test {
         )));
         let packet = packet_handler::process_packet(
             &byte_stream,
+            TEST_SOURCE_ADDRESS,
             &config,
             "vlan200",
             &*handler,
@@ -944,7 +1361,8 @@ mod test {
 
     #[tokio::test]
     async fn test_send_metadata_to_agent() {
-        let byte_stream = get_byte_stream(Ipv4Addr::new(0, 0, 0, 0), None, MessageType::Discover);
+        let byte_stream =
+            get_byte_stream(Ipv4Addr::new(0, 0, 0, 0), None, MessageType::Discover, None);
         let handler: Box<dyn DhcpMode> = Box::new(Test {});
         let config = init(get_test_args()).await.unwrap();
         let mut machine_cache = Arc::new(Mutex::new(LruCache::new(
@@ -1022,6 +1440,7 @@ mod test {
         ciaddr: Ipv4Addr,
         giaddr: Option<Ipv4Addr>,
         message_type: MessageType,
+        class_identifier: Option<&[u8]>,
     ) -> Vec<u8> {
         let mut msg = Message::new(
             ciaddr,
@@ -1036,6 +1455,10 @@ mod test {
         }
 
         msg.opts_mut().insert(DhcpOption::MessageType(message_type));
+        if let Some(class_identifier) = class_identifier {
+            msg.opts_mut()
+                .insert(DhcpOption::ClassIdentifier(class_identifier.to_vec()));
+        }
 
         let mut encoded_packet = Vec::new();
         let mut e = dhcproto::Encoder::new(&mut encoded_packet);
@@ -1045,7 +1468,7 @@ mod test {
 
     #[tokio::test]
     async fn validate_basic_ack() {
-        let packet = get_byte_stream(Ipv4Addr::new(0, 0, 0, 0), None, MessageType::Request);
+        let packet = get_byte_stream(Ipv4Addr::new(0, 0, 0, 0), None, MessageType::Request, None);
 
         let config = init(get_test_args()).await.unwrap();
         let handler: Box<dyn DhcpMode> = Box::new(Test {});
@@ -1055,6 +1478,7 @@ mod test {
 
         let encoded_packet = packet_handler::process_packet(
             &packet,
+            TEST_SOURCE_ADDRESS,
             &config,
             "vlan200",
             &*handler,
@@ -1062,6 +1486,18 @@ mod test {
         )
         .await
         .unwrap();
+
+        assert_eq!(
+            encoded_packet.dst_address(),
+            SocketAddrV4::new(Ipv4Addr::BROADCAST, 68)
+        );
+
+        // The reply type the send path counts lease grants under matches the
+        // encoded reply.
+        assert_eq!(
+            encoded_packet.message_type(),
+            crate::metrics::MessageTypeLabel::Ack
+        );
 
         let packet = Message::decode(&mut Decoder::new(encoded_packet.encoded_packet())).unwrap();
         assert_eq!(
@@ -1072,7 +1508,7 @@ mod test {
 
     #[tokio::test]
     async fn validate_nak() {
-        let packet = get_byte_stream(Ipv4Addr::new(10, 0, 0, 1), None, MessageType::Request);
+        let packet = get_byte_stream(Ipv4Addr::new(10, 0, 0, 1), None, MessageType::Request, None);
 
         let config = init(get_test_args()).await.unwrap();
         let handler: Box<dyn DhcpMode> = Box::new(Test {});
@@ -1082,6 +1518,7 @@ mod test {
 
         let encoded_packet = packet_handler::process_packet(
             &packet,
+            TEST_SOURCE_ADDRESS,
             &config,
             "vlan200",
             &*handler,
@@ -1089,6 +1526,12 @@ mod test {
         )
         .await
         .unwrap();
+
+        // The nak_packet branch reports the refusal, not the request's type.
+        assert_eq!(
+            encoded_packet.message_type(),
+            crate::metrics::MessageTypeLabel::Nak
+        );
 
         let packet = Message::decode(&mut Decoder::new(encoded_packet.encoded_packet())).unwrap();
         assert_eq!(

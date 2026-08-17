@@ -19,7 +19,7 @@ use carbide_uuid::switch::SwitchId;
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub enum Args {
+pub(crate) enum Args {
     #[clap(about = "Set the Name or Description of the Switch")]
     Set(SwitchMetadataCommandSet),
     #[clap(about = "Show the Metadata of the Switch")]
@@ -33,43 +33,88 @@ pub enum Args {
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct SwitchMetadataCommandShow {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show a switch's metadata:
+    $ nico-admin-cli switch metadata show 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct SwitchMetadataCommandShow {
     #[clap(help = "The switch which should get its metadata displayed")]
-    pub switch: SwitchId,
+    pub(super) switch: SwitchId,
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct SwitchMetadataCommandSet {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Set a switch's name and description:
+    $ nico-admin-cli switch metadata set 12345678-1234-5678-90ab-cdef01234567 \
+    --name spine-01 --description \"Rack 4 spine\"
+
+")]
+pub(crate) struct SwitchMetadataCommandSet {
     #[clap(help = "The switch which should get updated metadata")]
-    pub switch: SwitchId,
+    pub(super) switch: SwitchId,
     #[clap(long, help = "The updated name of the Switch")]
-    pub name: Option<String>,
+    pub(super) name: Option<String>,
     #[clap(long, help = "The updated description of the Switch")]
-    pub description: Option<String>,
+    pub(super) description: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct SwitchMetadataCommandAddLabel {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Add a key-only label:
+    $ nico-admin-cli switch metadata add-label 12345678-1234-5678-90ab-cdef01234567 --key edge
+
+Add a key/value label:
+    $ nico-admin-cli switch metadata add-label 12345678-1234-5678-90ab-cdef01234567 \
+    --key env --value prod
+
+")]
+pub(crate) struct SwitchMetadataCommandAddLabel {
     #[clap(help = "The switch which should get updated metadata")]
-    pub switch: SwitchId,
+    pub(super) switch: SwitchId,
     #[clap(long, help = "The key to add")]
-    pub key: String,
+    pub(super) key: String,
     #[clap(long, help = "The optional value to add")]
-    pub value: Option<String>,
+    pub(super) value: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct SwitchMetadataCommandRemoveLabels {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Remove one or more labels by key:
+    $ nico-admin-cli switch metadata remove-labels 12345678-1234-5678-90ab-cdef01234567 \
+    --keys env --keys edge
+
+")]
+pub(crate) struct SwitchMetadataCommandRemoveLabels {
     #[clap(help = "The switch which should get updated metadata")]
-    pub switch: SwitchId,
+    pub(super) switch: SwitchId,
     #[clap(long, help = "The keys to remove")]
-    pub keys: Vec<String>,
+    pub(super) keys: Vec<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct SwitchMetadataCommandFromExpectedSwitch {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Fill in missing metadata from the expected-switch (leaving existing values intact):
+    $ nico-admin-cli switch metadata from-expected-switch 12345678-1234-5678-90ab-cdef01234567
+
+Overwrite the switch's metadata with the expected-switch's values:
+    $ nico-admin-cli switch metadata from-expected-switch 12345678-1234-5678-90ab-cdef01234567 \
+    --replace-all
+
+")]
+pub(crate) struct SwitchMetadataCommandFromExpectedSwitch {
     #[clap(help = "The switch which should get updated metadata")]
-    pub switch: SwitchId,
+    pub(super) switch: SwitchId,
     /// Whether to fully replace the Metadata that is currently stored on the Switch.
     /// - If not set, existing Metadata on the Switch will not be touched by executing
     ///   the command:
@@ -82,5 +127,5 @@ pub struct SwitchMetadataCommandFromExpectedSwitch {
     ///   they would if the Switch would get freshly ingested.
     ///   Metadata that is currently set on the Switch will be overridden.
     #[clap(long, verbatim_doc_comment)]
-    pub replace_all: bool,
+    pub(super) replace_all: bool,
 }

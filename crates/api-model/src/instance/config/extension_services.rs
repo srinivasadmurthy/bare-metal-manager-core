@@ -17,8 +17,6 @@
 
 use std::collections::HashSet;
 
-use ::rpc::errors::RpcDataConversionError;
-use ::rpc::forge as rpc;
 use carbide_uuid::extension_service::ExtensionServiceId;
 use chrono::{DateTime, Utc};
 use config_version::ConfigVersion;
@@ -32,41 +30,6 @@ pub struct InstanceExtensionServiceConfig {
     pub service_id: ExtensionServiceId,
     pub version: ConfigVersion,
     pub removed: Option<DateTime<Utc>>, // We need to track terminating services
-}
-
-impl TryFrom<rpc::InstanceDpuExtensionServiceConfig> for InstanceExtensionServiceConfig {
-    type Error = RpcDataConversionError;
-
-    fn try_from(config: rpc::InstanceDpuExtensionServiceConfig) -> Result<Self, Self::Error> {
-        let service_id = config
-            .service_id
-            .parse::<ExtensionServiceId>()
-            .map_err(|e| {
-                RpcDataConversionError::InvalidUuid("ExtensionServiceId", e.to_string())
-            })?;
-
-        let version = config.version.parse::<ConfigVersion>().map_err(|e| {
-            RpcDataConversionError::InvalidConfigVersion(format!(
-                "Failed to parse version as ConfigVersion: {}",
-                e
-            ))
-        })?;
-
-        Ok(InstanceExtensionServiceConfig {
-            service_id,
-            version,
-            removed: None,
-        })
-    }
-}
-
-impl From<InstanceExtensionServiceConfig> for rpc::InstanceDpuExtensionServiceConfig {
-    fn from(config: InstanceExtensionServiceConfig) -> Self {
-        rpc::InstanceDpuExtensionServiceConfig {
-            service_id: config.service_id.into(),
-            version: config.version.to_string(),
-        }
-    }
 }
 
 /// Extension services configuration for an instance
@@ -113,6 +76,21 @@ impl InstanceExtensionServicesConfig {
             .collect();
 
         current_active != new_services
+    }
+
+    /// Returns whether `new_config` introduces an active service or service version that is not
+    /// already active in the current config.
+    pub fn has_new_active_services(&self, new_config: &Self) -> bool {
+        let current_active: HashSet<_> = self
+            .active_services()
+            .iter()
+            .map(|s| (s.service_id, s.version.to_string()))
+            .collect();
+
+        new_config
+            .active_services()
+            .iter()
+            .any(|s| !current_active.contains(&(s.service_id, s.version.to_string())))
     }
 
     /// Calculates the new actual extension services config based on the current config and the new config.
@@ -186,44 +164,99 @@ impl InstanceExtensionServicesConfig {
             .collect()
     }
 
-    /// Removes services that have been marked as removed AND have the specified service IDs
-    /// This is used to clean up services that have been fully terminated across all DPUs
+    /// Removes extension service entries that match a fully-terminated `(service_id, version)`.
     pub fn remove_terminated_services(
         &self,
-        service_ids_to_remove: &HashSet<ExtensionServiceId>,
+        keys_to_remove: &[(ExtensionServiceId, ConfigVersion)],
     ) -> Self {
         let mut config = self.clone();
-        config
-            .service_configs
-            .retain(|s| !service_ids_to_remove.contains(&s.service_id));
+        config.service_configs.retain(|s| {
+            !keys_to_remove
+                .iter()
+                .any(|&(id, ver)| id == s.service_id && ver == s.version)
+        });
         config
     }
 }
 
-impl TryFrom<rpc::InstanceDpuExtensionServicesConfig> for InstanceExtensionServicesConfig {
-    type Error = RpcDataConversionError;
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
 
-    fn try_from(config: rpc::InstanceDpuExtensionServicesConfig) -> Result<Self, Self::Error> {
-        let service_configs = config
-            .service_configs
-            .into_iter()
-            .map(InstanceExtensionServiceConfig::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
+    use carbide_uuid::extension_service::ExtensionServiceId;
+    use chrono::Utc;
+    use config_version::ConfigVersion;
 
-        Ok(InstanceExtensionServicesConfig { service_configs })
+    use super::{InstanceExtensionServiceConfig, InstanceExtensionServicesConfig};
+
+    #[test]
+    fn extension_service_remove_terminated_services() {
+        let sid = ExtensionServiceId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let init_version = ConfigVersion::initial();
+        let second_version = init_version.increment();
+
+        let config = InstanceExtensionServicesConfig {
+            service_configs: vec![
+                InstanceExtensionServiceConfig {
+                    service_id: sid,
+                    version: second_version,
+                    removed: None,
+                },
+                InstanceExtensionServiceConfig {
+                    service_id: sid,
+                    version: init_version,
+                    removed: Some(Utc::now()),
+                },
+            ],
+        };
+
+        let cleaned = config.remove_terminated_services(&[(sid, init_version)]);
+
+        assert_eq!(cleaned.service_configs.len(), 1);
+        assert_eq!(cleaned.service_configs[0].service_id, sid);
+        assert_eq!(cleaned.service_configs[0].version, second_version);
+        assert!(cleaned.service_configs[0].removed.is_none());
     }
-}
 
-impl TryFrom<InstanceExtensionServicesConfig> for rpc::InstanceDpuExtensionServicesConfig {
-    type Error = RpcDataConversionError;
+    #[test]
+    fn extension_service_detects_only_new_active_services() {
+        let existing_id =
+            ExtensionServiceId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let new_id = ExtensionServiceId::from_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let initial_version = ConfigVersion::initial();
+        let current = InstanceExtensionServicesConfig {
+            service_configs: vec![InstanceExtensionServiceConfig {
+                service_id: existing_id,
+                version: initial_version,
+                removed: None,
+            }],
+        };
 
-    fn try_from(config: InstanceExtensionServicesConfig) -> Result<Self, Self::Error> {
-        Ok(rpc::InstanceDpuExtensionServicesConfig {
-            service_configs: config
-                .service_configs
-                .into_iter()
-                .map(|config| config.into())
-                .collect(),
-        })
+        let detached = InstanceExtensionServicesConfig::default();
+        assert!(!current.has_new_active_services(&detached));
+
+        let unchanged = current.clone();
+        assert!(!current.has_new_active_services(&unchanged));
+
+        let added = InstanceExtensionServicesConfig {
+            service_configs: vec![
+                unchanged.service_configs[0].clone(),
+                InstanceExtensionServiceConfig {
+                    service_id: new_id,
+                    version: initial_version,
+                    removed: None,
+                },
+            ],
+        };
+        assert!(current.has_new_active_services(&added));
+
+        let upgraded = InstanceExtensionServicesConfig {
+            service_configs: vec![InstanceExtensionServiceConfig {
+                service_id: existing_id,
+                version: initial_version.increment(),
+                removed: None,
+            }],
+        };
+        assert!(current.has_new_active_services(&upgraded));
     }
 }

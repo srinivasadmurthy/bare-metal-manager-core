@@ -16,14 +16,14 @@
  */
 
 use ::rpc::admin_cli::output::OutputFormat;
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use rpc::forge::{VpcPeeringIdList, VpcPeeringSearchFilter, VpcPeeringsByIdsRequest};
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 use crate::vpc_peering::convert_vpc_peerings_to_table;
 
-pub async fn show(
+pub(super) async fn show(
     args: &Args,
     output_format: OutputFormat,
     api_client: &ApiClient,

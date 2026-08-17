@@ -15,17 +15,18 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use rpc::forge::{FindTenantRequest, UpdateTenantRequest};
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 use crate::tenant::show::cmd::convert_tenants_to_table;
 
 /// Update a tenant.
 /// On successful update, the details of the
 /// tenant will be displayed.
-pub async fn update(
+pub(super) async fn update(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,

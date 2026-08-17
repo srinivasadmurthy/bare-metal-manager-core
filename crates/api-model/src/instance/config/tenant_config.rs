@@ -17,7 +17,6 @@
 
 use std::collections::HashSet;
 
-use ::rpc::errors::RpcDataConversionError;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -39,41 +38,6 @@ pub struct TenantConfig {
 
 pub static HOSTNAME_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$").unwrap());
-
-impl TryFrom<rpc::forge::TenantConfig> for TenantConfig {
-    type Error = RpcDataConversionError;
-
-    fn try_from(config: rpc::forge::TenantConfig) -> Result<Self, Self::Error> {
-        let truncated_hostname = config.hostname.map(|mut name| {
-            if name.len() > 63 {
-                name.truncate(63);
-                tracing::warn!("Hostname has been truncated to 63 characters.")
-            }
-            name
-        });
-
-        Ok(Self {
-            tenant_organization_id: TenantOrganizationId::try_from(
-                config.tenant_organization_id.clone(),
-            )
-            .map_err(|_| RpcDataConversionError::InvalidTenantOrg(config.tenant_organization_id))?,
-            tenant_keyset_ids: config.tenant_keyset_ids,
-            hostname: truncated_hostname,
-        })
-    }
-}
-
-impl TryFrom<TenantConfig> for rpc::forge::TenantConfig {
-    type Error = RpcDataConversionError;
-
-    fn try_from(config: TenantConfig) -> Result<rpc::forge::TenantConfig, Self::Error> {
-        Ok(Self {
-            tenant_organization_id: config.tenant_organization_id.to_string(),
-            tenant_keyset_ids: config.tenant_keyset_ids,
-            hostname: config.hostname,
-        })
-    }
-}
 
 impl TenantConfig {
     /// Validates the tenant configuration
@@ -119,6 +83,11 @@ impl TenantConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::discriminant;
+
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::scenarios;
+
     use super::*;
 
     #[test]
@@ -141,32 +110,41 @@ mod tests {
     }
 
     #[test]
-    fn validate_tenant_config_duplicate_keysets() {
-        let config = TenantConfig {
-            tenant_organization_id: TenantOrganizationId::try_from("TenantA".to_string()).unwrap(),
-            tenant_keyset_ids: vec![
-                "a".to_string(),
-                "b".to_string(),
-                "c".to_string(),
-                "a".to_string(),
-            ],
-            hostname: Some("test-instance".to_string()),
-        };
+    fn validate_tenant_config() {
+        // `TenantConfig::validate`: duplicate keyset IDs are rejected, unique ones
+        // pass. The error type (ConfigValidationError) is not PartialEq, so failing
+        // rows assert the rejected *variant* via its discriminant rather than the
+        // exact error value.
+        scenarios!(
+            run = |config: TenantConfig| config.validate().map_err(|e| discriminant(&e));
+            "duplicate keyset ids are rejected" {
+                TenantConfig {
+                    tenant_organization_id: TenantOrganizationId::try_from(
+                        "TenantA".to_string(),
+                    )
+                    .unwrap(),
+                    tenant_keyset_ids: vec![
+                        "a".to_string(),
+                        "b".to_string(),
+                        "c".to_string(),
+                        "a".to_string(),
+                    ],
+                    hostname: Some("test-instance".to_string()),
+                } => FailsWith(discriminant(
+                    &ConfigValidationError::DuplicateTenantKeysetId(String::new()),
+                )),
+            }
 
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::DuplicateTenantKeysetId(_))
-        ))
-    }
-
-    #[test]
-    fn validate_tenant_config_unique_keysets() {
-        let config = TenantConfig {
-            tenant_organization_id: TenantOrganizationId::try_from("TenantA".to_string()).unwrap(),
-            tenant_keyset_ids: vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            hostname: Some("test-instance".to_string()),
-        };
-
-        config.validate().unwrap()
+            "unique keyset ids validate" {
+                TenantConfig {
+                    tenant_organization_id: TenantOrganizationId::try_from(
+                        "TenantA".to_string(),
+                    )
+                    .unwrap(),
+                    tenant_keyset_ids: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                    hostname: Some("test-instance".to_string()),
+                } => Yields(()),
+            }
+        );
     }
 }

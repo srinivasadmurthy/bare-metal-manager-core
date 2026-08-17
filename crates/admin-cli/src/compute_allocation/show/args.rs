@@ -20,26 +20,42 @@ use carbide_uuid::compute_allocation::ComputeAllocationId;
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show all compute allocations:
+    $ nico-admin-cli compute-allocation show
+
+Show one compute allocation by ID:
+    $ nico-admin-cli compute-allocation show --id 12345678-1234-5678-90ab-cdef01234567
+
+Show allocations for one tenant:
+    $ nico-admin-cli compute-allocation show --tenant-organization-id fds34511233a
+
+Filter by instance type:
+    $ nico-admin-cli compute-allocation show --instance-type-id DGX-H100-640GB
+
+")]
+pub(crate) struct Args {
     #[clap(
         short = 'i',
         long,
         help = "Optional, compute allocation ID to restrict the search"
     )]
-    pub id: Option<ComputeAllocationId>,
+    pub(crate) id: Option<ComputeAllocationId>,
 
     #[clap(
         short = 't',
         long,
         help = "Optional, tenant organization ID used to filter results"
     )]
-    pub tenant_organization_id: Option<String>,
+    pub(crate) tenant_organization_id: Option<String>,
 
     #[clap(short = 'n', long, help = "Optional, name used to filter results")]
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
 
     #[clap(long, help = "Optional, instance type ID used to filter results")]
-    pub instance_type_id: Option<String>,
+    pub(crate) instance_type_id: Option<String>,
 }
 
 impl From<Args> for FindComputeAllocationIdsRequest {

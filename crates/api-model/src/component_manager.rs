@@ -40,6 +40,32 @@ pub enum FirmwareState {
     Cancelled,
 }
 
+/// Switch certificate configuration job lifecycle state returned by component-manager backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfigureSwitchCertificateState {
+    Started,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl ConfigureSwitchCertificateState {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+}
+
+impl std::fmt::Display for ConfigureSwitchCertificateState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Started => write!(f, "Started"),
+            Self::InProgress => write!(f, "InProgress"),
+            Self::Completed => write!(f, "Completed"),
+            Self::Failed => write!(f, "Failed"),
+        }
+    }
+}
+
 /// Updatable components of an Switch tray.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NvSwitchComponent {
@@ -49,9 +75,49 @@ pub enum NvSwitchComponent {
     Nvos,
 }
 
+impl std::fmt::Display for NvSwitchComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bmc => f.write_str("BMC"),
+            Self::Cpld => f.write_str("CPLD"),
+            Self::Bios => f.write_str("BIOS"),
+            Self::Nvos => f.write_str("NVOS"),
+        }
+    }
+}
+
 /// Updatable components of a PowerShelf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PowerShelfComponent {
     Pmc,
     Psu,
+}
+
+impl std::fmt::Display for PowerShelfComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pmc => f.write_str("PMC"),
+            Self::Psu => f.write_str("PSU"),
+        }
+    }
+}
+
+/// Updatable components of a ComputeTray.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComputeTrayComponent {
+    Bmc,
+    Cpld,
+    Bios,
+    Cx7,
+}
+
+impl std::fmt::Display for ComputeTrayComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bmc => f.write_str("BMC"),
+            Self::Cpld => f.write_str("CPLD"),
+            Self::Bios => f.write_str("BIOS"),
+            Self::Cx7 => f.write_str("CX7"),
+        }
+    }
 }

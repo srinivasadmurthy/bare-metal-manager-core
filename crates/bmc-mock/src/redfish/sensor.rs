@@ -17,14 +17,14 @@
 
 use std::borrow::Cow;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde_json::json;
 
 use crate::json::{JsonExt, JsonPatch};
 use crate::redfish;
 use crate::redfish::Builder;
 
-pub fn chassis_collection(chassis_id: &str) -> redfish::Collection<'static> {
+pub(super) fn chassis_collection(chassis_id: &str) -> redfish::Collection<'static> {
     let odata_id = format!("/redfish/v1/Chassis/{chassis_id}/Sensors");
     redfish::Collection {
         odata_id: Cow::Owned(odata_id),
@@ -33,7 +33,7 @@ pub fn chassis_collection(chassis_id: &str) -> redfish::Collection<'static> {
     }
 }
 
-pub fn chassis_resource<'a>(chassis_id: &str, sensor_id: &'a str) -> redfish::Resource<'a> {
+pub(crate) fn chassis_resource<'a>(chassis_id: &str, sensor_id: &'a str) -> redfish::Resource<'a> {
     let odata_id = format!("{}/{sensor_id}", chassis_collection(chassis_id).odata_id);
     redfish::Resource {
         odata_id: Cow::Owned(odata_id),
@@ -43,7 +43,7 @@ pub fn chassis_resource<'a>(chassis_id: &str, sensor_id: &'a str) -> redfish::Re
     }
 }
 
-pub fn builder(resource: &redfish::Resource) -> SensorBuilder {
+pub(crate) fn builder(resource: &redfish::Resource) -> SensorBuilder {
     SensorBuilder {
         id: Cow::Owned(resource.id.to_string()),
         value: resource.json_patch().patch(json!({
@@ -53,28 +53,28 @@ pub fn builder(resource: &redfish::Resource) -> SensorBuilder {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct Layout {
-    pub temperature: usize,
-    pub fan: usize,
-    pub power: usize,
-    pub current: usize,
-    pub leak: usize,
+pub(crate) struct Layout {
+    pub(crate) temperature: usize,
+    pub(crate) fan: usize,
+    pub(crate) power: usize,
+    pub(crate) current: usize,
+    pub(crate) voltage: usize,
 }
 
 impl Layout {
-    pub const fn total(&self) -> usize {
-        self.temperature + self.fan + self.power + self.current + self.leak
+    const fn total(&self) -> usize {
+        self.temperature + self.fan + self.power + self.current + self.voltage
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Sensor {
-    pub id: Cow<'static, str>,
+pub(crate) struct Sensor {
+    pub(crate) id: Cow<'static, str>,
     value: serde_json::Value,
 }
 
 impl Sensor {
-    pub fn to_json(&self) -> serde_json::Value {
+    pub(crate) fn to_json(&self) -> serde_json::Value {
         let Some(reading_type) = self
             .value
             .get("ReadingType")
@@ -101,19 +101,19 @@ impl Sensor {
     }
 }
 
-pub struct SensorBuilder {
+pub(crate) struct SensorBuilder {
     id: Cow<'static, str>,
     value: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Thresholds {
-    pub lower_fatal: Option<f64>,
-    pub lower_critical: Option<f64>,
-    pub lower_caution: Option<f64>,
-    pub upper_caution: Option<f64>,
-    pub upper_critical: Option<f64>,
-    pub upper_fatal: Option<f64>,
+struct Thresholds {
+    lower_fatal: Option<f64>,
+    lower_critical: Option<f64>,
+    lower_caution: Option<f64>,
+    upper_caution: Option<f64>,
+    upper_critical: Option<f64>,
+    upper_fatal: Option<f64>,
 }
 
 impl Builder for SensorBuilder {
@@ -184,31 +184,31 @@ impl SensorBuilder {
         redfish::resource::Status::Ok
     }
 
-    pub fn name(self, value: &str) -> Self {
+    pub(crate) fn name(self, value: &str) -> Self {
         self.add_str_field("Name", value)
     }
 
-    pub fn reading_f64(self, value: f64) -> Self {
+    pub(crate) fn reading_f64(self, value: f64) -> Self {
         self.apply_patch(json!({ "Reading": value }))
     }
 
-    pub fn reading_u32(self, value: u32) -> Self {
+    fn reading_u32(self, value: u32) -> Self {
         self.apply_patch(json!({ "Reading": value }))
     }
 
-    pub fn reading_type(self, value: &str) -> Self {
+    pub(crate) fn reading_type(self, value: &str) -> Self {
         self.add_str_field("ReadingType", value)
     }
 
-    pub fn reading_units(self, value: &str) -> Self {
+    pub(crate) fn reading_units(self, value: &str) -> Self {
         self.add_str_field("ReadingUnits", value)
     }
 
-    pub fn physical_context(self, value: &str) -> Self {
+    fn physical_context(self, value: &str) -> Self {
         self.add_str_field("PhysicalContext", value)
     }
 
-    pub fn threshold_lower_critical(self, value: f64) -> Self {
+    fn threshold_lower_critical(self, value: f64) -> Self {
         self.apply_patch(json!({
             "Thresholds": {
                 "LowerCritical": {
@@ -218,7 +218,7 @@ impl SensorBuilder {
         }))
     }
 
-    pub fn threshold_lower_fatal(self, value: f64) -> Self {
+    fn threshold_lower_fatal(self, value: f64) -> Self {
         self.apply_patch(json!({
             "Thresholds": {
                 "LowerFatal": {
@@ -228,7 +228,7 @@ impl SensorBuilder {
         }))
     }
 
-    pub fn threshold_lower_caution(self, value: f64) -> Self {
+    pub(crate) fn threshold_lower_caution(self, value: f64) -> Self {
         self.apply_patch(json!({
             "Thresholds": {
                 "LowerCaution": {
@@ -238,7 +238,7 @@ impl SensorBuilder {
         }))
     }
 
-    pub fn threshold_upper_caution(self, value: f64) -> Self {
+    pub(crate) fn threshold_upper_caution(self, value: f64) -> Self {
         self.apply_patch(json!({
             "Thresholds": {
                 "UpperCaution": {
@@ -248,7 +248,7 @@ impl SensorBuilder {
         }))
     }
 
-    pub fn threshold_upper_critical(self, value: f64) -> Self {
+    pub(crate) fn threshold_upper_critical(self, value: f64) -> Self {
         self.apply_patch(json!({
             "Thresholds": {
                 "UpperCritical": {
@@ -258,7 +258,7 @@ impl SensorBuilder {
         }))
     }
 
-    pub fn threshold_upper_fatal(self, value: f64) -> Self {
+    fn threshold_upper_fatal(self, value: f64) -> Self {
         self.apply_patch(json!({
             "Thresholds": {
                 "UpperFatal": {
@@ -268,7 +268,7 @@ impl SensorBuilder {
         }))
     }
 
-    pub fn thresholds(mut self, thresholds: Thresholds) -> Self {
+    fn thresholds(mut self, thresholds: Thresholds) -> Self {
         if let Some(value) = thresholds.lower_fatal {
             self = self.threshold_lower_fatal(value);
         }
@@ -290,7 +290,7 @@ impl SensorBuilder {
         self
     }
 
-    pub fn build(self) -> Sensor {
+    pub(crate) fn build(self) -> Sensor {
         let status = self.health_status();
         Sensor {
             id: self.id,
@@ -302,12 +302,12 @@ impl SensorBuilder {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum SensorKind {
+pub(crate) enum SensorKind {
     Temperature,
     Fan,
     Power,
     Current,
-    LeakDetector,
+    Voltage,
 }
 
 enum SensorReading {
@@ -338,7 +338,7 @@ impl SensorKind {
             "Rotational" => Some(Self::Fan),
             "Power" => Some(Self::Power),
             "Current" => Some(Self::Current),
-            "Voltage" => Some(Self::LeakDetector),
+            "Voltage" => Some(Self::Voltage),
             _ => None,
         }
     }
@@ -349,7 +349,7 @@ impl SensorKind {
             SensorKind::Fan => "Fan",
             SensorKind::Power => "Power",
             SensorKind::Current => "Current",
-            SensorKind::LeakDetector => "LeakDetector",
+            SensorKind::Voltage => "Voltage",
         }
     }
 
@@ -359,7 +359,7 @@ impl SensorKind {
             SensorKind::Fan => "Fan Sensor",
             SensorKind::Power => "Power Sensor",
             SensorKind::Current => "Current Sensor",
-            SensorKind::LeakDetector => "Leak Detector Sensor",
+            SensorKind::Voltage => "Voltage Sensor",
         }
     }
 
@@ -369,7 +369,7 @@ impl SensorKind {
             SensorKind::Fan => "Rotational",
             SensorKind::Power => "Power",
             SensorKind::Current => "Current",
-            SensorKind::LeakDetector => "Voltage",
+            SensorKind::Voltage => "Voltage",
         }
     }
 
@@ -379,7 +379,7 @@ impl SensorKind {
             SensorKind::Fan => "RPM",
             SensorKind::Power => "W",
             SensorKind::Current => "A",
-            SensorKind::LeakDetector => "V",
+            SensorKind::Voltage => "V",
         }
     }
 
@@ -389,17 +389,17 @@ impl SensorKind {
             SensorKind::Fan => "Fan",
             SensorKind::Power => "PowerSupply",
             SensorKind::Current => "SystemBoard",
-            SensorKind::LeakDetector => "SystemBoard",
+            SensorKind::Voltage => "SystemBoard",
         }
     }
 
     fn random_reading(self, rng: &mut impl Rng) -> SensorReading {
         match self {
-            Self::Temperature => SensorReading::Float(random_tenths(rng, 25.0..=45.0)),
-            Self::Fan => SensorReading::Unsigned(rng.random_range(0..=9400)),
-            Self::Power => SensorReading::Float(random_tenths(rng, 130.0..=780.0)),
+            Self::Temperature => SensorReading::Float(random_tenths(rng, 25.0..=37.0)),
+            Self::Fan => SensorReading::Unsigned(rng.random_range(5000..=9400)),
+            Self::Power => SensorReading::Float(random_tenths(rng, 220.0..=680.0)),
             Self::Current => SensorReading::Float(random_tenths(rng, 1.5..=42.0)),
-            Self::LeakDetector => SensorReading::Float(random_tenths(rng, 1.2..=1.85)),
+            Self::Voltage => SensorReading::Float(random_tenths(rng, 1.55..=1.85)),
         }
     }
 
@@ -422,7 +422,7 @@ impl SensorKind {
                 ..Default::default()
             },
             Self::Current => Thresholds::default(),
-            Self::LeakDetector => Thresholds {
+            Self::Voltage => Thresholds {
                 lower_critical: Some(1.5),
                 ..Default::default()
             },
@@ -434,7 +434,7 @@ impl SensorKind {
     }
 }
 
-pub fn generate_chassis_sensors(chassis_id: &str, layout: Layout) -> Vec<Sensor> {
+pub(crate) fn generate_chassis_sensors(chassis_id: &str, layout: Layout) -> Vec<Sensor> {
     let mut rng = rand::rng();
     let mut sensors = Vec::with_capacity(layout.total());
     append_sensors(
@@ -468,11 +468,15 @@ pub fn generate_chassis_sensors(chassis_id: &str, layout: Layout) -> Vec<Sensor>
     append_sensors(
         &mut sensors,
         chassis_id,
-        layout.leak,
-        SensorKind::LeakDetector,
+        layout.voltage,
+        SensorKind::Voltage,
         &mut rng,
     );
     sensors
+}
+
+pub(crate) fn sensor_id(kind: SensorKind, index: usize) -> String {
+    format!("{}_{}", kind.id_prefix(), index)
 }
 
 fn append_sensors(
@@ -483,7 +487,7 @@ fn append_sensors(
     rng: &mut impl Rng,
 ) {
     for index in 1..=count {
-        let sensor_id = format!("{}_{}", kind.id_prefix(), index);
+        let sensor_id = sensor_id(kind, index);
         let sensor_name = format!("{} {}", kind.name_prefix(), index);
         let sensor = builder(&chassis_resource(chassis_id, &sensor_id))
             .name(&sensor_name)
@@ -517,7 +521,7 @@ mod tests {
                 fan: 10,
                 power: 20,
                 current: 10,
-                leak: 4,
+                voltage: 4,
             },
         );
         assert_eq!(sensors.len(), 54);
@@ -548,7 +552,7 @@ mod tests {
 
     #[test]
     fn sensor_status_is_ok_when_reading_within_thresholds() {
-        let sensor = builder(&chassis_resource("System.Embedded.1", "LeakDetector_1"))
+        let sensor = builder(&chassis_resource("System.Embedded.1", "Voltage_1"))
             .reading_f64(1.7)
             .thresholds(Thresholds {
                 lower_critical: Some(1.5),
@@ -578,7 +582,7 @@ mod tests {
 
     #[test]
     fn sensor_status_is_critical_when_crossing_critical_threshold() {
-        let sensor = builder(&chassis_resource("System.Embedded.1", "LeakDetector_1"))
+        let sensor = builder(&chassis_resource("System.Embedded.1", "Voltage_1"))
             .reading_f64(1.4)
             .thresholds(Thresholds {
                 lower_critical: Some(1.5),

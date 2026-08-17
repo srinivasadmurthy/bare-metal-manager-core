@@ -33,8 +33,9 @@ use crate::bmc::client_pool::BmcConnectionStore;
 use crate::config::Config;
 use crate::frontend::{Handler, HandlerError};
 use crate::shutdown_handle::ShutdownHandle;
+use crate::tcp_listener;
 
-pub async fn spawn(
+pub(crate) async fn spawn(
     config: Arc<Config>,
     forge_api_client: ForgeApiClient,
     bmc_connection_store: BmcConnectionStore,
@@ -69,40 +70,50 @@ pub async fn spawn(
         metrics,
     };
 
-    let listener = TcpListener::bind(listen_address)
-        .await
-        .map_err(|error| Listening {
-            addr: listen_address,
-            error,
-        })?;
-    tracing::info!("listening on {}", listen_address);
+    let (listener, listen_address) =
+        tcp_listener::bind(listen_address)
+            .await
+            .map_err(|error| Listening {
+                addr: listen_address,
+                error,
+            })?;
+    tracing::info!(%listen_address, "SSH server listening");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let join_handle = tokio::spawn(server.run(listener, shutdown_rx));
 
     Ok(Handle {
+        listen_address,
         shutdown_tx,
         join_handle,
     })
 }
 
 #[derive(thiserror::Error, Debug)]
+// Kept public because `crate::SpawnError` exposes it as a payload.
 pub enum SpawnError {
-    #[error("Error reading host key file at {path}: {error}")]
+    #[error("error reading host key file at {path}: {error}")]
     ReadingHostKeyFile {
         path: String,
         error: russh::keys::ssh_key::Error,
     },
-    #[error("Error listening on {addr}: {error}")]
+    #[error("error listening on {addr}: {error}")]
     Listening {
         addr: SocketAddr,
         error: std::io::Error,
     },
 }
 
-pub struct Handle {
+pub(crate) struct Handle {
+    listen_address: SocketAddr,
     shutdown_tx: oneshot::Sender<()>,
     join_handle: JoinHandle<()>,
+}
+
+impl Handle {
+    pub(crate) fn listen_address(&self) -> SocketAddr {
+        self.listen_address
+    }
 }
 
 impl ShutdownHandle<()> for Handle {
@@ -122,7 +133,7 @@ struct SshServer {
 impl SshServer {
     /// Run an instance of ssh-console on the given socket, looping forever until `shutdown` is
     /// received (or if the sending end of `shutdown` is dropped.)
-    pub async fn run(mut self, socket: TcpListener, mut shutdown: oneshot::Receiver<()>) {
+    async fn run(mut self, socket: TcpListener, mut shutdown: oneshot::Receiver<()>) {
         loop {
             tokio::select! {
                 accept_result = socket.accept() => {
@@ -193,14 +204,14 @@ impl SshServer {
     }
 }
 
-pub struct ServerMetrics {
-    pub total_clients: UpDownCounter<i64>,
-    pub client_auth_failures_total: Counter<u64>,
+pub(crate) struct ServerMetrics {
+    pub(crate) total_clients: UpDownCounter<i64>,
+    pub(crate) client_auth_failures_total: Counter<u64>,
     _auth_enforced: ObservableGauge<u64>,
     _include_dpus: ObservableGauge<u64>,
 
     // per-BMC stats
-    pub bmc_clients: UpDownCounter<i64>,
+    pub(crate) bmc_clients: UpDownCounter<i64>,
 }
 
 impl ServerMetrics {
@@ -208,11 +219,11 @@ impl ServerMetrics {
         Self {
             total_clients: meter
                 .i64_up_down_counter("ssh_console_total_clients")
-                .with_description("The number of SSH clients currently connected to the service")
+                .with_description("Number of SSH clients currently connected to the service")
                 .build(),
             client_auth_failures_total: meter
                 .u64_counter("ssh_console_client_auth_failures")
-                .with_description("The number of SSH clients authentication attempts denied")
+                .with_description("Number of SSH client authentication attempts denied")
                 .build(),
             _auth_enforced: meter
                 .u64_observable_gauge("ssh_console_auth_enforced")

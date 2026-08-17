@@ -18,14 +18,25 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show what is attached to a network security group:
+    $ nico-admin-cli network-security-group show-attachments --id 12345678-1234-5678-90ab-cdef01234567
+
+Include objects inheriting the group from a parent:
+    $ nico-admin-cli network-security-group show-attachments --id 12345678-1234-5678-90ab-cdef01234567 \
+    --include-indirect
+
+")]
+pub(crate) struct Args {
     #[clap(short = 'i', long, help = "network security group ID to query")]
-    pub id: String,
+    pub(super) id: String,
 
     #[clap(
         short = 'a',
         long,
         help = "include indirect relationships (objects that are inheriting the NSG from a parent object)"
     )]
-    pub include_indirect: bool,
+    pub(super) include_indirect: bool,
 }

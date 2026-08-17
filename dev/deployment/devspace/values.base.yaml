@@ -1,4 +1,11 @@
-carbide-api:
+nico-api:
+  # Disable legacy forge-system namespace alias for local dev
+  legacyAlias:
+    enabled: false
+  # Vault's local admin-CLI certificates are issued by CN=local-vault-ca.
+  auth:
+    additionalIssuerCns:
+      - "local-vault-ca"
   resources:
     limits:
       cpu: "16"
@@ -6,16 +13,22 @@ carbide-api:
     requests:
       cpu: "1"
       memory: "1Gi"
+  webAuth:
+    mode: "none"
   siteConfig:
     enabled: true
-    carbideApiSiteConfig: |
-      bypass_rbac = true
+    nicoApiSiteConfig: |
       attestation_enabled = false
       dpu_ipmi_tool_impl = "test"
-      initial_domain_name = "local.forge"
+      initial_domain_name = "local.nico"
       initial_dpu_agent_upgrade_policy = "off"
+      # devspace's deployment uses machine-a-tron in single-IP mode, which
+      # requires insecure discovery (where the server trusts a caller-provided
+      # machine interface ID rather than inspecting the connection's source
+      # IP.)
+      allow_insecure_discovery = true
 
-      # DB transactions in carbide should be quick, pool size should ≈ the
+      # DB transactions in nico should be quick, pool size should ≈ the
       # number of cores. Default postgres configuration is a 100 connection
       # limit, so let's stay safely below that.
       max_database_connections = 64
@@ -65,10 +78,10 @@ carbide-api:
       permissive_mode = true
 
       [auth.trust]
-      spiffe_trust_domain = "forge.local"
-      spiffe_service_base_paths = ["/forge-system/sa/", "/default/sa/"]
-      spiffe_machine_base_path = "/forge-system/machine/"
-      additional_issuer_cns = []
+      spiffe_trust_domain = "nico.local"
+      spiffe_service_base_paths = ["/nico-system/sa/", "/default/sa/"]
+      spiffe_machine_base_path = "/nico-system/machine/"
+      additional_issuer_cns = ["local-vault-ca"]
 
       [host_health]
       hardware_health_reports = "MonitorOnly"
@@ -81,6 +94,9 @@ carbide-api:
       iteration_time = "30s"
       max_concurrency = 100
 
+      [vpc_prefix_state_controller]
+      vpc_prefix_drain_time = "5m"
+
       [machine_validation_config]
       enabled = false
 
@@ -88,8 +104,7 @@ carbide-api:
       enabled = true
       create_machines = true
       allow_changing_bmc_proxy = true
-      allow_zero_dpu_hosts = true
-      bmc_proxy = "machine-a-tron-bmc-mock.forge-system.svc.cluster.local:1266"
+      bmc_proxy = "nico-machine-a-tron-mat-0-bmc-mock.nico-system.svc.cluster.local:1266"
       run_interval = "10s"
       machines_created_per_run = 1000
       explorations_per_run = 1000
@@ -101,17 +116,17 @@ carbide-api:
       run_interval = "10s"
       concurrency_limit = 100
 
-carbide-bmc-proxy:
+nico-bmc-proxy:
   enabled: true
   replicas: 1 # save on local resources
   configFiles:
     enabled: true
-    carbideBmcProxyConfig: |
+    nicoBmcProxyConfig: |
       listen = "[::]:1079"
       metrics_endpoint = "[::]:1080"
       database_url = "postgres://replaced-by-env-var"
       allowed_principals = ["trusted-certificate"]
-      bmc_proxy = "machine-a-tron-bmc-mock.forge-system.svc.cluster.local:1266"
+      bmc_proxy = "nico-machine-a-tron-mat-0-bmc-mock.nico-system.svc.cluster.local:1266"
 
       [tls]
       identity_pemfile_path = "/var/run/secrets/spiffe.io/tls.crt"
@@ -120,28 +135,58 @@ carbide-bmc-proxy:
       admin_root_cafile_path = "/etc/forge/carbide-bmc-proxy/site/admin_root_cert_pem"
 
       [auth.trust]
-      spiffe_trust_domain = "forge.local"
+      spiffe_trust_domain = "nico.local"
       spiffe_service_base_paths = [
-        "/forge-system/sa/",
+        "/nico-system/sa/",
         "/default/sa/",
       ]
-      spiffe_machine_base_path = "/forge-system/machine/"
-      additional_issuer_cns = []
+      spiffe_machine_base_path = "/nico-system/machine/"
+      additional_issuer_cns = ["local-vault-ca"]
 
       [auth.acls]
       "trusted-certificate" = ["/**"]
 
-carbide-dhcp:
+      [carbide_api]
+      api_url = "https://nico-api.nico-system.svc.cluster.local:1079"
+      root_ca = "/var/run/secrets/spiffe.io/ca.crt"
+      client_cert = "/var/run/secrets/spiffe.io/tls.crt"
+      client_key = "/var/run/secrets/spiffe.io/tls.key"
+
+nico-machine-a-tron:
+  enabled: true
+  # Deploy to nico-system (same namespace as nico-api) for simpler dev setup
+  # No need to copy secrets or configure cross-namespace access
+  machineATron:
+    nicoApiUrl: "https://nico-api.nico-system.svc.cluster.local:1079"
+  # Preserve simulated machine identity and installed OS across pod restarts.
+  # Without this, Core can remain in an Assigned state while a restarted
+  # machine-a-tron has reset the corresponding host and DPUs to MachineDown.
+  persistence:
+    enabled: true
+  # SPIFFE URI must match nico-api's allowed service_base_paths
+  certificate:
+    uris:
+      - "spiffe://nico.local/nico-system/sa/machine-a-tron"
+  pods:
+    mat-0:
+      machines:
+        rack-machines:
+          hwType: wiwynn_gb200_nvl
+          hostCount: 2
+          dpuPerHostCount: 2
+          oobDhcpRelayAddress: "192.168.192.1"
+          adminDhcpRelayAddress: "192.168.176.1"
+nico-dhcp:
   enabled: false
-carbide-dns:
+nico-dns:
   enabled: false
-carbide-dsx-exchange-consumer:
+nico-dsx-exchange-consumer:
   enabled: false
-carbide-hardware-health:
+nico-hardware-health:
   enabled: false
-carbide-pxe:
+nico-pxe:
   enabled: false
-carbide-ssh-console-rs:
+nico-ssh-console-rs:
   enabled: false
 unbound:
   enabled: false

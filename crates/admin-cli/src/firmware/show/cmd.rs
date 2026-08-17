@@ -15,14 +15,15 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use prettytable::{Table, row};
 
 use super::args::Args;
 use crate::async_write;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 
-pub async fn show(
+pub(super) async fn show(
     _args: &Args,
     format: OutputFormat,
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,

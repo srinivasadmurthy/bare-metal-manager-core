@@ -16,7 +16,6 @@
  */
 use std::io;
 use std::net::SocketAddr;
-use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -43,7 +42,7 @@ use crate::ssh_server::ServerMetrics;
 /// Spawn a connection to the given BMC in the background, returning a handle. Connections will
 /// be retried indefinitely, with exponential backoff, until a shutdown is signaled (ie. by dropping
 /// the ClientHandle.)
-pub fn spawn(
+pub(super) fn spawn(
     connection_details: ConnectionDetails,
     config: Arc<Config>,
     metrics: Arc<BmcPoolMetrics>,
@@ -142,6 +141,7 @@ impl BmcClient {
 
         // Connect and reconnect, in a loop, until the client is shut down.
         let mut retries = 0;
+        let mut previous_connection_close_was_sol_recovery = false;
         'retry: loop {
             // Every retry after the first time, emit a disconnected message
             if was_disconnected {
@@ -209,11 +209,15 @@ impl BmcClient {
             {
                 Ok(handle) => handle,
                 Err(error) => {
+                    previous_connection_close_was_sol_recovery = false;
                     tracing::error!(
                         %error,
                         %machine_id,
-                        "error spawning BMC connection, will retry in {}s",
-                        next_retry.checked_duration_since(Instant::now()).unwrap_or_default().as_secs()
+                        retry_delay_seconds = next_retry
+                            .checked_duration_since(Instant::now())
+                            .unwrap_or_default()
+                            .as_secs(),
+                        "error spawning BMC connection, will retry"
                     );
                     continue 'retry;
                 }
@@ -259,17 +263,38 @@ impl BmcClient {
                 // The connection should go forever, so if it doesn't, retry.
                 res = connection_result.clone() => {
                     let connection_time = try_start_time.elapsed();
-                    if connection_time > self.config.successful_connection_minimum_duration {
-                        tracing::debug!(%machine_id, "last connection lasted {}s, resetting backoff to 0s", connection_time.as_secs());
+                    let recovered_conflicting_sol_session = res
+                        .as_ref()
+                        .is_err_and(|error| error.retry_immediately());
+                    if should_reset_retry_backoff(
+                        connection_time,
+                        self.config.successful_connection_minimum_duration,
+                        &res,
+                        previous_connection_close_was_sol_recovery,
+                    ) {
+                        if recovered_conflicting_sol_session {
+                            tracing::debug!(%machine_id, "retrying immediately after IPMI SOL session recovery");
+                        } else {
+                            tracing::debug!(
+                                %machine_id,
+                                connection_duration_seconds = connection_time.as_secs_f64(),
+                                "last connection succeeded long enough; resetting backoff"
+                            );
+                        }
                         next_retry = Instant::now();
                     }
+                    previous_connection_close_was_sol_recovery =
+                        recovered_conflicting_sol_session;
                     let error_string = res.err().map(|e| format!("{:?}", e.as_ref())).unwrap_or("<none>".to_string());
                     tracing::warn!(
                         %machine_id,
                         error = error_string,
-                        ?connection_time,
-                        "connection to BMC closed, will retry in {}s",
-                        next_retry.checked_duration_since(Instant::now()).unwrap_or_default().as_secs(),
+                        connection_duration_seconds = connection_time.as_secs_f64(),
+                        retry_delay_seconds = next_retry
+                            .checked_duration_since(Instant::now())
+                            .unwrap_or_default()
+                            .as_secs(),
+                        "connection to BMC closed, will retry",
                     );
                 }
             }
@@ -305,20 +330,8 @@ async fn wait_until_host_is_up(
                         }
                     }
                     connection::Kind::Ipmi => {
-                        let status = tokio::process::Command::new("ping")
-                            .arg("-c")
-                            .arg("1")
-                            .arg("-W")
-                            .arg("2")
-                            .arg(addr.ip().to_string())
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn()?
-                            .wait()
-                            .await?;
-                        if status.success() {
-                            break Ok(())
+                        if check_ipmi_reachable(addr, Duration::from_secs(2)).await {
+                            break Ok(());
                         }
                     }
                 }
@@ -330,7 +343,11 @@ async fn wait_until_host_is_up(
 
         if do_log {
             do_log = false;
-            tracing::info!(%machine_id, %addr, "BMC is not listening on {addr}. Will wait until the port is open before attempting to connect.")
+            tracing::info!(
+                %machine_id,
+                bmc_address = %addr,
+                "BMC is not listening; waiting for the port to open before connecting"
+            )
         }
     }
 }
@@ -445,6 +462,25 @@ fn dev_null<T: Clone + Send + 'static>(mut rx: broadcast::Receiver<T>) {
     });
 }
 
+fn should_reset_retry_backoff(
+    connection_time: Duration,
+    successful_connection_minimum_duration: Duration,
+    connection_result: &Result<(), Arc<connection::SpawnError>>,
+    previous_connection_close_was_sol_recovery: bool,
+) -> bool {
+    let recovered_conflicting_sol_session = connection_result
+        .as_ref()
+        .is_err_and(|error| error.retry_immediately());
+
+    if recovered_conflicting_sol_session {
+        // Retry one activation immediately after recovery, then use normal backoff if the conflict
+        // persists so competing SOL clients cannot cause a tight deactivate/activate loop.
+        !previous_connection_close_was_sol_recovery
+    } else {
+        connection_time > successful_connection_minimum_duration
+    }
+}
+
 /// Calculate the next exponential backoff duration for retrying connections to a console
 fn next_retry_backoff(config: &Config, prev: Duration) -> Duration {
     let duration = if prev == Duration::ZERO {
@@ -455,14 +491,14 @@ fn next_retry_backoff(config: &Config, prev: Duration) -> Duration {
         Duration::from_secs_f64(rand::random_range(prev.as_secs_f64()..upper))
     };
     tracing::debug!(
-        "next_retry_backoff, increasing from {}ms to {}ms",
-        prev.as_millis(),
-        duration.as_millis()
+        previous_backoff_milliseconds = prev.as_millis(),
+        next_backoff_milliseconds = duration.as_millis(),
+        "increasing connection retry backoff"
     );
     duration
 }
 
-pub struct ClientHandle {
+pub(super) struct ClientHandle {
     machine_id: MachineId,
     kind: connection::Kind,
     /// Writer to send messages (including data) to BMC
@@ -472,7 +508,8 @@ pub struct ClientHandle {
     broadcast_to_frontend_tx: broadcast::Sender<ToFrontendMessage>,
     shutdown_tx: oneshot::Sender<()>,
     join_handle: JoinHandle<()>,
-    pub connection_state: Arc<AtomicConnectionState>, // pub for metrics gathering
+    // Read by the pool's observable-gauge callbacks.
+    pub(super) connection_state: Arc<AtomicConnectionState>,
 }
 
 impl ShutdownHandle<()> for ClientHandle {
@@ -482,7 +519,7 @@ impl ShutdownHandle<()> for ClientHandle {
 }
 
 impl ClientHandle {
-    pub fn subscribe(&self, metrics: Arc<ServerMetrics>) -> BmcConnectionSubscription {
+    pub(super) fn subscribe(&self, metrics: Arc<ServerMetrics>) -> BmcConnectionSubscription {
         tracing::debug!("new bmc subscription");
         metrics.total_clients.add(1, &[]);
         metrics.bmc_clients.add(
@@ -502,11 +539,11 @@ impl ClientHandle {
 
 /// An individual "subscription" to a BMC connection, expected to be used by a frontend. Metrics
 /// are affected when one is created or dropped.
-pub struct BmcConnectionSubscription {
-    pub machine_id: MachineId,
-    pub to_frontend_msg_weak_tx: broadcast::WeakSender<ToFrontendMessage>,
-    pub to_bmc_msg_tx: mpsc::Sender<ToBmcMessage>,
-    pub kind: connection::Kind,
+pub(crate) struct BmcConnectionSubscription {
+    pub(crate) machine_id: MachineId,
+    pub(crate) to_frontend_msg_weak_tx: broadcast::WeakSender<ToFrontendMessage>,
+    pub(crate) to_bmc_msg_tx: mpsc::Sender<ToBmcMessage>,
+    pub(crate) kind: connection::Kind,
     // Not pub, to make sure we go through ClientHandle::subscribe() to build, so we get the
     // right metrics
     metrics: Arc<ServerMetrics>,
@@ -521,5 +558,144 @@ impl Drop for BmcConnectionSubscription {
             -1,
             &[KeyValue::new("machine_id", self.machine_id.to_string())],
         );
+    }
+}
+
+/// Send an ASF Presence Ping (RMCP) to check if an IPMI endpoint is reachable.
+async fn check_ipmi_reachable(addr: SocketAddr, timeout: Duration) -> bool {
+    // Reference: IPMI v2.0 spec, section 13.2.3
+    const ASF_PRESENCE_PING: [u8; 12] = [
+        0x06, 0x00, 0xff, 0x06, 0x00, 0x00, 0x11, 0xbe, 0x80, 0x00, 0x00, 0x00,
+    ];
+
+    let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
+        tracing::debug!(%addr, "failed to bind UDP socket for IPMI reachability check");
+        return false;
+    };
+
+    if let Err(e) = socket.send_to(&ASF_PRESENCE_PING, addr).await {
+        tracing::debug!(%addr, error = %e, "failed to send ASF Presence Ping");
+        return false;
+    }
+
+    let mut recv_buf = [0u8; 32];
+    match tokio::time::timeout(timeout, socket.recv_from(&mut recv_buf)).await {
+        Ok(Ok((len, _))) => {
+            tracing::debug!(%addr, response_len = len, "IPMI endpoint responded to ASF Presence Ping");
+            true
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(%addr, error = %e, "error receiving ASF Presence Pong");
+            false
+        }
+        Err(_) => {
+            tracing::debug!(%addr, timeout_secs = ?timeout, "ASF Presence Ping timed out");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt;
+
+    use super::*;
+    use crate::bmc::connection_impl::ipmi;
+
+    #[test]
+    fn retry_backoff_resets_only_after_healthy_connection_or_successful_sol_recovery() {
+        let minimum_healthy_duration = Duration::from_secs(60);
+        let cases = [
+            (
+                "short successful connection",
+                Duration::from_secs(1),
+                Ok(()),
+                false,
+                false,
+            ),
+            (
+                "exact minimum connection duration",
+                minimum_healthy_duration,
+                Ok(()),
+                false,
+                false,
+            ),
+            (
+                "long-lived connection",
+                minimum_healthy_duration + Duration::from_secs(1),
+                Ok(()),
+                false,
+                true,
+            ),
+            (
+                "ordinary IPMI failure",
+                Duration::from_secs(1),
+                Err(Arc::new(connection::SpawnError::Ipmi(
+                    ipmi::SpawnError::IpmitoolUnexpectedExit {
+                        exit_status: failed_exit_status(),
+                        output: "authentication failed".to_string(),
+                    },
+                ))),
+                false,
+                false,
+            ),
+            (
+                "successful conflicting SOL session recovery",
+                Duration::from_secs(1),
+                Err(Arc::new(connection::SpawnError::Ipmi(
+                    ipmi::SpawnError::ConflictingSolSessionDeactivated {
+                        exit_status: failed_exit_status(),
+                        output: "SOL payload already active on another session".to_string(),
+                    },
+                ))),
+                false,
+                true,
+            ),
+            (
+                "repeated successful conflicting SOL session recovery",
+                Duration::from_secs(1),
+                Err(Arc::new(connection::SpawnError::Ipmi(
+                    ipmi::SpawnError::ConflictingSolSessionDeactivated {
+                        exit_status: failed_exit_status(),
+                        output: "SOL payload already active on another session".to_string(),
+                    },
+                ))),
+                true,
+                false,
+            ),
+            (
+                "failed conflicting SOL session recovery",
+                Duration::from_secs(1),
+                Err(Arc::new(connection::SpawnError::Ipmi(
+                    ipmi::SpawnError::ConflictingSolSessionDeactivationFailed {
+                        exit_status: failed_exit_status(),
+                        output: "SOL payload already active on another session".to_string(),
+                        error: ipmi::SolDeactivateError::Failure {
+                            exit_status: failed_exit_status(),
+                            output: "deactivation failed".to_string(),
+                        },
+                    },
+                ))),
+                false,
+                false,
+            ),
+        ];
+
+        for (scenario, connection_time, result, previous_was_recovery, expected) in cases {
+            assert_eq!(
+                should_reset_retry_backoff(
+                    connection_time,
+                    minimum_healthy_duration,
+                    &result,
+                    previous_was_recovery,
+                ),
+                expected,
+                "{scenario}",
+            );
+        }
+    }
+
+    fn failed_exit_status() -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(256)
     }
 }

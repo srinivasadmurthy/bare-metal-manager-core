@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#![cfg_attr(not(test), deny(dead_code_pub_in_binary))]
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -22,6 +23,7 @@ use std::time::Duration;
 
 use carbide_host_support::dpa_cmds::{DpaCommand, OpCode};
 use carbide_host_support::registration;
+use carbide_instrument::emit;
 use carbide_uuid::machine::MachineId;
 use cfg::{AutoDetect, Command, MlxAction, Mode, Options};
 use chrono::{DateTime, Days, TimeDelta, Utc};
@@ -32,14 +34,16 @@ use libmlx::device::discovery::discover_device;
 use libmlx::lockdown::cmd::cmds::handle_lockdown as handle_mlx_lockdown;
 use once_cell::sync::Lazy;
 use rpc::forge::ForgeAgentControlResponse;
-use rpc::forge::forge_agent_control_response::{Action, ForgeAgentControlExtraInfo};
-use rpc::forge_agent_control_response::forge_agent_control_extra_info::KeyValuePair;
+use rpc::forge_agent_control_response::Action;
 use rpc::protos::mlx_device::{
     FirmwareFlashReport as FirmwareFlashReportPb, LockStatus, MlxObservation, MlxObservationReport,
     PublishMlxObservationReportRequest,
 };
-use rpc::{ForgeScoutErrorReport, forge as rpc_forge};
-pub use scout::{CarbideClientError, CarbideClientResult};
+use rpc::{
+    ForgeScoutErrorReport, forge as rpc_forge, forge_agent_control_response as fac,
+    scout_firmware_upgrade as sfu,
+};
+use scout::{CarbideClientError, CarbideClientResult};
 use tokio::sync::RwLock;
 use tryhard::{RetryFutureConfig, RetryPolicy};
 use x509_parser::pem::parse_x509_pem;
@@ -52,7 +56,9 @@ mod deprovision;
 mod discovery;
 mod firmware_upgrade;
 mod machine_validation;
+mod metrics;
 mod mlx_device;
+mod platform;
 mod register;
 mod stream;
 mod tpm;
@@ -62,7 +68,7 @@ struct DevEnv {
 }
 static IN_QEMU_VM: Lazy<RwLock<DevEnv>> = Lazy::new(|| RwLock::new(DevEnv { in_qemu: false }));
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
-pub const REBOOT_COMPLETED_PATH: &str = "/tmp/reboot_completed";
+const REBOOT_COMPLETED_PATH: &str = "/tmp/reboot_completed";
 const MAX_FIRMWARE_UPGRADE_STATUS_FIELD_SIZE: usize = 1500;
 
 async fn check_if_running_in_qemu() {
@@ -91,11 +97,22 @@ async fn main() -> Result<(), eyre::Report> {
         return Ok(());
     }
 
+    // Purely local interrogation for troubleshooting.
+    if matches!(config.subcmd, Some(Command::LldpNeighbors)) {
+        let neighbors = carbide_host_support::lldp_collector::collect_lldp_neighbors()?;
+        println!("{neighbors:#?}");
+        return Ok(());
+    }
+
     check_if_running_in_qemu().await;
 
-    carbide_host_support::init_logging()?;
+    carbide_host_support::init_logging("nico-scout")?;
 
-    tracing::info!("Running as {}...{}", config.mode, config.version);
+    tracing::info!(
+        mode = %config.mode,
+        version_requested = config.version,
+        "Running scout",
+    );
 
     match config.mode {
         Mode::Service => run_as_service(&config).await?,
@@ -126,12 +143,16 @@ async fn initial_setup(config: &Options) -> Result<(uuid::Uuid, MachineId), eyre
     .custom_backoff(|_attempt, error: &CarbideClientError| {
         // we only want to retry if attestation has failed. In all other cases
         // just preserve the old behaviour by breaking from the retry loop
-        tracing::error!("Failed to register machine with error {}", error);
-        if !error.to_string().contains("Attestation failed") {
+        tracing::error!(error = %error, "Failed to register machine");
+        if !error
+            .to_string()
+            .to_lowercase()
+            .contains("attestation failed")
+        {
             tracing::info!("Not retrying registration as it is not an attestation error");
             RetryPolicy::Break
         } else {
-            tracing::info!("Retrying registration again in {} seconds", retry.secs);
+            tracing::info!(retry_delay_seconds = retry.secs, "Retrying registration",);
             RetryPolicy::Delay(Duration::from_secs(retry.secs))
         }
     })
@@ -156,7 +177,7 @@ async fn initial_setup(config: &Options) -> Result<(uuid::Uuid, MachineId), eyre
         interface_id
     } else {
         return Err(eyre::eyre!(
-            "machine_interface_id is unknown. Can't continue."
+            "machine_interface_id is unknown. can't continue"
         ));
     };
 
@@ -164,6 +185,35 @@ async fn initial_setup(config: &Options) -> Result<(uuid::Uuid, MachineId), eyre
 }
 
 async fn run_as_service(config: &Options) -> Result<(), eyre::Report> {
+    // Stand up the metrics/scrape endpoint when it is configured. The meter
+    // provider must stay alive for the lifetime of the service: dropping it
+    // shuts down the Prometheus exporter. The endpoint is opt-in -- without
+    // --metrics-listen-addr scout installs no meter and the counters below are
+    // no-ops.
+    let _metrics_guard = match config.metrics_listen_addr {
+        Some(address) => {
+            let metrics_setup =
+                metrics_endpoint::new_metrics_setup("nico-scout", "forge-system", true)?;
+            carbide_instrument::log_events::register(&metrics_setup.meter);
+            let metrics_config = metrics_endpoint::MetricsEndpointConfig {
+                address,
+                registry: metrics_setup.registry,
+                health_controller: Some(metrics_setup.health_controller),
+                additional_prefix: None,
+            };
+            // The endpoint's /health and /ready report process liveness (the
+            // default HealthController state), not scout readiness.
+            tokio::spawn(async move {
+                tracing::info!("Spawning metrics endpoint on {}", metrics_config.address);
+                if let Err(e) = metrics_endpoint::run_metrics_endpoint(&metrics_config).await {
+                    tracing::error!("Metrics endpoint error: {e}");
+                }
+            });
+            Some(metrics_setup.meter_provider)
+        }
+        None => None,
+    };
+
     // Implement the logic to run as a service here
     let (machine_interface_id, machine_id) = initial_setup(config).await?;
 
@@ -182,17 +232,24 @@ async fn run_as_service(config: &Options) -> Result<(), eyre::Report> {
     // initial_setup (and after registration is complete).
     match mlx_device::create_device_report_request(machine_id) {
         Ok(request) => match mlx_device::publish_mlx_device_report(config, request).await {
-            Ok(response) => tracing::info!("recevied PublishMlxDeviceReportResponse: {response:?}"),
-            Err(e) => tracing::warn!("failed to publish PublishMlxDeviceReportRequest: {e:?}"),
+            Ok(response) => tracing::info!(?response, "received PublishMlxDeviceReportResponse",),
+            Err(e) => emit(metrics::ScoutMlxOperationFailed::DeviceReportPublish {
+                error: format!("{e:?}"),
+            }),
         },
-        Err(e) => tracing::warn!("failed to create PublishMlxDeviceReportRequest: {e:?}"),
+        Err(e) => emit(metrics::ScoutMlxOperationFailed::DeviceReportCreate {
+            error: format!("{e:?}"),
+        }),
     };
 
     let mut scout_stream_started = false;
     loop {
         if is_time_to_check_certs_expiry(next_certs_check_time) {
             next_certs_check_time = get_next_certs_check_datetime()?;
-            tracing::info!("Renewed next certs check time to {}", next_certs_check_time);
+            tracing::info!(
+                %next_certs_check_time,
+                "Renewed next certificate check time",
+            );
 
             if check_certs_validity(&client_cert)? {
                 initial_setup(config).await?;
@@ -202,25 +259,28 @@ async fn run_as_service(config: &Options) -> Result<(), eyre::Report> {
             Ok(action) => action,
             Err(e) => {
                 report_scout_error(config, None, Some(machine_interface_id), &e).await?;
-                rpc_forge::ForgeAgentControlResponse {
-                    action: Action::Noop as i32,
-                    data: None,
-                }
+                rpc_forge::ForgeAgentControlResponse::noop()
             }
         };
-        let action = Action::try_from(controller_response.action)
-            .map_err(|err| CarbideClientError::RpcDecodeError(err.to_string()))?;
-        match handle_action(
-            controller_response,
-            &machine_id,
-            machine_interface_id,
-            config,
-        )
-        .await
-        {
-            Ok(_) => tracing::info!("Successfully served {}", action.as_str_name()),
-            Err(e) => tracing::info!("Failed to serve {}: Err {}", action.as_str_name(), e),
-        };
+        if let Some(action) = controller_response.action {
+            let action_name = action.as_str_name();
+            // Capture the action label before handle_action consumes `action`.
+            let scout_action = metrics::ScoutAction::from(&action);
+            let result = handle_action(action, &machine_id, machine_interface_id, config).await;
+            emit(match result {
+                Ok(()) => metrics::ScoutActionHandled::Ok {
+                    action: scout_action,
+                    action_name,
+                },
+                Err(error) => metrics::ScoutActionHandled::Error {
+                    action: scout_action,
+                    action_name,
+                    error: error.to_string(),
+                },
+            });
+        } else {
+            tracing::warn!("API response did not contain an action, skipping.");
+        }
 
         // Ensure the first scout API query has run before we establish
         // a Scout stream connection. There's no technical reason requiring
@@ -279,55 +339,41 @@ async fn run_standalone(config: &Options) -> Result<(), eyre::Report> {
         Ok(controller_response) => controller_response,
         Err(e) => {
             report_scout_error(config, None, Some(machine_interface_id), &e).await?;
-            ForgeAgentControlResponse {
-                action: Action::Noop as i32,
-                data: None,
-            }
+            ForgeAgentControlResponse::noop()
         }
     };
     let action = match subcmd {
-        Command::AutoDetect(AutoDetect { .. }) => controller_response,
-        Command::Deprovision(_) => ForgeAgentControlResponse {
-            action: Action::Reset as i32,
-            data: None,
-        },
-        Command::Discovery(_) => ForgeAgentControlResponse {
-            action: Action::Discovery as i32,
-            data: None,
-        },
-        Command::Reset(_) => ForgeAgentControlResponse {
-            action: Action::Reset as i32,
-            data: None,
-        },
-        Command::Logerror(_) => ForgeAgentControlResponse {
-            action: Action::Logerror as i32,
-            data: None,
-        },
-        Command::MachineValidation(data) => ForgeAgentControlResponse {
-            action: Action::MachineValidation as i32,
-            data: Some(ForgeAgentControlExtraInfo {
-                pair: [
-                    KeyValuePair {
-                        key: "Context".to_string(),
-                        value: data.context.clone(),
-                    },
-                    KeyValuePair {
-                        key: "ValidationId".to_string(),
-                        value: data.validataion_id.to_string(),
-                    },
-                    KeyValuePair {
-                        key: "IsEnabled".to_string(),
-                        value: "true".to_string(),
-                    },
-                ]
-                .to_vec(),
-            }),
-        },
+        Command::AutoDetect(AutoDetect { .. }) => {
+            let Some(action) = controller_response.action else {
+                tracing::warn!("ForgeAgentControlResponse from server has no action: ignoring");
+                return Ok(());
+            };
+            action
+        }
+        Command::Deprovision(_) => Action::reset(),
+        Command::Discovery(_) => Action::discovery(),
+        Command::Reset(_) => Action::reset(),
+        Command::Logerror(_) => Action::log_error(),
+        Command::MachineValidation(data) => {
+            fac::Action::MachineValidation(fac::MachineValidation {
+                is_enabled: true,
+                context: data.context.clone(),
+                validation_id: Some(data.validataion_id),
+                filter: Some(fac::MachineValidationFilter {
+                    tags: Vec::new(),
+                    allowed_tests: Vec::new(),
+                    run_unverfied_tests: None,
+                    contexts: None,
+                }),
+            })
+        }
         // This will have already been caught above and
         // handled, but we need to have it here to make
         // sure we match everything. Maybe this could
         // log something.
         Command::Mlx(_) => return Ok(()),
+        // Handled in main() before logging/API setup; kept for exhaustiveness.
+        Command::LldpNeighbors => return Ok(()),
     };
 
     handle_action(action, &machine_id, machine_interface_id, config).await?;
@@ -335,17 +381,15 @@ async fn run_standalone(config: &Options) -> Result<(), eyre::Report> {
 }
 
 async fn handle_action(
-    controller_response: rpc_forge::ForgeAgentControlResponse,
+    action: Action,
     machine_id: &MachineId,
     machine_interface_id: uuid::Uuid,
     config: &Options,
 ) -> Result<(), CarbideClientError> {
-    let action = Action::try_from(controller_response.action)
-        .map_err(|err| CarbideClientError::RpcDecodeError(err.to_string()))?;
-
     match action {
-        Action::Discovery => {
-            // This is temporary. All cleanup must be done when API call Reset.
+        fac::Action::Discovery(_) => {
+            // Discovery prep must not scrub storage. NVMe/HDD cleanup is owned by RESET so
+            // cleanup status is reported to the API and retried through the cleanup state.
             deprovision::run_no_api(&config.tpm_path).await?;
             let retry = registration::DiscoveryRetry {
                 secs: config.discovery_retry_secs,
@@ -363,55 +407,49 @@ async fn handle_action(
 
             discovery::completed(config, machine_id).await?;
         }
-        Action::Reset => {
+        fac::Action::Reset(_) => {
             deprovision::run(config, machine_id).await?;
         }
-        Action::Rebuild => {
+        fac::Action::Rebuild(_) => {
             unimplemented!("Rebuild not written yet");
         }
-        Action::Noop => {}
-        Action::Logerror => match logerror_to_carbide(config, machine_interface_id).await {
-            Ok(()) => (),
-            Err(e) => tracing::info!("Forge Scout logerror_to_carbide error: {}", e),
-        },
-        Action::Retry => {
+        fac::Action::Noop(_) => {}
+        fac::Action::LogError(_) => logerror_to_carbide(config, machine_interface_id)
+            .await
+            // Propagate the failure so `carbide_scout_actions_total` records this
+            // as `outcome = error`, not a silent success.
+            .map_err(|e| {
+                CarbideClientError::GenericError(format!("logerror_to_carbide failed: {e}"))
+            })?,
+        fac::Action::Retry(_) => {
             panic!(
                 "Retrieved Retry action, which should be handled internally by query_api_with_retries"
             );
         }
-        Action::Measure => {
+        fac::Action::Measure(_) => {
             initial_setup(config).await.map_err(|e| {
                 CarbideClientError::GenericError(format!(
                     "Could not perform attestation at the request of forge agent control: {e}"
                 ))
             })?;
         }
-        Action::MachineValidation => {
+        fac::Action::MachineValidation(machine_validation) => {
             tracing::info!("Machine validation");
-            let mut context = "Discovery".to_string();
-            let mut id = "".to_string();
-            let mut is_enabled = false;
-            let mut machine_validation_filter =
-                ::machine_validation::MachineValidationFilter::default();
-            for item in controller_response.data.unwrap().pair {
-                if item.key == "Context" {
-                    context = item.value;
-                } else if item.key == "ValidationId" {
-                    id = item.value;
-                } else if item.key == "IsEnabled" {
-                    is_enabled = item.value.parse().unwrap_or(true);
-                } else if item.key == "MachineValidationFilter" {
-                    machine_validation_filter =
-                        serde_json::from_str(&item.value).unwrap_or_default();
-                }
-            }
-            let mut ret: Result<(), CarbideClientError> = Ok(());
-            if is_enabled {
-                ret = match machine_validation::run(
+            let id = machine_validation.validation_id.ok_or_else(|| {
+                CarbideClientError::GenericError(
+                    "machine validation action missing validation_id".to_string(),
+                )
+            })?;
+            let machine_validation_filter = machine_validation
+                .filter
+                .map(Into::into)
+                .unwrap_or_default();
+            let ret = if machine_validation.is_enabled {
+                match machine_validation::run(
                     config,
                     machine_id,
-                    id.clone(),
-                    context,
+                    id,
+                    machine_validation.context,
                     machine_validation_filter,
                 )
                 .await
@@ -421,68 +459,53 @@ async fn handle_action(
                         Ok(())
                     }
                     Err(err) => Err(err),
-                };
-            }
-            machine_validation::completed(config, machine_id, id, None).await?;
+                }
+            } else {
+                Ok(())
+            };
+            let machine_validation_error = ret.as_ref().err().map(|err| err.to_string());
+            machine_validation::completed(config, machine_id, &id, machine_validation_error)
+                .await?;
             return ret;
         }
-        Action::MlxAction => {
-            handle_mlxreport_action(config, machine_id, controller_response.data).await;
+        fac::Action::MlxAction(mlx_action) => {
+            handle_mlxreport_action(config, machine_id, mlx_action).await;
             return Ok(());
         }
-        Action::FirmwareUpgrade => {
-            handle_firmware_upgrade_action(config, machine_id, controller_response.data).await?;
+        fac::Action::FirmwareUpgrade(firmware_upgrade) => {
+            handle_firmware_upgrade_action(config, machine_id, firmware_upgrade.task).await?;
         }
     }
     Ok(())
 }
 
-// handle_firmware_upgrade_action processes a firmware upgrade task received
-// from carbide-api via ForgeAgentControl. The task data is a JSON-serialized
-// FirmwareUpgradeTask in the "firmware_upgrade_task" key-value pair.
 async fn handle_firmware_upgrade_action(
     config: &Options,
     machine_id: &MachineId,
-    data: Option<ForgeAgentControlExtraInfo>,
+    task: Option<sfu::ScoutFirmwareUpgradeTask>,
 ) -> Result<(), CarbideClientError> {
-    let extra = data.ok_or_else(|| {
-        CarbideClientError::GenericError("firmware upgrade action missing extra data".to_string())
+    let task = task.ok_or_else(|| {
+        CarbideClientError::GenericError("firmware upgrade action missing task".to_string())
     })?;
-
-    let task_json = extra
-        .pair
-        .iter()
-        .find(|kv| kv.key == "firmware_upgrade_task")
-        .map(|kv| &kv.value)
-        .ok_or_else(|| {
-            CarbideClientError::GenericError(
-                "firmware upgrade action missing firmware_upgrade_task key".to_string(),
-            )
-        })?;
-
-    let task: firmware_upgrade::FirmwareUpgradeTask =
-        serde_json::from_str(task_json).map_err(|e| {
-            CarbideClientError::GenericError(format!("failed to parse firmware upgrade task: {e}"))
-        })?;
 
     let http_client = reqwest::Client::builder().no_proxy().build().map_err(|e| {
         CarbideClientError::GenericError(format!("failed to build HTTP client: {e}"))
     })?;
 
     tracing::info!(
-        "[firmware_upgrade] received upgrade task for component={} version={}",
-        task.component_type,
-        task.target_version,
+        component_type = %task.component_type,
+        target_version = %task.target_version,
+        "[firmware_upgrade] received upgrade task",
     );
 
     let result = firmware_upgrade::handle_firmware_upgrade(&http_client, &task).await;
 
     tracing::info!(
-        "[firmware_upgrade] upgrade finished: success={} component={} version={} exit_code={}",
-        result.success,
-        task.component_type,
-        task.target_version,
-        result.exit_code,
+        success = result.success,
+        component_type = %task.component_type,
+        target_version = %task.target_version,
+        exit_code = result.exit_code,
+        "[firmware_upgrade] upgrade finished",
     );
 
     report_firmware_upgrade_status(config, machine_id, task.upgrade_task_id, &result).await?;
@@ -547,65 +570,50 @@ fn truncate(value: &str, limit: usize) -> String {
 async fn handle_mlxreport_action(
     config: &Options,
     machine_id: &MachineId,
-    data: Option<ForgeAgentControlExtraInfo>,
+    mlx_action: fac::MlxAction,
 ) {
-    let Some(ed) = data else {
-        tracing::error!("handle_mlxreport_action Did not expect extra data to be empty");
-        return;
-    };
+    let commands = mlx_action
+        .device_actions
+        .iter()
+        .filter_map(|device_action| match DpaCommand::try_from(device_action) {
+            Ok(command) => Some((device_action.pci_name.clone(), command)),
+            Err(e) => {
+                emit(metrics::ScoutMlxReconciliationFailed::Decode {
+                    pci_name: device_action.pci_name.clone(),
+                    error: e,
+                });
+                None
+            }
+        })
+        .collect();
 
-    // The Extra data is an array of key value pairs.
-    // The key is the pci_name of a DPA NIC.
-    // The value is a json encoded DpaCommand.
-    // The DpaCommand can be Unlock/Lock, which don't have any other
-    // data (currently - may be we will send the lock/unlock key)
-    // The DpaCommand can also be ApplyProfile, in which case it
-    // will have the profile name.
+    handle_mlxreport_commands(config, machine_id, commands).await;
+}
 
+async fn handle_mlxreport_commands(
+    config: &Options,
+    machine_id: &MachineId,
+    commands: Vec<(String, DpaCommand<'static>)>,
+) {
     let mut report = MlxObservationReport {
         machine_id: Some(*machine_id),
         timestamp: Some(Utc::now().into()),
         observations: Vec::new(),
     };
 
-    for kv in ed.pair {
-        let dev_pci_name = kv.key;
-        let action = kv.value;
-
+    for (dev_pci_name, dpa_cmd) in commands {
         if dev_pci_name.is_empty() {
-            tracing::error!("handle_mlxreport_action dev_pci_name empty");
-            continue;
-        }
-
-        if action.is_empty() {
-            tracing::error!(
-                "handle_mlxreport_action action empty for dev: {:#?}",
-                dev_pci_name
-            );
+            emit(metrics::ScoutMlxRequestRejected::Reconciliation {});
             continue;
         }
 
         let dev = match discover_device(&dev_pci_name) {
             Ok(d) => d,
             Err(s) => {
-                tracing::error!(
-                    "handle_mlxreport_action Error from discover_device::from_str {s} for dev: {:#?}",
-                    dev_pci_name
-                );
-                continue;
-            }
-        };
-
-        // The action is a structure with an OpCode (like Lock/Unlock/ApplyProfile)
-        // and an additional optional string (for ApplyProfile)
-
-        let dpa_cmd: DpaCommand<'_> = match serde_json::from_str(&action) {
-            Ok(dpc) => dpc,
-            Err(e) => {
-                tracing::error!(
-                    "handle_mlxreport_action Error decodeing DpaCommand {e} for dev: {:#?}",
-                    dev_pci_name
-                );
+                emit(metrics::ScoutMlxReconciliationFailed::Discover {
+                    pci_name: dev_pci_name,
+                    error: s,
+                });
                 continue;
             }
         };
@@ -624,10 +632,10 @@ async fn handle_mlxreport_action(
                     report.observations.push(obs);
                 }
                 Err(e) => {
-                    tracing::info!(
-                        "handle_mlxreport_action Error from lock_device: {e} for dev: {:#?}",
-                        dev_pci_name
-                    );
+                    emit(metrics::ScoutMlxReconciliationFailed::Lock {
+                        pci_name: dev_pci_name,
+                        error: mlx_device::lockdown_error_context(&e, &key),
+                    });
                 }
             },
             // ApplyFirmware attempts to apply the provided FirmwareFlasherProfile
@@ -700,10 +708,10 @@ async fn handle_mlxreport_action(
                     report.observations.push(obs);
                 }
                 Err(e) => {
-                    tracing::info!(
-                        "handle_mlxreport_action Error from unlock_device: {e} for dev: {:#?}",
-                        dev_pci_name
-                    );
+                    emit(metrics::ScoutMlxReconciliationFailed::Unlock {
+                        pci_name: dev_pci_name,
+                        error: mlx_device::lockdown_error_context(&e, &key),
+                    });
                 }
             },
         };
@@ -717,7 +725,9 @@ async fn handle_mlxreport_action(
     match mlx_device::publish_mlx_observation_report(config, req).await {
         Ok(_resp) => (),
         Err(e) => {
-            tracing::error!("Error from publish_mlx_observation_report {e}");
+            emit(metrics::ScoutMlxOperationFailed::ObservationReportPublish {
+                error: e.to_string(),
+            });
         }
     }
 }
@@ -785,9 +795,9 @@ async fn query_api(
     query_attempt: u64,
 ) -> CarbideClientResult<rpc_forge::ForgeAgentControlResponse> {
     tracing::info!(
-        "Sending ForgeAgentControlRequest (attempt:{}.{})",
         action_attempt,
         query_attempt,
+        "Sending ForgeAgentControlRequest",
     );
     let query = rpc_forge::ForgeAgentControlRequest {
         machine_id: Some(*machine_id),
@@ -795,14 +805,17 @@ async fn query_api(
     let request = tonic::Request::new(query);
     let mut client = client::create_forge_client(config).await?;
     let response = client.forge_agent_control(request).await?.into_inner();
-    let action = Action::try_from(response.action)
-        .map_err(|err| CarbideClientError::RpcDecodeError(err.to_string()))?;
+    let action_str = response
+        .action
+        .as_ref()
+        .map(|a| a.as_str_name())
+        .unwrap_or_default();
 
     tracing::info!(
-        "Received ForgeAgentControlResponse (attempt:{}.{}, action:{})",
         action_attempt,
         query_attempt,
-        action.as_str_name()
+        action = %action_str,
+        "Received ForgeAgentControlResponse",
     );
     Ok(response)
 }
@@ -826,7 +839,7 @@ async fn query_api_with_retries(
         .on_retry(|_attempt, _next_delay, error: &CarbideClientError| {
             // We can't move the error, but CarbideClientError contains some results that are not clonable, so just do the format here
             let error = format!("{error}");
-            async move { tracing::info!("ForgeAgentControlRequest failed: {error}") }
+            async move { tracing::info!(error = %error, "ForgeAgentControlRequest failed") }
         });
 
     // State machine handler needs 1-2 cycles to update host_adminIP to leaf.
@@ -851,10 +864,8 @@ async fn query_api_with_retries(
         .await?;
 
         action_attempt += 1;
-        let action = Action::try_from(controller_response.action)
-            .map_err(|err| CarbideClientError::RpcDecodeError(err.to_string()))?;
 
-        if action != Action::Retry {
+        if !matches!(controller_response.action, Some(Action::Retry(_))) {
             return Ok(controller_response);
         }
 
@@ -885,9 +896,9 @@ fn is_time_to_check_certs_expiry(next_check_time: DateTime<Utc>) -> bool {
     let diff = next_check_time - now;
     if diff < TimeDelta::minutes(2) {
         tracing::info!(
-            "Time to check certs expiry: time now is {}, certs check time is {}",
-            now,
-            next_check_time
+            %now,
+            %next_check_time,
+            "Time to check certificate expiry",
         );
         return true;
     }
@@ -936,16 +947,16 @@ fn check_certs_validity(client_cert_path: &str) -> CarbideClientResult<bool> {
         let diff = not_after_datetime - now;
         if diff < TimeDelta::days(2) {
             tracing::info!(
-                "Now timestamp is {}, NotAfter is {}, triggering certs regen",
-                now,
-                not_after_datetime
+                %now,
+                %not_after_datetime,
+                "Certificate expires soon; triggering regeneration",
             );
             Ok(true)
         } else {
             tracing::info!(
-                "Now timestamp is {}, NotAfter is {}, NOT triggering certs regen",
-                now,
-                not_after_datetime
+                %now,
+                %not_after_datetime,
+                "Certificate does not expire soon; skipping regeneration",
             );
             Ok(false)
         }

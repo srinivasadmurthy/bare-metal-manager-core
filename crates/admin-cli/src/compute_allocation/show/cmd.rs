@@ -15,17 +15,18 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge::FindComputeAllocationsByIdsRequest;
 
 use super::args::Args;
 use crate::compute_allocation::common::convert_compute_allocations_to_table;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 
 /// Show one or more compute allocations.
 /// If only a single allocation is found, verbose output is used
 /// automatically.
-pub async fn show(
+pub(crate) async fn show(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,

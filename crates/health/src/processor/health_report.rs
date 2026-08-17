@@ -22,8 +22,8 @@ use nv_redfish::resource::Health as BmcHealth;
 
 use super::{CollectorEvent, EventContext, EventProcessor};
 use crate::sink::{
-    Classification, HealthReport, HealthReportAlert, HealthReportSuccess, Probe, ReportSource,
-    SensorHealthContext, SensorHealthData,
+    Classification, HealthReport, HealthReportAlert, HealthReportSuccess, MetricSample, Probe,
+    ReportSource, SensorThresholdContext,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -83,7 +83,7 @@ impl HealthReportProcessor {
         }
     }
 
-    fn classify(health: &SensorHealthContext, reading: f64) -> SensorHealth {
+    fn classify(health: &SensorThresholdContext, reading: f64) -> SensorHealth {
         if let Some(max) = health.range_max
             && reading > max
         {
@@ -102,7 +102,7 @@ impl HealthReportProcessor {
             return SensorHealth::Fatal;
         }
 
-        if let Some(lower_fatal) = health.range_min
+        if let Some(lower_fatal) = health.lower_fatal
             && reading <= lower_fatal
         {
             return SensorHealth::Fatal;
@@ -135,8 +135,8 @@ impl HealthReportProcessor {
     }
 
     fn to_health_result(
-        metric: &SensorHealthData,
-        health: &SensorHealthContext,
+        metric: &MetricSample,
+        health: &SensorThresholdContext,
     ) -> SensorHealthResult {
         let classification = Self::classify(health, metric.value);
 
@@ -225,6 +225,7 @@ impl EventProcessor for HealthReportProcessor {
                 };
                 let report = HealthReport {
                     source: ReportSource::BmcSensors,
+                    target: context.health_report_target(),
                     observed_at: Some(chrono::Utc::now()),
                     successes: window.successes,
                     alerts: window.alerts,
@@ -238,6 +239,9 @@ impl EventProcessor for HealthReportProcessor {
                 );
 
                 return vec![CollectorEvent::HealthReport(Arc::new(report))];
+            }
+            CollectorEvent::CollectorRemoved => {
+                self.windows.remove(&Self::stream_key(context));
             }
             CollectorEvent::Log(_)
             | CollectorEvent::Firmware(_)
@@ -257,7 +261,8 @@ mod tests {
     use nv_redfish::resource::Health as BmcHealth;
 
     use super::*;
-    use crate::endpoint::{BmcAddr, EndpointMetadata, MachineData};
+    use crate::endpoint::{BmcAddr, EndpointMetadata, MachineData, SharedSystemUuid};
+    use crate::sink::HealthReportTarget;
 
     fn test_context() -> EventContext {
         EventContext {
@@ -268,11 +273,19 @@ mod tests {
                 mac: MacAddress::from_str("42:9e:b1:bd:9d:dd").expect("valid mac"),
             },
             collector_type: "sensor_collector",
+            labels: Default::default(),
             metadata: Some(EndpointMetadata::Machine(MachineData {
-                machine_id: "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
-                    .parse()
-                    .expect("valid machine id"),
+                machine_id: Some(
+                    "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
+                        .parse()
+                        .expect("valid machine id"),
+                ),
                 machine_serial: None,
+                system_uuid: SharedSystemUuid::default(),
+                slot_number: None,
+                tray_index: None,
+                nvlink_domain_uuid: None,
+                driver_version: None,
             })),
             rack_id: None,
         }
@@ -287,14 +300,14 @@ mod tests {
         let _ = processor.process_event(
             &context,
             &CollectorEvent::Metric(
-                SensorHealthData {
+                MetricSample {
                     key: "sensor-1".to_string(),
                     name: "hw_sensor".to_string(),
                     metric_type: "temperature".to_string(),
                     unit: "celsius".to_string(),
                     value: 42.0,
                     labels: vec![],
-                    context: Some(SensorHealthContext {
+                    context: Some(SensorThresholdContext {
                         entity_type: "sensor".to_string(),
                         sensor_id: "Temp1".to_string(),
                         upper_fatal: None,
@@ -318,7 +331,22 @@ mod tests {
         };
 
         assert_eq!(report.source, ReportSource::BmcSensors);
+        assert_eq!(report.target, Some(HealthReportTarget::Machine));
         assert!(report.successes.is_empty());
         assert_eq!(report.alerts.len(), 1);
+    }
+
+    #[test]
+    fn collector_removed_clears_metric_window() {
+        let processor = HealthReportProcessor::new();
+        let context = test_context();
+
+        let _ = processor.process_event(&context, &CollectorEvent::MetricCollectionStart);
+        assert_eq!(processor.windows.len(), 1);
+
+        let emitted = processor.process_event(&context, &CollectorEvent::CollectorRemoved);
+
+        assert!(emitted.is_empty());
+        assert!(processor.windows.is_empty());
     }
 }

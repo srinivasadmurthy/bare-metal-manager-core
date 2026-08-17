@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliResult;
 use ::rpc::forge as forgerpc;
 
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn maintenance(api_client: &ApiClient, action: Args) -> CarbideCliResult<()> {
+pub(super) async fn maintenance(api_client: &ApiClient, action: Args) -> CarbideCliResult<()> {
     let req: forgerpc::MaintenanceRequest = match action {
         Args::On(args) => args.into(),
         Args::Off(args) => args.into(),

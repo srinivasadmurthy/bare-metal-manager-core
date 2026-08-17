@@ -18,4 +18,11 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args;
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all managed switches:
+    $ nico-admin-cli managed-switch list
+
+")]
+pub(crate) struct Args;

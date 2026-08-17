@@ -17,8 +17,7 @@
 
 use std::collections::HashMap;
 
-use ::rpc::errors::RpcDataConversionError;
-use ::rpc::forge::{self as rpc, LifecycleStatus};
+use carbide_uuid::nvlink::NvLinkDomainId;
 use carbide_uuid::rack::RackId;
 use carbide_uuid::switch::SwitchId;
 use chrono::prelude::*;
@@ -29,11 +28,12 @@ use sqlx::postgres::PgRow;
 use sqlx::{FromRow, Row};
 
 use crate::StateSla;
+use crate::bmc_info::BmcInfo;
 use crate::controller_outcome::PersistentStateHandlerOutcome;
 use crate::health::HealthReportSources;
 use crate::metadata::Metadata;
 
-pub mod slas;
+mod slas;
 pub mod switch_id;
 
 #[derive(Debug, Clone)]
@@ -45,47 +45,6 @@ pub struct NewSwitch {
     pub rack_id: Option<RackId>,
     pub slot_number: Option<i32>,
     pub tray_index: Option<i32>,
-}
-
-impl TryFrom<rpc::SwitchCreationRequest> for NewSwitch {
-    type Error = RpcDataConversionError;
-    fn try_from(value: rpc::SwitchCreationRequest) -> Result<Self, Self::Error> {
-        let conf = match value.config {
-            Some(c) => c,
-            None => {
-                return Err(RpcDataConversionError::InvalidArgument(
-                    "Switch configuration is empty".to_string(),
-                ));
-            }
-        };
-
-        let switch_uuid: Option<uuid::Uuid> = value
-            .id
-            .as_ref()
-            .map(|rpc_uuid| {
-                rpc_uuid
-                    .try_into()
-                    .map_err(|_| RpcDataConversionError::InvalidSwitchId(rpc_uuid.to_string()))
-            })
-            .transpose()?;
-
-        let id = match switch_uuid {
-            Some(v) => SwitchId::from(v),
-            None => uuid::Uuid::new_v4().into(),
-        };
-
-        let config = SwitchConfig::try_from(conf)?;
-
-        Ok(NewSwitch {
-            id,
-            config,
-            bmc_mac_address: None,
-            metadata: None,
-            rack_id: None,
-            slot_number: value.placement_in_rack.as_ref().and_then(|p| p.slot_number),
-            tray_index: value.placement_in_rack.as_ref().and_then(|p| p.tray_index),
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,12 +66,38 @@ pub struct SwitchStatus {
     pub health_status: String, // "ok", "warning", "critical"
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "lowercase")]
+#[allow(clippy::enum_variant_names)]
+pub enum SwitchMaintenanceOperation {
+    /// Power on the switch.
+    PowerOn,
+    /// Power off the switch.
+    PowerOff,
+    /// Reset the switch (restart / AC power cycle).
+    Reset,
+    /// Reinstall or rotate the switch NVOS mTLS certificate via Component Manager.
+    ReconfigureCertificate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchMaintenanceRequest {
+    pub requested_at: DateTime<Utc>,
+    pub initiator: String,
+    pub operation: SwitchMaintenanceOperation,
+}
+
 /// Set by an external entity to request switch reprovisioning. When the switch is in Ready state,
 /// the state controller checks this flag and transitions to ReProvisioning::Start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwitchReprovisionRequest {
     pub requested_at: DateTime<Utc>,
     pub initiator: String,
+    /// Rack maintenance activities that initiated this request. The switch
+    /// controller uses these to decide which ReProvisioning phases to wait for
+    /// (firmware / NVOS / NMXC). Empty means all activities.
+    #[serde(default)]
+    pub activities: Vec<crate::rack::MaintenanceActivity>,
 }
 
 pub use crate::rack::{
@@ -120,12 +105,29 @@ pub use crate::rack::{
     SwitchNvosUpdateStatus,
 };
 
+/// Controller state value for a switch in [`SwitchControllerState::Ready`].
+pub const SWITCH_CONTROLLER_STATE_READY: &str = "ready";
+
+/// `addition_info` value reported by Fabric Manager when the NMX-C control plane is configured.
+pub const CONTROL_PLANE_STATE_CONFIGURED: &str = "CONTROL_PLANE_STATE_CONFIGURED";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FabricManagerState {
     Ok,
     NotOk,
     Unknown,
+}
+
+impl FabricManagerState {
+    /// JSON representation stored in the `fabric_manager_status` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NotOk => "not_ok",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,22 +139,17 @@ pub struct FabricManagerStatus {
 }
 
 impl FabricManagerStatus {
+    pub fn is_control_plane_configured(&self) -> bool {
+        self.fabric_manager_state == FabricManagerState::Ok
+            && self.addition_info.as_deref() == Some(CONTROL_PLANE_STATE_CONFIGURED)
+    }
+
     pub fn display_status(&self) -> &'static str {
-        if self.fabric_manager_state == FabricManagerState::Ok
-            && self.addition_info.as_deref() == Some("CONTROL_PLANE_STATE_CONFIGURED")
-        {
+        if self.is_control_plane_configured() {
             "running"
         } else {
             "not_running"
         }
-    }
-}
-
-fn to_rpc_fabric_manager_state(state: FabricManagerState) -> i32 {
-    match state {
-        FabricManagerState::Ok => rpc::FabricManagerState::Ok as i32,
-        FabricManagerState::NotOk => rpc::FabricManagerState::NotOk as i32,
-        FabricManagerState::Unknown => rpc::FabricManagerState::Unknown as i32,
     }
 }
 
@@ -167,10 +164,26 @@ pub struct Switch {
 
     pub bmc_mac_address: Option<MacAddress>,
 
+    /// BMC endpoint (MAC/IP + machine-interface id) resolved from the `Bmc`
+    /// machine_interface linked back to this switch. Populated by the standard
+    /// switch load query, so every consumer (handlers, state machines) gets it
+    /// without re-resolving. `None` when no BMC interface is linked yet.
+    pub bmc_info: Option<BmcInfo>,
+
+    /// Operator "force-converge this switch BMC now" request. When
+    /// `true`, the switch state controller enters `RotatingBmc` and
+    /// force-converges the BMC on its next sweep, bypassing the passive
+    /// site-wide gate and the device's backoff quarantine. A switch has exactly
+    /// one BMC, so the flag's presence on the row names the target device.
+    pub bmc_credential_rotation_requested: bool,
+
     pub controller_state: Versioned<SwitchControllerState>,
 
     /// The result of the last attempt to change state
     pub controller_state_outcome: Option<PersistentStateHandlerOutcome>,
+
+    /// When set, the state controller (in Ready or Error) transitions to Maintenance.
+    pub switch_maintenance_requested: Option<SwitchMaintenanceRequest>,
 
     /// When set, the state controller (in Ready) transitions to ReProvisioning::Start.
     pub switch_reprovisioning_requested: Option<SwitchReprovisionRequest>,
@@ -183,6 +196,10 @@ pub struct Switch {
 
     /// FabricManager / NMX-C status set by the rack state machine.
     pub fabric_manager_status: Option<FabricManagerStatus>,
+
+    /// Last non-nil NVLink domain observed through the rack's selected NMX-C endpoint.
+    /// Failed or nil observations leave the previous value unchanged.
+    pub nvlink_domain_uuid: Option<NvLinkDomainId>,
 
     /// The rack that this switch is associated with.
     pub rack_id: Option<RackId>,
@@ -205,6 +222,8 @@ impl<'r> FromRow<'r, PgRow> for Switch {
         let status: Option<sqlx::types::Json<SwitchStatus>> = row.try_get("status").ok();
         let controller_state_outcome: Option<sqlx::types::Json<PersistentStateHandlerOutcome>> =
             row.try_get("controller_state_outcome").ok();
+        let switch_maintenance_requested: Option<sqlx::types::Json<SwitchMaintenanceRequest>> =
+            row.try_get("switch_maintenance_requested").ok();
         let switch_reprovisioning_requested: Option<sqlx::types::Json<SwitchReprovisionRequest>> =
             row.try_get("switch_reprovisioning_requested").ok();
         let firmware_upgrade_status: Option<sqlx::types::Json<RackFirmwareUpgradeStatus>> =
@@ -224,21 +243,33 @@ impl<'r> FromRow<'r, PgRow> for Switch {
             description: row.try_get("description")?,
             labels: labels.0,
         };
+        let bmc_info = row
+            .try_get::<Option<sqlx::types::Json<BmcInfo>>, _>("bmc_info")
+            .ok()
+            .flatten()
+            .map(|j| j.0);
         Ok(Switch {
             id: row.try_get("id")?,
             config: config.0,
             status: status.map(|s| s.0),
             deleted: row.try_get("deleted")?,
             bmc_mac_address: row.try_get("bmc_mac_address").ok().flatten(),
+            bmc_info,
+            bmc_credential_rotation_requested: row
+                .try_get("bmc_credential_rotation_requested")
+                .unwrap_or(false),
             controller_state: Versioned {
                 value: controller_state.0,
                 version: row.try_get("controller_state_version")?,
             },
             controller_state_outcome: controller_state_outcome.map(|o| o.0),
+            switch_maintenance_requested: switch_maintenance_requested.map(|j| j.0),
             switch_reprovisioning_requested: switch_reprovisioning_requested.map(|j| j.0),
             firmware_upgrade_status: firmware_upgrade_status.map(|j| j.0),
             nvos_update_status: nvos_update_status.map(|j| j.0),
             fabric_manager_status: fabric_manager_status.map(|j| j.0),
+            // A reader may overlap the additive migration during a rolling deployment.
+            nvlink_domain_uuid: row.try_get("nvlink_domain_uuid").ok().flatten(),
             metadata,
             version: row.try_get("version")?,
             is_primary: row.try_get("is_primary").unwrap_or(false),
@@ -250,21 +281,9 @@ impl<'r> FromRow<'r, PgRow> for Switch {
     }
 }
 
-impl TryFrom<rpc::SwitchConfig> for SwitchConfig {
-    type Error = RpcDataConversionError;
-
-    fn try_from(conf: rpc::SwitchConfig) -> Result<Self, Self::Error> {
-        Ok(SwitchConfig {
-            name: conf.name,
-            enable_nmxc: conf.enable_nmxc,
-            fabric_manager_config: Some(FabricManagerConfig {
-                config_map: conf.fabric_manager_config.unwrap_or_default().config_map,
-            }),
-        })
-    }
-}
-
-fn derive_switch_aggregate_health(sources: &HealthReportSources) -> health_report::HealthReport {
+pub fn derive_switch_aggregate_health(
+    sources: &HealthReportSources,
+) -> health_report::HealthReport {
     if let Some(replace) = &sources.replace {
         return replace.clone();
     }
@@ -276,128 +295,39 @@ fn derive_switch_aggregate_health(sources: &HealthReportSources) -> health_repor
     output
 }
 
-impl TryFrom<Switch> for rpc::Switch {
-    type Error = RpcDataConversionError;
-
-    fn try_from(src: Switch) -> Result<Self, Self::Error> {
-        let health = derive_switch_aggregate_health(&src.health_reports);
-        let fabric_manager_status = src
-            .fabric_manager_status
-            .as_ref()
-            .map(|status| status.display_status().to_string());
-        let fabric_manager_status_details =
-            src.fabric_manager_status
-                .as_ref()
-                .map(|status| rpc::FabricManagerStatus {
-                    fabric_manager_state: to_rpc_fabric_manager_state(
-                        status.fabric_manager_state.clone(),
-                    ),
-                    addition_info: status.addition_info.clone(),
-                    reason: status.reason.clone(),
-                    error_message: status.error_message.clone(),
-                });
-        let health_sources = src
-            .health_reports
-            .iter()
-            .map(|(hr, m)| rpc::HealthSourceOrigin {
-                mode: m as i32,
-                source: hr.source.clone(),
-            })
-            .collect();
-
-        let sla = state_sla(&src.controller_state.value, &src.controller_state.version);
-        let lifecycle = LifecycleStatus {
-            state: serde_json::to_string(&src.controller_state.value).unwrap_or_default(),
-            version: src.controller_state.version.version_string(),
-            state_reason: src.controller_state_outcome.map(Into::into),
-            sla: Some(sla.clone().into()),
-        };
-        let controller_state = lifecycle.state.clone();
-        let status = Some(
-            match (
-                src.status,
-                fabric_manager_status,
-                fabric_manager_status_details,
-            ) {
-                (Some(s), fabric_manager_status, fabric_manager_status_details) => {
-                    rpc::SwitchStatus {
-                        state_reason: lifecycle.state_reason.clone(),
-                        state_sla: Some(sla.into()),
-                        switch_name: Some(s.switch_name),
-                        power_state: Some(s.power_state),
-                        health_status: Some(s.health_status),
-                        controller_state: Some(lifecycle.state.clone()),
-                        health: Some(health.into()),
-                        health_sources,
-                        lifecycle: Some(lifecycle),
-                        fabric_manager_status,
-                        fabric_manager_status_details,
-                    }
-                }
-                (None, fabric_manager_status, fabric_manager_status_details) => rpc::SwitchStatus {
-                    state_reason: lifecycle.state_reason.clone(),
-                    state_sla: Some(sla.into()),
-                    switch_name: None,
-                    power_state: None,
-                    health_status: None,
-                    controller_state: Some(lifecycle.state.clone()),
-                    health: Some(health.into()),
-                    health_sources,
-                    lifecycle: Some(lifecycle),
-                    fabric_manager_status,
-                    fabric_manager_status_details,
-                },
-            },
-        );
-
-        let placement_in_rack = Some(rpc::PlacementInRack {
-            slot_number: src.slot_number,
-            tray_index: src.tray_index,
-        });
-        let config = rpc::SwitchConfig {
-            name: src.config.name,
-            fabric_manager_config: Some(rpc::FabricManagerConfig {
-                config_map: src
-                    .config
-                    .fabric_manager_config
-                    .unwrap_or_default()
-                    .config_map,
-            }),
-            enable_nmxc: src.config.enable_nmxc,
-        };
-
-        let deleted = if src.deleted.is_some() {
-            Some(src.deleted.unwrap().into())
-        } else {
-            None
-        };
-        let state_version = src.controller_state.version.to_string();
-        Ok(rpc::Switch {
-            id: Some(src.id),
-            config: Some(config),
-            status,
-            deleted,
-            controller_state,
-            bmc_info: None,
-            state_version,
-            metadata: Some(src.metadata.into()),
-            version: src.version.version_string(),
-            rack_id: src.rack_id,
-            placement_in_rack,
-            is_primary: src.is_primary,
-        })
-    }
-}
-
 /// Sub-state for SwitchControllerState::Initializing
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InitializingState {
     WaitForOsMachineInterface,
 }
 
+/// Sub-states of `ConfiguringState::ConfigureCertificate`.
+///
+/// `Start` submits certificate configuration via the component manager.
+/// `WaitForComplete` polls the returned RMS job id until the operation finishes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfigureCertificateState {
+    Start,
+    WaitForComplete { job_id: String },
+}
+
+impl std::fmt::Display for ConfigureCertificateState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigureCertificateState::Start => write!(f, "Start"),
+            ConfigureCertificateState::WaitForComplete { job_id } => {
+                write!(f, "WaitForComplete({job_id})")
+            }
+        }
+    }
+}
+
 /// Sub-state for SwitchControllerState::Configuring
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfiguringState {
+    ConfigureCertificate {
+        configure_certificate: ConfigureCertificateState,
+    },
     RotateOsPassword,
 }
 
@@ -439,6 +369,8 @@ pub enum SwitchControllerState {
     },
     /// The Switch is configuring.
     Configuring { config_state: ConfiguringState },
+    /// The Switch is fetching rack placement info (slot and tray) from the backend.
+    FetchInfo,
     /// The Switch is validating.
     Validating { validating_state: ValidatingState },
     /// The Switch is validating the BOM.
@@ -447,6 +379,27 @@ pub enum SwitchControllerState {
     },
     /// The Switch is ready for use.
     Ready,
+
+    /// The Switch is converging its BMC credentials to the staged site-wide
+    /// rotation target. Entered from `Ready` (lowest precedence) when
+    /// the switch BMC lags the target and site-wide rotation is enabled, or when
+    /// an operator force-converge request is pending; a BMC password change
+    /// never touches the switch data plane, so this is safe in `Ready`. The
+    /// shared engine owns crash-safety and per-device backoff, so this state
+    /// carries only a retry budget for transient handler failures.
+    RotatingBmc {
+        #[serde(default)]
+        retry_count: u32,
+    },
+
+    /// The Switch is executing an operator-requested maintenance operation.
+    Maintenance {
+        operation: SwitchMaintenanceOperation,
+        /// Sub-states for async maintenance operations such as certificate reconfiguration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configure_certificate: Option<ConfigureCertificateState>,
+    },
+
     // ReProvisioning
     ReProvisioning {
         reprovisioning_state: ReProvisioningState,
@@ -455,6 +408,20 @@ pub enum SwitchControllerState {
     Error { cause: String },
     /// The Switch is in the process of deleting.
     Deleting,
+}
+
+impl SwitchControllerState {
+    /// Builds the controller state for a requested maintenance operation.
+    pub fn maintenance_for_operation(operation: SwitchMaintenanceOperation) -> Self {
+        Self::Maintenance {
+            operation,
+            configure_certificate: matches!(
+                operation,
+                SwitchMaintenanceOperation::ReconfigureCertificate
+            )
+            .then_some(ConfigureCertificateState::Start),
+        }
+    }
 }
 
 /// Returns the SLA for the current state
@@ -477,6 +444,10 @@ pub fn state_sla(state: &SwitchControllerState, state_version: &ConfigVersion) -
             std::time::Duration::from_secs(slas::CONFIGURING),
             time_in_state,
         ),
+        SwitchControllerState::FetchInfo => StateSla::with_sla(
+            std::time::Duration::from_secs(slas::FETCH_INFO),
+            time_in_state,
+        ),
         SwitchControllerState::Validating { .. } => StateSla::with_sla(
             std::time::Duration::from_secs(slas::VALIDATING),
             time_in_state,
@@ -486,6 +457,14 @@ pub fn state_sla(state: &SwitchControllerState, state_version: &ConfigVersion) -
             time_in_state,
         ),
         SwitchControllerState::Ready => StateSla::no_sla(),
+        SwitchControllerState::RotatingBmc { .. } => StateSla::with_sla(
+            std::time::Duration::from_secs(slas::ROTATING_BMC),
+            time_in_state,
+        ),
+        SwitchControllerState::Maintenance { .. } => StateSla::with_sla(
+            std::time::Duration::from_secs(slas::MAINTENANCE),
+            time_in_state,
+        ),
         SwitchControllerState::ReProvisioning { .. } => StateSla::with_sla(
             std::time::Duration::from_secs(slas::CONFIGURING),
             time_in_state,
@@ -511,166 +490,367 @@ pub struct SwitchSearchFilter {
     pub controller_state: Option<String>,
     pub bmc_mac: Option<MacAddress>,
     pub nvos_mac: Option<MacAddress>,
-}
-
-impl From<rpc::SwitchSearchFilter> for SwitchSearchFilter {
-    fn from(filter: rpc::SwitchSearchFilter) -> Self {
-        SwitchSearchFilter {
-            rack_id: filter.rack_id,
-            deleted: crate::DeletedFilter::from(filter.deleted),
-            controller_state: filter.controller_state,
-            bmc_mac: filter.bmc_mac.and_then(|m| m.parse::<MacAddress>().ok()),
-            nvos_mac: filter.nvos_mac.and_then(|m| m.parse::<MacAddress>().ok()),
-        }
-    }
+    pub only_with_health_alert: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{scenarios, value_scenarios};
+
     use super::*;
-    use crate::controller_outcome::PersistentStateHandlerOutcome;
 
-    #[test]
-    fn try_from_switch_populates_state_reason() {
-        let switch = Switch {
-            id: SwitchId::from(uuid::Uuid::new_v4()),
-            config: SwitchConfig {
-                name: "test-switch".to_string(),
-                enable_nmxc: false,
-                fabric_manager_config: None,
-            },
-            status: Some(SwitchStatus {
-                switch_name: "test-switch".to_string(),
-                power_state: "on".to_string(),
-                health_status: "ok".to_string(),
-            }),
-            deleted: None,
-            bmc_mac_address: None,
-            controller_state: Versioned::new(
-                SwitchControllerState::Ready,
-                config_version::ConfigVersion::initial(),
-            ),
-            controller_state_outcome: Some(PersistentStateHandlerOutcome::Transition {
-                source_ref: None,
-            }),
-            switch_reprovisioning_requested: None,
-            firmware_upgrade_status: None,
-            nvos_update_status: None,
-            fabric_manager_status: Some(FabricManagerStatus {
-                fabric_manager_state: FabricManagerState::Ok,
-                addition_info: Some("CONTROL_PLANE_STATE_CONFIGURED".to_string()),
-                reason: Some(String::new()),
-                error_message: None,
-            }),
-            metadata: Metadata::default(),
-            version: ConfigVersion::initial(),
-            is_primary: true,
-            rack_id: None,
-            slot_number: Some(1),
-            tray_index: Some(2),
-            health_reports: Default::default(),
-        };
-
-        let rpc_switch: rpc::Switch = switch.try_into().unwrap();
-        let status = rpc_switch.status.expect("status should be Some");
-        assert!(
-            status.state_reason.is_some(),
-            "state_reason should be populated from controller_state_outcome"
-        );
-        assert!(status.state_sla.is_some(), "state_sla should be populated");
-        assert_eq!(status.power_state, Some("on".to_string()));
-        assert_eq!(status.health_status, Some("ok".to_string()));
-        assert_eq!(status.fabric_manager_status, Some("running".to_string()));
-        let details = status
-            .fabric_manager_status_details
-            .expect("fabric_manager_status_details should be populated");
-        assert_eq!(
-            details.fabric_manager_state,
-            rpc::FabricManagerState::Ok as i32
-        );
-        assert_eq!(
-            details.addition_info,
-            Some("CONTROL_PLANE_STATE_CONFIGURED".to_string())
-        );
-        assert!(rpc_switch.is_primary);
+    /// Build a `FabricManagerStatus` with only the two fields `display_status`
+    /// inspects; the rest are irrelevant to its logic.
+    fn fm_status(state: FabricManagerState, addition_info: Option<&str>) -> FabricManagerStatus {
+        FabricManagerStatus {
+            fabric_manager_state: state,
+            addition_info: addition_info.map(str::to_string),
+            reason: None,
+            error_message: None,
+        }
     }
 
     #[test]
-    fn try_from_switch_without_status_still_has_state_reason() {
-        let switch = Switch {
-            id: SwitchId::from(uuid::Uuid::new_v4()),
-            config: SwitchConfig {
-                name: "test-switch".to_string(),
-                enable_nmxc: false,
-                fabric_manager_config: None,
-            },
-            status: None,
-            deleted: None,
-            bmc_mac_address: None,
-            controller_state: Versioned::new(
-                SwitchControllerState::Created,
-                config_version::ConfigVersion::initial(),
-            ),
-            controller_state_outcome: Some(PersistentStateHandlerOutcome::Wait {
-                reason: "waiting for something".to_string(),
-                source_ref: None,
-            }),
-            switch_reprovisioning_requested: None,
-            firmware_upgrade_status: None,
-            nvos_update_status: None,
-            fabric_manager_status: None,
-            metadata: Metadata::default(),
-            version: ConfigVersion::initial(),
-            is_primary: false,
-            rack_id: None,
-            slot_number: None,
-            tray_index: None,
-            health_reports: Default::default(),
-        };
+    fn controller_state_serializes_to_expected_json() {
+        scenarios!(
+            run = |state| serde_json::to_string(&state).map_err(drop);
+            "created" {
+                SwitchControllerState::Created => Yields(r#"{"state":"created"}"#.to_string()),
+            }
 
-        let rpc_switch: rpc::Switch = switch.try_into().unwrap();
-        let status = rpc_switch
-            .status
-            .expect("status should be Some even when switch.status is None");
-        assert!(
-            status.state_reason.is_some(),
-            "state_reason should be populated even without switch status"
+            "initializing" {
+                SwitchControllerState::Initializing {
+                    initializing_state: InitializingState::WaitForOsMachineInterface,
+                } => Yields(
+                    r#"{"state":"initializing","initializing_state":"WaitForOsMachineInterface"}"#
+                        .to_string(),
+                ),
+            }
+
+            "configuring" {
+                SwitchControllerState::Configuring {
+                    config_state: ConfiguringState::RotateOsPassword,
+                } => Yields(
+                    r#"{"state":"configuring","config_state":"RotateOsPassword"}"#.to_string(),
+                ),
+            }
+
+            "fetchinfo" {
+                SwitchControllerState::FetchInfo => {
+                    Yields(r#"{"state":"fetchinfo"}"#.to_string())
+                }
+            }
+
+            "validating" {
+                SwitchControllerState::Validating {
+                    validating_state: ValidatingState::ValidationComplete,
+                } => Yields(
+                    r#"{"state":"validating","validating_state":"ValidationComplete"}"#
+                        .to_string(),
+                ),
+            }
+
+            "bomvalidating" {
+                SwitchControllerState::BomValidating {
+                    bom_validating_state: BomValidatingState::BomValidationComplete,
+                } => Yields(
+                    r#"{"state":"bomvalidating","bom_validating_state":"BomValidationComplete"}"#
+                        .to_string(),
+                ),
+            }
+
+            "ready" {
+                SwitchControllerState::Ready => Yields(r#"{"state":"ready"}"#.to_string()),
+            }
+
+            "rotatingbmc carries its retry count" {
+                SwitchControllerState::RotatingBmc { retry_count: 4 } => Yields(
+                    r#"{"state":"rotatingbmc","retry_count":4}"#.to_string(),
+                ),
+            }
+
+            "maintenance: power on" {
+                SwitchControllerState::Maintenance {
+                    operation: SwitchMaintenanceOperation::PowerOn,
+                    configure_certificate: None,
+                } => Yields(
+                    r#"{"state":"maintenance","operation":{"operation":"poweron"}}"#.to_string(),
+                ),
+            }
+
+            "maintenance: power off" {
+                SwitchControllerState::Maintenance {
+                    operation: SwitchMaintenanceOperation::PowerOff,
+                    configure_certificate: None,
+                } => Yields(
+                    r#"{"state":"maintenance","operation":{"operation":"poweroff"}}"#
+                        .to_string(),
+                ),
+            }
+
+            "maintenance: reset" {
+                SwitchControllerState::Maintenance {
+                    operation: SwitchMaintenanceOperation::Reset,
+                    configure_certificate: None,
+                } => Yields(
+                    r#"{"state":"maintenance","operation":{"operation":"reset"}}"#.to_string(),
+                ),
+            }
+
+            "maintenance: reconfigure certificate" {
+                SwitchControllerState::Maintenance {
+                    operation: SwitchMaintenanceOperation::ReconfigureCertificate,
+                    configure_certificate: Some(ConfigureCertificateState::Start),
+                } => Yields(
+                    r#"{"state":"maintenance","operation":{"operation":"reconfigurecertificate"},"configure_certificate":"Start"}"#
+                        .to_string(),
+                ),
+            }
+
+            "reprovisioning: firmware upgrade" {
+                SwitchControllerState::ReProvisioning {
+                    reprovisioning_state:
+                        ReProvisioningState::WaitingForRackFirmwareUpgrade,
+                } => Yields(
+                    r#"{"state":"reprovisioning","reprovisioning_state":"WaitingForRackFirmwareUpgrade"}"#
+                        .to_string(),
+                ),
+            }
+
+            "reprovisioning: nvos upgrade" {
+                SwitchControllerState::ReProvisioning {
+                    reprovisioning_state: ReProvisioningState::WaitingForNVOSUpgrade,
+                } => Yields(
+                    r#"{"state":"reprovisioning","reprovisioning_state":"WaitingForNVOSUpgrade"}"#
+                        .to_string(),
+                ),
+            }
+
+            "reprovisioning: nmxc configure" {
+                SwitchControllerState::ReProvisioning {
+                    reprovisioning_state: ReProvisioningState::WaitingForNMXCConfigure,
+                } => Yields(
+                    r#"{"state":"reprovisioning","reprovisioning_state":"WaitingForNMXCConfigure"}"#
+                        .to_string(),
+                ),
+            }
+
+            "error carries its cause" {
+                SwitchControllerState::Error {
+                    cause: "cause goes here".to_string(),
+                } => Yields(
+                    r#"{"state":"error","cause":"cause goes here"}"#.to_string(),
+                ),
+            }
+
+            "deleting" {
+                SwitchControllerState::Deleting => Yields(r#"{"state":"deleting"}"#.to_string()),
+            }
         );
-        assert_eq!(status.power_state, None);
-        assert_eq!(status.health_status, None);
-        assert_eq!(status.fabric_manager_status, None);
-        assert_eq!(status.fabric_manager_status_details, None);
-        assert!(!rpc_switch.is_primary);
     }
 
     #[test]
-    fn serialize_controller_state() {
-        let state = SwitchControllerState::Created;
-        let serialized = serde_json::to_string(&state).unwrap();
-        assert_eq!(serialized, "{\"state\":\"created\"}");
-        assert_eq!(
-            serde_json::from_str::<SwitchControllerState>(&serialized).unwrap(),
-            state
+    fn controller_state_deserializes_from_json() {
+        scenarios!(
+            run = |json| serde_json::from_str::<SwitchControllerState>(json).map_err(drop);
+            "created" {
+                r#"{"state":"created"}"# => Yields(SwitchControllerState::Created),
+            }
+
+            "initializing" {
+                r#"{"state":"initializing","initializing_state":"WaitForOsMachineInterface"}"# => Yields(SwitchControllerState::Initializing {
+                    initializing_state: InitializingState::WaitForOsMachineInterface,
+                }),
+            }
+
+            "configuring" {
+                r#"{"state":"configuring","config_state":"RotateOsPassword"}"# => Yields(SwitchControllerState::Configuring {
+                    config_state: ConfiguringState::RotateOsPassword,
+                }),
+            }
+
+            "fetchinfo" {
+                r#"{"state":"fetchinfo"}"# => Yields(SwitchControllerState::FetchInfo),
+            }
+
+            "validating" {
+                r#"{"state":"validating","validating_state":"ValidationComplete"}"# => Yields(SwitchControllerState::Validating {
+                    validating_state: ValidatingState::ValidationComplete,
+                }),
+            }
+
+            "bomvalidating" {
+                r#"{"state":"bomvalidating","bom_validating_state":"BomValidationComplete"}"# => Yields(SwitchControllerState::BomValidating {
+                    bom_validating_state: BomValidatingState::BomValidationComplete,
+                }),
+            }
+
+            "ready" {
+                r#"{"state":"ready"}"# => Yields(SwitchControllerState::Ready),
+            }
+
+            "legacy ready with stray ready_state still deserializes to Ready" {
+                r#"{"state":"ready","ready_state":"poweroff"}"# => Yields(SwitchControllerState::Ready),
+            }
+
+            "rotatingbmc round-trips its retry count" {
+                r#"{"state":"rotatingbmc","retry_count":4}"# => Yields(SwitchControllerState::RotatingBmc {
+                    retry_count: 4,
+                }),
+            }
+
+            "rotatingbmc absent retry_count defaults to 0" {
+                r#"{"state":"rotatingbmc"}"# => Yields(SwitchControllerState::RotatingBmc {
+                    retry_count: 0,
+                }),
+            }
+
+            "maintenance: reset" {
+                r#"{"state":"maintenance","operation":{"operation":"reset"}}"# => Yields(SwitchControllerState::Maintenance {
+                    operation: SwitchMaintenanceOperation::Reset,
+                    configure_certificate: None,
+                }),
+            }
+
+            "error" {
+                r#"{"state":"error","cause":"boom"}"# => Yields(SwitchControllerState::Error {
+                    cause: "boom".to_string(),
+                }),
+            }
+
+            "deleting" {
+                r#"{"state":"deleting"}"# => Yields(SwitchControllerState::Deleting),
+            }
+
+            "unknown state tag is rejected" {
+                r#"{"state":"frobnicating"}"# => Fails,
+            }
+
+            "missing state tag is rejected" {
+                r#"{"cause":"boom"}"# => Fails,
+            }
+
+            "error without its cause is rejected" {
+                r#"{"state":"error"}"# => Fails,
+            }
+
+            "not even json" {
+                "not json" => Fails,
+            }
         );
-        let state = SwitchControllerState::Initializing {
-            initializing_state: InitializingState::WaitForOsMachineInterface,
-        };
-        let serialized = serde_json::to_string(&state).unwrap();
-        assert_eq!(
-            serialized,
-            "{\"state\":\"initializing\",\"initializing_state\":\"WaitForOsMachineInterface\"}"
+    }
+
+    #[test]
+    fn maintenance_operation_serializes_lowercase() {
+        scenarios!(
+            run = |op| serde_json::to_string(&op).map_err(drop);
+            "power on" {
+                SwitchMaintenanceOperation::PowerOn => Yields(r#"{"operation":"poweron"}"#.to_string()),
+            }
+
+            "power off" {
+                SwitchMaintenanceOperation::PowerOff => Yields(r#"{"operation":"poweroff"}"#.to_string()),
+            }
+
+            "reset" {
+                SwitchMaintenanceOperation::Reset => Yields(r#"{"operation":"reset"}"#.to_string()),
+            }
+
+            "reconfigure certificate" {
+                SwitchMaintenanceOperation::ReconfigureCertificate => Yields(
+                    r#"{"operation":"reconfigurecertificate"}"#.to_string(),
+                ),
+            }
         );
-        assert_eq!(
-            serde_json::from_str::<SwitchControllerState>(&serialized).unwrap(),
-            state
+    }
+
+    #[test]
+    fn maintenance_operation_deserializes() {
+        scenarios!(
+            run = |json| serde_json::from_str::<SwitchMaintenanceOperation>(json).map_err(drop);
+            "power on" {
+                r#"{"operation":"poweron"}"# => Yields(SwitchMaintenanceOperation::PowerOn),
+            }
+
+            "power off" {
+                r#"{"operation":"poweroff"}"# => Yields(SwitchMaintenanceOperation::PowerOff),
+            }
+
+            "reset" {
+                r#"{"operation":"reset"}"# => Yields(SwitchMaintenanceOperation::Reset),
+            }
+
+            "reconfigure certificate" {
+                r#"{"operation":"reconfigurecertificate"}"# =>
+                    Yields(SwitchMaintenanceOperation::ReconfigureCertificate),
+            }
+
+            "uppercase tag is rejected" {
+                r#"{"operation":"PowerOn"}"# => Fails,
+            }
+
+            "unknown operation is rejected" {
+                r#"{"operation":"explode"}"# => Fails,
+            }
         );
+    }
+
+    #[test]
+    fn fabric_manager_state_serializes_snake_case() {
+        scenarios!(
+            run = |state| serde_json::to_string(&state).map_err(drop);
+            "ok" {
+                FabricManagerState::Ok => Yields(r#""ok""#.to_string()),
+            }
+
+            "not ok renders snake_case" {
+                FabricManagerState::NotOk => Yields(r#""not_ok""#.to_string()),
+            }
+
+            "unknown" {
+                FabricManagerState::Unknown => Yields(r#""unknown""#.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn fabric_manager_state_deserializes() {
+        scenarios!(
+            run = |json| serde_json::from_str::<FabricManagerState>(json).map_err(drop);
+            "ok" {
+                r#""ok""# => Yields(FabricManagerState::Ok),
+            }
+
+            "not_ok" {
+                r#""not_ok""# => Yields(FabricManagerState::NotOk),
+            }
+
+            "unknown" {
+                r#""unknown""# => Yields(FabricManagerState::Unknown),
+            }
+
+            "camelCase NotOk is rejected" {
+                r#""NotOk""# => Fails,
+            }
+
+            "unrecognized state is rejected" {
+                r#""degraded""# => Fails,
+            }
+        );
+    }
+
+    #[test]
+    fn configuring_certificate_state_serializes_and_deserializes() {
         let state = SwitchControllerState::Configuring {
-            config_state: ConfiguringState::RotateOsPassword,
+            config_state: ConfiguringState::ConfigureCertificate {
+                configure_certificate: ConfigureCertificateState::Start,
+            },
         };
         let serialized = serde_json::to_string(&state).unwrap();
         assert_eq!(
             serialized,
-            "{\"state\":\"configuring\",\"config_state\":\"RotateOsPassword\"}"
+            "{\"state\":\"configuring\",\"config_state\":{\"ConfigureCertificate\":{\"configure_certificate\":\"Start\"}}}"
         );
         assert_eq!(
             serde_json::from_str::<SwitchControllerState>(&serialized).unwrap(),
@@ -678,26 +858,73 @@ mod tests {
         );
         let state = SwitchControllerState::Ready;
         let serialized = serde_json::to_string(&state).unwrap();
-        assert_eq!(serialized, "{\"state\":\"ready\"}");
+        assert_eq!(serialized, r#"{"state":"ready"}"#);
         assert_eq!(
             serde_json::from_str::<SwitchControllerState>(&serialized).unwrap(),
             state
         );
-        let state = SwitchControllerState::Error {
-            cause: "cause goes here".to_string(),
-        };
-        let serialized = serde_json::to_string(&state).unwrap();
-        assert_eq!(serialized, r#"{"state":"error","cause":"cause goes here"}"#);
-        assert_eq!(
-            serde_json::from_str::<SwitchControllerState>(&serialized).unwrap(),
-            state
+    }
+
+    #[test]
+    fn display_status_is_running_only_when_ok_and_configured() {
+        value_scenarios!(
+            run = |status| status.display_status();
+            "ok + CONFIGURED is running" {
+                fm_status(
+                    FabricManagerState::Ok,
+                    Some("CONTROL_PLANE_STATE_CONFIGURED"),
+                ) => "running",
+            }
+
+            "ok but no addition_info is not running" {
+                fm_status(FabricManagerState::Ok, None) => "not_running",
+            }
+
+            "ok but different addition_info is not running" {
+                fm_status(
+                    FabricManagerState::Ok,
+                    Some("CONTROL_PLANE_STATE_INITIALIZING"),
+                ) => "not_running",
+            }
+
+            "ok but empty addition_info is not running" {
+                fm_status(FabricManagerState::Ok, Some("")) => "not_running",
+            }
+
+            "not_ok even when configured is not running" {
+                fm_status(
+                    FabricManagerState::NotOk,
+                    Some("CONTROL_PLANE_STATE_CONFIGURED"),
+                ) => "not_running",
+            }
+
+            "unknown even when configured is not running" {
+                fm_status(
+                    FabricManagerState::Unknown,
+                    Some("CONTROL_PLANE_STATE_CONFIGURED"),
+                ) => "not_running",
+            }
+
+            "not_ok with no info is not running" {
+                fm_status(FabricManagerState::NotOk, None) => "not_running",
+            }
         );
-        let state = SwitchControllerState::Deleting;
-        let serialized = serde_json::to_string(&state).unwrap();
-        assert_eq!(serialized, "{\"state\":\"deleting\"}");
-        assert_eq!(
-            serde_json::from_str::<SwitchControllerState>(&serialized).unwrap(),
-            state
-        );
+    }
+
+    #[test]
+    fn reprovision_request_defaults_activities_to_empty() {
+        let request: SwitchReprovisionRequest =
+            serde_json::from_str(r#"{"requested_at":"2026-01-01T00:00:00Z","initiator":"op"}"#)
+                .expect("SwitchReprovisionRequest should deserialize");
+        assert!(request.activities.is_empty());
+    }
+
+    #[test]
+    fn reprovision_request_ignores_legacy_fields() {
+        let request: SwitchReprovisionRequest = serde_json::from_str(
+            r#"{"requested_at":"2026-01-01T00:00:00Z","initiator":"op","continue_after_firmware_upgrade":true,"scope":{"activities":[]}}"#,
+        )
+        .expect("legacy continue_after_firmware_upgrade and scope fields should be ignored");
+        assert!(request.activities.is_empty());
     }
 }

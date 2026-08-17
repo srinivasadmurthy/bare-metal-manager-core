@@ -34,6 +34,7 @@ use prometheus::proto::LabelPair;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder, proto,
 };
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::HealthError;
@@ -45,6 +46,138 @@ pub fn operation_duration_buckets_seconds() -> Vec<f64> {
     vec![
         1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 240.0, 300.0,
     ]
+}
+
+pub fn bmc_latency_buckets_ms() -> Vec<f64> {
+    vec![
+        5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+        60_000.0,
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BmcLatencyAttribute {
+    HttpResponseStatusCode,
+    HttpRequestMethod,
+    HttpPath,
+    ServerAddress,
+    UrlScheme,
+    BmcVendor,
+    BmcModel,
+    EntityType,
+    MachineId,
+    RackId,
+}
+
+impl BmcLatencyAttribute {
+    pub const ATTRIBUTES: [Self; 10] = [
+        Self::HttpResponseStatusCode,
+        Self::HttpRequestMethod,
+        Self::HttpPath,
+        Self::ServerAddress,
+        Self::UrlScheme,
+        Self::BmcVendor,
+        Self::BmcModel,
+        Self::EntityType,
+        Self::MachineId,
+        Self::RackId,
+    ];
+
+    pub fn label_name(self) -> &'static str {
+        match self {
+            Self::HttpResponseStatusCode => "http_response_status_code",
+            Self::HttpRequestMethod => "http_request_method",
+            Self::HttpPath => "http_path",
+            Self::ServerAddress => "server_address",
+            Self::UrlScheme => "url_scheme",
+            Self::BmcVendor => "bmc_vendor",
+            Self::BmcModel => "bmc_model",
+            Self::EntityType => "entity_type",
+            Self::MachineId => "machine_id",
+            Self::RackId => "rack_id",
+        }
+    }
+
+    pub fn from_label_name(label_name: &str) -> Option<Self> {
+        Self::ATTRIBUTES
+            .iter()
+            .copied()
+            .find(|attribute| attribute.label_name() == label_name)
+    }
+}
+
+#[derive(Clone)]
+pub struct BmcLatencyMetrics {
+    latency_ms: HistogramVec,
+    attributes: Vec<BmcLatencyAttribute>,
+}
+
+pub struct BmcLatencyObservation<'a> {
+    pub status_code: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub server_address: &'a str,
+    pub url_scheme: &'a str,
+    pub bmc_vendor: Option<&'a str>,
+    pub bmc_model: Option<&'a str>,
+    pub entity_type: &'a str,
+    pub machine_id: Option<&'a str>,
+    pub rack_id: Option<&'a str>,
+    pub duration: std::time::Duration,
+}
+
+impl BmcLatencyMetrics {
+    pub fn new(registry: &Registry, prefix: &str) -> Result<Self, prometheus::Error> {
+        Self::new_with_attributes(registry, prefix, &BmcLatencyAttribute::ATTRIBUTES)
+    }
+
+    pub fn new_with_attributes(
+        registry: &Registry,
+        prefix: &str,
+        attributes: &[BmcLatencyAttribute],
+    ) -> Result<Self, prometheus::Error> {
+        let label_names = attributes
+            .iter()
+            .map(|attribute| attribute.label_name())
+            .collect::<Vec<_>>();
+        let latency_ms = HistogramVec::new(
+            HistogramOpts::new(
+                format!("{prefix}_bmc_latency_ms"),
+                "Duration of outbound Redfish HTTP requests to BMCs, in milliseconds",
+            )
+            .buckets(bmc_latency_buckets_ms()),
+            &label_names,
+        )?;
+        registry.register(Box::new(latency_ms.clone()))?;
+
+        Ok(Self {
+            latency_ms,
+            attributes: attributes.to_vec(),
+        })
+    }
+
+    pub fn observe(&self, observation: BmcLatencyObservation<'_>) {
+        let labels = self
+            .attributes
+            .iter()
+            .map(|attribute| match attribute {
+                BmcLatencyAttribute::HttpResponseStatusCode => observation.status_code,
+                BmcLatencyAttribute::HttpRequestMethod => observation.method,
+                BmcLatencyAttribute::HttpPath => observation.path,
+                BmcLatencyAttribute::ServerAddress => observation.server_address,
+                BmcLatencyAttribute::UrlScheme => observation.url_scheme,
+                BmcLatencyAttribute::BmcVendor => observation.bmc_vendor.unwrap_or("unknown"),
+                BmcLatencyAttribute::BmcModel => observation.bmc_model.unwrap_or("unknown"),
+                BmcLatencyAttribute::EntityType => observation.entity_type,
+                BmcLatencyAttribute::MachineId => observation.machine_id.unwrap_or("unknown"),
+                BmcLatencyAttribute::RackId => observation.rack_id.unwrap_or("unknown"),
+            })
+            .collect::<Vec<_>>();
+        self.latency_ms
+            .with_label_values(&labels)
+            .observe(observation.duration.as_secs_f64() * 1_000.0);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,7 +208,7 @@ impl ComponentMetrics {
         let failures_total = IntCounterVec::new(
             prometheus::Opts::new(
                 format!("{prefix}_component_failures_total"),
-                "Count of component operation failures",
+                "Number of component operation failures",
             ),
             &["component_kind", "component_name"],
         )?;
@@ -116,17 +249,25 @@ impl ComponentMetrics {
 
 pub struct MetricsManager {
     global_registry: Registry,
+    telemetry_registry: Registry,
     component_metrics: Arc<ComponentMetrics>,
+    /// The instrumentation framework's registry, exposed through the same
+    /// /metrics response so its events are scrapeable without migrating this
+    /// server off its raw prometheus pipeline. Set once at startup.
+    framework_registry: std::sync::OnceLock<Registry>,
 }
 
 impl MetricsManager {
     pub fn new(prefix: &str) -> Result<Self, prometheus::Error> {
         let global_registry = Registry::new();
+        let telemetry_registry = Registry::new();
         let component_metrics = Arc::new(ComponentMetrics::new(&global_registry, prefix)?);
 
         Ok(Self {
             global_registry,
+            telemetry_registry,
             component_metrics,
+            framework_registry: std::sync::OnceLock::new(),
         })
     }
 
@@ -146,17 +287,43 @@ impl MetricsManager {
         CollectorRegistry::new(id, self.global_registry.clone(), prefix)
     }
 
-    pub fn export_all(&self) -> Result<String, HealthError> {
-        let encoder = TextEncoder::new();
-        let metric_families = self.global_registry.gather();
-        let mut buffer = Vec::new();
-        encoder.encode(&metric_families, &mut buffer)?;
-        String::from_utf8(buffer).map_err(|e| {
-            HealthError::GenericError(format!(
-                "MetricManager encoutered IO error while export is called: {e:?}"
-            ))
-        })
+    pub fn create_telemetry_collector_registry(
+        &self,
+        id: String,
+        prefix: impl Into<String>,
+    ) -> Result<CollectorRegistry, HealthError> {
+        CollectorRegistry::new(id, self.telemetry_registry.clone(), prefix)
     }
+
+    /// Makes the instrumentation framework's registry part of every
+    /// subsequent /metrics response. A second call is ignored.
+    pub fn expose_framework_registry(&self, registry: Registry) {
+        let _ = self.framework_registry.set(registry);
+    }
+
+    pub fn export_metrics(&self) -> Result<String, HealthError> {
+        let mut exposition = export_registry(&self.global_registry)?;
+        if let Some(framework) = self.framework_registry.get() {
+            exposition.push_str(&export_registry(framework)?);
+        }
+        Ok(exposition)
+    }
+
+    pub fn export_telemetry(&self) -> Result<String, HealthError> {
+        export_registry(&self.telemetry_registry)
+    }
+}
+
+fn export_registry(registry: &Registry) -> Result<String, HealthError> {
+    let encoder = TextEncoder::new();
+    let metric_families = registry.gather();
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer)?;
+    String::from_utf8(buffer).map_err(|e| {
+        HealthError::GenericError(format!(
+            "MetricManager encoutered IO error while export is called: {e:?}"
+        ))
+    })
 }
 
 pub struct CollectorRegistry {
@@ -167,7 +334,8 @@ pub struct CollectorRegistry {
 
 impl CollectorRegistry {
     fn new(id: String, parent: Registry, prefix: impl Into<String>) -> Result<Self, HealthError> {
-        let desc = Desc::new(id.clone(), id, Vec::new(), HashMap::new())?;
+        let fq_id = id.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+        let desc = Desc::new(fq_id, id, Vec::new(), HashMap::new())?;
 
         let registry = Box::new(SubRegistry {
             registry: Registry::new(),
@@ -200,6 +368,16 @@ impl CollectorRegistry {
         Ok(metrics)
     }
 
+    pub fn unregister_gauge_metrics(
+        &self,
+        metrics: &GaugeMetrics,
+    ) -> Result<(), prometheus::Error> {
+        self.registry
+            .registry
+            .unregister(Box::new(metrics.clone()))
+            .map(|_| ())
+    }
+
     pub fn registry(&self) -> &Registry {
         &self.registry.registry
     }
@@ -228,7 +406,11 @@ impl Collector for SubRegistry {
 impl Drop for CollectorRegistry {
     fn drop(&mut self) {
         if let Err(e) = self.parent.unregister(self.registry.clone()) {
-            tracing::error!(e=?e, "Could not properly drop registry for collector {}", self.prefix())
+            tracing::error!(
+                error = ?e,
+                collector_prefix = self.prefix().as_str(),
+                "Could not properly drop registry for collector"
+            )
         }
     }
 }
@@ -354,6 +536,10 @@ impl GaugeMetrics {
         let current_gen = self.current_generation.load(Ordering::Acquire);
         self.gauges.retain(|_, data| data.generation == current_gen);
     }
+
+    pub fn clear(&self) {
+        self.gauges.clear();
+    }
 }
 
 impl Collector for GaugeMetrics {
@@ -397,7 +583,7 @@ impl Collector for GaugeMetrics {
             gauge.set_value(data.value);
 
             let mut metric = proto::Metric::new();
-            metric.set_label(labels.into());
+            metric.set_label(labels);
             metric.set_gauge(gauge);
 
             family.mut_metric().push(metric);
@@ -415,7 +601,10 @@ pub async fn run_metrics_server(
         .await
         .map_err(|e| Box::new(e) as BoxedErr)?;
 
-    tracing::info!("Metrics server listening on {}", metrics_endpoint);
+    tracing::info!(
+        %metrics_endpoint,
+        "Metrics server listening (paths: /metrics, /telemetry, /livez)"
+    );
 
     loop {
         let (stream, _) = listener
@@ -449,29 +638,37 @@ fn serve_request(
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
             .body("ok".to_string())
             .expect("BUG: Response::builder error")),
-        _ => serve_metrics(metrics_manager),
+        "/metrics" => serve_prometheus(metrics_manager.export_metrics(), "service metrics"),
+        "/telemetry" => serve_prometheus(metrics_manager.export_telemetry(), "telemetry metrics"),
+        _ => Ok(Response::builder()
+            .status(http::StatusCode::OK)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body("not found; use /metrics, /telemetry, or /livez".to_string())
+            .expect("BUG: Response::builder error")),
     }
 }
 
-fn serve_metrics(metrics_manager: Arc<MetricsManager>) -> Result<Response<String>, hyper::Error> {
+fn serve_prometheus(
+    export_result: Result<String, HealthError>,
+    export_name: &'static str,
+) -> Result<Response<String>, hyper::Error> {
     let encoder = TextEncoder::new();
-    let body = match metrics_manager.export_all() {
+    let body = match export_result {
         Ok(body) => body,
         Err(e) => {
-            tracing::error!(error=?e, "error exporting metrics");
+            tracing::error!(error=?e, export_name, "error exporting prometheus metrics");
             return Ok(Response::builder()
                 .status(http::StatusCode::INTERNAL_SERVER_ERROR)
-                .body("error exporting metrics, see logs".to_string())
+                .body(format!("error exporting {export_name}, see logs"))
                 .expect("BUG: Response::builder error"));
         }
     };
 
-    let response = Response::builder()
+    Ok(Response::builder()
         .status(200)
         .header(CONTENT_TYPE, encoder.format_type())
         .body(body)
-        .expect("BUG: Response::builder error");
-    Ok(response)
+        .expect("BUG: Response::builder error"))
 }
 
 pub fn sanitize_unit(unit: &str) -> String {
@@ -493,5 +690,110 @@ pub fn sanitize_unit(unit: &str) -> String {
                 }
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::{Check, check_values};
+
+    use super::*;
+
+    #[test]
+    fn collector_registry_sanitizes_descriptor_fq_name() {
+        for (id, expected_fq_name) in [
+            (
+                "sensor_collector_10.0.0.1:443",
+                "sensor_collector_10_0_0_1_443",
+            ),
+            (
+                "log_collector_bmc-01.example.com",
+                "log_collector_bmc_01_example_com",
+            ),
+            (
+                "collector with spaces/slashes",
+                "collector_with_spaces_slashes",
+            ),
+        ] {
+            let registry = CollectorRegistry::new(id.to_string(), Registry::new(), "test_prefix")
+                .expect("collector registry should accept sanitized id");
+
+            assert_eq!(registry.registry.desc.fq_name, expected_fq_name);
+            assert_eq!(registry.registry.desc.help, id);
+        }
+    }
+
+    #[test]
+    fn sanitize_unit_cases() {
+        check_values(
+            [
+                Check {
+                    scenario: "percent symbol",
+                    input: "%",
+                    expect: "percent".to_string(),
+                },
+                Check {
+                    scenario: "degree Celsius",
+                    input: "°C",
+                    expect: "celsius".to_string(),
+                },
+                Check {
+                    scenario: "Celsius abbreviation",
+                    input: "c",
+                    expect: "celsius".to_string(),
+                },
+                Check {
+                    scenario: "Redfish Celsius unit",
+                    input: "CEL",
+                    expect: "celsius".to_string(),
+                },
+                Check {
+                    scenario: "degree Fahrenheit",
+                    input: "°F",
+                    expect: "fahrenheit".to_string(),
+                },
+                Check {
+                    scenario: "Fahrenheit abbreviation",
+                    input: "f",
+                    expect: "fahrenheit".to_string(),
+                },
+                Check {
+                    scenario: "volts",
+                    input: "V",
+                    expect: "volts".to_string(),
+                },
+                Check {
+                    scenario: "amperes",
+                    input: "A",
+                    expect: "amperes".to_string(),
+                },
+                Check {
+                    scenario: "amps alias",
+                    input: "Amps",
+                    expect: "amperes".to_string(),
+                },
+                Check {
+                    scenario: "watts",
+                    input: "W",
+                    expect: "watts".to_string(),
+                },
+                Check {
+                    scenario: "hertz",
+                    input: "Hz",
+                    expect: "hertz".to_string(),
+                },
+                Check {
+                    scenario: "revolutions per minute",
+                    input: "RPM",
+                    expect: "rpm".to_string(),
+                },
+                Check {
+                    scenario: "punctuation is normalized",
+                    input: "J/s",
+                    expect: "j_s".to_string(),
+                },
+            ],
+            sanitize_unit,
+        );
     }
 }

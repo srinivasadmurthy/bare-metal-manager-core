@@ -15,16 +15,17 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::network_security_group::common::convert_nsgs_to_table;
 use crate::rpc::ApiClient;
 
 /// Update a network security group.
 /// On successful update, the details of the
 /// group will be displayed.
-pub async fn update(
+pub(super) async fn update(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,

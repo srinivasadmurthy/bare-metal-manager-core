@@ -15,10 +15,24 @@
  * limitations under the License.
  */
 
+use carbide_uuid::switch::SwitchId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
-    #[clap(help = "Switch ID or name to show (leave empty for all)")]
-    pub identifier: Option<String>,
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all switches:
+    $ nico-admin-cli switch show
+
+Show details for one switch:
+    $ nico-admin-cli switch show 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
+    #[clap(
+        default_value(None),
+        help = "The switch ID to query. Omit to show all switches."
+    )]
+    pub(super) switch_id: Option<SwitchId>,
 }

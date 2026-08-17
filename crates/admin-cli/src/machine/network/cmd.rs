@@ -15,23 +15,25 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn network(
+pub(super) async fn network(
     api_client: &ApiClient,
     cmd: Args,
     format: OutputFormat,
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
+    page_size: usize,
 ) -> CarbideCliResult<()> {
     match cmd {
         Args::Status => {
             println!(
                 "Deprecated: Use dpu network, instead machine network. machine network will be removed in future."
             );
-            crate::dpu::show_dpu_status(api_client, output_file).await?;
+            crate::dpu::show_dpu_status(api_client, output_file, page_size).await?;
         }
         Args::Config(query) => {
             println!(

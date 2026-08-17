@@ -14,29 +14,30 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 use std::collections::HashMap;
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge::ManagedHostNetworkConfigResponse;
 use carbide_uuid::machine::MachineId;
 use prettytable::{Table, format, row};
 
 use crate::async_write;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::machine::network::Args as NetworkCommand;
 use crate::rpc::ApiClient;
 
-pub async fn network(
+pub(super) async fn network(
     api_client: &ApiClient,
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
     cmd: NetworkCommand,
     output_format: OutputFormat,
+    page_size: usize,
 ) -> CarbideCliResult<()> {
     match cmd {
         NetworkCommand::Config(query) => {
             show_dpu_network_config(api_client, output_file, query.machine_id, output_format).await
         }
-        NetworkCommand::Status => show_dpu_status(api_client, output_file).await,
+        NetworkCommand::Status => show_dpu_status(api_client, output_file, page_size).await,
     }
 }
 
@@ -49,7 +50,9 @@ fn deny_prefix(config: &ManagedHostNetworkConfigResponse) -> String {
     deny_prefixes.join("\n")
 }
 
-pub async fn show_dpu_network_config(
+// This diagnostic view preserves the compatibility fields exposed to older agents.
+#[allow(deprecated)]
+async fn show_dpu_network_config(
     api_client: &ApiClient,
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
     dpu_id: MachineId,
@@ -194,9 +197,11 @@ pub async fn show_dpu_network_config(
     Ok(())
 }
 
-pub async fn show_dpu_status(
+#[allow(deprecated)]
+pub(crate) async fn show_dpu_status(
     api_client: &ApiClient,
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
+    page_size: usize,
 ) -> CarbideCliResult<()> {
     let all_status = api_client
         .0
@@ -210,11 +215,18 @@ pub async fn show_dpu_status(
             .iter()
             .filter_map(|status| status.dpu_machine_id)
             .collect();
-        let all_dpus = api_client.get_machines_by_ids(&all_ids).await?.machines;
+        // The Forge API rejects requests carrying more than 100 IDs, and a zero
+        // page size would panic chunks(), so clamp into the valid 1..=100 range
+        // and fetch the backing machines in pages instead of one call (see #2137).
+        const MAX_IDS_PER_REQUEST: usize = 100;
+        let page_size = page_size.clamp(1, MAX_IDS_PER_REQUEST);
         let mut dpus_by_id = HashMap::new();
-        for dpu in all_dpus.into_iter() {
-            if let Some(id) = dpu.id {
-                dpus_by_id.insert(id, dpu);
+        for ids in all_ids.chunks(page_size) {
+            let dpus = api_client.get_machines_by_ids(ids).await?.machines;
+            for dpu in dpus.into_iter() {
+                if let Some(id) = dpu.id {
+                    dpus_by_id.insert(id, dpu);
+                }
             }
         }
 
@@ -236,10 +248,8 @@ pub async fn show_dpu_status(
             };
             let observed_at = st
                 .observed_at
-                .map(|o| {
-                    let dt: chrono::DateTime<chrono::Utc> = o.try_into().unwrap();
-                    dt.format("%Y-%m-%d %H:%M:%S.%3f").to_string()
-                })
+                .and_then(|ts| chrono::DateTime::<chrono::Utc>::try_from(ts).ok())
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S.%3f").to_string())
                 .unwrap_or_default();
             let mut probe_alerts = String::new();
             if let Some(health) = &dpu.health {
@@ -256,7 +266,9 @@ pub async fn show_dpu_status(
             }
             table.add_row(row![
                 observed_at,
-                st.dpu_machine_id.unwrap(),
+                st.dpu_machine_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
                 st.network_config_version.unwrap_or_default(),
                 dpu.health
                     .as_ref()

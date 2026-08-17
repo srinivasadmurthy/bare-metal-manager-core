@@ -22,9 +22,21 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 use rpc::protos::mlx_device as mlx_device_pb;
 
+use crate::cfg::dispatch::Dispatch;
+
 // RegistryCommand are the registry subcommands.
-#[derive(Parser, Debug)]
-pub enum RegistryCommand {
+#[derive(Parser, Debug, Dispatch)]
+#[command(after_long_help = "\
+EXAMPLES:
+
+List the variable registries available on a machine:
+    $ nico-admin-cli mlx registry list 12345678-1234-5678-90ab-cdef01234567
+
+Show one registry's details:
+    $ nico-admin-cli mlx registry show 12345678-1234-5678-90ab-cdef01234567 my-registry
+
+")]
+pub(crate) enum RegistryCommand {
     #[clap(about = "List all available registries")]
     List(RegistryListCommand),
 
@@ -34,19 +46,19 @@ pub enum RegistryCommand {
 
 // RegistryListCommand lists all available registries.
 #[derive(Parser, Debug)]
-pub struct RegistryListCommand {
+pub(crate) struct RegistryListCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 }
 
 // RegistryShowCommand shows details of a specific registry.
 #[derive(Parser, Debug)]
-pub struct RegistryShowCommand {
+pub(crate) struct RegistryShowCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Registry name to show")]
-    pub registry_name: String,
+    registry_name: String,
 }
 
 impl From<RegistryListCommand> for mlx_device_pb::MlxAdminRegistryListRequest {

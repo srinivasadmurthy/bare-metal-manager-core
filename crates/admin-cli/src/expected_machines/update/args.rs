@@ -38,14 +38,21 @@ use clap::Parser;
 ///    }
 ///
 /// Usage:
-///   forge-admin-cli expected-machine update --filename machine.json
+///   nico-admin-cli expected-machine update --filename machine.json
 #[derive(Parser, Debug)]
 #[clap(verbatim_doc_comment)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Replace an expected machine record from a JSON file:
+    $ nico-admin-cli expected-machine update --filename ./machine.json
+
+")]
+pub(crate) struct Args {
     #[clap(
         short,
         long,
         help = "Path to JSON file containing the expected machine data"
     )]
-    pub filename: String,
+    pub(super) filename: String,
 }

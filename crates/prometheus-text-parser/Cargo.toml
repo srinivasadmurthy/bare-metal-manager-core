@@ -21,9 +21,13 @@ description = "Helper to parse prometheus results for testing assertions"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+
+[dev-dependencies]
+carbide-test-support = { path = "../test-support" }
 
 [lints]
 workspace = true

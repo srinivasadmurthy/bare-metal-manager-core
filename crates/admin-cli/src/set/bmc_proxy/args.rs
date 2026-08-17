@@ -18,9 +18,19 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Enable the BMC proxy and point it at a host:port:
+    $ nico-admin-cli set bmc-proxy --enabled true --proxy 192.0.2.10:8080
+
+Disable the BMC proxy:
+    $ nico-admin-cli set bmc-proxy --enabled false
+
+")]
+pub(crate) struct Args {
     #[clap(long, action = clap::ArgAction::Set, help = "Enable site-explorer bmc_proxy")]
-    pub enabled: bool,
+    pub(super) enabled: bool,
     #[clap(long, action = clap::ArgAction::Set, help = "host:port string use as a proxy for talking to BMC's")]
-    pub proxy: Option<String>,
+    pub(super) proxy: Option<String>,
 }

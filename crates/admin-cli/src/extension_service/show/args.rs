@@ -20,24 +20,43 @@ use clap::Parser;
 use super::super::common::ExtensionServiceType;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show all extension services:
+    $ nico-admin-cli extension-service show
+
+Show one extension service by ID:
+    $ nico-admin-cli extension-service show --id 12345678-1234-5678-90ab-cdef01234567
+
+Filter by service type:
+    $ nico-admin-cli extension-service show --type kubernetes-pod
+
+Filter by service name:
+    $ nico-admin-cli extension-service show --name my-service
+
+Filter by tenant organization ID:
+    $ nico-admin-cli extension-service show --tenant-organization-id fds34511233a
+
+")]
+pub(crate) struct Args {
     #[clap(
         short = 'i',
         long,
         help = "The extension service ID to show (leave empty to show all)"
     )]
-    pub id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[clap(short = 't', long = "type", help = "Filter by service type (optional)")]
-    pub service_type: Option<ExtensionServiceType>,
+    pub(super) service_type: Option<ExtensionServiceType>,
 
     #[clap(short = 'n', long = "name", help = "Filter by service name (optional)")]
-    pub service_name: Option<String>,
+    pub(super) service_name: Option<String>,
 
     #[clap(
         short = 'o',
         long,
         help = "Filter by tenant organization ID (optional)"
     )]
-    pub tenant_organization_id: Option<String>,
+    pub(super) tenant_organization_id: Option<String>,
 }

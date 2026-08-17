@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliResult;
 use ::rpc::forge as forgerpc;
 use prettytable::{Row, Table, row};
 
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn positions(args: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
+pub(super) async fn positions(args: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
     let machine_ids = if args.machine.is_empty() {
         // Query all machines if none specified
         api_client

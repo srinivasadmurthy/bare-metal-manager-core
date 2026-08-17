@@ -16,7 +16,6 @@
  */
 use carbide_uuid::instance_type::InstanceTypeId;
 use carbide_uuid::rack::RackId;
-use rpc::errors::RpcDataConversionError;
 
 /// MachineSearchConfig: Search parameters
 #[derive(Default, Debug, Clone)]
@@ -41,7 +40,8 @@ pub struct MachineSearchConfig {
     /// and any joined tables.  The value is *not*
     /// propagated to any additional underlying queries.
     pub for_update: bool,
-    /// Only include NVLink capable machines (GB200/GB300 etc)
+    /// Only include NVLink capable machines (GB200/GB300/VR etc), identified by GPU
+    /// `name` or DMI `product_name` on entries with `platform_info` in discovered topology.
     pub mnnvl_only: bool,
     pub only_with_power_state: Option<String>,
     pub only_with_health_alert: Option<String>,
@@ -49,32 +49,4 @@ pub struct MachineSearchConfig {
     pub rack_id: Option<RackId>,
     /// Filter by the top-level controller state tag (e.g. "created", "ready")
     pub controller_state: Option<String>,
-}
-
-impl TryFrom<rpc::forge::MachineSearchConfig> for MachineSearchConfig {
-    type Error = RpcDataConversionError;
-
-    fn try_from(value: rpc::forge::MachineSearchConfig) -> Result<Self, Self::Error> {
-        Ok(MachineSearchConfig {
-            include_dpus: value.include_dpus,
-            include_history: value.include_history,
-            include_predicted_host: value.include_predicted_host,
-            only_maintenance: value.only_maintenance,
-            only_quarantine: value.only_quarantine,
-            exclude_hosts: value.exclude_hosts,
-            instance_type_id: value
-                .instance_type_id
-                .map(|t| {
-                    t.parse::<InstanceTypeId>()
-                        .map_err(|_| RpcDataConversionError::InvalidInstanceTypeId(t.clone()))
-                })
-                .transpose()?,
-            for_update: false, // This isn't exposed to API callers
-            mnnvl_only: value.mnnvl_only,
-            only_with_power_state: value.only_with_power_state,
-            only_with_health_alert: value.only_with_health_alert,
-            rack_id: value.rack_id,
-            controller_state: None,
-        })
-    }
 }

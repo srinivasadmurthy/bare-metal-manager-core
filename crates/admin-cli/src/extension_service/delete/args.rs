@@ -18,9 +18,20 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Delete an entire extension service (all versions):
+    $ nico-admin-cli extension-service delete --id 12345678-1234-5678-90ab-cdef01234567
+
+Delete only specific versions, keeping the rest:
+    $ nico-admin-cli extension-service delete --id 12345678-1234-5678-90ab-cdef01234567 \
+    --versions 1.0,1.1
+
+")]
+pub(crate) struct Args {
     #[clap(short = 'i', long = "id", help = "The extension service ID to delete")]
-    pub service_id: String,
+    service_id: String,
 
     #[clap(
         short = 'v',
@@ -28,7 +39,7 @@ pub struct Args {
         help = "Version strings to delete (optional, leave empty to keep all versions)",
         value_delimiter = ','
     )]
-    pub versions: Vec<String>,
+    versions: Vec<String>,
 }
 
 impl From<Args> for ::rpc::forge::DeleteDpuExtensionServiceRequest {

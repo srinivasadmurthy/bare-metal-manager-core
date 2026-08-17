@@ -78,7 +78,7 @@ pub fn sync(
 /// the provided options, and attempts to sync each file,
 /// ensuring the file has the expected content. Once it's
 /// done, it returns the results for each path!
-pub fn sync_files(
+fn sync_files(
     files: HashMap<PathBuf, FileSpec>,
     options: &SyncOptions,
 ) -> io::Result<HashMap<PathBuf, SyncStatus>> {
@@ -145,7 +145,7 @@ pub fn sync_file(
 /// maybe_update_file is called when it is determined
 /// the file already exists, and now we check to see if
 /// it needs to be updated, deleted, or if it's good to go.
-pub fn maybe_update_file(
+pub(super) fn maybe_update_file(
     dest_path: &Path,
     file_spec: &FileSpec,
     options: &SyncOptions,
@@ -160,8 +160,8 @@ pub fn maybe_update_file(
     let mut existing = String::new();
     File::open(dest_path)?.read_to_string(&mut existing)?;
 
-    let src_hash = Sha256::digest(file_spec.content.as_bytes());
-    let dst_hash = Sha256::digest(existing.as_bytes());
+    let src_hash = hex::encode(Sha256::digest(file_spec.content.as_bytes()));
+    let dst_hash = hex::encode(Sha256::digest(existing.as_bytes()));
 
     // If the observed data isn't the expected
     // data, lets update it!
@@ -170,8 +170,8 @@ pub fn maybe_update_file(
             dest_path,
             &file_spec.content,
             &existing,
-            src_hash,
-            dst_hash,
+            &src_hash,
+            &dst_hash,
             options,
         )?;
         updated = true;
@@ -202,7 +202,7 @@ pub fn maybe_update_file(
 
     logln!(
         options,
-        "{}: {} (sha256: {:x})",
+        "{}: {} (sha256: {})",
         maybe_colorize("Destination file unchanged", |s| s.blue().bold(), options),
         dest_path.display(),
         dst_hash
@@ -214,16 +214,12 @@ pub fn maybe_update_file(
 /// create_file is called when it is determined the file
 /// doesn't exist yet, so we create it with the expected
 /// content.
-pub fn create_file(
-    dest_path: &Path,
-    file_spec: &FileSpec,
-    options: &SyncOptions,
-) -> io::Result<()> {
-    let hash = Sha256::digest(file_spec.content.as_bytes());
+fn create_file(dest_path: &Path, file_spec: &FileSpec, options: &SyncOptions) -> io::Result<()> {
+    let hash = hex::encode(Sha256::digest(file_spec.content.as_bytes()));
 
     logln!(
         options,
-        "{}: {} (sha256: {:x})",
+        "{}: {} (sha256: {})",
         maybe_colorize("Creating new file", |s| s.green().bold(), options),
         dest_path.display(),
         hash
@@ -252,18 +248,18 @@ pub fn create_file(
 
 /// update_file updates an existing file with whatever
 /// source content we provide it.
-pub fn update_file(
+fn update_file(
     dest_path: &Path,
     source_content: &str,
     existing_content: &str,
-    src_hash: impl std::fmt::LowerHex,
-    dst_hash: impl std::fmt::LowerHex,
+    src_hash: &str,
+    dst_hash: &str,
     options: &SyncOptions,
 ) -> io::Result<()> {
     let diff = build_diff(source_content, existing_content);
     logln!(
         options,
-        "{}: {} (expected sha256: {:x}, observed sha256: {:x}), diff:\n{}",
+        "{}: {} (expected sha256: {}, observed sha256: {}), diff:\n{}",
         maybe_colorize("Updating existing file", |s| s.yellow().bold(), options),
         dest_path.display(),
         src_hash,
@@ -277,7 +273,7 @@ pub fn update_file(
 
 /// delete_file deletes an existing file when FileEnsure::Absent
 /// is specified.
-pub fn delete_file(dest_path: &Path, options: &SyncOptions) -> io::Result<()> {
+fn delete_file(dest_path: &Path, options: &SyncOptions) -> io::Result<()> {
     logln!(
         options,
         "{}: {}",
@@ -308,7 +304,7 @@ fn write_file_content(
 /// maybe_update_file_permissions possibly updates the permissions
 /// on a file (if there's a mode mismatch), and is used by both
 /// create_file and update_file to ensure the correct permission is set.
-pub fn maybe_update_file_permissions(
+fn maybe_update_file_permissions(
     path: &Path,
     expected_mode: Option<u32>,
     options: &SyncOptions,
@@ -346,7 +342,7 @@ pub fn maybe_update_file_permissions(
 /// maybe_update_file_ownership possibly updates the owner and/or
 /// group on a file (if there's a mismatch), and is used by both
 /// create_file and update_file to ensure the correct ownership.
-pub fn maybe_update_file_ownership(
+fn maybe_update_file_ownership(
     path: &Path,
     owner: &Option<String>,
     group: &Option<String>,

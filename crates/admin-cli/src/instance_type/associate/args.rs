@@ -16,15 +16,28 @@
  */
 
 use clap::Parser;
-use rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use rpc::forge::AssociateMachinesWithInstanceTypeRequest;
 
+use crate::errors::{CarbideCliError, CarbideCliResult};
+
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Associate one machine with an instance type:
+    $ nico-admin-cli instance-type associate 12345678-1234-5678-90ab-cdef01234567 \
+    abcdef01-2345-6789-abcd-ef0123456789
+
+Associate several machines (comma-separated, no spaces):
+    $ nico-admin-cli instance-type associate 12345678-1234-5678-90ab-cdef01234567 \
+    abcdef01-2345-6789-abcd-ef0123456789,11111111-2222-3333-4444-555555555555
+
+")]
+pub(crate) struct Args {
     #[clap(help = "InstanceTypeId")]
-    pub instance_type_id: String,
+    instance_type_id: String,
     #[clap(help = "Machine Ids, separated by comma", value_delimiter = ',')]
-    pub machine_ids: Vec<String>,
+    machine_ids: Vec<String>,
 }
 
 impl TryFrom<Args> for AssociateMachinesWithInstanceTypeRequest {

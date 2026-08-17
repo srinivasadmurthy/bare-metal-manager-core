@@ -16,96 +16,139 @@
  */
 
 use carbide_uuid::machine::MachineId;
-use carbide_uuid::vpc::VpcPrefixId;
+use carbide_uuid::vpc::{VpcId, VpcPrefixId};
 use clap::{ArgGroup, Parser};
-use rpc::forge::InstanceOperatingSystemConfig;
+use rpc::forge::{InstanceOperatingSystemConfig, InstanceSpxConfig};
 
 #[derive(Parser, Debug)]
-#[clap(group(ArgGroup::new("selector").required(true).args(&["subnet", "vpc_prefix_id"])))]
-pub struct Args {
+#[clap(group(ArgGroup::new("selector").required(true).multiple(true).args(&["subnet", "vpc_prefix_id", "flat_vpc_id"])))]
+#[command(after_long_help = "\
+EXAMPLES:
+
+Allocate one instance onto a VPC prefix:
+    $ nico-admin-cli instance allocate --prefix-name eth0 \
+    --vpc-prefix-id 12345678-1234-5678-90ab-cdef01234567
+
+Allocate one instance onto a subnet:
+    $ nico-admin-cli instance allocate --prefix-name eth0 --subnet 192.0.2.0/24
+
+Allocate several instances at once:
+    $ nico-admin-cli instance allocate --number 4 --prefix-name eth0 \
+    --vpc-prefix-id 12345678-1234-5678-90ab-cdef01234567
+
+Allocate transactionally (all-or-nothing for --number > 1):
+    $ nico-admin-cli instance allocate --number 4 --prefix-name eth0 \
+    --vpc-prefix-id 12345678-1234-5678-90ab-cdef01234567 --transactional
+
+Allocate onto specific machines:
+    $ nico-admin-cli instance allocate --prefix-name eth0 \
+    --vpc-prefix-id 12345678-1234-5678-90ab-cdef01234567 \
+    --machine-id 12345678-1234-5678-90ab-cdef01234567
+
+Allocate with an expected instance type and a network security group:
+    $ nico-admin-cli instance allocate --prefix-name eth0 \
+    --vpc-prefix-id 12345678-1234-5678-90ab-cdef01234567 \
+    --instance-type-id abcdef01-2345-6789-abcd-ef0123456789 \
+    --network-security-group-id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(short, long)]
-    pub number: Option<u16>,
+    pub(super) number: Option<u16>,
 
     #[clap(short, long, help = "The subnet to assign to a PF")]
-    pub subnet: Vec<String>,
+    pub(crate) subnet: Vec<String>,
 
     #[clap(short, long)]
     // This will not be needed after vpc_prefix implementation.
     // Code can query to carbide and fetch it from db using vpc_prefix_id.
-    pub tenant_org: Option<String>,
+    pub(crate) tenant_org: Option<String>,
 
     #[clap(short, long, required = true)]
-    pub prefix_name: String,
+    pub(super) prefix_name: String,
 
     #[clap(long, help = "The key of label instance to query")]
-    pub label_key: Option<String>,
+    pub(crate) label_key: Option<String>,
 
     #[clap(long, help = "The value of label instance to query")]
-    pub label_value: Option<String>,
+    pub(crate) label_value: Option<String>,
 
     #[clap(
         long,
         help = "The ID of a network security group to apply to the new instance upon creation"
     )]
-    pub network_security_group_id: Option<String>,
+    pub(crate) network_security_group_id: Option<String>,
 
     #[clap(
         long,
         help = "The expected instance type id for the instance, which will be compared to type ID set for the machine of the request"
     )]
-    pub instance_type_id: Option<String>,
+    pub(crate) instance_type_id: Option<String>,
 
     #[clap(long, help = "OS definition in JSON format", value_name = "OS_JSON")]
-    pub os: Option<InstanceOperatingSystemConfig>,
+    pub(crate) os: Option<InstanceOperatingSystemConfig>,
+
+    #[clap(
+        long,
+        help = "SPX configuration in JSON format",
+        value_name = "SPX_JSON"
+    )]
+    pub(crate) spxconfig: Option<InstanceSpxConfig>,
 
     #[clap(long, help = "The subnet to assign to a VF")]
-    pub vf_subnet: Vec<String>,
+    pub(crate) vf_subnet: Vec<String>,
 
     #[clap(short, long, help = "The VPC prefix to assign to a PF")]
-    pub vpc_prefix_id: Vec<VpcPrefixId>,
+    pub(crate) vpc_prefix_id: Vec<VpcPrefixId>,
+
+    #[clap(
+        long,
+        help = "Create an instance in the given \"flat\" VPC, for machines without DPUs"
+    )]
+    pub(crate) flat_vpc_id: Option<VpcId>,
 
     #[clap(long, help = "The VPC prefix to assign to a VF")]
-    pub vf_vpc_prefix_id: Vec<VpcPrefixId>,
+    pub(crate) vf_vpc_prefix_id: Vec<VpcPrefixId>,
 
     #[clap(long, help = "Explicit IPv4 address to request for each PF interface")]
-    pub ip_address: Vec<String>,
+    pub(crate) ip_address: Vec<String>,
 
     #[clap(long, help = "Explicit IPv4 address to request for each VF interface")]
-    pub vf_ip_address: Vec<String>,
+    pub(crate) vf_ip_address: Vec<String>,
 
     #[clap(
         long,
         help = "IPv6 VPC prefix to pair with each PF vpc-prefix-id for dual-stack"
     )]
-    pub ipv6_vpc_prefix_id: Vec<VpcPrefixId>,
+    pub(crate) ipv6_vpc_prefix_id: Vec<VpcPrefixId>,
 
     #[clap(
         long,
         help = "IPv6 VPC prefix to pair with each VF vf-vpc-prefix-id for dual-stack"
     )]
-    pub ipv6_vf_prefix_id: Vec<VpcPrefixId>,
+    pub(crate) ipv6_vf_prefix_id: Vec<VpcPrefixId>,
 
     #[clap(
         long,
         help = "Explicit IPv6 address to request for each PF interface (dual-stack)"
     )]
-    pub ipv6_ip_address: Vec<String>,
+    pub(crate) ipv6_ip_address: Vec<String>,
 
     #[clap(
         long,
         help = "Explicit IPv6 address to request for each VF interface (dual-stack)"
     )]
-    pub ipv6_vf_ip_address: Vec<String>,
+    pub(crate) ipv6_vf_ip_address: Vec<String>,
 
     #[clap(
         long,
         help = "The machine ids for the machines to use (instead of searching)"
     )]
-    pub machine_id: Vec<MachineId>,
+    pub(super) machine_id: Vec<MachineId>,
 
     #[clap(
         long,
         help = "Use batch API for all-or-nothing allocation (requires --number > 1)"
     )]
-    pub transactional: bool,
+    pub(super) transactional: bool,
 }

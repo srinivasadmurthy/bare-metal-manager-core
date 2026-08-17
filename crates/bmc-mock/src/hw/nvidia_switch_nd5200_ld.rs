@@ -21,16 +21,16 @@ use mac_address::MacAddress;
 
 use crate::redfish;
 
-pub struct NvidiaSwitchNd5200Ld<'a> {
-    pub bmc_mac_address_eth0: MacAddress,
-    pub bmc_mac_address_eth1: MacAddress,
-    pub bmc_mac_address_usb0: MacAddress,
-    pub bmc_serial_number: Cow<'a, str>,
-    pub switch_serial_number: Cow<'a, str>,
+pub(crate) struct NvidiaSwitchNd5200Ld<'a> {
+    pub(crate) bmc_mac_address_eth0: MacAddress,
+    pub(crate) bmc_mac_address_eth1: MacAddress,
+    pub(crate) bmc_mac_address_usb0: MacAddress,
+    pub(crate) bmc_serial_number: Cow<'a, str>,
+    pub(crate) switch_serial_number: Cow<'a, str>,
 }
 
 impl NvidiaSwitchNd5200Ld<'_> {
-    pub fn manager_config(&self) -> redfish::manager::Config {
+    pub(crate) fn manager_config(&self) -> redfish::manager::Config {
         let manager_id = "BMC_0";
         let eth_builder = |eth| {
             redfish::ethernet_interface::builder(&redfish::ethernet_interface::manager_resource(
@@ -55,13 +55,14 @@ impl NvidiaSwitchNd5200Ld<'_> {
                         .build(),
                 ]),
                 host_interfaces: None,
+                serial_interfaces: None,
                 firmware_version: Some("88.0002.1333"),
                 oem: None,
             }],
         }
     }
 
-    pub fn system_config(&self) -> redfish::computer_system::Config {
+    pub(crate) fn system_config(&self) -> redfish::computer_system::Config {
         let system_id = "System_0";
 
         redfish::computer_system::Config {
@@ -79,13 +80,16 @@ impl NvidiaSwitchNd5200Ld<'_> {
                 oem: redfish::computer_system::Oem::Generic,
                 log_services: None,
                 storage: Some(vec![]),
+                processors: None,
+                memory: None,
                 base_bios: None,
+                serial_console: None,
                 secure_boot_available: false,
             }],
         }
     }
 
-    pub fn chassis_config(&self) -> redfish::chassis::ChassisConfig {
+    pub(crate) fn chassis_config(&self) -> redfish::chassis::ChassisConfig {
         redfish::chassis::ChassisConfig {
             chassis: [
                 redfish::chassis::SingleChassisConfig {
@@ -123,6 +127,9 @@ impl NvidiaSwitchNd5200Ld<'_> {
                             temperature: 1,
                             ..Default::default()
                         },
+                    )),
+                    leak_detectors: Some(redfish::leak_detector::generate_chassis_leak_detectors(
+                        8,
                     )),
                     ..redfish::chassis::SingleChassisConfig::defaults()
                 },
@@ -175,9 +182,10 @@ impl NvidiaSwitchNd5200Ld<'_> {
         }
     }
 
-    pub fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
+    pub(crate) fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
         redfish::update_service::UpdateServiceConfig {
             firmware_inventory: vec![],
+            ..Default::default()
         }
     }
 }

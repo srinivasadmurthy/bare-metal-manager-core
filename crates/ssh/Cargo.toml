@@ -20,14 +20,16 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 # TODO: rename to carbide_ssh in source
 [lib]
 name = "forge_ssh"
 
+[features]
+test_support = []
+
 [dependencies]
-async-ssh2-tokio = { workspace = true }
-humantime = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

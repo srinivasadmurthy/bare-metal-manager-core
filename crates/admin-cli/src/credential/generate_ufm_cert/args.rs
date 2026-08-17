@@ -21,9 +21,19 @@ use rpc::{CredentialType, forge as forgerpc};
 use crate::credential::common::DEFAULT_IB_FABRIC_NAME;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Generate a UFM cert for the default fabric:
+    $ nico-admin-cli credential generate-ufm-cert
+
+Generate a UFM cert for a named fabric:
+    $ nico-admin-cli credential generate-ufm-cert --fabric default
+
+")]
+pub(crate) struct Args {
     #[clap(long, default_value_t = DEFAULT_IB_FABRIC_NAME.to_string(), help = "Infiniband fabric.")]
-    pub fabric: String,
+    fabric: String,
 }
 
 impl From<Args> for forgerpc::CredentialCreationRequest {

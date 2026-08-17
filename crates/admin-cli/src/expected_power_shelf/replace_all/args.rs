@@ -18,7 +18,14 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Replace all expected power shelves with the contents of a JSON file:
+    $ nico-admin-cli expected-power-shelf replace-all --filename ./power-shelves.json
+
+")]
+pub(crate) struct Args {
     #[clap(short, long)]
-    pub filename: String,
+    pub(super) filename: String,
 }

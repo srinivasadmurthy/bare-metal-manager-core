@@ -20,20 +20,36 @@ use mac_address::MacAddress;
 use rpc::forge::DeletedFilter;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all live switches:
+    $ nico-admin-cli switch list
+
+Include deleted switches:
+    $ nico-admin-cli switch list --deleted include
+
+Filter by controller state:
+    $ nico-admin-cli switch list --controller-state ready
+
+Find a switch by its BMC MAC address:
+    $ nico-admin-cli switch list --bmc-mac 00:11:22:33:44:55
+
+")]
+pub(crate) struct Args {
     /// Include deleted switches
     #[clap(long, value_enum, default_value = "exclude")]
-    pub deleted: DeletedFilter,
+    pub(super) deleted: DeletedFilter,
 
     /// Filter by controller state (e.g. "ready", "initializing", "error")
     #[clap(long)]
-    pub controller_state: Option<String>,
+    pub(super) controller_state: Option<String>,
 
     /// Filter by BMC MAC address
     #[clap(long)]
-    pub bmc_mac: Option<MacAddress>,
+    pub(super) bmc_mac: Option<MacAddress>,
 
     /// Filter by NVOS MAC address
     #[clap(long)]
-    pub nvos_mac: Option<MacAddress>,
+    pub(super) nvos_mac: Option<MacAddress>,
 }

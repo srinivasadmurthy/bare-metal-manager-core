@@ -18,7 +18,17 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show the full network topology (all devices):
+    $ nico-admin-cli network-device show
+
+Show one network device by MAC:
+    $ nico-admin-cli network-device show mac=00:11:22:33:44:55
+
+")]
+pub(crate) struct Args {
     #[clap(
         short,
         long,
@@ -26,13 +36,13 @@ pub struct Args {
         conflicts_with = "id",
         help = "Show all network devices (DEPRECATED)"
     )]
-    pub all: bool,
+    all: bool,
 
     #[clap(
         default_value(""),
         help = "Show data for the given network device (e.g. `mac=<mac>`), leave empty for all (default)"
     )]
-    pub id: String,
+    id: String,
 }
 
 impl From<Args> for ::rpc::forge::NetworkTopologyRequest {

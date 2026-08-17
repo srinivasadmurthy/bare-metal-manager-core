@@ -18,20 +18,18 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use carbide_utils::models::arch::CpuArchitecture;
-use rpc::machine_discovery::{BlockDevice, CpuInfo, DiscoveryInfo, DmiData, NvmeDevice};
 use serde_json::json;
 
 use crate::{BootOptionKind, Callbacks, hw, redfish};
 
-pub struct WiwynnGB200Nvl<'a> {
-    pub system_serial_number: Cow<'a, str>,
-    pub chassis_serial_number: Cow<'a, str>,
-    pub compute_board: [hw::nvidia_gb200::BiancaBoard<'a>; 2],
-    pub dpu1: hw::bluefield3::Bluefield3<'a>,
-    pub dpu2: hw::bluefield3::Bluefield3<'a>,
-    pub topology: hw::nvidia_gbx00::Topology,
-    pub io_board: [hw::nvidia_gb200::IoBoard<'a>; 2],
+pub(crate) struct WiwynnGB200Nvl<'a> {
+    pub(crate) system_serial_number: Cow<'a, str>,
+    pub(crate) chassis_serial_number: Cow<'a, str>,
+    pub(crate) compute_board: [hw::nvidia_gb200::BiancaBoard<'a>; 2],
+    pub(crate) dpu1: hw::bluefield3::Bluefield3<'a>,
+    pub(crate) dpu2: hw::bluefield3::Bluefield3<'a>,
+    pub(crate) topology: hw::nvidia_gbx00::Topology,
+    pub(crate) io_board: [hw::nvidia_gb200::IoBoard<'a>; 2],
 }
 
 impl WiwynnGB200Nvl<'_> {
@@ -41,11 +39,11 @@ impl WiwynnGB200Nvl<'_> {
             fan: 10,
             power: 10,
             current: 10,
-            leak: 4,
+            voltage: 4,
         }
     }
 
-    pub fn manager_config(&self) -> redfish::manager::Config {
+    pub(crate) fn manager_config(&self) -> redfish::manager::Config {
         redfish::manager::Config {
             managers: vec![
                 redfish::manager::SingleConfig {
@@ -58,6 +56,7 @@ impl WiwynnGB200Nvl<'_> {
                         .interface_enabled(true)
                         .build(),
                     ]),
+                    serial_interfaces: None,
                     firmware_version: Some("25.06-2_NV_WW_02"),
                     oem: None,
                 },
@@ -65,6 +64,7 @@ impl WiwynnGB200Nvl<'_> {
                     id: "HGX_BMC_0",
                     eth_interfaces: Some(vec![]), // TODO: usb0
                     host_interfaces: None,
+                    serial_interfaces: None,
                     firmware_version: Some("GB200Nvl-25.06-A"),
                     oem: None,
                 },
@@ -72,7 +72,10 @@ impl WiwynnGB200Nvl<'_> {
         }
     }
 
-    pub fn system_config(&self, callbacks: Arc<dyn Callbacks>) -> redfish::computer_system::Config {
+    pub(crate) fn system_config(
+        &self,
+        callbacks: Arc<dyn Callbacks>,
+    ) -> redfish::computer_system::Config {
         let system_id = "System_0";
         let callbacks = Some(callbacks);
         let serial_number = Some(self.system_serial_number.to_string().into());
@@ -92,7 +95,9 @@ impl WiwynnGB200Nvl<'_> {
                 .display_name(&display_name)
                 .uefi_device_path(&format!("MAC({mac},0x1)/IPv4(0.0.0.0,0x0,DHCP,0.0.0.0,0.0.0.0,0.0.0.0)/Uri()"))
                 .build()
-        })).collect();
+        })).collect::<Vec<_>>();
+
+        let hgx_baseboard_id = "HGX_Baseboard_0";
 
         redfish::computer_system::Config {
             systems: vec![
@@ -117,10 +122,13 @@ impl WiwynnGB200Nvl<'_> {
                     ),
                     log_services: None,
                     storage: None,
+                    processors: None,
+                    memory: None,
+                    serial_console: None,
                     secure_boot_available: true,
                 },
                 redfish::computer_system::SingleSystemConfig {
-                    id: "HGX_Baseboard_0".into(),
+                    id: hgx_baseboard_id.into(),
                     manufacturer: Some("NVIDIA".into()),
                     model: Some("GB200 NVL".into()),
                     chassis: vec!["HGX_Chassis_0".into()],
@@ -134,13 +142,26 @@ impl WiwynnGB200Nvl<'_> {
                     base_bios: None,
                     log_services: None,
                     storage: None,
+                    processors: Some(
+                        self.compute_board
+                            .iter()
+                            .flat_map(|board| board.hgx_gpu_processors(hgx_baseboard_id))
+                            .collect(),
+                    ),
+                    memory: Some(
+                        self.compute_board
+                            .iter()
+                            .flat_map(|board| board.hgx_gpu_memory(hgx_baseboard_id))
+                            .collect(),
+                    ),
+                    serial_console: None,
                     secure_boot_available: false,
                 },
             ],
         }
     }
 
-    pub fn chassis_config(&self) -> redfish::chassis::ChassisConfig {
+    pub(crate) fn chassis_config(&self) -> redfish::chassis::ChassisConfig {
         let dpu_chassis = |chassis_id: &'static str, bf3: &hw::bluefield3::Bluefield3<'_>| {
             let nic = bf3.host_nic();
             let network_adapters = Some(vec![
@@ -183,6 +204,7 @@ impl WiwynnGB200Nvl<'_> {
                     "Chassis_0",
                     Self::sensor_layout(),
                 )),
+                leak_detectors: Some(redfish::leak_detector::generate_chassis_leak_detectors(4)),
                 assembly: Some(
                     redfish::assembly::builder(&redfish::assembly::chassis_resource("Chassis_0"))
                         .add_data(
@@ -202,36 +224,9 @@ impl WiwynnGB200Nvl<'_> {
                     .map(|(index, id)| self.compute_board[index].hgx_cpu_chassis(id.into())),
             )
             .chain(
-                [
-                    (
-                        0,
-                        [
-                            hw::nvidia_gb200::GpuChassisIds {
-                                chassis_id: "HGX_GPU_0".into(),
-                                pcie_device_id: "GPU_0".into(),
-                            },
-                            hw::nvidia_gb200::GpuChassisIds {
-                                chassis_id: "HGX_GPU_1".into(),
-                                pcie_device_id: "GPU_1".into(),
-                            },
-                        ],
-                    ),
-                    (
-                        1,
-                        [
-                            hw::nvidia_gb200::GpuChassisIds {
-                                chassis_id: "HGX_GPU_2".into(),
-                                pcie_device_id: "GPU_2".into(),
-                            },
-                            hw::nvidia_gb200::GpuChassisIds {
-                                chassis_id: "HGX_GPU_3".into(),
-                                pcie_device_id: "GPU_3".into(),
-                            },
-                        ],
-                    ),
-                ]
-                .into_iter()
-                .flat_map(|(index, ids)| self.compute_board[index].hgx_gpu_chassis(ids)),
+                self.compute_board
+                    .iter()
+                    .flat_map(|board| board.hgx_gpu_chassis()),
             )
             .chain(
                 self.io_board
@@ -251,7 +246,7 @@ impl WiwynnGB200Nvl<'_> {
         }
     }
 
-    pub fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
+    pub(crate) fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
         let fw_inv_builder = |id: &str| {
             redfish::software_inventory::builder(
                 &redfish::software_inventory::firmware_inventory_resource(id),
@@ -275,68 +270,8 @@ impl WiwynnGB200Nvl<'_> {
             .iter()
             .map(|(id, version)| fw_inv_builder(id).version(version).build())
             .collect(),
-        }
-    }
-
-    pub fn discovery_info(&self) -> DiscoveryInfo {
-        DiscoveryInfo {
-            network_interfaces: vec![
-                self.dpu1.host_nic().discovery_info(0x0603),
-                self.dpu2.host_nic().discovery_info(0x1603),
-            ],
-            infiniband_interfaces: self
-                .io_board
-                .iter()
-                .flat_map(|board| board.discovery_infiniband())
-                .collect(),
-            cpu_info: vec![CpuInfo {
-                model: "Neoverse-V2".into(),
-                vendor: "ARM".into(),
-                sockets: 2,
-                cores: 72,
-                threads: 72,
-            }],
-            block_devices: (0..9)
-                .map(|n| BlockDevice {
-                    model: "SAMSUNG MZTL63T8HFLT-00AW7".into(),
-                    revision: "LDDL4U2Q".into(),
-                    serial: format!("BDFAKESERNUM{n}"),
-                    device_type: "disk".into(),
-                })
-                .collect(),
-            machine_type: CpuArchitecture::Aarch64.to_string(),
-            machine_arch: Some(CpuArchitecture::Aarch64.into()),
-            nvme_devices: (0..9)
-                .map(|n| NvmeDevice {
-                    model: "SAMSUNG MZTL63T8HFLT-00AW7".into(),
-                    firmware_rev: "LDDL4U2Q".into(),
-                    serial: format!("BDFAKESERNUM{n}"),
-                })
-                .collect(),
-            dmi_data: Some(DmiData {
-                board_name: "KINABALU BMC CARD".into(),
-                board_version: "PVT".into(),
-                bios_version: "00000083".into(),
-                bios_date: "20260107".into(),
-                product_serial: self.chassis_serial_number.to_string(),
-                board_serial: self.chassis_serial_number.to_string(),
-                chassis_serial: self.chassis_serial_number.to_string(),
-                product_name: "GB200 NVL".into(),
-                sys_vendor: "NVIDIA".into(),
-            }),
-            dpu_info: None,
-            gpus: self
-                .compute_board
-                .iter()
-                .flat_map(|board| board.discovery_gpu())
-                .collect(),
-            memory_devices: self
-                .compute_board
-                .iter()
-                .map(|board| board.discovery_memory())
-                .collect(),
-            tpm_ek_certificate: None,
-            tpm_description: None,
+            host_bmc_inventory_id: Some("FW_BMC_0".to_string()),
+            host_uefi_inventory_id: Some("HGX_FW_CPU_0".to_string()),
             ..Default::default()
         }
     }

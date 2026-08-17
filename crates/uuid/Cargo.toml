@@ -21,6 +21,7 @@ edition.workspace = true
 description = "Common UUID types Forge components."
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 # TODO: rename to carbide_uuid in source
 [lib]
@@ -36,7 +37,8 @@ serde = { features = ["derive"], workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true, features = [
-  "runtime-tokio-rustls",
+  "runtime-tokio",
+  "tls-rustls",
   "mac_address",
   "ipnetwork",
   "uuid",
@@ -47,9 +49,11 @@ sqlx = { workspace = true, features = [
   "json",
 ], optional = true }
 thiserror = { workspace = true }
-tonic = { workspace = true }
 uuid = { features = ["v4", "serde"], workspace = true }
 prost = { workspace = true }
+
+[dev-dependencies]
+carbide-test-support = { path = "../test-support" }
 
 [lints]
 workspace = true

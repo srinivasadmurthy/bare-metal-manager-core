@@ -19,20 +19,32 @@ use clap::Parser;
 use mac_address::MacAddress;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Copy a BFB to a DPU's rshim via its BMC, power-cycling the host afterward:
+    $ nico-admin-cli site-explorer copy-bfb-to-dpu-rshim 192.0.2.10 \
+    --host-bmc-ip 192.0.2.20
+
+Power-cycle the host first to release rshim control to the DPU BMC:
+    $ nico-admin-cli site-explorer copy-bfb-to-dpu-rshim 192.0.2.10 \
+    --host-bmc-ip 192.0.2.20 --pre-copy-powercycle
+
+")]
+pub(crate) struct Args {
     #[clap(help = "BMC IP address or hostname with optional port")]
-    pub address: String,
+    pub(super) address: String,
     #[clap(long, help = "The MAC address the BMC sent DHCP from")]
-    pub mac: Option<MacAddress>,
+    pub(super) mac: Option<MacAddress>,
     #[clap(
         long,
         help = "Host BMC IP address. Required for the mandatory post-copy host power-cycle \
                 that applies the new BFB image to the DPU."
     )]
-    pub host_bmc_ip: String,
+    pub(super) host_bmc_ip: String,
     #[clap(
         long,
         help = "Power-cycle the host before the BFB copy to release rshim control to the DPU BMC."
     )]
-    pub pre_copy_powercycle: bool,
+    pub(super) pre_copy_powercycle: bool,
 }

@@ -14,23 +14,34 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use std::net::IpAddr;
-use std::time::SystemTime;
+use std::net::{IpAddr, Ipv6Addr};
 
-use ::rpc::errors::RpcDataConversionError;
-use ::rpc::forge as rpc;
 use carbide_uuid::machine::MachineId;
 use chrono::{DateTime, Duration, Utc};
 use config_version::ConfigVersion;
 use health_report::HealthReport;
 use serde::{Deserialize, Serialize};
 
-use crate::instance::status::extension_service::{
-    ExtensionServiceStatusObservation, InstanceExtensionServiceStatusObservation,
-};
-use crate::instance::status::network::{
-    InstanceInterfaceStatusObservation, InstanceNetworkStatusObservation,
-};
+use crate::instance::status::extension_service::InstanceExtensionServiceStatusObservation;
+use crate::instance::status::network::InstanceNetworkStatusObservation;
+
+/// The fabric interface status last reported by a DPU agent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DpuFabricInterfaceStatusObservation {
+    pub interface_name: String,
+    pub link_data: Option<DpuLinkStatusObservation>,
+}
+
+/// The persisted subset of link attributes reported for a DPU fabric interface.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DpuLinkStatusObservation {
+    pub link_type: Option<String>,
+    pub state: Option<String>,
+    pub carrier_up: Option<bool>,
+    pub mtu: Option<u32>,
+    pub carrier_up_count: Option<u32>,
+    pub carrier_down_count: Option<u32>,
+}
 
 /// The network status that was last reported by the networking subsystem
 /// Stored in a Postgres JSON field so new fields have to be Option until fully deployed
@@ -44,6 +55,8 @@ pub struct MachineNetworkStatusObservation {
     pub agent_version_superseded_at: Option<DateTime<Utc>>,
     pub instance_network_observation: Option<InstanceNetworkStatusObservation>,
     pub extension_service_observation: Option<InstanceExtensionServiceStatusObservation>,
+    #[serde(default)]
+    pub fabric_interfaces: Vec<DpuFabricInterfaceStatusObservation>,
 }
 
 impl MachineNetworkStatusObservation {
@@ -127,131 +140,23 @@ impl MachineNetworkStatusObservation {
     }
 }
 
-impl TryFrom<rpc::DpuNetworkStatus> for MachineNetworkStatusObservation {
-    type Error = RpcDataConversionError;
-
-    fn try_from(obs: rpc::DpuNetworkStatus) -> Result<Self, Self::Error> {
-        let observed_at = match obs.observed_at {
-            Some(timestamp) => {
-                let system_time = SystemTime::try_from(timestamp)
-                    .map_err(|_| Self::Error::InvalidTimestamp(timestamp.to_string()))?;
-                DateTime::from(system_time)
-            }
-            None => Utc::now(),
-        };
-
-        // We're going to piggy-back on InstanceNetworkStatusObservation
-        // to get the instance_config_version for now.
-        let instance_config_version = match obs.instance_config_version {
-            Some(version_string) => match version_string.as_str().parse() {
-                Ok(version) => Some(version),
-                _ => {
-                    return Err(RpcDataConversionError::InvalidConfigVersion(format!(
-                        "applied_config.instance_config_version: {version_string}"
-                    )));
-                }
-            },
-            _ => None,
-        };
-
-        let instance_network_observation =
-            if let Some(version_string) = obs.instance_network_config_version {
-                let Ok(version) = version_string.as_str().parse() else {
-                    return Err(RpcDataConversionError::InvalidConfigVersion(format!(
-                        "applied_config.instance_network_config_version: {version_string}"
-                    )));
-                };
-                let mut interfaces: Vec<InstanceInterfaceStatusObservation> = vec![];
-                for iface in obs.interfaces {
-                    let v = iface.try_into()?;
-                    interfaces.push(v);
-                }
-
-                Some(InstanceNetworkStatusObservation {
-                    config_version: version,
-                    instance_config_version,
-                    observed_at,
-                    interfaces,
-                })
-            } else {
-                None
-            };
-
-        let extension_service_observation =
-            if let Some(version_string) = obs.dpu_extension_service_version {
-                let Ok(version) = version_string.as_str().parse() else {
-                    return Err(RpcDataConversionError::InvalidConfigVersion(format!(
-                        "applied_config.extension_service_version: {version_string}"
-                    )));
-                };
-
-                let mut extension_service_statuses: Vec<ExtensionServiceStatusObservation> = vec![];
-                for service in obs.dpu_extension_services {
-                    let v = service.try_into()?;
-                    extension_service_statuses.push(v);
-                }
-
-                Some(InstanceExtensionServiceStatusObservation {
-                    config_version: version,
-                    instance_config_version,
-                    extension_service_statuses,
-                    observed_at,
-                })
-            } else {
-                None
-            };
-
-        Ok(MachineNetworkStatusObservation {
-            observed_at,
-            machine_id: obs
-                .dpu_machine_id
-                .ok_or(Self::Error::MissingArgument("dpu_machine_id"))?,
-            agent_version: obs.dpu_agent_version.clone(),
-            network_config_version: obs.network_config_version.and_then(|n| n.parse().ok()),
-            client_certificate_expiry: obs.client_certificate_expiry_unix_epoch_secs,
-            agent_version_superseded_at: None,
-            instance_network_observation,
-            extension_service_observation,
-        })
-    }
-}
-
-// TODO: This API is only used by the carbide-web generating the Network Status page
-// It improperly returns the values of a lot of things - since those are not actually
-// persisted.
-// It would be preferable to migrate carbide-web from reading the status to using
-// a better supported API. E.g. the FindMachinesByIds one.
-impl From<MachineNetworkStatusObservation> for rpc::DpuNetworkStatus {
-    fn from(m: MachineNetworkStatusObservation) -> rpc::DpuNetworkStatus {
-        rpc::DpuNetworkStatus {
-            dpu_machine_id: Some(m.machine_id),
-            dpu_agent_version: m.agent_version.clone(),
-            observed_at: Some(m.observed_at.into()),
-            network_config_version: m.network_config_version.map(|v| v.version_string()),
-            instance_id: None,
-            instance_config_version: None,
-            instance_network_config_version: None,
-            interfaces: vec![],
-            network_config_error: None,
-            client_certificate_expiry_unix_epoch_secs: None,
-            dpu_health: None,
-            fabric_interfaces: vec![],
-            last_dhcp_requests: vec![],
-            dpu_extension_service_version: None,
-            dpu_extension_services: vec![],
-        }
-    }
-}
-
 /// Desired network configuration for an instance.
 /// This is persisted to a Postgres JSON column, so only use Option
 /// fields for easier migrations.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedHostNetworkConfig {
     pub loopback_ip: Option<IpAddr>,
-    pub secondary_overlay_vtep_ip: Option<IpAddr>,
+    /// IPv6 loopback reserved for the FNN underlay. `None` keeps the existing
+    /// IPv4-only behavior for sites without `lo-ip-v6`.
+    pub loopback_ip_v6: Option<Ipv6Addr>,
+    /// This is a host-level field of the "consolidated" network
+    /// config served to all [DPU] agents within host machine group.
+    /// This is set in the config for the host-specific row in the
+    /// database, and we use it as a base layer of sorts for then
+    /// merging in DPU-specific configs.
     pub use_admin_network: Option<bool>,
     pub quarantine_state: Option<ManagedHostQuarantineState>,
+    pub use_admin_network_changed: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,47 +172,6 @@ impl ManagedHostQuarantineState {
 
     pub fn mode_str(&self) -> &str {
         self.mode.as_str()
-    }
-}
-
-impl From<ManagedHostQuarantineState> for rpc::ManagedHostQuarantineState {
-    fn from(m: ManagedHostQuarantineState) -> Self {
-        Self {
-            mode: rpc::ManagedHostQuarantineMode::from(m.mode) as i32,
-            reason: m.reason,
-        }
-    }
-}
-
-impl From<ManagedHostQuarantineMode> for rpc::ManagedHostQuarantineMode {
-    fn from(m: ManagedHostQuarantineMode) -> Self {
-        match m {
-            ManagedHostQuarantineMode::BlockAllTraffic => {
-                rpc::ManagedHostQuarantineMode::BlockAllTraffic
-            }
-        }
-    }
-}
-
-impl TryFrom<rpc::ManagedHostQuarantineState> for ManagedHostQuarantineState {
-    type Error = RpcDataConversionError;
-    fn try_from(value: rpc::ManagedHostQuarantineState) -> Result<Self, Self::Error> {
-        Ok(Self {
-            reason: value.reason,
-            mode: rpc::ManagedHostQuarantineMode::try_from(value.mode)
-                .map_err(|_| {
-                    RpcDataConversionError::InvalidValue(value.mode.to_string(), "mode".to_string())
-                })?
-                .into(),
-        })
-    }
-}
-
-impl From<rpc::ManagedHostQuarantineMode> for ManagedHostQuarantineMode {
-    fn from(m: rpc::ManagedHostQuarantineMode) -> Self {
-        match m {
-            rpc::ManagedHostQuarantineMode::BlockAllTraffic => Self::BlockAllTraffic,
-        }
     }
 }
 
@@ -328,9 +192,10 @@ impl Default for ManagedHostNetworkConfig {
     fn default() -> Self {
         ManagedHostNetworkConfig {
             loopback_ip: None,
-            secondary_overlay_vtep_ip: None,
+            loopback_ip_v6: None,
             use_admin_network: Some(true),
             quarantine_state: None,
+            use_admin_network_changed: None,
         }
     }
 }
@@ -338,22 +203,205 @@ impl Default for ManagedHostNetworkConfig {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::str::FromStr;
+
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{Check, scenarios, value_scenarios};
+    use carbide_uuid::extension_service::ExtensionServiceId;
+    use chrono::TimeZone;
+    use config_version::ConfigVersion;
 
     use super::*;
+    use crate::extension_service::ExtensionServiceType;
+    use crate::instance::status::extension_service::{
+        ExtensionServiceDeploymentStatus, ExtensionServiceStatusObservation,
+    };
+    use crate::test_support::machine_snapshot::config_version;
 
-    // Verify that existing JSON with IPv4 addresses (as stored in Postgres) still
-    // deserializes correctly after going from Ipv4Addr to IpAddr (to support v6).
+    // A stable MachineId for status observations; `any_observed_version_changed`
+    // never inspects it, so any valid id does.
+    fn machine_id() -> MachineId {
+        MachineId::from_str("fm100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg").unwrap()
+    }
+
+    // A fixed timestamp so observations built in tests compare deterministically.
+    fn observed_at() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+    }
+
+    // A MachineNetworkStatusObservation carrying only the fields
+    // `any_observed_version_changed` reads; everything else is a fixed default.
+    fn network_status(
+        network_config_version: Option<ConfigVersion>,
+        instance_network_observation: Option<InstanceNetworkStatusObservation>,
+        extension_service_observation: Option<InstanceExtensionServiceStatusObservation>,
+    ) -> MachineNetworkStatusObservation {
+        MachineNetworkStatusObservation {
+            machine_id: machine_id(),
+            agent_version: None,
+            observed_at: observed_at(),
+            network_config_version,
+            client_certificate_expiry: None,
+            agent_version_superseded_at: None,
+            instance_network_observation,
+            extension_service_observation,
+            fabric_interfaces: Vec::new(),
+        }
+    }
+
+    fn network_observation(
+        config_version: ConfigVersion,
+        instance_config_version: Option<ConfigVersion>,
+    ) -> InstanceNetworkStatusObservation {
+        InstanceNetworkStatusObservation {
+            config_version,
+            instance_config_version,
+            interfaces: Vec::new(),
+            observed_at: observed_at(),
+        }
+    }
+
+    fn extension_observation(
+        observation_config_version: ConfigVersion,
+        instance_config_version: Option<ConfigVersion>,
+    ) -> InstanceExtensionServiceStatusObservation {
+        InstanceExtensionServiceStatusObservation {
+            config_version: observation_config_version,
+            instance_config_version,
+            extension_service_statuses: vec![ExtensionServiceStatusObservation {
+                service_id: ExtensionServiceId::from_str("00000000-0000-0000-0000-000000000000")
+                    .unwrap(),
+                service_type: ExtensionServiceType::KubernetesPod,
+                service_name: "test-service".to_string(),
+                version: config_version(1),
+                removed: None,
+                overall_state: ExtensionServiceDeploymentStatus::Running,
+                components: vec![],
+                message: String::new(),
+            }],
+            observed_at: observed_at(),
+        }
+    }
+
+    // JSON round-trips: serialize a config to JSON and deserialize it back; the
+    // config must survive intact. The error type (serde_json::Error) is not
+    // PartialEq, so failing rows would use `Fails`; all rows here round-trip
+    // cleanly.
     #[test]
-    fn test_managed_host_network_config_ipv4_json_roundtrip() {
-        let config = ManagedHostNetworkConfig {
-            loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-            secondary_overlay_vtep_ip: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 5))),
-            use_admin_network: Some(true),
-            quarantine_state: None,
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: ManagedHostNetworkConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(config, deserialized);
+    fn test_managed_host_network_config_json_roundtrip() {
+        scenarios!(
+            run = |config| {
+                let json = serde_json::to_string(&config).map_err(drop)?;
+                serde_json::from_str::<ManagedHostNetworkConfig>(&json).map_err(drop)
+            };
+            "ipv4 round-trip" {
+                ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    loopback_ip_v6: None,
+                    use_admin_network: Some(true),
+                    quarantine_state: None,
+                    use_admin_network_changed: None,
+                } => Yields(ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    loopback_ip_v6: None,
+                    use_admin_network: Some(true),
+                    quarantine_state: None,
+                    use_admin_network_changed: None,
+                }),
+            }
+
+            "generic IPv6 addresses round-trip" {
+                ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V6(Ipv6Addr::new(
+                        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                    ))),
+                    loopback_ip_v6: None,
+                    use_admin_network: Some(false),
+                    quarantine_state: None,
+                    use_admin_network_changed: None,
+                } => Yields(ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V6(Ipv6Addr::new(
+                        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                    ))),
+                    loopback_ip_v6: None,
+                    use_admin_network: Some(false),
+                    quarantine_state: None,
+                    use_admin_network_changed: None,
+                }),
+            }
+
+            "dedicated IPv6 loopback round-trip" {
+                ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    loopback_ip_v6: Some(Ipv6Addr::new(
+                        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                    )),
+                    use_admin_network: Some(false),
+                    quarantine_state: None,
+                    use_admin_network_changed: None,
+                } => Yields(ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    loopback_ip_v6: Some(Ipv6Addr::new(
+                        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                    )),
+                    use_admin_network: Some(false),
+                    quarantine_state: None,
+                    use_admin_network_changed: None,
+                }),
+            }
+        );
+    }
+
+    // `loopback_ip_v6` is optional in persisted machine JSON, so rows written
+    // before this field existed keep loading it as `None`. Once populated, the
+    // `Ipv6Addr` type rejects an IPv4 value before it can reach FNN rendering.
+    #[test]
+    fn test_managed_host_network_config_deserialize_json() {
+        scenarios!(
+            run = |json| {
+                serde_json::from_str::<ManagedHostNetworkConfig>(json)
+                    .map(|c| (c.loopback_ip, c.loopback_ip_v6))
+                    .map_err(drop)
+            };
+            "legacy ipv4 json" {
+                r#"{
+                            "loopback_ip": "10.0.0.1",
+                            "secondary_overlay_vtep_ip": "172.16.0.5",
+                            "use_admin_network": true,
+                            "quarantine_state": null
+                }"# => Yields((
+                    Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    None,
+                )),
+            }
+
+            "generic IPv6 address json" {
+                r#"{
+                            "loopback_ip": "2001:db8::1",
+                            "use_admin_network": true,
+                            "quarantine_state": null
+                }"# => Yields((
+                    Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+                    None,
+                )),
+            }
+
+            "dedicated IPv6 loopback json" {
+                r#"{
+                            "loopback_ip": "10.0.0.1",
+                            "loopback_ip_v6": "2001:db8::1",
+                            "use_admin_network": true,
+                            "quarantine_state": null
+                }"# => Yields((
+                    Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                )),
+            }
+
+            "IPv4 rejected for dedicated IPv6 loopback" {
+                r#"{"loopback_ip_v6": "192.0.2.1"}"# => Fails,
+            }
+        );
     }
 
     // Ensure that the JSON representation of an IPv4 address under IpAddr is
@@ -364,108 +412,327 @@ mod tests {
     fn test_managed_host_network_config_ipv4_json_format_unchanged() {
         let config = ManagedHostNetworkConfig {
             loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-            secondary_overlay_vtep_ip: None,
+            loopback_ip_v6: None,
             use_admin_network: Some(true),
             quarantine_state: None,
+            use_admin_network_changed: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         // Ensure IpAddr serializes IPv4 same as Ipv4Addr.
         assert!(json.contains(r#""loopback_ip":"10.0.0.1""#), "json: {json}");
-    }
-
-    // Confirm that a raw JSON string with an IPv4 address (as would already
-    // exist in the database from before switching to IpAddr for v6 support),
-    // deserializes correctly into the new IpAddr type.
-    #[test]
-    fn test_managed_host_network_config_deserialize_legacy_ipv4_json() {
-        let json = r#"{
-            "loopback_ip": "10.0.0.1",
-            "secondary_overlay_vtep_ip": "172.16.0.5",
-            "use_admin_network": true,
-            "quarantine_state": null
-        }"#;
-        let config: ManagedHostNetworkConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            config.loopback_ip,
-            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
-        );
-        assert_eq!(
-            config.secondary_overlay_vtep_ip,
-            Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 5)))
-        );
-    }
-
-    // Verify that IPv6 addresses serialize/deserialize correctly through our
-    // ManagedHostNetworkConfig JSON representation, for the case when IPv6
-    // pools are enabled.
-    #[test]
-    fn test_managed_host_network_config_ipv6_json_roundtrip() {
-        let config = ManagedHostNetworkConfig {
-            loopback_ip: Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
-            secondary_overlay_vtep_ip: Some(IpAddr::V6(Ipv6Addr::new(
-                0xfd00, 0, 0, 0, 0, 0, 0, 0x42,
-            ))),
-            use_admin_network: Some(false),
-            quarantine_state: None,
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: ManagedHostNetworkConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(config, deserialized);
-    }
-
-    // ...aand confirm deserialization of IPv6 addresses from JSON.
-    #[test]
-    fn test_managed_host_network_config_deserialize_ipv6_json() {
-        let json = r#"{
-            "loopback_ip": "2001:db8::1",
-            "secondary_overlay_vtep_ip": null,
-            "use_admin_network": true,
-            "quarantine_state": null
-        }"#;
-        let config: ManagedHostNetworkConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            config.loopback_ip,
-            Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)))
-        );
-        assert_eq!(config.secondary_overlay_vtep_ip, None);
+        assert!(!json.contains("secondary_overlay_vtep_ip"), "json: {json}");
     }
 
     // Ensure default ManagedHostNetworkConfig is still all-None/Some(true),
     // etc etc, and unaffected by the type change to IpAddr for v6 support.
+    // Folded from four hand-written asserts into a table that projects each
+    // default field; equality of the whole default config is exercised by the
+    // round-trip test.
     #[test]
     fn test_managed_host_network_config_default() {
-        let config = ManagedHostNetworkConfig::default();
-        assert_eq!(config.loopback_ip, None);
-        assert_eq!(config.secondary_overlay_vtep_ip, None);
-        assert_eq!(config.use_admin_network, Some(true));
-        assert_eq!(config.quarantine_state, None);
+        let default = ManagedHostNetworkConfig::default();
+        assert_eq!(default.loopback_ip_v6, None);
+
+        value_scenarios!(
+            run = |ip| ip;
+            "loopback_ip defaults to None" {
+                default.loopback_ip => None,
+            }
+        );
+        value_scenarios!(
+            run = |flag| flag;
+            "use_admin_network defaults to Some(true)" {
+                default.use_admin_network => Some(true),
+            }
+
+            "use_admin_network_changed defaults to None" {
+                default.use_admin_network_changed => None,
+            }
+        );
+        Check {
+            scenario: "quarantine_state defaults to None",
+            input: default.quarantine_state,
+            expect: None,
+        }
+        .check(|qs| qs);
     }
 
-    // Verify that IpAddr::to_string() produces the expected format for both
-    // address families, since several call sites throughout the codebase
-    // use .to_string() on the loopback_ip value.
+    // ManagedHostQuarantineState::reason_str() returns the reason or an empty
+    // string when None. ManagedHostQuarantineMode has a single variant today;
+    // its as_str()/mode_str() must render it exactly so the persisted form is
+    // stable.
     #[test]
-    fn test_ip_addr_to_string_format() {
-        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        assert_eq!(v4.to_string(), "10.0.0.1");
+    fn test_quarantine_reason_str() {
+        value_scenarios!(
+            run = |state| state.reason_str().to_string();
+            "present reason passes through" {
+                ManagedHostQuarantineState {
+                    reason: Some("flooding the fabric".to_string()),
+                    mode: ManagedHostQuarantineMode::BlockAllTraffic,
+                } => "flooding the fabric".to_string(),
+            }
 
-        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-        assert_eq!(v6.to_string(), "2001:db8::1");
+            "empty reason stays empty" {
+                ManagedHostQuarantineState {
+                    reason: Some(String::new()),
+                    mode: ManagedHostQuarantineMode::BlockAllTraffic,
+                } => String::new(),
+            }
+
+            "missing reason yields empty string" {
+                ManagedHostQuarantineState {
+                    reason: None,
+                    mode: ManagedHostQuarantineMode::BlockAllTraffic,
+                } => String::new(),
+            }
+        );
     }
 
-    // Verify that IPv4 strings parse correctly as IpAddr, since resource pools
-    // store values as strings and parse them via IpAddr::from_str.
     #[test]
-    fn test_ip_addr_parse_from_pool_strings() {
-        let v4: IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(v4.is_ipv4());
-        assert_eq!(v4, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    fn test_quarantine_mode_str() {
+        value_scenarios!(
+            run = |mode| {
+                ManagedHostQuarantineState { reason: None, mode }
+                    .mode_str()
+                    .to_string()
+            };
+            "block-all-traffic renders its name" {
+                ManagedHostQuarantineMode::BlockAllTraffic => "BlockAllTraffic".to_string(),
+            }
+        );
+    }
 
-        let v6: IpAddr = "2001:db8::1".parse().unwrap();
-        assert!(v6.is_ipv6());
-        assert_eq!(
-            v6,
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+    // any_observed_version_changed compares the network config version and then
+    // the two nested observations (instance-network and extension-service),
+    // each via a None/Some pairing that delegates to the sub-observation's own
+    // comparison. Enumerate every arm: matching versions, differing versions,
+    // each None/Some transition, and a deeper change inside each Some/Some pair.
+    #[test]
+    fn test_any_observed_version_changed() {
+        let v1 = config_version(1);
+        let v2 = config_version(2);
+
+        value_scenarios!(
+            run = |(a, b)| a.any_observed_version_changed(&b);
+            "identical observations -> unchanged" {
+                (
+                    network_status(Some(v1), None, None),
+                    network_status(Some(v1), None, None),
+                ) => false,
+            }
+
+            "both network config versions None -> unchanged" {
+                (
+                    network_status(None, None, None),
+                    network_status(None, None, None),
+                ) => false,
+            }
+
+            "network config version differs -> changed" {
+                (
+                    network_status(Some(v1), None, None),
+                    network_status(Some(v2), None, None),
+                ) => true,
+            }
+
+            "network config version None vs Some -> changed" {
+                (
+                    network_status(None, None, None),
+                    network_status(Some(v1), None, None),
+                ) => true,
+            }
+
+            "network config version Some vs None -> changed" {
+                (
+                    network_status(Some(v1), None, None),
+                    network_status(None, None, None),
+                ) => true,
+            }
+
+            "instance observation None vs Some -> changed" {
+                (
+                    network_status(Some(v1), None, None),
+                    network_status(Some(v1), Some(network_observation(v1, None)), None),
+                ) => true,
+            }
+
+            "instance observation Some vs None -> changed" {
+                (
+                    network_status(Some(v1), Some(network_observation(v1, None)), None),
+                    network_status(Some(v1), None, None),
+                ) => true,
+            }
+
+            "instance observation Some/Some identical -> unchanged" {
+                (
+                    network_status(Some(v1), Some(network_observation(v1, Some(v1))), None),
+                    network_status(Some(v1), Some(network_observation(v1, Some(v1))), None),
+                ) => false,
+            }
+
+            "instance observation inner config version differs -> changed" {
+                (
+                    network_status(Some(v1), Some(network_observation(v1, None)), None),
+                    network_status(Some(v1), Some(network_observation(v2, None)), None),
+                ) => true,
+            }
+
+            "instance observation inner instance-config version differs -> changed" {
+                (
+                    network_status(Some(v1), Some(network_observation(v1, Some(v1))), None),
+                    network_status(Some(v1), Some(network_observation(v1, Some(v2))), None),
+                ) => true,
+            }
+
+            "extension observation None vs Some -> changed" {
+                (
+                    network_status(Some(v1), None, None),
+                    network_status(Some(v1), None, Some(extension_observation(v1, None))),
+                ) => true,
+            }
+
+            "extension observation Some vs None -> changed" {
+                (
+                    network_status(Some(v1), None, Some(extension_observation(v1, None))),
+                    network_status(Some(v1), None, None),
+                ) => true,
+            }
+
+            "extension observation Some/Some identical -> unchanged" {
+                (
+                    network_status(Some(v1), None, Some(extension_observation(v1, Some(v1)))),
+                    network_status(Some(v1), None, Some(extension_observation(v1, Some(v1)))),
+                ) => false,
+            }
+
+            "extension observation inner config version differs -> changed" {
+                (
+                    network_status(Some(v1), None, Some(extension_observation(v1, None))),
+                    network_status(Some(v1), None, Some(extension_observation(v2, None))),
+                ) => true,
+            }
+
+            "extension observation inner instance-config version differs -> changed" {
+                (
+                    network_status(Some(v1), None, Some(extension_observation(v1, Some(v1)))),
+                    network_status(Some(v1), None, Some(extension_observation(v1, Some(v2)))),
+                ) => true,
+            }
+
+            "extension observation service version differs -> changed" {
+                (
+                    network_status(Some(v1), None, Some(extension_observation(v1, None))),
+                    network_status(
+                        Some(v1),
+                        None,
+                        Some({
+                            let mut observation = extension_observation(v1, None);
+                            observation.extension_service_statuses[0].version = v2;
+                            observation
+                        }),
+                    ),
+                ) => true,
+            }
+        );
+    }
+
+    // Deserialize raw JSON whose shape is malformed or whose IP strings are
+    // invalid; serde_json::Error is not PartialEq, so rejected rows use `Fails`.
+    // Also covers a populated quarantine_state, which the earlier deserialize
+    // table left null.
+    #[test]
+    fn test_managed_host_network_config_deserialize_errors() {
+        scenarios!(
+            run = |json| serde_json::from_str::<ManagedHostNetworkConfig>(json).map_err(drop);
+            "well-formed with quarantine state" {
+                r#"{
+                            "loopback_ip": "10.0.0.1",
+                            "use_admin_network": false,
+                            "quarantine_state": {
+                                "reason": "noisy",
+                                "mode": "BlockAllTraffic"
+                            }
+                        }"# => Yields(ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    loopback_ip_v6: None,
+                    use_admin_network: Some(false),
+                    quarantine_state: Some(ManagedHostQuarantineState {
+                        reason: Some("noisy".to_string()),
+                        mode: ManagedHostQuarantineMode::BlockAllTraffic,
+                    }),
+                    use_admin_network_changed: None,
+                }),
+            }
+
+            "empty object defaults all optional fields" {
+                "{}" => Yields(ManagedHostNetworkConfig {
+                    loopback_ip: None,
+                    loopback_ip_v6: None,
+                    use_admin_network: None,
+                    quarantine_state: None,
+                    use_admin_network_changed: None,
+                }),
+            }
+
+            "invalid loopback ip string is rejected" {
+                r#"{"loopback_ip": "not-an-ip"}"# => Fails,
+            }
+
+            "unknown quarantine mode is rejected" {
+                r#"{"quarantine_state": {"mode": "Nope"}}"# => Fails,
+            }
+
+            "wrong type for use_admin_network is rejected" {
+                r#"{"use_admin_network": "true"}"# => Fails,
+            }
+
+            "truncated json is rejected" {
+                r#"{"loopback_ip": "10.0.0.1""# => Fails,
+            }
+
+            "non-object json is rejected" {
+                "[]" => Fails,
+            }
+        );
+    }
+
+    // The default config round-trips through JSON unchanged, and the
+    // quarantine-state variant survives a round-trip too. Folds the prior
+    // single-default assertion into the round-trip table that already exists
+    // for the IP cases. serde_json::Error is not PartialEq, so failing rows
+    // would use `Fails`.
+    #[test]
+    fn test_managed_host_network_config_default_and_quarantine_roundtrip() {
+        scenarios!(
+            run = |config| {
+                let json = serde_json::to_string(&config).map_err(drop)?;
+                serde_json::from_str::<ManagedHostNetworkConfig>(&json).map_err(drop)
+            };
+            "default round-trips" {
+                ManagedHostNetworkConfig::default() => Yields(ManagedHostNetworkConfig::default()),
+            }
+
+            "quarantine state round-trips" {
+                ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    loopback_ip_v6: None,
+                    use_admin_network: Some(true),
+                    quarantine_state: Some(ManagedHostQuarantineState {
+                        reason: Some("flooded".to_string()),
+                        mode: ManagedHostQuarantineMode::BlockAllTraffic,
+                    }),
+                    use_admin_network_changed: None,
+                } => Yields(ManagedHostNetworkConfig {
+                    loopback_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                    loopback_ip_v6: None,
+                    use_admin_network: Some(true),
+                    quarantine_state: Some(ManagedHostQuarantineState {
+                        reason: Some("flooded".to_string()),
+                        mode: ManagedHostQuarantineMode::BlockAllTraffic,
+                    }),
+                    use_admin_network_changed: None,
+                }),
+            }
         );
     }
 }

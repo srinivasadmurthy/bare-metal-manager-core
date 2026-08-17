@@ -19,28 +19,29 @@ use clap::Parser;
 use rpc::forge::AdminForceDeleteMachineRequest;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Force delete a machine (by UUID, IPv4, MAC, or hostname):
+    $ nico-admin-cli machine force-delete --machine 12345678-1234-5678-90ab-cdef01234567
+
+Force delete a machine and its interfaces (redeploy kea afterward):
+    $ nico-admin-cli machine force-delete --machine 12345678-1234-5678-90ab-cdef01234567 \
+    --delete-interfaces
+
+")]
+pub(crate) struct Args {
     #[clap(
         long,
         help = "UUID, IPv4, MAC or hostnmame of the host or DPU machine to delete"
     )]
-    pub machine: String,
+    pub(super) machine: String,
 
-    #[clap(
-        short = 'd',
-        long,
-        action,
-        help = "Delete interfaces. Redeploy kea after deleting machine interfaces."
-    )]
-    pub delete_interfaces: bool,
+    #[clap(short = 'd', long, action, help = "Delete interfaces.")]
+    delete_interfaces: bool,
 
-    #[clap(
-        short = 'b',
-        long,
-        action,
-        help = "Delete BMC interfaces. Redeploy kea after deleting machine interfaces."
-    )]
-    pub delete_bmc_interfaces: bool,
+    #[clap(short = 'b', long, action, help = "Delete BMC interfaces.")]
+    delete_bmc_interfaces: bool,
 
     #[clap(
         short = 'c',
@@ -48,14 +49,21 @@ pub struct Args {
         action,
         help = "Delete BMC credentials. Only applicable if site explorer has configured credentials for the BMCs associated with this managed host."
     )]
-    pub delete_bmc_credentials: bool,
+    delete_bmc_credentials: bool,
 
     #[clap(
         long,
         action,
         help = "Delete machine with allocated instance. This flag acknowledges destroying the user instance as well."
     )]
-    pub allow_delete_with_instance: bool,
+    pub(super) allow_delete_with_instance: bool,
+
+    #[clap(
+        long,
+        action,
+        help = "Delete machine even if DPF CRDs exist and DPF is disabled at the site level. This flag acknowledges that orphaned DPF resources may remain"
+    )]
+    allow_delete_with_orphaned_dpf_crds: bool,
 }
 
 impl From<&Args> for AdminForceDeleteMachineRequest {
@@ -65,6 +73,7 @@ impl From<&Args> for AdminForceDeleteMachineRequest {
             delete_interfaces: args.delete_interfaces,
             delete_bmc_interfaces: args.delete_bmc_interfaces,
             delete_bmc_credentials: args.delete_bmc_credentials,
+            allow_delete_with_orphaned_dpf_crds: args.allow_delete_with_orphaned_dpf_crds,
         }
     }
 }

@@ -19,7 +19,14 @@ use carbide_uuid::power_shelf::PowerShelfId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List the health report sources for a power shelf:
+    $ nico-admin-cli power-shelf health-report show 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(help = "Power Shelf ID to show health reports for")]
-    pub power_shelf_id: PowerShelfId,
+    pub(super) power_shelf_id: PowerShelfId,
 }

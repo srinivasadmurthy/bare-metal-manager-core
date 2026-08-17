@@ -18,17 +18,20 @@
 use std::collections::VecDeque;
 use std::fmt::Write;
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge as forgerpc;
 use carbide_uuid::machine::MachineId;
+use carbide_uuid::vpc::VpcId;
 use prettytable::{Table, row};
 use rpc::Machine;
 
 use super::args::Args;
 use crate::cfg::cli_options::SortField;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 use crate::{async_write, async_write_table_as_csv, async_writeln};
 
+#[allow(deprecated)]
 fn convert_machine_to_nice_format(
     machine: forgerpc::Machine,
     history_count: u32,
@@ -215,6 +218,7 @@ fn get_machine_type(machine_id: Option<MachineId>) -> String {
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
+#[allow(deprecated)]
 fn convert_machines_to_nice_table(machines: forgerpc::MachineList) -> Box<Table> {
     let mut table = Box::new(Table::new());
 
@@ -334,7 +338,7 @@ async fn show_all_machines(
         .await?;
 
     match sort_by {
-        SortField::PrimaryId => machines.machines.sort_by(|m1, m2| m1.id.cmp(&m2.id)),
+        SortField::PrimaryId => machines.machines.sort_by_key(|machine| machine.id),
         SortField::State => machines.machines.sort_by(|m1, m2| m1.state.cmp(&m2.state)),
     };
 
@@ -351,9 +355,7 @@ async fn show_all_machines(
             async_write_table_as_csv!(output_file, table)?;
         }
         OutputFormat::Yaml => {
-            return Err(CarbideCliError::NotImplemented(
-                "YAML formatted output".to_string(),
-            ));
+            return Err(CarbideCliError::NotImplemented(output_format.to_string()));
         }
     }
     Ok(())
@@ -391,7 +393,7 @@ async fn show_machine_information(
     Ok(())
 }
 
-pub async fn handle_show(
+pub(crate) async fn handle_show(
     args: Args,
     output_format: &OutputFormat,
     output_file: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,
@@ -425,17 +427,37 @@ pub async fn handle_show(
     Ok(())
 }
 
-pub async fn get_next_free_machine(
+#[allow(deprecated)]
+pub(crate) async fn get_next_free_machine(
     api_client: &ApiClient,
     machine_ids: &mut VecDeque<MachineId>,
     min_interface_count: usize,
+    flat_vpc_id: Option<VpcId>,
 ) -> Option<Machine> {
     while let Some(id) = machine_ids.pop_front() {
-        tracing::debug!("Checking {}", id);
+        tracing::debug!(
+            machine_id = %id,
+            "Checking machine",
+        );
         if let Ok(machine) = api_client.get_machine(id).await {
             if machine.state != "Ready" {
                 tracing::debug!("Machine is not ready");
                 continue;
+            }
+            if flat_vpc_id.is_some() {
+                if machine
+                    .instance_network_restrictions
+                    .as_ref()
+                    .is_some_and(|r| {
+                        r.network_segment_membership_type()
+                            == forgerpc::InstanceNetworkSegmentMembershipType::Static
+                    })
+                {
+                    return Some(machine);
+                } else {
+                    tracing::debug!(machine_id = %id, "machine does not support flat VPC auto allocation");
+                    continue;
+                }
             }
             if let Some(discovery_info) = &machine.discovery_info {
                 let dpu_interfaces = discovery_info

@@ -20,6 +20,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [features]
 sqlx = ["dep:sqlx"]
@@ -29,7 +30,8 @@ chrono = { workspace = true }
 serde = { features = ["derive"], workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true, features = [
-  "runtime-tokio-rustls",
+  "runtime-tokio",
+  "tls-rustls",
   "mac_address",
   "ipnetwork",
   "uuid",
@@ -40,6 +42,9 @@ sqlx = { workspace = true, features = [
   "json",
 ], optional = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+carbide-test-support = { path = "../test-support" }
 
 [lints]
 workspace = true

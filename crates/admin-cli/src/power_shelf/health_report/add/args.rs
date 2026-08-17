@@ -22,16 +22,32 @@ use crate::machine::HealthReportTemplates;
 
 #[derive(Parser, Debug)]
 #[clap(group(ArgGroup::new("health_report_source").required(true).args(&["health_report", "template"])))]
-pub struct Args {
-    pub power_shelf_id: PowerShelfId,
+#[command(after_long_help = "\
+EXAMPLES:
+
+Add a health report source from a predefined template:
+    $ nico-admin-cli power-shelf health-report add 12345678-1234-5678-90ab-cdef01234567 \
+    --template internal-maintenance --message \"Firmware upgrade in progress\"
+
+Add a health report source from raw JSON:
+    $ nico-admin-cli power-shelf health-report add 12345678-1234-5678-90ab-cdef01234567 \
+    --health-report '{...}'
+
+Preview the report without sending it:
+    $ nico-admin-cli power-shelf health-report add 12345678-1234-5678-90ab-cdef01234567 \
+    --template degraded --print-only
+
+")]
+pub(crate) struct Args {
+    pub(super) power_shelf_id: PowerShelfId,
     #[clap(long, help = "New health report as json")]
-    pub health_report: Option<String>,
+    pub(super) health_report: Option<String>,
     #[clap(long, help = "Predefined Template name")]
-    pub template: Option<HealthReportTemplates>,
+    pub(super) template: Option<HealthReportTemplates>,
     #[clap(long, help = "Message to be filled in template.")]
-    pub message: Option<String>,
+    pub(super) message: Option<String>,
     #[clap(long, help = "Replace all other health reports with this source")]
-    pub replace: bool,
+    pub(super) replace: bool,
     #[clap(long, help = "Print the template that is going to be send to carbide")]
-    pub print_only: bool,
+    pub(super) print_only: bool,
 }

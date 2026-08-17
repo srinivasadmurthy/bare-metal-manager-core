@@ -18,7 +18,17 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Opts {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show client and server versions:
+    $ nico-admin-cli version
+
+Also display the runtime config:
+    $ nico-admin-cli version --show-runtime-config
+
+")]
+pub(crate) struct Opts {
     #[clap(short, long, action, help = "Display Runtime Config also.")]
-    pub show_runtime_config: bool,
+    pub(super) show_runtime_config: bool,
 }

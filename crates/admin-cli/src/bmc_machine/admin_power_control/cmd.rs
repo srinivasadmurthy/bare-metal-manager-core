@@ -15,12 +15,14 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliResult;
-
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn admin_power_control(args: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
+pub(super) async fn admin_power_control(
+    args: Args,
+    api_client: &ApiClient,
+) -> CarbideCliResult<()> {
     api_client.0.admin_power_control(args).await?;
     Ok(())
 }

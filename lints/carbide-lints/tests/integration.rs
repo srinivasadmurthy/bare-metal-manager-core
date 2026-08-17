@@ -46,6 +46,17 @@ fn driver_runs_and_emits_expected_lint() {
 
     let cargo = std::env::var("CARGO").expect("Cargo should set $CARGO to the running binary");
 
+    let clean_status = Command::new(&cargo)
+        .arg("clean")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .arg("-p")
+        .arg("sqlx_app")
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .status()
+        .expect("failed to clean sqlx_app fixture");
+    assert!(clean_status.success(), "failed to clean sqlx_app fixture");
+
     let output = Command::new(cargo)
         .arg("check")
         .arg("--manifest-path")
@@ -63,11 +74,12 @@ fn driver_runs_and_emits_expected_lint() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let diff = similar::TextDiff::from_lines(&expected_stderr, &relevant_stderr)
-        .unified_diff()
-        .context_radius(3)
-        .header("expected", "output")
-        .to_string();
+    let diff =
+        similar::TextDiff::from_lines(expected_stderr.trim_end(), relevant_stderr.trim_end())
+            .unified_diff()
+            .context_radius(3)
+            .header("expected", "output")
+            .to_string();
 
     // Now assert on stderr
     assert!(

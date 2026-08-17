@@ -21,9 +21,19 @@ use carbide_uuid::switch::SwitchId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all managed switches:
+    $ nico-admin-cli managed-switch show
+
+Show one managed switch by ID or name:
+    $ nico-admin-cli managed-switch show 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(help = "Switch ID or name to show details for (leave empty for all)")]
-    pub identifier: Option<String>,
+    identifier: Option<String>,
 
     #[clap(
         short,
@@ -32,7 +42,7 @@ pub struct Args {
         help = "Show BMC/NVOS MAC details in summary",
         conflicts_with = "identifier"
     )]
-    pub ips: bool,
+    pub(super) ips: bool,
 
     #[clap(
         short,
@@ -41,11 +51,11 @@ pub struct Args {
         help = "Show serial, power, and health details in summary",
         conflicts_with = "identifier"
     )]
-    pub more: bool,
+    pub(super) more: bool,
 }
 
 impl Args {
-    pub fn parse_identifier(&self) -> (Option<SwitchId>, Option<String>) {
+    pub(super) fn parse_identifier(&self) -> (Option<SwitchId>, Option<String>) {
         match &self.identifier {
             Some(id) if !id.is_empty() => match SwitchId::from_str(id) {
                 Ok(switch_id) => (Some(switch_id), None),

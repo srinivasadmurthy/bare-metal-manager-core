@@ -24,7 +24,7 @@ use super::args::Args;
 use crate::cfg::runtime::RuntimeConfig;
 use crate::rpc::ApiClient;
 
-pub async fn list_switches(
+pub(super) async fn list_switches(
     args: Args,
     api_client: &ApiClient,
     config: &RuntimeConfig,
@@ -35,6 +35,7 @@ pub async fn list_switches(
         controller_state: args.controller_state,
         bmc_mac: args.bmc_mac.map(|m| m.to_string()),
         nvos_mac: args.nvos_mac.map(|m| m.to_string()),
+        only_with_health_alert: None,
     };
     let response = api_client
         .get_all_switches(filter, config.page_size)

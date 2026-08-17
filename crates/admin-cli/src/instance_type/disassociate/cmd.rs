@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use rpc::TenantState;
 use rpc::forge::RemoveMachineInstanceTypeAssociationRequest;
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 
-pub async fn remove_association(
+pub(super) async fn remove_association(
     args: Args,
     cloud_unsafe_operation_allowed: bool,
     api_client: &ApiClient,

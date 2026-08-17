@@ -15,12 +15,11 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliResult;
-
 use crate::bmc_machine::common::{AdminPowerControlAction, InfiniteBootArgs};
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn enable_infinite_boot(
+pub(super) async fn enable_infinite_boot(
     args: InfiniteBootArgs,
     api_client: &ApiClient,
 ) -> CarbideCliResult<()> {

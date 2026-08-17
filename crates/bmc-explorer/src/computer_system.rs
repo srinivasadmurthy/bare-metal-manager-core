@@ -21,9 +21,9 @@ use std::str::FromStr;
 use carbide_network::{deserialize_input_mac_to_address, sanitized_mac};
 use mac_address::MacAddress;
 use model::site_explorer::{
-    BootOption as ModelBootOption, BootOrder as ModelBootOrder,
+    BlueFieldOperatingMode, BootOption as ModelBootOption, BootOrder as ModelBootOrder,
     ComputerSystem as ModelComputerSystem, ComputerSystemAttributes,
-    EthernetInterface as ModelEthernetInterface, MachineSetupDiff, NicMode, PCIeDevice,
+    EthernetInterface as ModelEthernetInterface, MachineSetupDiff, PCIeDevice,
     PowerState as ModelPowerState, SecureBootStatus, UefiDevicePath as ModelUefiDevicePath,
 };
 use nv_redfish::computer_system::boot_option::UefiDevicePath as BootOptionUefiDevicePath;
@@ -31,7 +31,7 @@ use nv_redfish::computer_system::{
     Bios, BootOption, ComputerSystem, SecureBoot, SecureBootCurrentBootType,
 };
 use nv_redfish::ethernet_interface::{EthernetInterface, UefiDevicePath as EthUefiDevicePath};
-use nv_redfish::oem::nvidia::bluefield::NvidiaComputerSystem;
+use nv_redfish::oem::nvidia::NvidiaComputerSystem;
 use nv_redfish::pcie_device::PcieDevice;
 use nv_redfish::resource::PowerState;
 use nv_redfish::{Bmc, Resource, ResourceProvidesStatus};
@@ -46,30 +46,30 @@ lazy_static::lazy_static! {
     static ref UEFI_MAC_PATTERN: Regex = Regex::new(&format!(r"MAC\((?<{UEFI_MAC_PATTERN_CAPTURE}>[[:alnum:]]+)\,")).unwrap();
 }
 
-pub struct Config<'a, B: Bmc> {
-    pub need_oem_nvidia_bluefield: bool,
+pub(crate) struct Config<'a, B: Bmc> {
+    pub(crate) need_oem_nvidia_bluefield: bool,
     // Temporary workaround for BlueField DPU BMCs that intermittently return
     // HTTP 500 for the BIOS resource while the DPU is in NIC mode.
-    pub ignore_500_on_bios_fetch: bool,
+    pub(crate) ignore_500_on_bios_fetch: bool,
     // Temporary workaround for BlueField DPU BMCs that intermittently return
     // HTTP 404 for the OOB interface or the full EthernetInterfaces collection.
     // This is expected to be fixed in BMC firmware 24.10-39, which adds
     // internal retries.
-    pub retry_404_on_eth_interfaces: bool,
-    pub explore: &'a ExploreConfig<'a, B>,
+    pub(crate) retry_404_on_eth_interfaces: bool,
+    pub(crate) explore: &'a ExploreConfig<'a, B>,
 }
 
-pub struct ExploredComputerSystem<B: Bmc> {
-    pub system: ComputerSystem<B>,
-    pub bios: Option<Bios<B>>,
-    pub boot_options: Vec<BootOption<B>>,
-    pub ethernet_interfaces: Vec<EthernetInterface<B>>,
-    pub oem_nvidia_bluefield: Option<NvidiaComputerSystem<B>>,
-    pub secure_boot: Option<SecureBoot<B>>,
+pub(crate) struct ExploredComputerSystem<B: Bmc> {
+    pub(crate) system: ComputerSystem<B>,
+    pub(crate) bios: Option<Bios<B>>,
+    pub(crate) boot_options: Vec<BootOption<B>>,
+    ethernet_interfaces: Vec<EthernetInterface<B>>,
+    oem_nvidia_bluefield: Option<NvidiaComputerSystem<B>>,
+    secure_boot: Option<SecureBoot<B>>,
 }
 
 impl<B: Bmc> ExploredComputerSystem<B> {
-    pub async fn explore(
+    pub(crate) async fn explore(
         system: ComputerSystem<B>,
         config: &Config<'_, B>,
     ) -> Result<Self, Error<B>> {
@@ -94,7 +94,7 @@ impl<B: Bmc> ExploredComputerSystem<B> {
 
         let oem_nvidia_bluefield = if config.need_oem_nvidia_bluefield {
             system
-                .oem_nvidia_bluefield()
+                .oem_nvidia()
                 .await
                 .map_err(Error::nv_redfish("NVIDIA system Bluefield OEM"))?
         } else {
@@ -113,6 +113,30 @@ impl<B: Bmc> ExploredComputerSystem<B> {
             ethernet_interfaces,
             oem_nvidia_bluefield,
             secure_boot,
+        })
+    }
+
+    /// Chassis explicitly associated with this ComputerSystem by Redfish.
+    pub(crate) fn linked_chassis_ids(&self) -> Vec<nv_redfish::core::ODataId> {
+        self.system
+            .raw()
+            .links
+            .as_ref()
+            .and_then(|links| links.chassis.as_ref())
+            .into_iter()
+            .flatten()
+            .map(|chassis| chassis.id().clone())
+            .collect()
+    }
+
+    /// Whether the System EthernetInterfaces collection contains a usable MAC.
+    pub(crate) fn has_usable_ethernet_mac_address(&self) -> bool {
+        self.ethernet_interfaces.iter().any(|interface| {
+            let mac_address = interface.mac_address();
+            is_usable_ethernet_mac_address(
+                interface.interface_enabled(),
+                mac_address.as_ref().map(|mac_address| mac_address.as_str()),
+            )
         })
     }
 
@@ -158,7 +182,8 @@ impl<B: Bmc> ExploredComputerSystem<B> {
                             == Some(ErrorClass::NotFound)
                     {
                         tracing::warn!(
-                            "received 404 on system's ethernet collection fetch. Retrying. {retries_remaining} tries left"
+                            retries_remaining,
+                            "received 404 while fetching the system ethernet collection; retrying"
                         );
                         retries_remaining -= 1;
                         tokio::time::sleep(config.explore.retry_timeout).await;
@@ -170,7 +195,7 @@ impl<B: Bmc> ExploredComputerSystem<B> {
             }
         }
     }
-    pub fn to_model(
+    pub(crate) fn to_model(
         &self,
         hw_type: Option<hw::HwType>,
         chassis: &ExploredChassisCollection<B>,
@@ -187,7 +212,7 @@ impl<B: Bmc> ExploredComputerSystem<B> {
             // This part processes dpu case and do two things such as
             // 1. update system serial_number in case it is empty using chassis serial_number
             // 2. format serial_number data using the same rules as in fetch_chassis()
-            if serial_number.is_none() {
+            if serial_number.is_none() && !chassis.is_bluefield4() {
                 serial_number = chassis.dpu_card1_serial_number()?;
             }
 
@@ -196,11 +221,29 @@ impl<B: Bmc> ExploredComputerSystem<B> {
                     v.inner()
                         .parse()
                         .inspect_err(|err| {
-                            tracing::warn!("Failed to parse BaseMAC: {err} (mac: {v})");
+                            tracing::warn!(
+                                error = %err,
+                                mac_address = %v,
+                                "failed to parse BaseMAC"
+                            );
                         })
                         .ok()
                 });
-                nic_mode = Self::dpu_mode(&self.system, self.bios.as_ref(), oem_bf);
+                nic_mode = Self::bluefield_operating_mode(&self.system, self.bios.as_ref(), oem_bf);
+            }
+            let is_bf4_shape = chassis
+                .members
+                .iter()
+                .any(|c| c.chassis.id().into_inner() == "BlueField_0");
+            if base_mac.is_none() && is_bf4_shape {
+                // BF4 temporary patch: some BMC firmware misses ComputerSystem
+                // BaseMAC; patch from NDF0-derived base MAC (NDF0 - 0x10) if available.
+                base_mac = chassis.dpu_bf4_ndf0_permanent_mac();
+                if base_mac.is_none() {
+                    tracing::warn!(
+                        "BF4 NDF0 fallback did not provide PF0 base MAC (NIC inventory unavailable/uninitialized?)"
+                    );
+                }
             }
         }
 
@@ -245,6 +288,8 @@ impl<B: Bmc> ExploredComputerSystem<B> {
                         PowerState::PoweringOn => Some(ModelPowerState::PoweringOn),
                         PowerState::PoweringOff => Some(ModelPowerState::PoweringOff),
                         PowerState::Paused => Some(ModelPowerState::Paused),
+                        PowerState::Hibernating => Some(ModelPowerState::Hibernating),
+                        PowerState::Sleeping => Some(ModelPowerState::Sleeping),
                         PowerState::UnsupportedValue => None,
                     })
                     .unwrap_or_default()
@@ -268,7 +313,7 @@ impl<B: Bmc> ExploredComputerSystem<B> {
         })
     }
 
-    pub fn secure_boot_status(&self) -> Result<SecureBootStatus, Error<B>> {
+    pub(crate) fn secure_boot_status(&self) -> Result<SecureBootStatus, Error<B>> {
         let secure_boot = self
             .secure_boot
             .as_ref()
@@ -289,7 +334,7 @@ impl<B: Bmc> ExploredComputerSystem<B> {
         })
     }
 
-    pub fn boot_order_first_option(&self) -> Option<&BootOption<B>> {
+    pub(crate) fn boot_order_first_option(&self) -> Option<&BootOption<B>> {
         self.system
             .boot_order()
             .as_ref()
@@ -301,11 +346,34 @@ impl<B: Bmc> ExploredComputerSystem<B> {
             })
     }
 
-    pub fn check_boot_by_uefi_prefix(
+    pub(crate) fn check_boot_by_uefi_prefix(
         &self,
         boot_interface_mac: MacAddress,
     ) -> Option<MachineSetupDiff> {
-        let expected = self
+        let expected = self.boot_option_by_uefi_prefix(boot_interface_mac);
+
+        // Find actual option that is first in boot_order.
+        let actual = self.boot_order_first_option();
+        compare_boot_options(expected, actual)
+    }
+
+    pub(crate) fn check_boot_option_enabled_by_uefi_prefix(
+        &self,
+        boot_interface_mac: MacAddress,
+    ) -> Option<MachineSetupDiff> {
+        let option = self.boot_option_by_uefi_prefix(boot_interface_mac)?;
+        (option.enabled() != Some(true)).then(|| MachineSetupDiff {
+            key: "boot_option_enabled".to_string(),
+            expected: "true".to_string(),
+            actual: option
+                .enabled()
+                .map(|enabled| enabled.to_string())
+                .unwrap_or_else(|| "Not provided".to_string()),
+        })
+    }
+
+    fn boot_option_by_uefi_prefix(&self, boot_interface_mac: MacAddress) -> Option<&BootOption<B>> {
+        self
             // Find UEFI device path of the ethernet interface
             // that has boot_interface_mac MAC address.
             .ethernet_interfaces
@@ -329,36 +397,39 @@ impl<B: Bmc> ExploredComputerSystem<B> {
                             && path.inner().contains("/IPv4(")
                     })
                 })
-            });
-
-        // Find actual option that is first in boot_order.
-        let actual = self.boot_order_first_option();
-        compare_boot_options(expected, actual)
+            })
     }
 
     fn ethernet_interfaces(
         &self,
         hw_type: Option<hw::HwType>,
     ) -> Result<Vec<ModelEthernetInterface>, Error<B>> {
-        let mut result = self.ethernet_interfaces.iter()
+        let is_bluefield = hw_type == Some(hw::HwType::Bluefield);
+        let mut result = self
+            .ethernet_interfaces
+            .iter()
             .map(|iface| {
                 let mac_address = iface
                     .mac_address()
                     .map(|addr| {
-                        deserialize_input_mac_to_address(addr.as_str())
-                            .map_err(|e| Error::InvalidValue(format!("MAC address not valid: {addr} (err: {e})")))
+                        deserialize_input_mac_to_address(addr.as_str()).map_err(|e| {
+                            Error::InvalidValue(format!("MAC address not valid: {addr} (err: {e})"))
+                        })
                     })
                     .transpose()
                     .or_else(|err| {
-                        if iface
-                            .interface_enabled().is_some_and(|is_enabled| !is_enabled)
+                        if is_bluefield
+                            || iface
+                                .interface_enabled()
+                                .is_some_and(|is_enabled| !is_enabled)
                         {
-                            // disabled interfaces sometimes populate the MAC address with junk,
-                            // ignore this error and create the interface with an empty mac address
-                            // in the exploration report
+                            // Some BlueField firmware and disabled interfaces can populate
+                            // MACAddress with junk. Keep the interface but omit its invalid MAC.
                             tracing::debug!(
-                                "could not parse MAC address for a disabled interface {} (link_status: {:#?}): {err}",
-                                iface.id(), iface.link_status()
+                                interface_id = %iface.id(),
+                                link_status = ?iface.link_status(),
+                                error = %err,
+                                "ignoring invalid system interface MAC address"
                             );
                             Ok(None)
                         } else {
@@ -381,9 +452,10 @@ impl<B: Bmc> ExploredComputerSystem<B> {
                     link_status: iface.link_status().map(|s| format!("{s:?}")),
                     uefi_device_path,
                 })
-            }).collect::<Result<Vec<_>, _>>()?;
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        if hw_type.is_some_and(|v| v == hw::HwType::Bluefield)
+        if is_bluefield
             && !result.iter().any(|iface| {
                 iface
                     .id
@@ -440,11 +512,11 @@ impl<B: Bmc> ExploredComputerSystem<B> {
             .transpose()
     }
 
-    fn dpu_mode(
+    fn bluefield_operating_mode(
         system: &ComputerSystem<B>,
         bios: Option<&Bios<B>>,
         bf_ncs: &NvidiaComputerSystem<B>,
-    ) -> Option<NicMode> {
+    ) -> Option<BlueFieldOperatingMode> {
         let hw_id = system.hardware_id();
         let manufacturer = hw_id.manufacturer.map(|v| v.into_inner());
         let model = hw_id.model.map(|v| v.into_inner());
@@ -456,10 +528,10 @@ impl<B: Bmc> ExploredComputerSystem<B> {
                     | Some("Bluefield 3 DPU")
                     | Some("BlueField-3 SmartNIC Main Card")
                     | Some("Bluefield 3 SmartNIC Main Card") => {
-                        use nv_redfish::oem::nvidia::bluefield::nvidia_computer_system::Mode;
+                        use nv_redfish::oem::nvidia::computer_system::Mode;
                         bf_ncs.mode().and_then(|v| match v {
-                            Mode::DpuMode => Some(NicMode::Dpu),
-                            Mode::NicMode => Some(NicMode::Nic),
+                            Mode::DpuMode => Some(BlueFieldOperatingMode::Dpu),
+                            Mode::NicMode => Some(BlueFieldOperatingMode::Nic),
                             Mode::UnsupportedValue => None,
                         })
                     }
@@ -468,8 +540,8 @@ impl<B: Bmc> ExploredComputerSystem<B> {
                         bios.and_then(|bios| bios.attribute("NicMode"))
                             .and_then(|attr| {
                                 attr.str_value().and_then(|v| match v {
-                                    "NicMode" => Some(NicMode::Nic),
-                                    "DpuMode" => Some(NicMode::Dpu),
+                                    "NicMode" => Some(BlueFieldOperatingMode::Nic),
+                                    "DpuMode" => Some(BlueFieldOperatingMode::Dpu),
                                     _ => None,
                                 })
                             })
@@ -481,7 +553,7 @@ impl<B: Bmc> ExploredComputerSystem<B> {
         }
     }
 
-    pub fn bios_attr_eq(&self, expected: &hw::BiosAttr) -> Option<bool> {
+    fn bios_attr_eq(&self, expected: &hw::BiosAttr) -> Option<bool> {
         self.bios
             .as_ref()
             .and_then(|bios| bios.attribute(expected.key))
@@ -493,7 +565,7 @@ impl<B: Bmc> ExploredComputerSystem<B> {
             })
     }
 
-    pub fn verify_bios_attr(&self, expected: &hw::BiosAttr<'_>) -> Option<MachineSetupDiff> {
+    pub(crate) fn verify_bios_attr(&self, expected: &hw::BiosAttr<'_>) -> Option<MachineSetupDiff> {
         if let Some(actual) = self
             .bios
             .as_ref()
@@ -519,6 +591,15 @@ impl<B: Bmc> ExploredComputerSystem<B> {
             None
         }
     }
+}
+
+fn is_usable_ethernet_mac_address(
+    interface_enabled: Option<bool>,
+    mac_address: Option<&str>,
+) -> bool {
+    interface_enabled.is_none_or(identity)
+        && mac_address
+            .is_some_and(|mac_address| deserialize_input_mac_to_address(mac_address).is_ok())
 }
 
 fn is_uefi_tree_child(
@@ -611,4 +692,34 @@ fn pcie_device_to_model<B: Bmc>(
                 .unwrap_or("".into()),
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::value_scenarios;
+
+    use super::is_usable_ethernet_mac_address;
+
+    #[test]
+    fn usable_ethernet_mac_address_cases() {
+        value_scenarios!(run = |(interface_enabled, mac_address)| {
+            is_usable_ethernet_mac_address(interface_enabled, mac_address)
+        };
+            "enabled interface with a valid MAC" {
+                (Some(true), Some("94:6d:ae:53:cb:9b")) => true,
+            }
+            "interface without an enabled state and with a valid MAC" {
+                (None, Some("94:6d:ae:53:cb:9b")) => true,
+            }
+            "disabled interface with a placeholder MAC" {
+                (Some(false), Some("00:00:00:00:00:00")) => false,
+            }
+            "enabled interface with an invalid MAC" {
+                (Some(true), Some("not-a-mac")) => false,
+            }
+            "enabled interface without a MAC" {
+                (Some(true), None) => false,
+            }
+        );
+    }
 }

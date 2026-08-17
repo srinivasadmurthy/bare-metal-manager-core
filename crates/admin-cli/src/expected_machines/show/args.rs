@@ -15,21 +15,35 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliError;
 use clap::Parser;
 use mac_address::MacAddress;
 use uuid::Uuid;
 
+use crate::errors::CarbideCliError;
+
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all expected machines:
+    $ nico-admin-cli expected-machine show
+
+Show one expected machine by BMC MAC address:
+    $ nico-admin-cli expected-machine show 00:11:22:33:44:55
+
+Show one expected machine by id:
+    $ nico-admin-cli expected-machine show --id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(
         default_value(None),
         help = "BMC MAC address of the expected machine to show. Leave unset for all."
     )]
-    pub bmc_mac_address: Option<MacAddress>,
+    bmc_mac_address: Option<MacAddress>,
 
     #[clap(long, help = "ID (UUID) of the expected machine to show.")]
-    pub id: Option<Uuid>,
+    id: Option<Uuid>,
 }
 
 impl TryFrom<&Args> for Option<::rpc::forge::ExpectedMachineRequest> {

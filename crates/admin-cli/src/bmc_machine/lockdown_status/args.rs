@@ -20,9 +20,17 @@ use clap::Parser;
 use rpc::forge as forgerpc;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Check the lockdown status of a machine:
+    $ nico-admin-cli bmc-machine lockdown-status \
+    --machine 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(long, help = "ID of the machine to check lockdown status")]
-    pub machine: MachineId,
+    machine: MachineId,
 }
 
 impl From<Args> for forgerpc::LockdownStatusRequest {

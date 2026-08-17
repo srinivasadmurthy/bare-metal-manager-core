@@ -18,7 +18,14 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Delete an explored endpoint from the database:
+    $ nico-admin-cli site-explorer delete --address 192.0.2.10
+
+")]
+pub(crate) struct Args {
     #[clap(long, help = "BMC IP address of the endpoint to delete")]
-    pub address: String,
+    pub(super) address: String,
 }

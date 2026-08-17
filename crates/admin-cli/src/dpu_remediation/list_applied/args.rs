@@ -20,15 +20,35 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all applied remediations:
+    $ nico-admin-cli dpu-remediation list-applied
+
+List the machines a specific remediation has been applied to:
+    $ nico-admin-cli dpu-remediation list-applied \
+    --remediation-id 12345678-1234-5678-90ab-cdef01234567
+
+List the remediations applied to a specific machine:
+    $ nico-admin-cli dpu-remediation list-applied \
+    --machine-id abcdef01-2345-6789-abcd-ef0123456789
+
+Show full details for one remediation on one machine:
+    $ nico-admin-cli dpu-remediation list-applied \
+    --remediation-id 12345678-1234-5678-90ab-cdef01234567 \
+    --machine-id abcdef01-2345-6789-abcd-ef0123456789
+
+")]
+pub(crate) struct Args {
     #[clap(
         help = "The remediation id to query, in case the user wants to see which machines have a specific remediation applied.  Provide both arguments to see all the details for a specific remediation and machine.",
         long
     )]
-    pub remediation_id: Option<RemediationId>,
+    pub(super) remediation_id: Option<RemediationId>,
     #[clap(
         help = "The machine id to query, in case the user wants to see which remediations have been applied to a specific box.  Provide both arguments to see all the details for a specific remediation and machine.",
         long
     )]
-    pub machine_id: Option<MachineId>,
+    pub(super) machine_id: Option<MachineId>,
 }

@@ -28,7 +28,7 @@ use crate::json::{JsonExt, JsonPatch};
 use crate::redfish;
 use crate::redfish::Builder;
 
-pub fn resource<'a>() -> redfish::Resource<'a> {
+pub(crate) fn resource<'a>() -> redfish::Resource<'a> {
     redfish::Resource {
         odata_id: Cow::Borrowed("/redfish/v1"),
         odata_type: Cow::Borrowed("#ServiceRoot.v1_10_0.ServiceRoot"),
@@ -37,11 +37,11 @@ pub fn resource<'a>() -> redfish::Resource<'a> {
     }
 }
 
-pub fn add_routes(r: Router<BmcState>) -> Router<BmcState> {
+pub(crate) fn add_routes(r: Router<BmcState>) -> Router<BmcState> {
     r.route(&resource().odata_id, get(get_service_root))
 }
 
-pub fn builder(resource: &redfish::Resource) -> ServiceRootBuilder {
+fn builder(resource: &redfish::Resource) -> ServiceRootBuilder {
     ServiceRootBuilder {
         value: resource.json_patch().patch(json!({
             "Links": {
@@ -54,7 +54,7 @@ pub fn builder(resource: &redfish::Resource) -> ServiceRootBuilder {
 }
 
 async fn get_service_root(State(state): State<BmcState>) -> Response {
-    builder(&resource())
+    let builder = builder(&resource())
         .redfish_version(state.bmc_redfish_version)
         .maybe_with(
             ServiceRootBuilder::vendor,
@@ -62,15 +62,23 @@ async fn get_service_root(State(state): State<BmcState>) -> Response {
         )
         .maybe_with(ServiceRootBuilder::product, &state.bmc_product)
         .account_service(&redfish::account_service::resource())
-        .chassis_collection(&redfish::chassis::collection())
-        .system_collection(&redfish::computer_system::collection())
+        .session_service(&redfish::session_service::service_resource())
+        .chassis_collection(&redfish::chassis::collection());
+    // Delta power shelves advertise no `Systems` collection (see `BmcState`).
+    let builder = if state.exposes_computer_systems {
+        builder.system_collection(&redfish::computer_system::collection())
+    } else {
+        builder
+    };
+    builder
         .manager_collection(&redfish::manager::collection())
         .update_service(&redfish::update_service::resource())
+        .telemetry_service(&redfish::telemetry_service::resource())
         .build()
         .into_ok_response()
 }
 
-pub struct ServiceRootBuilder {
+struct ServiceRootBuilder {
     value: serde_json::Value,
 }
 
@@ -83,39 +91,47 @@ impl Builder for ServiceRootBuilder {
 }
 
 impl ServiceRootBuilder {
-    pub fn build(self) -> serde_json::Value {
+    fn build(self) -> serde_json::Value {
         self.value
     }
 
-    pub fn redfish_version(self, v: &str) -> Self {
+    fn redfish_version(self, v: &str) -> Self {
         self.add_str_field("RedfishVersion", v)
     }
 
-    pub fn vendor(self, v: &str) -> Self {
+    fn vendor(self, v: &str) -> Self {
         self.add_str_field("Vendor", v)
     }
 
-    pub fn product(self, v: &str) -> Self {
+    fn product(self, v: &str) -> Self {
         self.add_str_field("Product", v)
     }
 
-    pub fn account_service(self, v: &redfish::Resource<'_>) -> Self {
+    fn account_service(self, v: &redfish::Resource<'_>) -> Self {
         self.apply_patch(v.nav_property("AccountService"))
     }
 
-    pub fn chassis_collection(self, v: &redfish::Collection<'_>) -> Self {
+    fn session_service(self, v: &redfish::Resource<'_>) -> Self {
+        self.apply_patch(v.nav_property("SessionService"))
+    }
+
+    fn chassis_collection(self, v: &redfish::Collection<'_>) -> Self {
         self.apply_patch(v.nav_property("Chassis"))
     }
 
-    pub fn system_collection(self, v: &redfish::Collection<'_>) -> Self {
+    fn system_collection(self, v: &redfish::Collection<'_>) -> Self {
         self.apply_patch(v.nav_property("Systems"))
     }
 
-    pub fn manager_collection(self, v: &redfish::Collection<'_>) -> Self {
+    fn manager_collection(self, v: &redfish::Collection<'_>) -> Self {
         self.apply_patch(v.nav_property("Managers"))
     }
 
-    pub fn update_service(self, v: &redfish::Resource<'_>) -> Self {
+    fn update_service(self, v: &redfish::Resource<'_>) -> Self {
         self.apply_patch(v.nav_property("UpdateService"))
+    }
+
+    fn telemetry_service(self, v: &redfish::Resource<'_>) -> Self {
+        self.apply_patch(v.nav_property("TelemetryService"))
     }
 }

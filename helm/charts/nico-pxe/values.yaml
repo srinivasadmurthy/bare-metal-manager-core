@@ -1,0 +1,158 @@
+## nico-pxe — PXE boot server for OS provisioning workflows
+## Global settings (overridden by umbrella chart)
+global:
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  certificate:
+    duration: 720h0m0s
+    renewBefore: 360h0m0s
+    privateKey:
+      algorithm: ECDSA
+      size: 384
+    issuerRef:
+      kind: ClusterIssuer
+      name: vault-nico-issuer
+      group: cert-manager.io
+  spiffe:
+    trustDomain: nico.local
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: site-controller
+
+## Override the release namespace (defaults to helm install -n <namespace>)
+namespaceOverride: ""
+
+## Legacy name aliases — opt-in ExternalName Services so binaries that
+## hardcode the pre-rename hostname (e.g. `carbide-pxe.forge-system.svc.
+## cluster.local`) continue to resolve to this chart's nico-pxe Service.
+## See helm/charts/nico-api/values.yaml `legacyAlias` for the full
+## explanation; this chart's variant creates only the Service. The alias
+## namespace is owned by nico-api's legacyAlias template, so enable
+## nico-api.legacyAlias in tandem.
+legacyAlias:
+  # On by default to match the chart's cert SAN posture (the `nico-pxe`
+  # Certificate already includes `carbide-pxe.forge-system.svc.cluster.local`
+  # as a SAN). Flip to false on all-modern fleets where no client uses the
+  # legacy hostname. Requires `nico-api.legacyAlias.enabled` to be true so
+  # the `forge-system` namespace is owned by nico-api's template.
+  enabled: true
+  aliases:
+    - name: carbide-pxe
+      namespace: forge-system
+
+replicas: 1
+
+## Optional init containers (general-purpose pass-through)
+initContainers: []
+
+## Boot-artifact init containers
+## Each entry is rendered as a Kubernetes init container with the boot-artifacts
+## volume automatically mounted at /forge-boot-artifacts/blobs/internal, then served by
+## nico-pxe at /public/blobs/internal.
+##
+## REQUIRED for DPU and host HTTP boot: if empty, the DPU/host requests its bootloader
+## (e.g. /public/blobs/internal/aarch64/ipxe.efi) and gets HTTP 404, then falls back to
+## its local disk and never (re)provisions. Populate per site (extensible list).
+##
+## NOTE: copy ONLY directories that exist in the image. The boot-artifacts-aarch64 image
+## ships /aarch64 and /apt (NOT /firmware); copying a missing dir makes `cp` exit non-zero
+## and the init container crash-loops.
+## Prefer separate `repository` + `tag` fields (they win when set). The combined
+## `image: <ref>:<tag>` form is still honored for backward compatibility.
+bootArtifactContainers: []
+# bootArtifactContainers:
+#   - name: boot-artifacts-x86-64
+#     repository: <your-registry>/boot-artifacts-x86_64
+#     tag: <tag>
+#     command: ["sh", "-c", "cp -r /x86_64 /forge-boot-artifacts/blobs/internal"]
+#   - name: boot-artifacts-aarch64
+#     repository: <your-registry>/boot-artifacts-aarch64
+#     tag: <tag>
+#     command: ["sh", "-c", "cp -r /aarch64 /apt /forge-boot-artifacts/blobs/internal"]
+#   - name: machine-validation-config
+#     repository: <your-registry>/machine-validation-config
+#     tag: <tag>
+#     command: ["sh", "-c", "cp -r /machine-validation /forge-boot-artifacts/blobs/internal"]
+
+## Boot artifact serving configuration
+bootArtifacts:
+  servePath: /forge-boot-artifacts
+
+annotations:
+  configmap.reloader.stakater.com/reload: '{{ include "nico-pxe.name" . }}-env-config'
+
+service:
+  port: 8080
+
+apiServiceName: nico-api
+
+certificate:
+  ## serviceName is used to auto-generate dnsNames and SPIFFE URIs based on the release namespace
+  serviceName: ""
+  spiffeServiceName: ""
+  identityNamespace: ""
+  ## Fully override the auto-generated dnsNames/uris. When empty, dnsNames and
+  ## uris are generated from serviceName + namespace (extraDnsNames/extraUris
+  ## are appended to the generated list).
+  dnsNames: []
+  uris: []
+  extraDnsNames: []
+  extraUris: []
+
+env:
+  FORGE_ROOT_CAFILE_PATH: "/var/run/secrets/spiffe.io/ca.crt"
+  NICO_ROOT_CAFILE_PATH: "/var/run/secrets/spiffe.io/ca.crt"
+  FORGE_CLIENT_CERT_PATH: "/var/run/secrets/spiffe.io/tls.crt"
+  NICO_CLIENT_CERT_PATH: "/var/run/secrets/spiffe.io/tls.crt"
+  FORGE_CLIENT_KEY_PATH: "/var/run/secrets/spiffe.io/tls.key"
+  NICO_CLIENT_KEY_PATH: "/var/run/secrets/spiffe.io/tls.key"
+  RUST_BACKTRACE: "full"
+  RUST_LIB_BACKTRACE: "0"
+
+## Optional CA bundle served to bootstrapping clients at /api/v0/tls/root_ca.
+## Set at most one of configMapName or secretName. When neither is set, PXE
+## serves FORGE_ROOT_CAFILE_PATH exactly as it does in legacy deployments.
+## The referenced object must exist in the release namespace. The CA is public,
+## but Secret references are supported for sites that already distribute trust
+## bundles that way.
+bootstrapRootCa:
+  configMapName: ""
+  secretName: ""
+  key: ca.crt
+
+## ConfigMap settings for the env ConfigMap
+config:
+  ## NICO_API_HOST, NICO_API_PORT are auto-generated from the release namespace
+  nicoApiPort: "1079"
+  extraEnvData: {}  # additional keys to add to the env ConfigMap
+
+envFrom:
+  pxeEnvConfig:
+    configMapName: nico-pxe-env-config
+    optional: true
+
+livenessProbe:
+  tcpSocket:
+    port: 8080
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  failureThreshold: 3
+  successThreshold: 1
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 25s
+
+## External LoadBalancer Services (for bare-metal / MetalLB)
+## Creates nico-pxe-external (8080) and nico-pxe-external-80 (80→8080) with shared IP
+externalService:
+  enabled: false
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  annotations: {}
+  # annotations:
+  #   metallb.universe.tf/loadBalancerIPs: "10.x.x.x"

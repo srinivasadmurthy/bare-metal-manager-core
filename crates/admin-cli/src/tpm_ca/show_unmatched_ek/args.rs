@@ -18,4 +18,11 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args;
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show TPM EK certificates that have no matching CA:
+    $ nico-admin-cli tpm-ca show-unmatched-ek
+
+")]
+pub(crate) struct Args;

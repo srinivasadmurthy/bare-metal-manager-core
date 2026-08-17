@@ -19,7 +19,17 @@ use clap::Parser;
 use clap::builder::BoolishValueParser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Enable OTLP trace/span export:
+    $ nico-admin-cli set tracing-enabled true
+
+Disable OTLP trace/span export:
+    $ nico-admin-cli set tracing-enabled false
+
+")]
+pub(crate) struct Args {
     #[arg(num_args = 1, value_parser = BoolishValueParser::new(), action = clap::ArgAction::Set, value_name = "true|false")]
-    pub value: bool,
+    pub(super) value: bool,
 }

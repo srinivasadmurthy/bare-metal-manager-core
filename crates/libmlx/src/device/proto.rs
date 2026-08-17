@@ -15,19 +15,15 @@
  * limitations under the License.
  */
 
-use std::str::FromStr;
-
 use chrono::{DateTime, Utc};
-use mac_address::MacAddress;
 use rpc::Timestamp;
 use rpc::protos::mlx_device::{
     DeviceField as DeviceFieldPb, DeviceFilter as DeviceFilterPb,
     DeviceFilterSet as DeviceFilterSetPb, MatchMode as MatchModePb,
-    MlxDeviceInfo as MlxDeviceInfoPb, MlxDeviceReport as MlxDeviceReportPb,
+    MlxDeviceReport as MlxDeviceReportPb,
 };
 
 use crate::device::filters::{DeviceField, DeviceFilter, DeviceFilterSet, MatchMode};
-use crate::device::info::MlxDeviceInfo;
 use crate::device::report::MlxDeviceReport;
 
 // Convert chrono DateTime to RPC Timestamp.
@@ -87,69 +83,6 @@ impl TryFrom<MlxDeviceReportPb> for MlxDeviceReport {
             devices: devices?,
             filters,
             machine_id: proto.machine_id,
-        })
-    }
-}
-
-// Implement conversion from Rust MlxDeviceInfo to protobuf.
-impl From<MlxDeviceInfo> for MlxDeviceInfoPb {
-    fn from(info: MlxDeviceInfo) -> Self {
-        MlxDeviceInfoPb {
-            pci_name: info.pci_name,
-            device_type: info.device_type,
-            psid: info.psid.unwrap_or_default(),
-            device_description: info.device_description.unwrap_or_default(),
-            part_number: info.part_number.unwrap_or_default(),
-            fw_version_current: info.fw_version_current.unwrap_or_default(),
-            pxe_version_current: info.pxe_version_current.unwrap_or_default(),
-            uefi_version_current: info.uefi_version_current.unwrap_or_default(),
-            uefi_version_virtio_blk_current: info
-                .uefi_version_virtio_blk_current
-                .unwrap_or_default(),
-            uefi_version_virtio_net_current: info
-                .uefi_version_virtio_net_current
-                .unwrap_or_default(),
-            base_mac: info.base_mac.map(|mac| mac.to_string()).unwrap_or_default(),
-            status: info.status.unwrap_or_default(),
-        }
-    }
-}
-
-// Implement conversion from protobuf MlxDeviceInfo to Rust.
-impl TryFrom<MlxDeviceInfoPb> for MlxDeviceInfo {
-    type Error = String;
-
-    fn try_from(proto: MlxDeviceInfoPb) -> Result<Self, Self::Error> {
-        let base_mac = if proto.base_mac.is_empty() {
-            None
-        } else {
-            Some(
-                MacAddress::from_str(&proto.base_mac)
-                    .map_err(|e| format!("Invalid MAC address '{}': {}", proto.base_mac, e))?,
-            )
-        };
-
-        // Similar to parse_optional_xml_field, have a little helper
-        // for handling it with Rust <-> proto type conversion as well.
-        let parse_optional_field = |s: String| if s.is_empty() { None } else { Some(s) };
-
-        Ok(MlxDeviceInfo {
-            pci_name: proto.pci_name,
-            device_type: proto.device_type,
-            psid: parse_optional_field(proto.psid),
-            device_description: parse_optional_field(proto.device_description),
-            part_number: parse_optional_field(proto.part_number),
-            fw_version_current: parse_optional_field(proto.fw_version_current),
-            pxe_version_current: parse_optional_field(proto.pxe_version_current),
-            uefi_version_current: parse_optional_field(proto.uefi_version_current),
-            uefi_version_virtio_blk_current: parse_optional_field(
-                proto.uefi_version_virtio_blk_current,
-            ),
-            uefi_version_virtio_net_current: parse_optional_field(
-                proto.uefi_version_virtio_net_current,
-            ),
-            status: parse_optional_field(proto.status),
-            base_mac,
         })
     }
 }
@@ -256,77 +189,20 @@ fn proto_match_mode_to_rust(mode: i32) -> Result<MatchMode, String> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use carbide_libmlx_model::device::info::MlxDeviceInfo;
+    use chrono::{DateTime, Utc};
 
     use super::*;
-
-    // create_test_device creates a sample device for testing purposes.
-    fn create_test_device() -> MlxDeviceInfo {
-        MlxDeviceInfo {
-            pci_name: "01:00.0".to_string(),
-            device_type: "ConnectX-6".to_string(),
-            psid: Some("MT_0000055".to_string()),
-            device_description: Some("Mellanox ConnectX-6 Dx EN 100GbE".to_string()),
-            part_number: Some("MCX623106AN-CDAT_A1".to_string()),
-            fw_version_current: Some("22.32.1010".to_string()),
-            pxe_version_current: Some("3.6.0502".to_string()),
-            uefi_version_current: Some("14.25.1020".to_string()),
-            uefi_version_virtio_blk_current: Some("1.0.0".to_string()),
-            uefi_version_virtio_net_current: Some("1.0.0".to_string()),
-            base_mac: Some("b8:3f:d2:12:34:56".parse().unwrap()),
-            status: None,
-        }
-    }
-
-    // create_test_device_with_missing_data creates a device with partial data (like a DPU).
-    fn create_test_device_with_missing_data() -> MlxDeviceInfo {
-        MlxDeviceInfo {
-            pci_name: "b4:00.0".to_string(),
-            device_type: "BlueField3".to_string(),
-            psid: None,
-            device_description: None,
-            part_number: None,
-            fw_version_current: None,
-            pxe_version_current: None,
-            uefi_version_current: None,
-            uefi_version_virtio_blk_current: None,
-            uefi_version_virtio_net_current: None,
-            base_mac: None,
-            status: Some("Failed to open device".to_string()),
-        }
-    }
-
-    #[test]
-    fn test_device_info_roundtrip_conversion() {
-        let original = create_test_device();
-        let proto: MlxDeviceInfoPb = original.clone().into();
-        let converted: MlxDeviceInfo = proto.try_into().unwrap();
-        assert_eq!(original, converted);
-    }
-
-    #[test]
-    fn test_device_info_with_missing_data_conversion() {
-        let original = create_test_device_with_missing_data();
-        let proto: MlxDeviceInfoPb = original.clone().into();
-        let converted: MlxDeviceInfo = proto.try_into().unwrap();
-
-        // Required fields should be preserved
-        assert_eq!(original.pci_name, converted.pci_name);
-        assert_eq!(original.device_type, converted.device_type);
-
-        // Optional fields should become None
-        assert_eq!(converted.psid, None);
-        assert_eq!(converted.part_number, None);
-        assert_eq!(converted.base_mac, None);
-        assert_eq!(converted.status, Some("Failed to open device".to_string()));
-    }
 
     #[test]
     fn test_device_report_roundtrip_conversion() {
         let original = MlxDeviceReport {
             hostname: "test-host".to_string(),
-            timestamp: Utc::now(),
-            devices: vec![create_test_device(), create_test_device_with_missing_data()],
+            timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_789).unwrap(),
+            devices: vec![
+                MlxDeviceInfo::create_test_device(),
+                MlxDeviceInfo::create_test_device_with_missing_data(),
+            ],
             filters: None,
             machine_id: None,
         };
@@ -335,12 +211,10 @@ mod tests {
         let converted: MlxDeviceReport = proto.try_into().unwrap();
 
         assert_eq!(original.hostname, converted.hostname);
-        assert_eq!(original.devices.len(), converted.devices.len());
-        // Timestamp comparison with some tolerance due to precision differences.
-        let time_diff = (original.timestamp - converted.timestamp)
-            .num_milliseconds()
-            .abs();
-        assert!(time_diff < 1000); // Within 1 second
+        assert_eq!(original.timestamp, converted.timestamp);
+        assert_eq!(original.devices, converted.devices);
+        assert!(converted.filters.is_none());
+        assert_eq!(original.machine_id, converted.machine_id);
     }
 
     #[test]
@@ -390,31 +264,5 @@ mod tests {
 
         assert_eq!(original_filter_set.filters.len(), converted.filters.len());
         assert_eq!(original_filter_set.summary(), converted.summary());
-    }
-
-    #[test]
-    fn test_empty_string_fields_become_none() {
-        let proto = MlxDeviceInfoPb {
-            pci_name: "01:00.0".to_string(),
-            device_type: "BlueField3".to_string(),
-            psid: "".to_string(), // Empty string should become None
-            device_description: "".to_string(),
-            part_number: "".to_string(),
-            fw_version_current: "".to_string(),
-            pxe_version_current: "".to_string(),
-            uefi_version_current: "".to_string(),
-            uefi_version_virtio_blk_current: "".to_string(),
-            uefi_version_virtio_net_current: "".to_string(),
-            base_mac: "".to_string(), // Empty MAC becomes None
-            status: "".to_string(),
-        };
-
-        let converted: MlxDeviceInfo = proto.try_into().unwrap();
-
-        assert_eq!(converted.psid, None);
-        assert_eq!(converted.part_number, None);
-        assert_eq!(converted.base_mac, None);
-        assert_eq!(converted.fw_version_current, None);
-        assert_eq!(converted.status, None);
     }
 }

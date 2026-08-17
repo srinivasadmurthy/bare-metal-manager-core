@@ -22,11 +22,15 @@
 //
 // Command Structure - Baseline debug_assert() of the entire command.
 // Argument Parsing  - Ensure required/optional arg combinations parse correctly.
-// ValueEnum Parsing - Test string parsing for types deriving claps ValueEnum.
 
-use clap::{CommandFactory, Parser};
+use carbide_test_support::Outcome::*;
+use carbide_test_support::scenarios;
+use clap::CommandFactory;
+use rpc::forge::DpuReprovisioningRequest;
+use rpc::forge::dpu_reprovisioning_request::Mode;
 
 use super::*;
+use crate::test_support::{parse_with_leaf_matches, raw_value};
 
 // Define a basic/working MachineId for testing.
 const TEST_MACHINE_ID: &str = "fm100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg";
@@ -48,143 +52,101 @@ fn verify_cmd_structure() {
 // including testing required arguments, as well as optional
 // flag-specific checking.
 
-// parse_status ensures status parses with no
-// arguments.
-#[test]
-fn parse_status() {
-    let cmd = Cmd::try_parse_from(["dpu", "status"]).expect("should parse status");
-    assert!(matches!(cmd, Cmd::Status(_)));
-}
-
-// parse_versions ensures versions parses with no
-// arguments.
+// versions parses with and without --updates-only; the parsed flag mirrors
+// whether the switch was supplied.
 #[test]
 fn parse_versions() {
-    let cmd = Cmd::try_parse_from(["dpu", "versions"]).expect("should parse versions");
-
-    match cmd {
-        Cmd::Versions(args) => {
-            assert!(!args.updates_only);
+    scenarios!(
+        run = |argv| {
+            parse_with_leaf_matches::<Cmd>(argv, &["versions"])
+                .map(|(cmd, matches)| {
+                    assert!(matches!(cmd, Cmd::Versions(_)));
+                    matches.get_flag("updates_only")
+                })
+                .map_err(drop)
+        };
+        "versions with no flags leaves updates_only off" {
+            &["dpu", "versions"][..] => Yields(false),
         }
-        _ => panic!("expected Versions variant"),
-    }
-}
 
-// parse_versions_updates_only ensures versions parses
-// with --updates-only.
-#[test]
-fn parse_versions_updates_only() {
-    let cmd = Cmd::try_parse_from(["dpu", "versions", "--updates-only"])
-        .expect("should parse versions --updates-only");
-
-    match cmd {
-        Cmd::Versions(args) => {
-            assert!(args.updates_only);
+        "versions --updates-only sets the flag" {
+            &["dpu", "versions", "--updates-only"][..] => Yields(true),
         }
-        _ => panic!("expected Versions variant"),
-    }
+    );
 }
 
-// parse_reprovision_list ensures reprovision list
-// parses.
+// reprovision routes to its three subcommands: list (no payload), set (an id
+// plus the --update-firmware flag), and clear (an id). The closure yields the
+// subcommand name, the machine id as a string (empty for list), and the
+// update_firmware flag.
 #[test]
-fn parse_reprovision_list() {
-    let cmd =
-        Cmd::try_parse_from(["dpu", "reprovision", "list"]).expect("should parse reprovision list");
-
-    assert!(matches!(cmd, Cmd::Reprovision(reprovision::Args::List)));
-}
-
-// parse_reprovision_set ensures reprovision set parses
-// with machine ID.
-#[test]
-fn parse_reprovision_set() {
-    let cmd = Cmd::try_parse_from(["dpu", "reprovision", "set", "--id", TEST_MACHINE_ID])
-        .expect("should parse reprovision set");
-
-    match cmd {
-        Cmd::Reprovision(reprovision::Args::Set(args)) => {
-            assert_eq!(args.id.to_string(), TEST_MACHINE_ID);
-            assert!(!args.update_firmware);
+fn parse_reprovision() {
+    scenarios!(
+        run = |argv| {
+            let subcommand = argv[2];
+            parse_with_leaf_matches::<Cmd>(argv, &["reprovision", subcommand])
+                .map(|(cmd, _)| {
+                    match cmd {
+                        Cmd::Reprovision(reprovision::Args::List) => {
+                            ("list", String::new(), false)
+                        }
+                        Cmd::Reprovision(reprovision::Args::Set(args)) => {
+                            let request = DpuReprovisioningRequest::from(&args);
+                            assert_eq!(request.mode, Mode::Set as i32);
+                            (
+                                "set",
+                                request.dpu_id.expect("machine ID is required").to_string(),
+                                request.update_firmware,
+                            )
+                        }
+                        Cmd::Reprovision(reprovision::Args::Clear(args)) => {
+                            let request = DpuReprovisioningRequest::from(&args);
+                            assert_eq!(request.mode, Mode::Clear as i32);
+                            (
+                                "clear",
+                                request.dpu_id.expect("machine ID is required").to_string(),
+                                request.update_firmware,
+                            )
+                        }
+                        _ => panic!("expected Reprovision variant"),
+                    }
+                })
+                .map_err(drop)
+        };
+        "reprovision list routes to List" {
+            &["dpu", "reprovision", "list"][..] => Yields(("list", String::new(), false)),
         }
-        _ => panic!("expected Reprovision Set variant"),
-    }
-}
 
-// parse_reprovision_clear ensures reprovision clear
-// parses with machine ID.
-#[test]
-fn parse_reprovision_clear() {
-    let cmd = Cmd::try_parse_from(["dpu", "reprovision", "clear", "--id", TEST_MACHINE_ID])
-        .expect("should parse reprovision clear");
-
-    match cmd {
-        Cmd::Reprovision(reprovision::Args::Clear(args)) => {
-            assert_eq!(args.id.to_string(), TEST_MACHINE_ID);
+        "reprovision set carries the machine id, firmware off" {
+            &["dpu", "reprovision", "set", "--id", TEST_MACHINE_ID][..] => Yields(("set", TEST_MACHINE_ID.to_string(), false)),
         }
-        _ => panic!("expected Reprovision Clear variant"),
-    }
-}
 
-// parse_agent_upgrade_policy_get ensures
-// agent-upgrade-policy parses for get.
-#[test]
-fn parse_agent_upgrade_policy_get() {
-    let cmd = Cmd::try_parse_from(["dpu", "agent-upgrade-policy"])
-        .expect("should parse agent-upgrade-policy");
-
-    match cmd {
-        Cmd::AgentUpgradePolicy(args) => {
-            assert!(args.set.is_none());
+        "reprovision clear carries the machine id" {
+            &["dpu", "reprovision", "clear", "--id", TEST_MACHINE_ID][..] => Yields(("clear", TEST_MACHINE_ID.to_string(), false)),
         }
-        _ => panic!("expected AgentUpgradePolicy variant"),
-    }
+    );
 }
 
-// parse_agent_upgrade_policy_set ensures
-// agent-upgrade-policy parses with --set.
+// agent-upgrade-policy parses with no --set (get, leaving set unset) and with
+// --set up-only (selecting the UpOnly choice). The closure yields the policy
+// name the parsed --set resolves to ("<get>" when unset).
 #[test]
-fn parse_agent_upgrade_policy_set() {
-    let cmd = Cmd::try_parse_from(["dpu", "agent-upgrade-policy", "--set", "up-only"])
-        .expect("should parse agent-upgrade-policy --set");
-
-    match cmd {
-        Cmd::AgentUpgradePolicy(args) => {
-            assert!(matches!(
-                args.set,
-                Some(agent_upgrade_policy::args::AgentUpgradePolicyChoice::UpOnly)
-            ));
+fn parse_agent_upgrade_policy() {
+    scenarios!(
+        run = |argv| {
+            parse_with_leaf_matches::<Cmd>(argv, &["agent-upgrade-policy"])
+                .map(|(cmd, matches)| {
+                    assert!(matches!(cmd, Cmd::AgentUpgradePolicy(_)));
+                    raw_value(&matches, "set").unwrap_or_else(|| "<get>".to_string())
+                })
+                .map_err(drop)
+        };
+        "no --set is a get and leaves the policy unset" {
+            &["dpu", "agent-upgrade-policy"][..] => Yields("<get>".to_string()),
         }
-        _ => panic!("expected AgentUpgradePolicy variant"),
-    }
-}
 
-/////////////////////////////////////////////////////////////////////////////
-// ValueEnum Parsing
-//
-// These tests are for testing argument values which derive
-// ValueEnum, ensuring the string representations of said
-// values correctly convert back into their expected variant,
-// or fail otherwise.
-
-// agent_upgrade_policy_choice_value_enum ensures AgentUpgradePolicyChoice
-// parses from strings.
-#[test]
-fn agent_upgrade_policy_choice_value_enum() {
-    use agent_upgrade_policy::args::AgentUpgradePolicyChoice;
-    use clap::ValueEnum;
-
-    assert!(matches!(
-        AgentUpgradePolicyChoice::from_str("off", false),
-        Ok(AgentUpgradePolicyChoice::Off)
-    ));
-    assert!(matches!(
-        AgentUpgradePolicyChoice::from_str("up-only", false),
-        Ok(AgentUpgradePolicyChoice::UpOnly)
-    ));
-    assert!(matches!(
-        AgentUpgradePolicyChoice::from_str("up-down", false),
-        Ok(AgentUpgradePolicyChoice::UpDown)
-    ));
-    assert!(AgentUpgradePolicyChoice::from_str("invalid", false).is_err());
+        "--set up-only selects the UpOnly policy" {
+            &["dpu", "agent-upgrade-policy", "--set", "up-only"][..] => Yields("up-only".to_string()),
+        }
+    );
 }

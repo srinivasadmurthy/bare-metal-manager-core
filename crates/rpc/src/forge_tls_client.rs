@@ -23,13 +23,13 @@ use eyre::Result;
 use forge_http_connector::connector::ForgeHttpConnector;
 use forge_http_connector::resolver::{ForgeResolver, ForgeResolverOpts};
 use forge_tls::client_config::ClientCert;
+use forge_tls::dummy_tls_verifier::DummyTlsVerifier;
 use hickory_resolver::config::ResolverConfig;
 use hyper::body::Incoming;
 use hyper_util::client::legacy;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ClientConfig, RootCertStore};
 use tonic::body::Body;
 use tonic::transport::Uri;
 use tower::ServiceExt;
@@ -41,9 +41,29 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::forge::VersionRequest;
 use crate::forge_resolver::resolver::ResolverError;
 use crate::forge_tls_client::ConfigurationError::CouldNotReadRootCa;
+use crate::node_jwt::{BearerAuthService, NodeJwtMinter, NodeTokenProvider};
 use crate::protos::forge::forge_client::ForgeClient;
 use crate::protos::nmx_c::nmx_controller_client::NmxControllerClient;
 use crate::{forge_resolver, protos};
+
+/// Formats an error as `"{top}: {root}"` using the deepest source in its chain,
+/// since `Display` alone doesn't walk `source()` and would hide the root cause.
+fn format_error_chain<E: std::error::Error + ?Sized>(err: &E) -> String {
+    // Bound the walk so a cyclic or pathologically deep `source()` chain can't hang us.
+    let max_depth = 16;
+    let out = err.to_string();
+    let source = std::iter::successors(err.source(), |e| e.source())
+        .take(max_depth)
+        .last()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| out.clone());
+
+    if out != source {
+        format!("{out}: {source}")
+    } else {
+        out
+    }
+}
 
 pub type NmxCClientT = NmxControllerClient<
     BoxCloneService<
@@ -61,115 +81,28 @@ pub type ForgeClientT = ForgeClient<
     >,
 >;
 
-//this code was copy and pasted from the implementation of the same struct in sqlx::core,
-//and is only necessary for as long as we're optionally validating TLS
-#[derive(Debug)]
-pub struct DummyTlsVerifier {
-    print_warning: bool,
-}
-
-impl Default for DummyTlsVerifier {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DummyTlsVerifier {
-    #[cfg(not(test))]
-    pub fn new() -> Self {
-        Self {
-            // Warnings are suppressed if this is running in a unit-test
-            print_warning: std::env::var_os("CARGO_MANIFEST_DIR").is_none(),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn new() -> Self {
-        Self {
-            // Warnings are suppressed if this is running in a unit-test
-            print_warning: false,
-        }
-    }
-}
-
 pub const DEFAULT_DOMAIN: &str = "forge.local";
 
 const VRF_NAME: &str = "mgmt";
-
-impl ServerCertVerifier for DummyTlsVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        if self.print_warning {
-            eprintln!(
-                "IGNORING SERVER CERT, Please ensure that I am removed to actually validate TLS."
-            );
-        }
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        if self.print_warning {
-            eprintln!(
-                "IGNORING SERVER CERT, Please ensure that I am removed to actually validate TLS."
-            );
-        }
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        if self.print_warning {
-            eprintln!(
-                "IGNORING SERVER CERT, Please ensure that I am removed to actually validate TLS."
-            );
-        }
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA1,
-            SignatureScheme::ECDSA_SHA1_Legacy,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-            SignatureScheme::ED448,
-        ]
-    }
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct ForgeClientConfig {
     pub root_ca_path: String,
     pub client_cert: Option<ClientCert>,
     pub enforce_tls: bool,
+    #[cfg(feature = "test-support")]
+    pub suppress_insecure_tls_warning: bool,
     pub use_mgmt_vrf: bool,
     pub max_decoding_message_size: Option<usize>,
     pub socks_proxy: Option<String>,
     pub connect_retries_max: Option<u32>,
     pub connect_retries_interval: Option<Duration>,
+    /// Optional node-auth token provider (issue #355). When set, each request
+    /// carries an `Authorization: Bearer <jwt>` — either self-signed with the
+    /// client certificate's own private key ([`NodeJwtMinter`]) or fetched
+    /// from the dpu-agent's local API (`SocketTokenSource`). Independent of
+    /// mTLS: the channel may present a client cert, a token, or both.
+    pub node_token_provider: Option<Arc<dyn NodeTokenProvider>>,
 }
 
 impl ForgeClientConfig {
@@ -186,6 +119,8 @@ impl ForgeClientConfig {
             root_ca_path,
             client_cert,
             enforce_tls: !disabled,
+            #[cfg(feature = "test-support")]
+            suppress_insecure_tls_warning: false,
             use_mgmt_vrf: false,
             max_decoding_message_size,
             socks_proxy: None,
@@ -206,7 +141,57 @@ impl ForgeClientConfig {
             // MR though, I think.
             connect_retries_max: Some(3),
             connect_retries_interval: Some(Duration::from_secs(20)),
+            node_token_provider: None,
         }
+    }
+
+    /// Restores server-certificate validation on a config built without a
+    /// client certificate.
+    ///
+    /// [`ForgeClientConfig::new`] disables TLS enforcement whenever
+    /// `client_cert` is `None`, which predates node-auth: back then "no client
+    /// cert" meant "no credentials at all", and such callers were not expected
+    /// to reach the API over verified TLS. A node-token client does hold
+    /// credentials — a bearer JWT brokered by the dpu-agent (issue #355) — and
+    /// must still authenticate the server against `root_ca_path` rather than
+    /// fall back to [`DummyTlsVerifier`]. Callers that never opt in keep the
+    /// previous behavior.
+    ///
+    /// `DISABLE_TLS_ENFORCEMENT` continues to win, so local-development
+    /// overrides work the same as they do for mTLS clients.
+    #[must_use]
+    pub fn require_tls_enforcement(mut self) -> Self {
+        self.enforce_tls = std::env::var("DISABLE_TLS_ENFORCEMENT").is_err();
+        self
+    }
+
+    /// Enables node-auth JWTs: requests built from this config mint and carry
+    /// short-lived bearer tokens signed with the configured client cert's key.
+    /// A no-op when no client cert is configured.
+    #[must_use]
+    pub fn with_node_jwt(mut self) -> Self {
+        self.node_token_provider = self.client_cert.as_ref().map(|client_cert| {
+            NodeJwtMinter::new(client_cert.cert_path.clone(), client_cert.key_path.clone())
+                as Arc<dyn NodeTokenProvider>
+        });
+        self
+    }
+
+    /// Attaches an explicit node-auth token provider — e.g. a pre-built
+    /// [`NodeJwtMinter`] the caller also serves through the agent's local
+    /// API, or a `SocketTokenSource` in a process that holds no key at all.
+    ///
+    /// Implies [`require_tls_enforcement`](Self::require_tls_enforcement).
+    /// A bearer token IS the client's credential, so the server must always
+    /// be authenticated before one is handed over — a token-only config
+    /// (no client cert) would otherwise sit on [`DummyTlsVerifier`] and
+    /// present its token to whatever answered. Enforcing it here rather than
+    /// asking every caller to remember the pairing keeps the type hard to
+    /// misuse; `DISABLE_TLS_ENFORCEMENT` still wins for local development.
+    #[must_use]
+    pub fn with_token_provider(mut self, provider: Arc<dyn NodeTokenProvider>) -> Self {
+        self.node_token_provider = Some(provider);
+        self.require_tls_enforcement()
     }
 
     /// This is required when using `ForgeTlsConfig` on a DPU to communicate with site-controller.
@@ -290,7 +275,7 @@ impl ForgeClientConfig {
                     });
 
                 if !errors.is_empty() {
-                    tracing::warn!( certs = ?errors, "Found error parsing one or more certificates");
+                    tracing::warn!(error = ?errors, "Found error parsing one or more certificates");
                 }
 
                 valid_certificates
@@ -459,12 +444,12 @@ impl<'a> ForgeTlsClient<'a> {
                     .await
                     .inspect_err(|err| {
                         tracing::error!(
-                            "error connecting client to forge api (url: {}), will retry: {}",
-                            api_config.url,
-                            err
+                            url = %api_config.url,
+                            error = %format_error_chain(err),
+                            "Failed to connect client to Forge API; retrying",
                         );
                     })
-                    .map_err(|e| ForgeTlsClientError::Connection(e.to_string()))?;
+                    .map_err(|e| ForgeTlsClientError::Connection(format_error_chain(&e)))?;
 
                 // ok, ok
                 Ok(Ok(client))
@@ -473,10 +458,10 @@ impl<'a> ForgeTlsClient<'a> {
             .await
             .inspect_err(|err| {
                 tracing::error!(
-                    "error connecting client to forge api (url: {}, attempts: {}): {}",
-                    api_config.url,
-                    api_config.retry_config.retries,
-                    err
+                    url = %api_config.url,
+                    retries = api_config.retry_config.retries,
+                    error = %err,
+                    "Failed to connect client to Forge API after retries",
                 );
             });
 
@@ -503,6 +488,32 @@ impl<'a> ForgeTlsClient<'a> {
             error: e,
         })?;
 
+        // A bearer token is the client's credential, so it may only be sent to
+        // a server this client has authenticated. Both ways that can fail are
+        // checked here rather than in the builders: `enforce_tls` and
+        // `node_token_provider` are public fields, so a caller can clear
+        // enforcement after `with_token_provider` or build the struct
+        // literally, and the handshake only happens at all for an https:// URL
+        // — a plaintext one skips TLS setup entirely while `BearerAuthService`
+        // below still stamps the token. `DISABLE_TLS_ENFORCEMENT` is honored
+        // for parity with the rest of this config so local development works.
+        if self.forge_client_config.node_token_provider.is_some()
+            && std::env::var("DISABLE_TLS_ENFORCEMENT").is_err()
+        {
+            if uri.scheme() != Some(&tonic::codegen::http::uri::Scheme::HTTPS) {
+                return Err(ConfigurationError::BearerTokenOverPlaintext {
+                    uri_string: url.as_ref().to_string(),
+                }
+                .into());
+            }
+            if !self.forge_client_config.enforce_tls {
+                return Err(ConfigurationError::BearerTokenWithoutTlsEnforcement {
+                    uri_string: url.as_ref().to_string(),
+                }
+                .into());
+            }
+        }
+
         let connector = self.build_https_client(url.as_ref()).await?;
 
         // ping interval + ping timeout should add up to less than tcp_user_timeout,
@@ -519,8 +530,17 @@ impl<'a> ForgeTlsClient<'a> {
             // We never make more than a single connection to carbide at a time.
             .pool_max_idle_per_host(2)
             .timer(TokioTimer::new())
-            .build(connector)
-            .boxed_clone();
+            .build(connector);
+        // Stamp a freshly-minted node-auth bearer token onto each request when
+        // configured (issue #355). A `None` minter is a transparent pass-through,
+        // so the boxed service type is identical in both modes.
+        let hyper_client = BearerAuthService::new(
+            hyper_client,
+            self.forge_client_config.node_token_provider.clone(),
+        );
+        // Inject the issuing span's W3C trace context into every request this client sends
+        // (issue #2438). Wrapping before `boxed_clone` keeps the erased `BoxCloneService` type.
+        let hyper_client = trace_propagation::TraceInjectService::new(hyper_client).boxed_clone();
 
         let mut forge_client = ForgeClient::with_origin(hyper_client, uri);
 
@@ -542,7 +562,8 @@ impl<'a> ForgeTlsClient<'a> {
             error: e,
         })?;
 
-        // only check for the root cert if the uri we were given is actually HTTPS.  That lets tests function properly.
+        // Only check the root and client certs if the uri we were given is actually HTTPS.
+        // That lets tests and plaintext-HTTP environments function properly.
         if let Some(scheme) = uri.scheme()
             && scheme == &tonic::codegen::http::uri::Scheme::HTTPS
         {
@@ -563,6 +584,25 @@ impl<'a> ForgeTlsClient<'a> {
                     .into());
                 }
             }
+
+            if let Some(cert_expiry) = self.forge_client_config.client_cert_expiry() {
+                let start = SystemTime::now();
+                let current_time = start
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards");
+                if u64::try_from(cert_expiry)
+                    .ok()
+                    .is_none_or(|v| current_time.as_secs() > v)
+                {
+                    tracing::error!(
+                        "Client certificate is expired, perhaps you need to regenerate your cert?"
+                    );
+                    return Err(ConfigurationError::InvalidClientCert(
+                        rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+                    )
+                    .into());
+                }
+            }
         }
 
         let base_config_builder = || {
@@ -578,29 +618,19 @@ impl<'a> ForgeTlsClient<'a> {
                 if self.forge_client_config.enforce_tls {
                     base_config_builder().with_root_certificates(roots)
                 } else {
+                    #[cfg(feature = "test-support")]
+                    let verifier = if self.forge_client_config.suppress_insecure_tls_warning {
+                        DummyTlsVerifier::new_for_tests()
+                    } else {
+                        DummyTlsVerifier::new_for_prod()
+                    };
+                    #[cfg(not(feature = "test-support"))]
+                    let verifier = DummyTlsVerifier::new_for_prod();
                     base_config_builder()
                         .dangerous()
-                        .with_custom_certificate_verifier(std::sync::Arc::new(
-                            DummyTlsVerifier::new(),
-                        ))
+                        .with_custom_certificate_verifier(Arc::new(verifier))
                 }
             };
-
-            if let Some(cert_expiry) = self.forge_client_config.client_cert_expiry() {
-                let start = SystemTime::now();
-                let current_time = start
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Time went backwards");
-                if current_time.as_secs() > cert_expiry.try_into().unwrap() {
-                    tracing::error!(
-                        "Client certificate is expired, perhaps you need to regenerate your cert?"
-                    );
-                    return Err(ConfigurationError::InvalidClientCert(
-                        rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
-                    )
-                    .into());
-                }
-            }
 
             if let Some((certs, key)) = self.forge_client_config.read_client_cert() {
                 builder()
@@ -622,7 +652,7 @@ impl<'a> ForgeTlsClient<'a> {
         let resolver_config = ResolverConfig::from_parts(
             forge_resolver_config.0.domain,
             forge_resolver_config.0.search_domain,
-            forge_resolver_config.0.inner.into_inner(),
+            forge_resolver_config.0.inner,
         );
         // Five seconds is the default, but setting anyway for documentation and future proofing
         let mut resolver_opts = ForgeResolverOpts::default().timeout(Duration::from_secs(5));
@@ -712,8 +742,10 @@ impl<'a> ForgeTlsClient<'a> {
             // We never make more than a single connection to carbide at a time.
             .pool_max_idle_per_host(2)
             .timer(TokioTimer::new())
-            .build(connector)
-            .boxed_clone();
+            .build(connector);
+        // Inject the issuing span's W3C trace context into every request this client sends
+        // (issue #2438). Wrapping before `boxed_clone` keeps the erased `BoxCloneService` type.
+        let hyper_client = trace_propagation::TraceInjectService::new(hyper_client).boxed_clone();
 
         let mut nmx_c_client = NmxControllerClient::with_origin(hyper_client, uri);
 
@@ -756,12 +788,12 @@ impl<'a> ForgeTlsClient<'a> {
                     .await
                     .inspect_err(|err| {
                         tracing::error!(
-                            "error connecting client to forge api (url: {}), will retry: {}",
-                            api_config.url,
-                            err
+                            url = %api_config.url,
+                            error = %format_error_chain(err),
+                            "Failed to connect client to NMX-C API; retrying",
                         );
                     })
-                    .map_err(|e| ForgeTlsClientError::Connection(e.to_string()))?;
+                    .map_err(|e| ForgeTlsClientError::Connection(format_error_chain(&e)))?;
 
                 // ok, ok
                 Ok(Ok(client))
@@ -770,10 +802,10 @@ impl<'a> ForgeTlsClient<'a> {
             .await
             .inspect_err(|err| {
                 tracing::error!(
-                    "error connecting client to nmx-c api (url: {}, attempts: {}): {}",
-                    api_config.url,
-                    api_config.retry_config.retries,
-                    err
+                    url = %api_config.url,
+                    retries = api_config.retry_config.retries,
+                    error = %err,
+                    "Failed to connect client to NMX-C API after retries",
                 );
             });
 
@@ -789,22 +821,33 @@ impl<'a> ForgeTlsClient<'a> {
 pub enum ForgeTlsClientError {
     #[error("ConnectError error: {0}")]
     Connection(String),
-    #[error("Configuration error: {0}")]
+    #[error("configuration error: {0}")]
     Configuration(#[from] ConfigurationError),
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum ConfigurationError {
-    #[error("Invalid URI {uri_string}: {error}")]
+    #[error("invalid URI {uri_string}: {error}")]
     InvalidUri {
         uri_string: String,
         error: hyper::http::uri::InvalidUri,
     },
-    #[error("Could not read Root CA cert at {path}: {error}")]
+    #[error("could not read root CA cert at {path}: {error}")]
     CouldNotReadRootCa { path: String, error: io::Error },
-    #[error("Invalid client cert: {0}")]
+    #[error(
+        "refusing to send node-auth bearer tokens to non-HTTPS URL {uri_string}: \
+         the token would travel in cleartext"
+    )]
+    BearerTokenOverPlaintext { uri_string: String },
+    #[error(
+        "refusing to send node-auth bearer tokens to {uri_string} with TLS enforcement \
+         disabled: the server's certificate would not be verified, so the token could \
+         be handed to an impersonator"
+    )]
+    BearerTokenWithoutTlsEnforcement { uri_string: String },
+    #[error("invalid client cert: {0}")]
     InvalidClientCert(rustls::Error),
-    #[error("Error configuring resolver: {0}")]
+    #[error("error configuring resolver: {0}")]
     Resolver(#[from] ResolverError),
 }
 
@@ -821,10 +864,136 @@ pub type ForgeHttpsClientResult<T> = Result<T, ForgeTlsClientError>;
 mod tests {
     use std::net::SocketAddr;
 
+    use carbide_test_support::value_scenarios;
     use forge_http_connector::connector::ConnectorMetrics;
     use hyper_rustls::HttpsConnector;
 
     use super::*;
+
+    /// A node-token client presents no client certificate, which by itself
+    /// drops the channel onto `DummyTlsVerifier`. `require_tls_enforcement`
+    /// puts it back on root-CA validation.
+    #[test]
+    fn require_tls_enforcement_restores_validation_without_a_client_cert() {
+        if std::env::var("DISABLE_TLS_ENFORCEMENT").is_ok() {
+            // The override wins by design; the assertions below would not hold.
+            return;
+        }
+
+        let config = ForgeClientConfig::new("/etc/carbide/root-ca.pem".to_string(), None);
+        assert!(
+            !config.enforce_tls,
+            "a config without a client cert starts out unenforced"
+        );
+
+        let config = config.require_tls_enforcement();
+        assert!(
+            config.enforce_tls,
+            "opting in must restore server certificate validation"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FixedToken;
+
+    impl NodeTokenProvider for FixedToken {
+        fn current(&self) -> Option<String> {
+            Some("a.b.c".to_string())
+        }
+    }
+
+    /// The bearer token IS the credential, so the server must be authenticated
+    /// before one is sent. Callers must not have to remember to pair
+    /// `with_token_provider` with `require_tls_enforcement` — forgetting it
+    /// would hand tokens to whatever answered the connection.
+    #[test]
+    fn with_token_provider_enforces_tls_without_being_asked() {
+        if std::env::var("DISABLE_TLS_ENFORCEMENT").is_ok() {
+            // The override wins by design; the assertion below would not hold.
+            return;
+        }
+
+        let config = ForgeClientConfig::new("/etc/carbide/root-ca.pem".to_string(), None)
+            .with_token_provider(Arc::new(FixedToken));
+
+        assert!(
+            config.enforce_tls,
+            "attaching a token provider must restore server validation by itself"
+        );
+    }
+
+    /// TLS setup only runs for an https:// URL, so `enforce_tls` alone does not
+    /// cover a plaintext one — the token would still be stamped and travel in
+    /// the clear. Building such a client has to fail.
+    #[tokio::test]
+    async fn bearer_tokens_are_refused_over_plaintext() {
+        if std::env::var("DISABLE_TLS_ENFORCEMENT").is_ok() {
+            // The override deliberately permits plaintext development.
+            return;
+        }
+
+        let config = ForgeClientConfig::new("/etc/carbide/root-ca.pem".to_string(), None)
+            .with_token_provider(Arc::new(FixedToken));
+
+        let error = ForgeTlsClient::new(&config)
+            .build("http://carbide-api.local:8080")
+            .await
+            .expect_err("a token client must refuse a plaintext endpoint");
+
+        assert!(
+            error.to_string().contains("cleartext"),
+            "the error should explain the refusal, got: {error}"
+        );
+    }
+
+    /// `enforce_tls` and `node_token_provider` are both public, so the builder
+    /// pairing is not the last word: a caller can clear enforcement afterwards
+    /// or build the struct literally. Over https:// that still selects
+    /// `DummyTlsVerifier`, so the check has to live at client construction.
+    #[tokio::test]
+    async fn bearer_tokens_are_refused_when_tls_enforcement_is_cleared() {
+        if std::env::var("DISABLE_TLS_ENFORCEMENT").is_ok() {
+            // The override deliberately permits unverified development setups.
+            return;
+        }
+
+        let mut config = ForgeClientConfig::new("/etc/carbide/root-ca.pem".to_string(), None)
+            .with_token_provider(Arc::new(FixedToken));
+        // Exactly what a caller ordering the builders the other way round, or
+        // assigning the public field, would end up with.
+        config.enforce_tls = false;
+
+        let error = ForgeTlsClient::new(&config)
+            .build("https://carbide-api.local:8080")
+            .await
+            .expect_err("an unverified token client must be refused");
+
+        assert!(
+            error.to_string().contains("TLS enforcement disabled"),
+            "the error should explain the refusal, got: {error}"
+        );
+    }
+
+    /// The same client over https:// must still build — the guard above is
+    /// scoped to the scheme, not to token clients in general.
+    #[tokio::test]
+    async fn bearer_tokens_are_allowed_over_https() {
+        let config = ForgeClientConfig::new("/etc/carbide/root-ca.pem".to_string(), None)
+            .with_token_provider(Arc::new(FixedToken));
+
+        // Reaching a root-CA read means the plaintext guard let it through;
+        // the file itself need not exist in a unit test.
+        let result = ForgeTlsClient::new(&config)
+            .build("https://carbide-api.local:8080")
+            .await;
+
+        if let Err(error) = result {
+            assert!(
+                !error.to_string().contains("cleartext"),
+                "https must not trip the plaintext guard, got: {error}"
+            );
+        }
+    }
 
     #[tokio::test]
     // test_max_retries builds up an instance of hyper client using
@@ -848,7 +1017,7 @@ mod tests {
         let resolver_config = ResolverConfig::from_parts(
             forge_resolver_config.0.domain,
             forge_resolver_config.0.search_domain,
-            forge_resolver_config.0.inner.into_inner(),
+            forge_resolver_config.0.inner,
         );
 
         let resolver_opts = ForgeResolverOpts::default().timeout(Duration::from_secs(5));
@@ -877,7 +1046,7 @@ mod tests {
                 .with_safe_default_protocol_versions()
                 .unwrap()
                 .dangerous()
-                .with_custom_certificate_verifier(std::sync::Arc::new(DummyTlsVerifier::new()))
+                .with_custom_certificate_verifier(Arc::new(DummyTlsVerifier::new_for_tests()))
                 .with_no_client_auth();
 
                 hyper_rustls::HttpsConnectorBuilder::new()
@@ -924,5 +1093,34 @@ mod tests {
 
         assert_eq!(attempts_for_addr.unwrap(), max_retries + 1);
         assert_eq!(errors_for_addr.unwrap(), max_retries + 1);
+    }
+
+    #[test]
+    fn format_error_chain_formats_each_error() {
+        #[derive(thiserror::Error, Debug)]
+        #[error("invalid peer certificate: UnknownIssuer")]
+        struct Inner;
+
+        #[derive(thiserror::Error, Debug)]
+        #[error("client error (connect)")]
+        struct Outer(#[from] Inner);
+
+        #[derive(thiserror::Error, Debug)]
+        #[error("only message")]
+        struct Plain;
+
+        // `format_error_chain` appends the deepest `source()` when it differs
+        // from the top-level message, otherwise returns the top message alone.
+        value_scenarios!(
+            run = |err| format_error_chain(err.as_ref());
+            "walks source chain to the root cause" {
+                Box::new(Outer::from(Inner)) as Box<dyn std::error::Error> => "client error (connect): invalid peer certificate: UnknownIssuer"
+                .to_string(),
+            }
+
+            "no source returns top message" {
+                Box::new(Plain) as Box<dyn std::error::Error> => "only message".to_string(),
+            }
+        );
     }
 }

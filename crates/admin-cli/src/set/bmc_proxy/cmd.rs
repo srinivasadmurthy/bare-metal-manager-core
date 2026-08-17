@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliResult;
 use ::rpc::forge::ConfigSetting;
 
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn bmc_proxy(opts: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
+pub(super) async fn bmc_proxy(opts: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
     if opts.enabled {
         api_client
             .set_dynamic_config(

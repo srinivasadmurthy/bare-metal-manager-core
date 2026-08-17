@@ -18,12 +18,23 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show all instances using an extension service:
+    $ nico-admin-cli extension-service show-instances --service-id 12345678-1234-5678-90ab-cdef01234567
+
+Show instances using a specific version of the service:
+    $ nico-admin-cli extension-service show-instances --service-id 12345678-1234-5678-90ab-cdef01234567 \
+    --version 1.0
+
+")]
+pub(crate) struct Args {
     #[clap(short = 'i', long, help = "The extension service ID")]
-    pub service_id: String,
+    service_id: String,
 
     #[clap(short = 'v', long, help = "Version string to filter by (optional)")]
-    pub version: Option<String>,
+    version: Option<String>,
 }
 
 impl From<Args> for ::rpc::forge::FindInstancesByDpuExtensionServiceRequest {

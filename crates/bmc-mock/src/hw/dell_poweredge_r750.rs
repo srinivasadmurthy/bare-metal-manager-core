@@ -18,24 +18,57 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use bmc_vendor::BMCVendor;
-use carbide_utils::models::arch::CpuArchitecture;
 use mac_address::MacAddress;
-use rpc::machine_discovery::{BlockDevice, CpuInfo, DiscoveryInfo, DmiData, MemoryDevice};
 use serde_json::json;
 
-use crate::{BootOptionKind, Callbacks, hw, redfish};
+use crate::{BootOptionKind, Callbacks, LogService, LogServices, hw, redfish};
 
-pub struct DellPowerEdgeR750<'a> {
-    pub bmc_mac_address: MacAddress,
-    pub product_serial_number: Cow<'a, str>,
-    pub nics: Vec<(hw::nic::SlotNumber, hw::nic::Nic<'a>)>,
-    pub embedded_nic: EmbeddedNic,
+pub(crate) struct DellPowerEdgeR750<'a> {
+    pub(crate) bmc_mac_address: MacAddress,
+    pub(crate) product_serial_number: Cow<'a, str>,
+    pub(crate) nics: Vec<(hw::nic::SlotNumber, hw::nic::Nic<'a>)>,
+    pub(crate) embedded_nic: EmbeddedNic,
 }
 
-pub struct EmbeddedNic {
-    pub port_1: MacAddress,
-    pub port_2: MacAddress,
+pub(crate) struct EmbeddedNic {
+    pub(crate) port_1: MacAddress,
+    pub(crate) port_2: MacAddress,
+}
+
+struct DellEventLog {
+    entries: Vec<String>,
+}
+
+impl LogService for DellEventLog {
+    fn id(&self) -> &str {
+        "EventLog"
+    }
+
+    fn entries(&self, collection: &redfish::Collection<'_>) -> Vec<serde_json::Value> {
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                redfish::log_service::event_entry(collection, &idx.to_string())
+                    .message(entry)
+                    // Severity + Created are not required by the Redfish spec but
+                    // libredfish expects them (mirrors the BlueField event log).
+                    .severity("OK")
+                    .created("2026-02-12T02:06:58+00:00")
+                    .build()
+            })
+            .collect()
+    }
+}
+
+struct DellLogServices {
+    event_log: DellEventLog,
+}
+
+impl LogServices for DellLogServices {
+    fn services(&self) -> Vec<&(dyn LogService + '_)> {
+        vec![&self.event_log as &dyn LogService]
+    }
 }
 
 impl DellPowerEdgeR750<'_> {
@@ -45,11 +78,11 @@ impl DellPowerEdgeR750<'_> {
             fan: 10,
             power: 20,
             current: 10,
-            leak: 0,
+            voltage: 0,
         }
     }
 
-    pub fn manager_config(&self) -> redfish::manager::Config {
+    pub(crate) fn manager_config(&self) -> redfish::manager::Config {
         redfish::manager::Config {
             managers: vec![redfish::manager::SingleConfig {
                 id: "iDRAC.Embedded.1",
@@ -69,13 +102,17 @@ impl DellPowerEdgeR750<'_> {
                     .interface_enabled(false)
                     .build(),
                 ]),
+                serial_interfaces: None,
                 firmware_version: Some("6.00.30.00"),
                 oem: Some(redfish::manager::Oem::Dell),
             }],
         }
     }
 
-    pub fn system_config(&self, callbacks: Arc<dyn Callbacks>) -> redfish::computer_system::Config {
+    pub(crate) fn system_config(
+        &self,
+        callbacks: Arc<dyn Callbacks>,
+    ) -> redfish::computer_system::Config {
         let callbacks = Some(callbacks);
         let serial_number = Some(self.product_serial_number.to_string().into());
         let system_id = "System.Embedded.1";
@@ -128,7 +165,7 @@ impl DellPowerEdgeR750<'_> {
                     .display_name(&display_name)
                     .build()
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         redfish::computer_system::Config {
             systems: vec![redfish::computer_system::SingleSystemConfig {
@@ -137,18 +174,28 @@ impl DellPowerEdgeR750<'_> {
                 model: Some("PowerEdge R750".into()),
                 eth_interfaces: Some(eth_interfaces),
                 serial_number,
-                boot_order_mode: redfish::computer_system::BootOrderMode::DellOem,
+                boot_order_mode: redfish::computer_system::BootOrderMode::OrderedCollection,
                 callbacks,
                 chassis: vec!["System.Embedded.1".into()],
                 boot_options: Some(boot_options),
                 bios_mode: redfish::computer_system::BiosMode::DellOem,
                 oem: redfish::computer_system::Oem::Generic,
-                log_services: None,
+                log_services: Some(Arc::new(DellLogServices {
+                    event_log: DellEventLog {
+                        // Always report a completed reboot so the controller's
+                        // restart verification (which reads the host BMC event
+                        // log) can confirm reboots for this host.
+                        entries: vec!["Server reset.".to_string()],
+                    },
+                })),
                 // Today carbide need for any Dell to have storage
                 // collection. It tries to find BOSS controller
                 // there. So we provide empty collection to avoid 404
                 // failure.
                 storage: Some(vec![]),
+                processors: None,
+                memory: None,
+                serial_console: None,
                 secure_boot_available: true,
                 base_bios: Some(redfish::bios::builder(&redfish::bios::resource(system_id))
                     .attributes(json!({
@@ -173,7 +220,7 @@ impl DellPowerEdgeR750<'_> {
         }
     }
 
-    pub fn chassis_config(&self) -> redfish::chassis::ChassisConfig {
+    pub(crate) fn chassis_config(&self) -> redfish::chassis::ChassisConfig {
         let chassis_id = "System.Embedded.1";
         let net_adapter_builder = |id: &str| {
             redfish::network_adapter::builder(&redfish::network_adapter::chassis_resource(
@@ -252,62 +299,26 @@ impl DellPowerEdgeR750<'_> {
         }
     }
 
-    pub fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
+    pub(crate) fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
         redfish::update_service::UpdateServiceConfig {
-            firmware_inventory: vec![],
-        }
-    }
-
-    pub fn discovery_info(&self) -> DiscoveryInfo {
-        DiscoveryInfo {
-            network_interfaces: self
-                .nics
-                .iter()
-                .map(|(slot, nic)| nic.discovery_info(*slot))
-                .collect(),
-            infiniband_interfaces: vec![],
-            cpu_info: vec![CpuInfo {
-                model: "Intel(R) Xeon(R) Gold 6354 CPU @ 3.00GHz".into(),
-                vendor: "GenuineIntel".into(),
-                sockets: 2,
-                cores: 18,
-                threads: 36,
-            }],
-            block_devices: (0..2)
-                .map(|n| BlockDevice {
-                    model: "Dell Ent NVMe v2 AGN RI U.2 1.92TB".into(),
-                    revision: "2.3.0".into(),
-                    serial: format!("FAKESERNUM{n}"),
-                    device_type: "".into(),
-                })
-                .collect(),
-            machine_type: CpuArchitecture::X86_64.to_string(),
-            machine_arch: Some(CpuArchitecture::X86_64.into()),
-            nvme_devices: vec![],
-            dmi_data: Some(DmiData {
-                board_name: "01J4WF".into(),
-                board_version: "A05".into(),
-                bios_version: "1.13.2".into(),
-                bios_date: "12/19/2023".into(),
-                product_serial: self.product_serial_number.to_string(),
-                board_serial: format!(".{}.FAKESERNUM2.", self.product_serial_number),
-                chassis_serial: self.product_serial_number.to_string(),
-                product_name: "PowerEdge R750".into(),
-                // Logic of machine state handler depends on BMC
-                // vendor that is calculated from dmi_data.sys_vendor
-                // value.
-                sys_vendor: hw::bmc_vendor_to_udev_dmi(BMCVendor::Dell).into(),
-            }),
-            dpu_info: None,
-            gpus: vec![],
-            memory_devices: (0..8)
-                .map(|_| MemoryDevice {
-                    size_mb: Some(16384),
-                    mem_type: Some("DDR4".into()),
-                })
-                .collect(),
-            tpm_ek_certificate: None,
-            tpm_description: None,
+            firmware_inventory: [
+                // BMC (iDRAC) version matches manager_config firmware_version.
+                ("HostBMC_0", "6.00.30.00"),
+                // Representative BIOS version for Dell PowerEdge R750.
+                ("HostBIOS_0", "2.22.2"),
+            ]
+            .iter()
+            .map(|(id, version)| {
+                redfish::software_inventory::builder(
+                    &redfish::software_inventory::firmware_inventory_resource(id),
+                )
+                .version(version)
+                .build()
+            })
+            .collect(),
+            advertise_multipart_push_uri: false,
+            host_bmc_inventory_id: Some("HostBMC_0".to_string()),
+            host_uefi_inventory_id: Some("HostBIOS_0".to_string()),
             ..Default::default()
         }
     }

@@ -17,7 +17,7 @@
 
 use std::fmt::Write;
 
-use ::rpc::admin_cli::{CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge::{
     self as forgerpc, MachineValidationTestEnableDisableTestRequest,
     MachineValidationTestUpdateRequest, MachineValidationTestVerfiedRequest,
@@ -27,9 +27,10 @@ use prettytable::{Table, row};
 use super::args::{
     AddTestOptions, EnableDisableTestOptions, ShowTestOptions, UpdateTestOptions, VerifyTestOptions,
 };
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn show_tests(
+pub(super) async fn show_tests(
     api_client: &ApiClient,
     args: ShowTestOptions,
     output_format: OutputFormat,
@@ -136,7 +137,10 @@ fn convert_tests_to_nice_format(
             ("Args", test.args),
             ("Contexts", contexts),
             ("PreCondition", test.pre_condition.unwrap_or_default()),
-            ("TimeOut", test.timeout.unwrap().to_string()),
+            (
+                "TimeOut",
+                test.timeout.map(|t| t.to_string()).unwrap_or_default(),
+            ),
             ("CustomTags", custom_tags),
             ("Components", components),
             ("SupportedPlatforms", platforms),
@@ -174,7 +178,7 @@ fn convert_tests_to_nice_format(
     Ok(lines)
 }
 
-pub async fn machine_validation_test_verfied(
+pub(super) async fn machine_validation_test_verfied(
     api_client: &ApiClient,
     options: VerifyTestOptions,
 ) -> CarbideCliResult<()> {
@@ -188,7 +192,7 @@ pub async fn machine_validation_test_verfied(
     Ok(())
 }
 
-pub async fn machine_validation_test_enable(
+pub(super) async fn machine_validation_test_enable(
     api_client: &ApiClient,
     options: EnableDisableTestOptions,
 ) -> CarbideCliResult<()> {
@@ -205,7 +209,7 @@ pub async fn machine_validation_test_enable(
     Ok(())
 }
 
-pub async fn machine_validation_test_disable(
+pub(super) async fn machine_validation_test_disable(
     api_client: &ApiClient,
     options: EnableDisableTestOptions,
 ) -> CarbideCliResult<()> {
@@ -222,7 +226,7 @@ pub async fn machine_validation_test_disable(
     Ok(())
 }
 
-pub async fn machine_validation_test_update(
+pub(super) async fn machine_validation_test_update(
     api_client: &ApiClient,
     options: UpdateTestOptions,
 ) -> CarbideCliResult<()> {
@@ -257,7 +261,7 @@ pub async fn machine_validation_test_update(
     Ok(())
 }
 
-pub async fn machine_validation_test_add(
+pub(super) async fn machine_validation_test_add(
     api_client: &ApiClient,
     options: AddTestOptions,
 ) -> CarbideCliResult<()> {

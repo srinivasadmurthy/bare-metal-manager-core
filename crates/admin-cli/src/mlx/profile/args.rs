@@ -22,9 +22,29 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 use rpc::protos::mlx_device as mlx_device_pb;
 
+use crate::cfg::dispatch::Dispatch;
+
 // ProfileCommand are the profile subcommands.
-#[derive(Parser, Debug)]
-pub enum ProfileCommand {
+#[derive(Parser, Debug, Dispatch)]
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all available profiles:
+    $ nico-admin-cli mlx profile list
+
+Show a profile's details:
+    $ nico-admin-cli mlx profile show my-profile
+
+Sync a profile to a device on a machine:
+    $ nico-admin-cli mlx profile sync 12345678-1234-5678-90ab-cdef01234567 0000:01:00.0 \
+    --profile-name my-profile
+
+Compare a device against a profile:
+    $ nico-admin-cli mlx profile compare 12345678-1234-5678-90ab-cdef01234567 0000:01:00.0 \
+    --profile-name my-profile
+
+")]
+pub(crate) enum ProfileCommand {
     #[clap(about = "Synchronize a profile to a device on a given machine")]
     Sync(ProfileSyncCommand),
 
@@ -40,40 +60,40 @@ pub enum ProfileCommand {
 
 // ProfileSyncCommand synchronizes a profile to a device.
 #[derive(Parser, Debug)]
-pub struct ProfileSyncCommand {
+pub(crate) struct ProfileSyncCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Device ID is the PCI or mst path on the target machine")]
-    pub device_id: String,
+    device_id: String,
 
     #[arg(long, help = "Profile name to sync")]
-    pub profile_name: String,
+    profile_name: String,
 }
 
 // ProfileCompareCommand compares a profile against a device.
 #[derive(Parser, Debug)]
-pub struct ProfileCompareCommand {
+pub(crate) struct ProfileCompareCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Device ID is the PCI or mst path on the target machine")]
-    pub device_id: String,
+    device_id: String,
 
     #[arg(long, help = "Profile name to compare")]
-    pub profile_name: String,
+    profile_name: String,
 }
 
 // ProfileShowCommand shows details of a specific profile.
 #[derive(Parser, Debug)]
-pub struct ProfileShowCommand {
+pub(crate) struct ProfileShowCommand {
     #[arg(help = "Profile name to show")]
-    pub profile_name: String,
+    profile_name: String,
 }
 
 // ProfileListCommand lists all available profiles.
 #[derive(Parser, Debug)]
-pub struct ProfileListCommand {}
+pub(crate) struct ProfileListCommand {}
 
 impl From<ProfileSyncCommand> for mlx_device_pb::MlxAdminProfileSyncRequest {
     fn from(cmd: ProfileSyncCommand) -> Self {

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Multi-stage build for custom OpenTelemetry Collector targeting arm64 DPUs.
 #
 # Stage 1: Build the custom otelcol-contrib binary with fileresourceprocessor
@@ -9,9 +24,13 @@
 #
 # NOTE: This image uses debian:12-slim instead of NVIDIA distroless because the
 # otelcol-wrapper entrypoint is a bash script that requires a full shell.
+#
+# The journaldreceiver invokes `journalctl`; install systemd so that binary and
+# its libraries are present (see journaldreceiver/examples/container/README.md
+# in opentelemetry-collector-contrib).
 
-ARG GO_VERSION=1.22.0
-ARG OTELCOL_VERSION=0.101.0
+ARG GO_VERSION=1.26.4
+ARG OTELCOL_VERSION=0.155.0
 
 # ---------------------------------------------------------------------------
 # Builder (host-native Go, cross-compiles to arm64)
@@ -34,6 +53,14 @@ COPY bluefield/otel/puntstatsreceiver /build/puntstatsreceiver
 COPY bluefield/otel/otelcol_builder_config_yaml.txt /build/
 COPY bluefield/otel/get_module_version.sh /build/
 
+# Committed go.mod/go.sum produced by running update-ocb-modules.sh locally.
+# Using these instead of a fresh `go mod tidy` inside the build makes the
+# dependency graph deterministic — two builds from the same commit produce
+# identical module sets. Run update-ocb-modules.sh and commit the outputs
+# whenever otelcol_builder_config_yaml.txt or component versions change.
+COPY bluefield/otel/ocb-generated/go.mod /build/ocb-generated/go.mod
+COPY bluefield/otel/ocb-generated/go.sum /build/ocb-generated/go.sum
+
 # Generate the builder config with resolved versions
 RUN FILERESOURCE_VERSION=$(bash /build/get_module_version.sh /build/fileresourceprocessor) && \
     TELEMETRYSTATS_VERSION=$(bash /build/get_module_version.sh /build/telemetrystatsprocessor) && \
@@ -44,24 +71,37 @@ RUN FILERESOURCE_VERSION=$(bash /build/get_module_version.sh /build/fileresource
         -e "s/\${PUNTSTATS_VERSION}/${PUNTSTATS_VERSION}/g" \
         otelcol_builder_config_yaml.txt > ocb_config.yaml
 
-# Cross-compile the collector binary for arm64
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 ocb --config ocb_config.yaml
+# Generate Go source only — skip the go mod tidy step that makes module
+# resolution non-deterministic across builds.
+RUN ocb --config ocb_config.yaml --skip-compilation --skip-get-modules
+
+# Overwrite the incomplete OCB-generated go.mod/go.sum (missing indirect deps)
+# with the committed versions that have the full module graph resolved.
+RUN cp /build/ocb-generated/go.mod /build/ocb-build/go.mod && \
+    cp /build/ocb-generated/go.sum /build/ocb-build/go.sum
+
+# Cross-compile from the pinned module graph.
+RUN cd /build/ocb-build && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=readonly -o otelcol-contrib .
 
 # ---------------------------------------------------------------------------
 # Runtime (arm64)
 # ---------------------------------------------------------------------------
-FROM --platform=linux/arm64 debian:12-slim
+FROM debian:12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libudev1 \
+    systemd \
     && rm -rf /var/lib/apt/lists/*
 
 # Collector binary
 COPY --from=builder --chmod=755 /build/ocb-build/otelcol-contrib /usr/bin/otelcol-contrib
 
+COPY --from=builder /lib/aarch64-linux-gnu/libudev.so.1 /lib/aarch64-linux-gnu/libudev.so.1
 # Wrapper scripts
 COPY bluefield/otel/otelcol-wrapper /etc/otelcol-contrib/otelcol-wrapper
-COPY bluefield/otel/otelcol-wrapper-imports /etc/otelcol-contrib/otelcol-wrapper-imports
+COPY bluefield/otel/otelcol-wrapper-imports-dpf /etc/otelcol-contrib/otelcol-wrapper-imports
 COPY bluefield/otel/otelcol-wrapper-validate /etc/otelcol-contrib/otelcol-wrapper-validate
 RUN chmod +x /etc/otelcol-contrib/otelcol-wrapper \
              /etc/otelcol-contrib/otelcol-wrapper-imports \

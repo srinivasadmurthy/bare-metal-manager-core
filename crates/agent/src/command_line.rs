@@ -14,13 +14,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use carbide_network::virtualization::VpcVirtualizationType;
 use carbide_uuid::machine::MachineId;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use url::Url;
 
 use crate::network_monitor::NetworkPingerType;
 
@@ -50,12 +51,15 @@ pub enum AgentCommand {
     Hardware(HardwareOptions),
 
     #[clap(
-        about = "Init-container entry point: download the root CA cert and snapshot hardware to the shared volume for the main container."
+        about = "Init-container entry point: provision the root CA cert and snapshot hardware to the shared volume for the main container."
     )]
-    InitContainer,
+    InitContainer(InitContainerOptions),
 
     #[clap(about = "One-off health check")]
     Health,
+
+    #[clap(about = "Print LLDP neighbors visible on this host and exit")]
+    LldpNeighbors,
 
     #[clap(about = "One-off network monitor")]
     Network(NetworkOptions),
@@ -65,6 +69,41 @@ pub enum AgentCommand {
 
     #[clap(about = "Write a templated config file", subcommand)]
     Write(WriteTarget),
+}
+
+const DEFAULT_BOOTSTRAP_CA_URL: &str = "http://carbide-pxe.forge/api/v0/tls/root_ca";
+
+fn parse_bootstrap_ca_url(value: &str) -> Result<Url, String> {
+    let url = Url::parse(value).map_err(|error| format!("invalid URL: {error}"))?;
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        scheme => Err(format!(
+            "unsupported bootstrap CA URL scheme {scheme:?}; expected http or https"
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum InitContainerBootstrapCaSource {
+    LegacyDownload,
+    Mounted,
+}
+
+#[derive(Parser, Debug)]
+pub struct InitContainerOptions {
+    /// Selects where the bootstrap CA is obtained. The default preserves the
+    /// legacy unauthenticated PXE download.
+    #[clap(long, default_value = "legacy_download")]
+    pub bootstrap_ca_source: InitContainerBootstrapCaSource,
+
+    /// URL used only when --bootstrap-ca-source=legacy_download.
+    #[clap(
+        long,
+        default_value = DEFAULT_BOOTSTRAP_CA_URL,
+        value_parser = parse_bootstrap_ca_url
+    )]
+    pub bootstrap_ca_url: Url,
 }
 
 #[derive(Parser, Debug)]
@@ -97,6 +136,9 @@ pub struct NvueOptions {
     pub loopback_ip: IpAddr,
 
     #[clap(long)]
+    pub loopback_ip_v6: Option<Ipv6Addr>,
+
+    #[clap(long)]
     pub asn: u32,
 
     #[clap(long)]
@@ -118,10 +160,10 @@ pub struct NvueOptions {
     pub uplinks: Vec<String>,
 
     #[clap(long, use_value_delimiter = true, help = "Comma separated")]
-    pub route_servers: Vec<String>,
+    pub route_servers: Vec<IpAddr>,
 
     #[clap(long, use_value_delimiter = true, help = "Comma separated")]
-    pub dhcp_servers: Vec<String>,
+    pub dhcp_servers: Vec<IpAddr>,
 
     #[clap(
         long,
@@ -171,36 +213,6 @@ pub struct NvueOptions {
         default_value_t = false
     )]
     pub stateful_acls_enabled: bool,
-
-    #[clap(
-        long,
-        help = "IP to be used for a local VTEP when configuring an additional overlay network"
-    )]
-    pub secondary_overlay_vtep_ip: Option<String>,
-
-    #[clap(
-        long,
-        help = "Prefix to be used for configuring a set of internal bridges to be used with advanced routing for traffic interception.  Prefix length is expected to be /29 or smaller (i.e., 8 or more IP addresses)."
-    )]
-    pub internal_bridge_routing_prefix: Option<String>,
-
-    #[clap(
-        long,
-        help = "The name of a patch-port to be used with advanced routing for traffic interception that connects the HBN pod to an intermediate bridge between VFs and HBN."
-    )]
-    pub vf_intercept_bridge_port_name: Option<String>,
-
-    #[clap(
-        long,
-        help = "The name of patch-port to be used with advanced routing for traffic interception that connects the HBN pod to an intermediate bridge between the host PF and HBN."
-    )]
-    pub host_intercept_bridge_port_name: Option<String>,
-
-    #[clap(
-        long,
-        help = "The SF used for routing intercepted VF traffic to the HBN pod."
-    )]
-    pub vf_intercept_bridge_sf: Option<String>,
 
     #[clap(
         long,
@@ -317,6 +329,7 @@ pub struct RunOptions {
     )]
     pub fmds_grpc_server: Option<String>,
     #[clap(
+        long,
         default_value = "container-exec",
         help = "Set the configuration mode for HBN. Specify \"container-exec\" or \"nvue-rest\".",
         env = "HBN_CONFIG_MODE"
@@ -359,7 +372,7 @@ impl FromStr for HbnConfigMode {
         match s {
             "container-exec" => Ok(ContainerExec),
             "nvue-rest" => Ok(NvueRest),
-            unknown_mode => Err(eyre::eyre!("Unknown HBN config mode \"{unknown_mode}\"")),
+            unknown_mode => Err(eyre::eyre!("unknown HBN config mode \"{unknown_mode}\"")),
         }
     }
 }
@@ -391,7 +404,7 @@ impl FromStr for AgentPlatformType {
         match s {
             "dpu-os" => Ok(DpuOs),
             "containerized" => Ok(Containerized),
-            unknown_type => Err(eyre::eyre!("Unknown platform type \"{unknown_type}\"")),
+            unknown_type => Err(eyre::eyre!("unknown platform type \"{unknown_type}\"")),
         }
     }
 }
@@ -454,30 +467,118 @@ impl Options {
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{Check, check_values, scenarios, value_scenarios};
+
     use super::*;
 
-    #[test]
-    fn test_platform_type_parses_all_valid_values() {
-        assert!(matches!(
-            "dpu-os".parse::<AgentPlatformType>().unwrap(),
-            AgentPlatformType::DpuOs
-        ));
-        assert!(matches!(
-            "containerized".parse::<AgentPlatformType>().unwrap(),
-            AgentPlatformType::Containerized
-        ));
+    /// Names an `AgentPlatformType` so parse results compare as a stable tag --
+    /// the enum is a clap value type and isn't `PartialEq`.
+    fn platform_tag(t: &AgentPlatformType) -> &'static str {
+        match t {
+            AgentPlatformType::DpuOs => "dpu-os",
+            AgentPlatformType::Containerized => "containerized",
+        }
+    }
+
+    /// Names an `HbnConfigMode` for the same reason as [`platform_tag`].
+    fn hbn_mode_tag(m: &HbnConfigMode) -> &'static str {
+        match m {
+            HbnConfigMode::ContainerExec => "container-exec",
+            HbnConfigMode::NvueRest => "nvue-rest",
+        }
     }
 
     #[test]
-    fn test_platform_type_rejects_unknown_value() {
-        let err = "banana".parse::<AgentPlatformType>().unwrap_err();
+    fn test_platform_type_from_str() {
+        scenarios!(run = |s: &str| s
+            .parse::<AgentPlatformType>()
+            .map(|t| platform_tag(&t))
+            .map_err(|e| e.to_string());
+            "valid values map to their variant" {
+                "dpu-os" => Yields("dpu-os"),
+                "containerized" => Yields("containerized"),
+            }
+
+            "unknown values are rejected" {
+                // `init-container` is now a dedicated subcommand, not a platform-type
+                // value; callers must use the subcommand instead.
+                "banana" => Fails,
+                "init-container" => Fails,
+            }
+        );
+    }
+
+    #[test]
+    fn test_platform_type_rejects_unknown_value_naming_the_input() {
+        // The rejection message echoes the offending value so operators can see
+        // what they mistyped.
+        for bad in ["banana", "init-container"] {
+            let err = bad.parse::<AgentPlatformType>().unwrap_err();
+            assert!(err.to_string().contains(bad), "error should name {bad}");
+        }
+    }
+
+    #[test]
+    fn test_hbn_config_mode_from_str() {
+        scenarios!(run = |s: &str| s
+            .parse::<HbnConfigMode>()
+            .map(|m| hbn_mode_tag(&m))
+            .map_err(|e| e.to_string());
+            "valid modes map to their variant" {
+                "container-exec" => Yields("container-exec"),
+                "nvue-rest" => Yields("nvue-rest"),
+            }
+
+            "unknown modes are rejected" {
+                "banana" => Fails,
+                "" => Fails,
+            }
+        );
+    }
+
+    #[test]
+    fn test_hbn_config_mode_rejects_unknown_value_naming_the_input() {
+        let err = "banana".parse::<HbnConfigMode>().unwrap_err();
         assert!(err.to_string().contains("banana"));
     }
 
     #[test]
     fn test_is_dpu_os_only_true_for_dpu_os() {
-        assert!(AgentPlatformType::DpuOs.is_dpu_os());
-        assert!(!AgentPlatformType::Containerized.is_dpu_os());
+        check_values(
+            [
+                Check {
+                    scenario: "dpu-os is the DPU OS",
+                    input: AgentPlatformType::DpuOs,
+                    expect: true,
+                },
+                Check {
+                    scenario: "containerized is not the DPU OS",
+                    input: AgentPlatformType::Containerized,
+                    expect: false,
+                },
+            ],
+            |t| t.is_dpu_os(),
+        );
+    }
+
+    #[test]
+    fn test_is_container_exec_only_true_for_container_exec() {
+        check_values(
+            [
+                Check {
+                    scenario: "container-exec uses crictl exec",
+                    input: HbnConfigMode::ContainerExec,
+                    expect: true,
+                },
+                Check {
+                    scenario: "nvue-rest does not use crictl exec",
+                    input: HbnConfigMode::NvueRest,
+                    expect: false,
+                },
+            ],
+            |m| m.is_container_exec(),
+        );
     }
 
     #[test]
@@ -490,15 +591,89 @@ mod tests {
 
     #[test]
     fn test_init_container_subcommand_parses_without_args() {
-        // The init-container subcommand deliberately takes no flags: the output path
-        // is fixed so devs cannot misroute hardware data away from the main container.
         let opts = Options::try_parse_from(["forge-dpu-agent", "init-container"]).unwrap();
-        assert!(matches!(opts.cmd, Some(AgentCommand::InitContainer)));
+        let Some(AgentCommand::InitContainer(options)) = opts.cmd else {
+            panic!("expected init-container command");
+        };
+        assert!(matches!(
+            options.bootstrap_ca_source,
+            InitContainerBootstrapCaSource::LegacyDownload
+        ));
+        assert_eq!(options.bootstrap_ca_url.as_str(), DEFAULT_BOOTSTRAP_CA_URL);
+    }
+
+    #[test]
+    fn test_init_container_subcommand_parses_bootstrap_ca_sources() {
+        value_scenarios!(run = |value: &str| {
+            Options::try_parse_from([
+                "forge-dpu-agent",
+                "init-container",
+                "--bootstrap-ca-source",
+                value,
+            ])
+            .is_ok_and(|opts| {
+                matches!(opts.cmd, Some(AgentCommand::InitContainer(_)))
+            })
+        };
+            "supported bootstrap CA sources parse" {
+                "legacy_download" => true,
+                "mounted" => true,
+            }
+
+            "unknown bootstrap CA sources are rejected" {
+                "embedded" => false,
+                "download-or-whatever" => false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_init_container_subcommand_parses_custom_bootstrap_ca_url() {
+        let opts = Options::try_parse_from([
+            "forge-dpu-agent",
+            "init-container",
+            "--bootstrap-ca-url",
+            "https://pxe.example.test/custom/ca.pem",
+        ])
+        .unwrap();
+        let Some(AgentCommand::InitContainer(options)) = opts.cmd else {
+            panic!("expected init-container command");
+        };
+        assert_eq!(
+            options.bootstrap_ca_url.as_str(),
+            "https://pxe.example.test/custom/ca.pem"
+        );
+    }
+
+    #[test]
+    fn test_init_container_subcommand_rejects_invalid_bootstrap_ca_url() {
+        let result = Options::try_parse_from([
+            "forge-dpu-agent",
+            "init-container",
+            "--bootstrap-ca-url",
+            "not a URL",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_init_container_subcommand_rejects_unsupported_bootstrap_ca_url_scheme() {
+        let result = Options::try_parse_from([
+            "forge-dpu-agent",
+            "init-container",
+            "--bootstrap-ca-url",
+            "file:///tmp/site-ca.pem",
+        ]);
+        let error = result.err().expect("file URL should be rejected");
+        assert!(
+            error.to_string().contains("expected http or https"),
+            "unexpected parser error: {error}"
+        );
     }
 
     #[test]
     fn test_init_container_subcommand_rejects_output_file_flag() {
-        // If someone tries to pass --output-file (or any other flag), parsing must fail.
+        // Hardware output remains fixed even though bootstrap CA options are configurable.
         let result = Options::try_parse_from([
             "forge-dpu-agent",
             "init-container",
@@ -522,15 +697,14 @@ mod tests {
 
     #[test]
     fn test_hardware_subcommand_accepts_remaining_platform_types() {
-        for value in ["dpu-os", "containerized"] {
-            let opts = Options::try_parse_from([
-                "forge-dpu-agent",
-                "hardware",
-                "--agent-platform-type",
-                value,
-            ])
-            .unwrap_or_else(|e| panic!("hardware --agent-platform-type={value} should parse: {e}"));
-            assert!(matches!(opts.cmd, Some(AgentCommand::Hardware(_))));
-        }
+        value_scenarios!(run = |value: &str| {
+            Options::try_parse_from(["forge-dpu-agent", "hardware", "--agent-platform-type", value])
+                .is_ok_and(|opts| matches!(opts.cmd, Some(AgentCommand::Hardware(_))))
+        };
+            "remaining platform types parse as the hardware subcommand" {
+                "dpu-os" => true,
+                "containerized" => true,
+            }
+        );
     }
 }

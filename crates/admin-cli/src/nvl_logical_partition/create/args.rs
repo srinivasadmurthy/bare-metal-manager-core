@@ -19,11 +19,19 @@ use ::rpc::forge as forgerpc;
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Create a logical partition for a tenant:
+    $ nico-admin-cli logical-partition create --name my-partition \
+    --tenant-organization-id fds34511233a
+
+")]
+pub(crate) struct Args {
     #[clap(short = 'n', long, help = "name of the partition")]
-    pub name: String,
+    name: String,
     #[clap(short = 't', long, help = "tenant organization id of the partition")]
-    pub tenant_organization_id: String,
+    tenant_organization_id: String,
 }
 
 impl From<Args> for forgerpc::NvLinkLogicalPartitionCreationRequest {

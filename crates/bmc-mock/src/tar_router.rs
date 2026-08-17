@@ -36,7 +36,7 @@ use eyre::Context;
 use flate2::read::GzDecoder;
 use regex::Regex;
 
-pub type EntryMap = Arc<Mutex<HashMap<String, String>>>;
+pub(super) type EntryMap = Arc<Mutex<HashMap<String, String>>>;
 
 #[derive(Clone, Default)]
 struct TarRouterCache {
@@ -45,7 +45,7 @@ struct TarRouterCache {
 
 /// Allows callers to specify an in-memory tar (like via include_bytes!()) or a path to one on the
 /// filesystem.
-pub enum TarGzOption<'a> {
+pub(super) enum TarGzOption<'a> {
     Disk(&'a PathBuf),
 }
 
@@ -58,7 +58,7 @@ impl TarGzOption<'_> {
 }
 
 /// Create a mock of
-pub fn tar_router(
+pub(super) fn tar_router(
     targz: TarGzOption,
     existing_tars: Option<&mut HashMap<std::path::PathBuf, EntryMap>>,
 ) -> eyre::Result<Router> {
@@ -140,7 +140,10 @@ async fn get_from_tar(
 
     match cache.entries.lock().unwrap().get(&path) {
         None => {
-            tracing::trace!("Not found: {path}");
+            tracing::trace!(
+                path = %path,
+                "BMC mock archive path not found",
+            );
             (StatusCode::NOT_FOUND, path).into_response()
         }
         Some(s) => (StatusCode::OK, s.clone()).into_response(),
@@ -149,7 +152,11 @@ async fn get_from_tar(
 
 // We should never get here, but axum's matchit bug means we sometimes do: https://github.com/tokio-rs/axum/issues/1986
 async fn not_found_handler(req: Request<Body>) -> (StatusCode, String) {
-    tracing::warn!("fallback: No route for {} {}", req.method(), req.uri());
+    tracing::warn!(
+        method = %req.method(),
+        uri = %req.uri(),
+        "No route for BMC mock request",
+    );
     (
         StatusCode::NOT_FOUND,
         format!("No route for {} {}", req.method(), req.uri()),

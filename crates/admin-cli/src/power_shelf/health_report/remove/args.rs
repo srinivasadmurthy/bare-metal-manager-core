@@ -19,7 +19,15 @@ use carbide_uuid::power_shelf::PowerShelfId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
-    pub power_shelf_id: PowerShelfId,
-    pub report_source: String,
+#[command(after_long_help = "\
+EXAMPLES:
+
+Remove a health report source from a power shelf (source name from `health-report show`):
+    $ nico-admin-cli power-shelf health-report remove 12345678-1234-5678-90ab-cdef01234567 \
+    internal-maintenance
+
+")]
+pub(crate) struct Args {
+    pub(super) power_shelf_id: PowerShelfId,
+    pub(super) report_source: String,
 }

@@ -15,19 +15,25 @@
  * limitations under the License.
  */
 
-pub mod args;
-pub mod cmds;
+pub(crate) mod args;
+mod cmds;
 
 #[cfg(test)]
 mod tests;
 
-pub use args::Cmd;
+use args::Cmd;
 use librms::RackManagerClientPool;
 
 use crate::cfg::cli_options::CliOptions;
 use crate::rms::args::RmsAction;
 
-pub async fn action(action: RmsAction, config: &CliOptions) -> color_eyre::Result<()> {
+// `rms` is intentionally OUTSIDE the `Dispatch`/`Run` trait flow: like `redfish`,
+// it builds its own client (an RMS rack-manager pool) from raw `CliOptions` and
+// is dispatched by `main` *before* the API client / `RuntimeContext` exists --
+// see the `CliCommand::Rms` branch in `main.rs`. The traits carry a
+// `RuntimeContext` rms never has, so it stays a plain `action` fn rather than
+// implementing them. Please don't "realign" it onto the traits.
+pub(crate) async fn action(action: RmsAction, config: &CliOptions) -> color_eyre::Result<()> {
     let url = if let Some(x) = action.url {
         x
     } else if let Some(y) = config.rms_api_url.clone() {
@@ -61,7 +67,7 @@ pub async fn action(action: RmsAction, config: &CliOptions) -> color_eyre::Resul
     let rms_client = rms_client_pool.create_client().await;
 
     match action.command {
-        Cmd::Inventory => cmds::get_all_inventory(&rms_client).await,
+        Cmd::Inventory => cmds::list_node_inventory(&rms_client).await,
         Cmd::PowerOnSequence(args) => cmds::power_on_sequence(args, &rms_client).await,
         Cmd::PowerState(args) => cmds::power_state(args, &rms_client).await,
         Cmd::FirmwareInventory(args) => cmds::get_firmware_inventory(args, &rms_client).await,

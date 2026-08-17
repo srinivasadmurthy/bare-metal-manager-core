@@ -15,12 +15,13 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge as forgerpc;
 use prettytable::{Table, row};
 use rpc::forge::TenantByOrganizationIdsRequest;
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 
 /// Produces a table for printing a non-JSON representation of a
@@ -60,7 +61,7 @@ pub(crate) fn convert_tenants_to_table(
 }
 
 /// Show one or more tenants.
-pub async fn show(
+pub(super) async fn show(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,

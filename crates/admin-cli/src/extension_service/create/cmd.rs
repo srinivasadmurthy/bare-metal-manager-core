@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliResult;
 use ::rpc::admin_cli::output::OutputFormat;
 
 use super::super::show::cmd::convert_extension_services_to_table;
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn handle_create(
+pub(super) async fn handle_create(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,

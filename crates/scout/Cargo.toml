@@ -20,6 +20,7 @@ version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [lib]
 name = "scout"
@@ -34,17 +35,20 @@ path = "src/main.rs"
 # [local-dependencies]
 carbide-rpc = { path = "../rpc" }
 carbide-host-support = { path = "../host-support" }
+carbide-instrument = { path = "../instrument" }
 carbide-tls = { path = "../tls" }
 carbide-uuid = { path = "../uuid" }
 carbide-version = { path = "../version" }
 carbide-utils = { path = "../utils" }
 carbide-machine-validation = { path = "../machine-validation" }
 carbide-libmlx = { path = "../libmlx" }
+metrics-endpoint = { path = "../metrics-endpoint" }
 
 chrono = { workspace = true }
 clap = { workspace = true }
 eyre = { workspace = true }
 efivar = { workspace = true }
+hex = { workspace = true }
 http = { workspace = true }
 lazy_static = { workspace = true }
 once_cell = { workspace = true }
@@ -60,20 +64,20 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tryhard = { workspace = true }
 tss-esapi = { workspace = true }
-uname = { workspace = true }
 uuid = { workspace = true }
 reqwest = { default-features = false, features = [
-  "rustls-tls",
+  "rustls",
   "stream",
 ], workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 futures-util = { workspace = true }
-prost-types = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+carbide-instrument = { path = "../instrument", features = ["test-support"] }
+carbide-test-support = { path = "../test-support" }
 
 [build-dependencies]
 carbide-version = { path = "../version" }

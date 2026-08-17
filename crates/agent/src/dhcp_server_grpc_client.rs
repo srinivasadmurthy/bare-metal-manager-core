@@ -15,13 +15,18 @@
  * limitations under the License.
  */
 
-pub mod proto {
+mod proto {
+    #![allow(
+        unreachable_pub,
+        reason = "tonic_prost_build emits public items for this crate-internal protocol module"
+    )]
+
     tonic::include_proto!("dhcp_server_control");
 }
 
-use carbide_utils::models::dhcp::{
+use carbide_rpc_utils::dhcp::{
     DhcpConfig as ModelDhcpConfig, HostConfig as ModelHostConfig,
-    InterfaceInfo as ModelInterfaceInfo,
+    InterfaceInfo as ModelInterfaceInfo, InterfaceInfoV6 as ModelInterfaceInfoV6,
 };
 use carbide_uuid::machine::MachineInterfaceId;
 use proto::dhcp_server_control_client::DhcpServerControlClient;
@@ -47,6 +52,28 @@ impl From<ModelDhcpConfig> for proto::DhcpConfig {
                 .collect(),
             carbide_provisioning_server_ipv4: c.carbide_provisioning_server_ipv4.to_string(),
             carbide_dhcp_server: c.carbide_dhcp_server.to_string(),
+            carbide_nameservers_v6: c
+                .carbide_nameservers_v6
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect(),
+            carbide_ntpservers_v6: c
+                .carbide_ntpservers_v6
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect(),
+            carbide_dhcp_server_v6: c.carbide_dhcp_server_v6.map(|ip| ip.to_string()),
+            dhcpv6_preferred_lifetime_secs: c.dhcpv6_preferred_lifetime_secs,
+            dhcpv6_valid_lifetime_secs: c.dhcpv6_valid_lifetime_secs,
+        }
+    }
+}
+
+impl From<ModelInterfaceInfoV6> for proto::InterfaceInfoV6 {
+    fn from(i: ModelInterfaceInfoV6) -> Self {
+        proto::InterfaceInfoV6 {
+            address: i.address.map(|ip| ip.to_string()),
+            prefix: i.prefix,
         }
     }
 }
@@ -54,12 +81,13 @@ impl From<ModelDhcpConfig> for proto::DhcpConfig {
 impl From<ModelInterfaceInfo> for proto::InterfaceInfo {
     fn from(i: ModelInterfaceInfo) -> Self {
         proto::InterfaceInfo {
-            address: i.address.to_string(),
-            gateway: i.gateway.to_string(),
+            address: i.address.map(|address| address.to_string()),
+            gateway: i.gateway.map(|gateway| gateway.to_string()),
             prefix: i.prefix,
             fqdn: i.fqdn,
             booturl: i.booturl,
             mtu: i.mtu,
+            ipv6: i.ipv6.map(Into::into),
         }
     }
 }
@@ -86,7 +114,7 @@ impl From<ModelHostConfig> for proto::HostConfig {
 /// the host interface UUID and the timestamp of the last DHCP request seen for
 /// that interface.  Returns an empty `Vec` (with a warning) if the call fails,
 /// so the caller can degrade gracefully.
-pub async fn get_dhcp_timestamps(
+pub(super) async fn get_dhcp_timestamps(
     grpc_addr: &str,
 ) -> eyre::Result<Vec<::rpc::forge::LastDhcpRequest>> {
     let channel = tonic::transport::Endpoint::new(grpc_addr.to_string())
@@ -109,7 +137,9 @@ pub async fn get_dhcp_timestamps(
             let id = e
                 .host_interface_id
                 .parse::<MachineInterfaceId>()
-                .map_err(|err| tracing::warn!("Skipping unparseable host_interface_id: {err}"))
+                .map_err(
+                    |err| tracing::warn!(error = %err, "Skipping unparseable host_interface_id"),
+                )
                 .ok()?;
             Some(::rpc::forge::LastDhcpRequest {
                 host_interface_id: Some(id),
@@ -125,7 +155,7 @@ pub async fn get_dhcp_timestamps(
 ///
 /// The gRPC control server remains running after this call so that a future
 /// [`update_and_reload`] call can restart the DHCP process.
-pub async fn stop_server(grpc_addr: &str) -> eyre::Result<()> {
+pub(super) async fn stop_server(grpc_addr: &str) -> eyre::Result<()> {
     let channel = tonic::transport::Endpoint::new(grpc_addr.to_string())
         .map_err(|e| eyre::eyre!("invalid dhcp-server gRPC endpoint {grpc_addr}: {e}"))?
         .connect()
@@ -147,7 +177,7 @@ pub async fn stop_server(grpc_addr: &str) -> eyre::Result<()> {
 /// The server only restarts the DHCP process if the incoming config differs
 /// from what is already active, so this function is safe to call on every
 /// agent tick.
-pub async fn update_and_reload(
+pub(super) async fn update_and_reload(
     grpc_addr: &str,
     dhcp_config: ModelDhcpConfig,
     host_config: Option<ModelHostConfig>,

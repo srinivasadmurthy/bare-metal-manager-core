@@ -38,12 +38,13 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioExecutor;
 use ipnetwork::IpNetwork;
-use rpc::forge::{DpuInfo, FlatInterfaceNetworkSecurityGroupConfig, InterfaceAssociationType};
+use rpc::forge::{
+    DpuInfo, FlatInterfaceNetworkSecurityGroupConfig, InterfaceAssociationType, InterfaceType,
+};
 use rpc::{Timestamp, common as rpc_common};
 use tokio::sync::Mutex;
 
 use crate::tests::common;
-use crate::traffic_intercept_bridging;
 use crate::util::compare_lines;
 
 #[derive(Default, Debug)]
@@ -82,28 +83,6 @@ async fn test_fnn_l3() -> eyre::Result<()> {
     test_nvue_generic(VpcVirtualizationType::Fnn, expected).await
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_traffic_intercept_bridging() -> eyre::Result<()> {
-    let expected = include_str!("../../templates/tests/update_intercept_bridging.sh.expected");
-    let bridging = traffic_intercept_bridging::build(
-        traffic_intercept_bridging::TrafficInterceptBridgingConfig {
-            secondary_overlay_vtep_ip: "1.1.1.1".to_string(),
-            vf_intercept_bridge_ip: "10.10.10.2".to_string(),
-            vf_intercept_bridge_name: "pfdpu000br-dpu".to_string(),
-            intercept_bridge_prefix_len: 29,
-        },
-    )?;
-
-    let r = compare_lines(bridging.as_str(), expected, None);
-    eprint!("Diff output:\n{}", r.report());
-    assert!(
-        r.is_identical(),
-        "generated bridging script does not match expected bridging script"
-    );
-
-    Ok(())
-}
-
 // All of the new tests are leveraging nvue for configs, regardless
 // of template, so have a test_nvue_generic that just takes a virtualization
 // type.
@@ -140,7 +119,7 @@ async fn test_nvue_generic(
             let mut f = fs::File::create(ERR_FILE).unwrap();
             f.write_all(startup_yaml.as_bytes()).unwrap();
         })
-        .wrap_err(format!("YAML parser error. Output written to {ERR_FILE}"))?;
+        .wrap_err(format!("YAML parser error. output written to {ERR_FILE}"))?;
     assert_eq!(yaml_obj.len(), 2); // 'header' and 'set'
 
     let r = compare_lines(startup_yaml.as_str(), expected, None);
@@ -161,7 +140,7 @@ async fn test_nvue_generic(
 // and that data populates the data retrieved by the metadata endpoint server.
 #[tokio::test(flavor = "multi_thread")]
 // Test retrieving instance metadata using FMDS
-pub async fn test_fmds_get_data() -> eyre::Result<()> {
+async fn test_fmds_get_data() -> eyre::Result<()> {
     let out = run_common_parts(VpcVirtualizationType::EthernetVirtualizer, true).await?;
     if out.is_skip {
         return Ok(());
@@ -183,6 +162,56 @@ pub async fn test_fmds_get_data() -> eyre::Result<()> {
     let body_str = std::str::from_utf8(&body).unwrap();
 
     assert_eq!(body_str, "9afaedd3-b36e-4603-a029-8b94a82b89a0");
+
+    // Test get instance name
+    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
+    let request: hyper::Request<Full<Bytes>> = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri("http://0.0.0.0:7777/latest/meta-data/instance-name".to_string())
+        .body("".into())
+        .unwrap();
+
+    let response = client.request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body).unwrap();
+
+    assert_eq!(body_str, "test-instance");
+
+    // Core reports IPv6 first here, but FMDS still exposes each family through its own category.
+    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
+    let request: hyper::Request<Full<Bytes>> = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri("http://0.0.0.0:7777/latest/meta-data/public-ipv4".to_string())
+        .body("".into())
+        .unwrap();
+
+    let response = client.request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body).unwrap();
+
+    assert_eq!(body_str, "10.217.104.146");
+
+    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
+    let request: hyper::Request<Full<Bytes>> = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri("http://0.0.0.0:7777/latest/meta-data/public-ipv6".to_string())
+        .body("".into())
+        .unwrap();
+
+    let response = client.request(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body_str = std::str::from_utf8(&body).unwrap();
+
+    assert_eq!(body_str, "2001:db8::146");
 
     // Test get machine_id
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
@@ -265,7 +294,7 @@ async fn run_common_parts(
     virtualization_type: VpcVirtualizationType,
     test_metadata_service: bool,
 ) -> eyre::Result<TestOut> {
-    carbide_host_support::init_logging()?;
+    carbide_host_support::init_logging("nico-dpu-agent")?;
 
     let state: Arc<Mutex<State>> = Arc::new(Mutex::new(Default::default()));
     state.lock().await.virtualization_type = virtualization_type;
@@ -278,30 +307,36 @@ async fn run_common_parts(
     // additional bits of context (just like carbide-api would).
     let app = Router::new()
         .route("/up", get(handle_up))
-        .route("/forge.Forge/DiscoverMachine", post(handle_discover))
         .route(
-            "/forge.Forge/GetManagedHostNetworkConfig",
+            ::rpc::service_path!("DiscoverMachine"),
+            post(handle_discover),
+        )
+        .route(
+            ::rpc::service_path!("GetManagedHostNetworkConfig"),
             post(handle_netconf),
         )
         .route(
-            "/forge.Forge/RecordDpuNetworkStatus",
+            ::rpc::service_path!("RecordDpuNetworkStatus"),
             post(handle_record_netstat),
         )
         .route(
-            "/forge.Forge/DpuAgentUpgradeCheck",
+            ::rpc::service_path!("DpuAgentUpgradeCheck"),
             post(handle_dpu_agent_upgrade_check),
         )
         .route(
-            "/forge.Forge/UpdateAgentReportedInventory",
+            ::rpc::service_path!("UpdateAgentReportedInventory"),
             post(handle_update_agent_reported_inventory),
         )
         .route(
-            "/forge.Forge/GetDpuInfoList",
+            ::rpc::service_path!("GetDpuInfoList"),
             post(handle_get_dpu_info_list),
         )
-        .route("/forge.Forge/FindInterfaces", post(handle_find_interfaces))
+        .route(
+            ::rpc::service_path!("FindInterfaces"),
+            post(handle_find_interfaces),
+        )
         // ForgeApiClient needs a working Version route for connection retrying
-        .route("/forge.Forge/Version", post(handle_version))
+        .route(::rpc::service_path!("Version"), post(handle_version))
         .fallback(handler)
         .with_state(state.clone());
     let (addr, join_handle) = common::run_grpc_server(app).await?;
@@ -325,7 +360,7 @@ async fn run_common_parts(
     // Start forge-dpu-agent
     tokio::spawn(async move {
         if let Err(e) = crate::start(opts).await {
-            tracing::error!("Failed to start DPU agent: {:#}", e);
+            tracing::error!(error = ?e, "Failed to start DPU agent");
         }
     });
 
@@ -343,7 +378,7 @@ async fn run_common_parts(
 
         if start.elapsed() > std::time::Duration::from_secs(60) {
             return Err(eyre::eyre!(
-                "Health report was not sent 2 times in 30s. State: {:?}",
+                "health report was not sent 2 times in 30s. state: {:?}",
                 statel
             ));
         }
@@ -400,6 +435,8 @@ async fn handle_version() -> impl IntoResponse {
     common::respond(resp)
 }
 
+// This mock omits `addresses` to exercise the rolling-upgrade fallback for older Core versions.
+#[allow(deprecated)]
 async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl IntoResponse {
     {
         state
@@ -459,6 +496,9 @@ async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl 
         internal_uuid: None,
         mtu: None,
         ipv6_interface_config: None,
+        vpc_routing_profile: None,
+        interface_routing_profile: None,
+        addresses: vec![],
     };
     assert_eq!(admin_interface.svi_ip, None);
 
@@ -628,6 +668,9 @@ async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl 
         internal_uuid: None,
         mtu: None,
         ipv6_interface_config: None,
+        vpc_routing_profile: None,
+        interface_routing_profile: None,
+        addresses: vec![],
     };
 
     let network_security_policy_overrides = vec![
@@ -744,7 +787,11 @@ async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl 
     let instance = rpc::Instance {
         id: Some("9afaedd3-b36e-4603-a029-8b94a82b89a0".parse().unwrap()),
         machine_id: Some("fm100htjsaledfasinabqqer70e2ua5ksqj4kfjii0v0a90vulps48c1h7g".parse().unwrap()),
-        metadata: None,
+        metadata: Some(rpc::Metadata {
+            name: "test-instance".to_string(),
+            description: String::new(),
+            labels: vec![],
+        }),
         instance_type_id: None,
         config: Some(rpc::InstanceConfig {
             tenant: Some(rpc::TenantConfig {
@@ -758,7 +805,6 @@ async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl 
                 user_data: Some("".to_string()),
                 variant: Some(rpc::forge::instance_operating_system_config::Variant::Ipxe(rpc::forge::InlineIpxe {
                     ipxe_script: " chain http://10.217.126.4/public/blobs/internal/x86_64/qcow-imager.efi loglevel=7 console=ttyS0,115200 console=tty0 pci=realloc=off image_url=https://pbss.s8k.io/v1/AUTH_team-forge/images.qcow2/carbide-dev-environment/carbide-dev-environment-latest.qcow2".to_string(),
-                    user_data: Some("".to_string()),
                 })),
             }),
             network: Some(rpc::InstanceNetworkConfig {
@@ -773,13 +819,18 @@ async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl 
                     virtual_function_id: None,
                     ip_address: None,
                     ipv6_interface_config: None,
+                    routing_profile: None,
                 }],
+                #[allow(deprecated)]
+                auto: false,
+                auto_config: None,
             }),
             infiniband: None,
             network_security_group_id: None,
             dpu_extension_services: None,
             nvlink: None,
-
+            spxconfig: None,
+            power_profile: None,
         }),
         status: Some(rpc::InstanceStatus {
             tenant: Some(rpc::InstanceTenantStatus {
@@ -790,11 +841,22 @@ async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl 
                 interfaces: vec![rpc::InstanceInterfaceStatus {
                     virtual_function_id: None,
                     mac_address: Some("5C:25:73:9E:92:F2".to_string()),
-                    addresses: vec!["10.217.104.146".to_string()],
-                    gateways: vec!["10.217.104.145/30".to_string()],
-                    prefixes: vec!["10.217.104.146/32".to_string()],
-            device: None,
-            device_instance: 0u32,
+                    addresses: vec![
+                        "2001:db8::146".to_string(),
+                        "10.217.104.146".to_string(),
+                    ],
+                    gateways: vec![
+                        "2001:db8::145/64".to_string(),
+                        "10.217.104.145/30".to_string(),
+                    ],
+                    prefixes: vec![
+                        "2001:db8::146/128".to_string(),
+                        "10.217.104.146/32".to_string(),
+                    ],
+                    device: None,
+                    device_instance: 0u32,
+                    vpc_id: None,
+                    resolved_vpc_prefixes: None,
                 }],
                 configs_synced: rpc::SyncState::Synced.into(),
             }),
@@ -812,6 +874,7 @@ async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl 
             }),
             configs_synced: rpc::SyncState::Synced.into(),
             update: None,
+            spx_status: None,
         }),
         network_config_version: "V1-T1748645613333257".to_string(),
         ib_config_version: "V1-T1748645613333260".to_string(),
@@ -838,6 +901,8 @@ async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl 
             tenant_leak_communities_accepted: false,
             leak_default_route_from_underlay: false,
             leak_tenant_host_routes_to_underlay: false,
+            accepted_leaks_from_underlay: vec![],
+            allowed_anycast_prefixes: vec![],
             route_target_imports: vec![rpc_common::RouteTarget {
                 asn: 44444,
                 vni: 55555,
@@ -850,24 +915,13 @@ async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl 
 
         anycast_site_prefixes: vec!["5.255.255.0/24".to_string()],
         tenant_host_asn: Some(65100),
-        traffic_intercept_config: Some(rpc::forge::TrafficInterceptConfig {
-            bridging: Some(rpc::forge::TrafficInterceptBridging {
-                internal_bridge_routing_prefix: "10.255.255.0/29".to_string(),
-                host_intercept_bridge_name: "br-host".to_string(),
-                vf_intercept_bridge_name: "br-dpu".to_string(),
-                vf_intercept_bridge_port: "pfdpu000br-dpu".to_string(),
-                vf_intercept_bridge_sf: "pf0dpu5".to_string(),
-                host_intercept_bridge_port: "pfdpu000br-host".to_string(),
-            }),
-            additional_overlay_vtep_ip: Some("10.2.2.1".to_string()),
-            public_prefixes: vec!["7.8.0.0/16".to_string()],
-        }),
-
         dhcp_servers: vec!["127.0.0.1".to_string()],
+        ntp_servers: vec![],
         vni_device: "".to_string(),
 
         managed_host_config: Some(rpc::forge::ManagedHostNetworkConfig {
             loopback_ip: "127.0.0.1".to_string(),
+            loopback_ip_v6: None,
             quarantine_state: None,
         }),
         managed_host_config_version: config_version.clone(),
@@ -896,6 +950,8 @@ async fn handle_netconf(AxumState(state): AxumState<Arc<Mutex<State>>>) -> impl 
         stateful_acls_enabled: true,
         instance: Some(instance),
         dpu_extension_services: vec![],
+        astra_config: None,
+        use_admin_network_changed: None,
     };
     common::respond(netconf)
 }
@@ -943,10 +999,12 @@ async fn handle_get_dpu_info_list(
             DpuInfo {
                 id: "fm100dsvstfujf6mis0gpsoi81tadmllicv7rqo4s7gc16gi0t2478672vg".to_string(),
                 loopback_ip: "172.20.0.119".to_string(),
+                observed_status: None,
             },
             DpuInfo {
                 id: "fm100dsjd1vuk6gklgvh0ao8t7r7tk1pt101ub5ck0g3j7lqcm8h3rf1p8g".to_string(),
                 loopback_ip: "172.20.0.200".to_string(),
+                observed_status: None,
             },
         ],
     })
@@ -958,6 +1016,7 @@ fn timestamp_from_secs_nanos(secs: i64, nanos: i32) -> Timestamp {
     Timestamp::from(system_time)
 }
 
+#[allow(deprecated)]
 async fn handle_find_interfaces() -> impl axum::response::IntoResponse {
     let interface = rpc::forge::MachineInterface {
         id: Some(
@@ -986,7 +1045,8 @@ async fn handle_find_interfaces() -> impl axum::response::IntoResponse {
         vendor: None,
         created: Some(timestamp_from_secs_nanos(1773084037, 3824000)),
         last_dhcp: Some(timestamp_from_secs_nanos(1773097243, 70533000)),
-        is_bmc: None,
+        is_bmc: Some(false),
+        interface_type: Some(InterfaceType::Data.into()),
         power_shelf_id: None,
         switch_id: None,
         association_type: Some(InterfaceAssociationType::Machine.into()),
@@ -998,7 +1058,7 @@ async fn handle_find_interfaces() -> impl axum::response::IntoResponse {
 }
 
 async fn handler(uri: Uri) -> impl IntoResponse {
-    tracing::debug!("general handler: {:?}", uri);
+    tracing::debug!(?uri, "General request handler received request");
     StatusCode::NOT_FOUND
 }
 

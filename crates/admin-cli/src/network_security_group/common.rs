@@ -15,16 +15,17 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use ::rpc::forge::{self as forgerpc};
 use prettytable::{Table, row};
+
+use crate::errors::{CarbideCliError, CarbideCliResult};
 
 /// Produces a table for printing a non-JSON representation of a
 /// network security group to standard out.
 ///
 /// * `nsgs`    - A reference to an active DB transaction
 /// * `verbose` - A bool to select more verbose output (e.g., include full rule details)
-pub fn convert_nsgs_to_table(
+pub(super) fn convert_nsgs_to_table(
     nsgs: &[forgerpc::NetworkSecurityGroup],
     verbose: bool,
 ) -> CarbideCliResult<Box<Table>> {

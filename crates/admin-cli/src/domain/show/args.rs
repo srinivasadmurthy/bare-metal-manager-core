@@ -19,7 +19,17 @@ use carbide_uuid::domain::DomainId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all domains:
+    $ nico-admin-cli domain show
+
+Show one domain by ID:
+    $ nico-admin-cli domain show 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(
         short,
         long,
@@ -27,11 +37,11 @@ pub struct Args {
         conflicts_with = "domain",
         help = "Show all domains (DEPRECATED)"
     )]
-    pub all: bool,
+    pub(crate) all: bool,
 
     #[clap(
         default_value(None),
         help = "The domain to query, leave empty for all (default)"
     )]
-    pub domain: Option<DomainId>,
+    pub(crate) domain: Option<DomainId>,
 }

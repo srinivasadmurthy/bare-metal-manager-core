@@ -20,9 +20,9 @@ use clap::Parser;
 use rpc::forge as forgerpc;
 
 /// Enable or disable maintenance mode on a managed host.
-/// To list machines in maintenance mode use `forge-admin-cli mh show --all --fix`
+/// To list machines in maintenance mode use `nico-admin-cli mh show --all --fix`
 #[derive(Parser, Debug)]
-pub enum Args {
+pub(crate) enum Args {
     /// Put this machine into maintenance mode. Prevents an instance being assigned to it.
     On(MaintenanceOn),
     /// Return this machine to normal operation.
@@ -30,9 +30,17 @@ pub enum Args {
 }
 
 #[derive(Parser, Debug)]
-pub struct MaintenanceOn {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Put a host into maintenance mode (prevents instance assignment):
+    $ nico-admin-cli managed-host maintenance on --host 12345678-1234-5678-90ab-cdef01234567 \
+    --reference https://tickets.example.com/MH-42
+
+")]
+pub(crate) struct MaintenanceOn {
     #[clap(long, required(true), help = "Managed Host ID")]
-    pub host: MachineId,
+    host: MachineId,
 
     #[clap(
         long,
@@ -40,7 +48,7 @@ pub struct MaintenanceOn {
         required(true),
         help = "URL of reference (ticket, issue, etc) for this machine's maintenance"
     )]
-    pub reference: String,
+    reference: String,
 }
 
 impl From<MaintenanceOn> for forgerpc::MaintenanceRequest {
@@ -54,9 +62,16 @@ impl From<MaintenanceOn> for forgerpc::MaintenanceRequest {
 }
 
 #[derive(Parser, Debug)]
-pub struct MaintenanceOff {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Return a host to normal operation:
+    $ nico-admin-cli managed-host maintenance off --host 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct MaintenanceOff {
     #[clap(long, required(true), help = "Managed Host ID")]
-    pub host: MachineId,
+    host: MachineId,
 }
 
 impl From<MaintenanceOff> for forgerpc::MaintenanceRequest {

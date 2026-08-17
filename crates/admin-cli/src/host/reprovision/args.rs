@@ -21,7 +21,20 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub enum Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Set a host into reprovisioning mode:
+    $ nico-admin-cli host reprovision set --id 12345678-1234-5678-90ab-cdef01234567
+
+Clear reprovisioning mode for a host:
+    $ nico-admin-cli host reprovision clear --id 12345678-1234-5678-90ab-cdef01234567
+
+List all hosts pending reprovisioning:
+    $ nico-admin-cli host reprovision list
+
+")]
+pub(crate) enum Args {
     #[clap(about = "Set the host in reprovisioning mode.")]
     Set(ReprovisionSet),
     #[clap(about = "Clear the reprovisioning mode.")]
@@ -34,19 +47,34 @@ pub enum Args {
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct ReprovisionSet {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Set a host into reprovisioning mode:
+    $ nico-admin-cli host reprovision set --id 12345678-1234-5678-90ab-cdef01234567
+
+Set into reprovisioning mode and update firmware:
+    $ nico-admin-cli host reprovision set --id 12345678-1234-5678-90ab-cdef01234567 \
+    --update-firmware
+
+Set into reprovisioning mode and raise a health alert with a message:
+    $ nico-admin-cli host reprovision set --id 12345678-1234-5678-90ab-cdef01234567 \
+    --update-message \"Quarterly firmware refresh\"
+
+")]
+pub(crate) struct ReprovisionSet {
     #[clap(short, long, help = "Machine ID for which reprovisioning is needed.")]
-    pub id: MachineId,
+    pub(super) id: MachineId,
 
     #[clap(short, long, action)]
-    pub update_firmware: bool,
+    update_firmware: bool,
 
     #[clap(
         long,
         alias = "maintenance_reference",
         help = "If set, a HostUpdateInProgress health alert will be applied to the host"
     )]
-    pub update_message: Option<String>,
+    pub(super) update_message: Option<String>,
 }
 
 impl From<&ReprovisionSet> for HostReprovisioningRequest {
@@ -60,16 +88,27 @@ impl From<&ReprovisionSet> for HostReprovisioningRequest {
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct ReprovisionClear {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Clear reprovisioning mode for a host:
+    $ nico-admin-cli host reprovision clear --id 12345678-1234-5678-90ab-cdef01234567
+
+Clear reprovisioning mode and update firmware:
+    $ nico-admin-cli host reprovision clear --id 12345678-1234-5678-90ab-cdef01234567 \
+    --update-firmware
+
+")]
+pub(crate) struct ReprovisionClear {
     #[clap(
         short,
         long,
         help = "Machine ID for which reprovisioning should be cleared."
     )]
-    pub id: MachineId,
+    id: MachineId,
 
     #[clap(short, long, action)]
-    pub update_firmware: bool,
+    update_firmware: bool,
 }
 
 impl From<ReprovisionClear> for HostReprovisioningRequest {
@@ -83,11 +122,19 @@ impl From<ReprovisionClear> for HostReprovisioningRequest {
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct ManualFirmwareUpgradeComplete {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Mark manual firmware upgrade complete for a host:
+    $ nico-admin-cli host reprovision mark-manual-upgrade-complete \
+    --id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct ManualFirmwareUpgradeComplete {
     #[clap(
         short,
         long,
         help = "Machine ID for which manual firmware upgrade should be set."
     )]
-    pub id: MachineId,
+    pub(super) id: MachineId,
 }

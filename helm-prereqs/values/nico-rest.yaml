@@ -1,0 +1,40 @@
+# =============================================================================
+# nico-rest.yaml — values for: helm upgrade --install nico-rest <chart>
+#
+# Image registry and tag are injected at install time via --set flags:
+#   --set global.image.repository=<your-registry>
+#   --set global.image.tag=<tag>
+# In setup.sh these come from NICO_IMAGE_REGISTRY and NICO_IMAGE_TAG.
+# =============================================================================
+
+global:
+  image:
+    repository: ""    # set via --set global.image.repository (NICO_IMAGE_REGISTRY env var)
+    tag: ""           # set via --set global.image.tag (NICO_IMAGE_TAG env var)
+    pullPolicy: IfNotPresent
+
+nico-rest-api:
+  replicaCount: 3
+  nodePort:
+    enabled: true
+    port: 30388
+  config:
+    keycloak:
+      enabled: true
+      baseURL: "http://keycloak.nico-rest:8082"
+      externalBaseURL: "http://keycloak.nico-rest:8082"
+      realm: "nico"
+      clientID: "nico-rest"
+      serviceAccount: true
+
+nico-rest-cert-manager:
+  replicaCount: 3
+
+nico-rest-site-manager:
+  replicaCount: 3
+
+nico-rest-workflow:
+  cloudWorker:
+    replicaCount: 3
+  siteWorker:
+    replicaCount: 3

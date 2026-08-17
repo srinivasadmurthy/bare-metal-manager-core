@@ -1,28 +1,35 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! MQTT consumer that receives messages and writes them to a channel.
 
 use std::sync::Arc;
 
-use forge_secrets::credentials::CredentialReader;
+use carbide_instrument::emit;
+use carbide_secrets::credentials::CredentialReader;
 use mqttea::QoS;
 use mqttea::client::{ClientOptions, MqtteaClient};
 use mqttea::registry::JsonRegistration;
 use tokio::sync::mpsc;
 
+use crate::DsxConsumerError;
 use crate::config::{MqttAuthMode, MqttConfig};
 use crate::messages::{LeakMetadata, ValueMessage};
-use crate::{ConsumerMetrics, DsxConsumerError};
+use crate::metrics::{DroppedMessageType, MessageDropped, MessageReceived};
 
 /// Message types received from MQTT.
 #[derive(Debug, Clone)]
@@ -37,15 +44,18 @@ pub enum MqttMessage {
     },
 }
 
-/// Connect to MQTT and return a receiver for incoming messages.
+/// Connect to MQTT and return the processing channel's sender and receiver.
 ///
-/// Sets up the MQTT client, registers message handlers, subscribes to topics,
-/// and connects. Returns a receiver that yields messages with drop-on-overflow.
+/// Sets up the MQTT client, registers message handlers and the client's
+/// queue/publish/connection metrics on the meter, subscribes to topics,
+/// and connects. Returns a sender handle (for the caller to observe the
+/// channel's pending depth) alongside the receiver that yields messages with
+/// drop-on-overflow.
 pub async fn connect(
     config: &MqttConfig,
-    metrics: ConsumerMetrics,
+    meter: &opentelemetry::metrics::Meter,
     credential_reader: Arc<dyn CredentialReader>,
-) -> Result<mpsc::Receiver<MqttMessage>, DsxConsumerError> {
+) -> Result<(mpsc::Sender<MqttMessage>, mpsc::Receiver<MqttMessage>), DsxConsumerError> {
     let (tx, rx) = mpsc::channel(config.queue_capacity);
 
     // QoS 0 is the recommended setting for DSX Exchange integrations.
@@ -61,14 +71,14 @@ pub async fn connect(
         }
     };
 
-    let client = MqtteaClient::new(
-        &config.endpoint,
-        config.port,
-        &config.client_id,
-        Some(options),
-    )
-    .await
-    .map_err(|e| DsxConsumerError::Mqtt(e.to_string()))?;
+    // Suffix the broker-level client identifier so multiple replicas (or a new
+    // pod coming up while the old one is still terminating) do not race for
+    // the same MQTT session and ping-pong each other off the broker.
+    let client_id = mqttea::unique_client_id(&config.client_id);
+    let client = MqtteaClient::new(&config.endpoint, config.port, &client_id, Some(options))
+        .await
+        .map_err(|e| DsxConsumerError::Mqtt(e.to_string()))?;
+    client.register_metrics(meter, "dsx_exchange_consumer");
 
     // Register message types with distinct suffix patterns.
     // mqttea converts simple strings to suffix regex: "Metadata" -> "/Metadata$"
@@ -86,13 +96,13 @@ pub async fn connect(
     client
         .on_message::<LeakMetadata, _, _>({
             let tx = tx.clone();
-            let metrics = metrics.clone();
             move |_client, metadata, topic| {
-                metrics.record_message_received();
+                emit(MessageReceived);
                 let msg = MqttMessage::Metadata { topic, metadata };
                 if tx.try_send(msg).is_err() {
-                    metrics.record_message_dropped();
-                    tracing::warn!("Message queue full, dropping metadata message");
+                    emit(MessageDropped {
+                        message_type: DroppedMessageType::Metadata,
+                    });
                 }
                 std::future::ready(())
             }
@@ -101,14 +111,18 @@ pub async fn connect(
 
     // Register handler for value messages
     client
-        .on_message::<ValueMessage, _, _>(move |_client, value, topic| {
-            metrics.record_message_received();
-            let msg = MqttMessage::Value { topic, value };
-            if tx.try_send(msg).is_err() {
-                metrics.record_message_dropped();
-                tracing::warn!("Message queue full, dropping value message");
+        .on_message::<ValueMessage, _, _>({
+            let tx = tx.clone();
+            move |_client, value, topic| {
+                emit(MessageReceived);
+                let msg = MqttMessage::Value { topic, value };
+                if tx.try_send(msg).is_err() {
+                    emit(MessageDropped {
+                        message_type: DroppedMessageType::Value,
+                    });
+                }
+                std::future::ready(())
             }
-            std::future::ready(())
         })
         .await;
 
@@ -129,15 +143,15 @@ pub async fn connect(
 
     tracing::info!("MQTT consumer connected");
 
-    Ok(rx)
+    Ok((tx, rx))
 }
 
 async fn build_credentials_provider(
     config: &MqttConfig,
     credential_reader: Arc<dyn CredentialReader>,
 ) -> Result<Option<Arc<dyn mqttea::auth::CredentialsProvider>>, DsxConsumerError> {
-    let credential_key = forge_secrets::credentials::CredentialKey::MqttAuth {
-        credential_type: forge_secrets::credentials::MqttCredentialType::DsxExchangeConsumer,
+    let credential_key = carbide_secrets::credentials::CredentialKey::MqttAuth {
+        credential_type: carbide_secrets::credentials::MqttCredentialType::DsxExchangeConsumer,
     };
 
     match config.auth.auth_mode {
@@ -153,7 +167,7 @@ async fn build_credentials_provider(
                         credential_key.to_key_str()
                     ))
                 })?;
-            let forge_secrets::credentials::Credentials::UsernamePassword { username, password } =
+            let carbide_secrets::credentials::Credentials::UsernamePassword { username, password } =
                 creds;
             Ok(Some(Arc::new(mqttea::auth::StaticCredentials::new(
                 username, password,
@@ -189,7 +203,7 @@ async fn build_credentials_provider(
 }
 
 struct SecretBackedOAuth2Credentials {
-    credential_key: forge_secrets::credentials::CredentialKey,
+    credential_key: carbide_secrets::credentials::CredentialKey,
     credential_reader: Arc<dyn CredentialReader>,
 }
 
@@ -209,7 +223,7 @@ impl mqttea::auth::ClientCredentialsProvider for SecretBackedOAuth2Credentials {
                     self.credential_key.to_key_str()
                 ))
             })?;
-        let forge_secrets::credentials::Credentials::UsernamePassword { username, password } =
+        let carbide_secrets::credentials::Credentials::UsernamePassword { username, password } =
             creds;
         Ok((
             mqttea::ClientId::new(username),

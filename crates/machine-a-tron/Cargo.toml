@@ -20,6 +20,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [lib]
 name = "machine_a_tron"
@@ -39,11 +40,14 @@ uuid = { features = ["v4"], workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tonic = { workspace = true }
+dhcproto = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
+tower = { workspace = true }
 crossterm = { features = ["event-stream"], workspace = true }
 ratatui = { workspace = true }
 mac_address = { workspace = true }
@@ -51,7 +55,7 @@ futures = { workspace = true }
 figment = { features = ["toml"], workspace = true }
 reqwest = { default-features = false, features = [
   "json",
-  "rustls-tls",
+  "rustls",
   "stream",
   "socks",
   "multipart",
@@ -60,18 +64,23 @@ eyre = { workspace = true }
 tempfile = { workspace = true }
 duration-str = { workspace = true }
 rand = { workspace = true }
-rcgen = { workspace = true }
 russh = { workspace = true }
 
 # [local-dependencies]
-carbide-rpc = { path = "../rpc" }
+carbide-api-model = { path = "../api-model" }
+carbide-ipmi = { path = "../ipmi" }
+carbide-rpc = { path = "../rpc", features = ["model"] }
 bmc-mock = { path = "../bmc-mock" }
 carbide-tls = { path = "../tls" }
 carbide-version = { path = "../version" }
 carbide-uuid = { path = "../uuid" }
 carbide-network = { path = "../network" }
+carbide-utils = { path = "../utils", features = ["test-support"] }
+metrics-endpoint = { path = "../metrics-endpoint" }
+ufm-mock = { package = "carbide-ufm-mock", path = "../ufm-mock" }
 
 [dev-dependencies]
+carbide-test-support = { path = "../test-support" }
 toml = { workspace = true }
 
 [build-dependencies]

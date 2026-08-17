@@ -25,40 +25,64 @@ use serde::{Deserialize, Serialize};
 use crate::metadata::parse_rpc_labels;
 
 #[derive(Parser, Debug, Serialize, Deserialize)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Add an expected switch with its BMC credentials and serial number:
+    $ nico-admin-cli expected-switch add --bmc-mac-address 00:11:22:33:44:55 \
+    --bmc-username admin --bmc-password mypassword --switch-serial-number DGX-H100-640GB
+
+Add an expected switch and associate it with a rack:
+    $ nico-admin-cli expected-switch add --bmc-mac-address 00:11:22:33:44:55 \
+    --bmc-username admin --bmc-password mypassword --switch-serial-number DGX-H100-640GB \
+    --rack_id 12345678-1234-5678-90ab-cdef01234567
+
+Add an expected switch with NVOS credentials and a static NVOS IP:
+    $ nico-admin-cli expected-switch add --bmc-mac-address 00:11:22:33:44:55 \
+    --bmc-username admin --bmc-password mypassword --switch-serial-number DGX-H100-640GB \
+    --nvos-mac-address aa:bb:cc:dd:ee:ff --nvos-username admin --nvos-password mypassword \
+    --nvos-ip-address 192.0.2.10
+
+Add an expected switch with metadata name and a label:
+    $ nico-admin-cli expected-switch add --bmc-mac-address 00:11:22:33:44:55 \
+    --bmc-username admin --bmc-password mypassword --switch-serial-number DGX-H100-640GB \
+    --meta-name spine-01 --label DATACENTER:XYZ
+
+")]
+pub(crate) struct Args {
     #[clap(short = 'a', long, help = "BMC MAC Address of the expected switch")]
-    pub bmc_mac_address: MacAddress,
+    bmc_mac_address: MacAddress,
     #[clap(short = 'u', long, help = "BMC username of the expected switch")]
-    pub bmc_username: String,
+    bmc_username: String,
     #[clap(short = 'p', long, help = "BMC password of the expected switch")]
-    pub bmc_password: String,
+    bmc_password: String,
     #[clap(
         short = 's',
         long,
         help = "Chassis serial number of the expected switch"
     )]
-    pub switch_serial_number: String,
+    switch_serial_number: String,
 
     #[clap(long = "nvos-mac-address", help = "NVOS MAC address(es) of the expected switch", action = clap::ArgAction::Append)]
-    pub nvos_mac_addresses: Vec<MacAddress>,
+    nvos_mac_addresses: Vec<MacAddress>,
     #[clap(long, help = "NVOS username of the expected switch")]
-    pub nvos_username: Option<String>,
+    nvos_username: Option<String>,
     #[clap(long, help = "NVOS password of the expected switch")]
-    pub nvos_password: Option<String>,
+    nvos_password: Option<String>,
 
     #[clap(
         long = "meta-name",
         value_name = "META_NAME",
         help = "The name that should be used as part of the Metadata for newly created Switches. If empty, the SwitchId will be used"
     )]
-    pub meta_name: Option<String>,
+    meta_name: Option<String>,
 
     #[clap(
         long = "meta-description",
         value_name = "META_DESCRIPTION",
         help = "The description that should be used as part of the Metadata for newly created Machines"
     )]
-    pub meta_description: Option<String>,
+    meta_description: Option<String>,
 
     #[clap(
         long = "label",
@@ -66,7 +90,7 @@ pub struct Args {
         help = "A label that will be added as metadata for the newly created Machine. The labels key and value must be separated by a : character. E.g. DATACENTER:XYZ",
         action = clap::ArgAction::Append
     )]
-    pub labels: Option<Vec<String>>,
+    labels: Option<Vec<String>>,
 
     #[clap(
         long = "rack_id",
@@ -74,21 +98,28 @@ pub struct Args {
         help = "Rack ID for this machine",
         action = clap::ArgAction::Append
     )]
-    pub rack_id: Option<RackId>,
+    rack_id: Option<RackId>,
 
     #[clap(
         long = "bmc-ip-address",
         value_name = "BMC_IP_ADDRESS",
         help = "BMC IP address of the expected switch"
     )]
-    pub bmc_ip_address: Option<IpAddr>,
+    bmc_ip_address: Option<IpAddr>,
+
+    #[clap(
+        long = "nvos-ip-address",
+        value_name = "NVOS_IP_ADDRESS",
+        help = "Static IP for the single wired NVOS port. Requires exactly one --nvos-mac-address"
+    )]
+    nvos_ip_address: Option<IpAddr>,
 
     #[clap(
         long = "bmc-retain-credentials",
         value_name = "BMC_RETAIN_CREDENTIALS",
         help = "When true, site-explorer skips BMC password rotation and stores factory-default credentials in Vault as-is"
     )]
-    pub bmc_retain_credentials: Option<bool>,
+    bmc_retain_credentials: Option<bool>,
 }
 
 impl From<Args> for rpc::forge::ExpectedSwitch {
@@ -118,6 +149,7 @@ impl From<Args> for rpc::forge::ExpectedSwitch {
                 .bmc_ip_address
                 .map(|ip| ip.to_string())
                 .unwrap_or_default(),
+            nvos_ip_address: value.nvos_ip_address.map(|ip| ip.to_string()),
             bmc_retain_credentials: value.bmc_retain_credentials,
         }
     }

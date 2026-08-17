@@ -15,22 +15,82 @@
  * limitations under the License.
  */
 use std::collections::HashMap;
+use std::time::Duration;
 
+use carbide_uuid::site_prefix::SitePrefixId;
 use carbide_uuid::vpc::{VpcId, VpcPrefixId};
+use chrono::{DateTime, Utc};
+use config_version::{ConfigVersion, Versioned};
 use ipnetwork::IpNetwork;
-use rpc::errors::RpcDataConversionError;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 
+use crate::controller_outcome::PersistentStateHandlerOutcome;
 use crate::metadata::Metadata;
+use crate::{DeletedFilter, StateSla};
+
+const PROVISIONING_SLA: Duration = Duration::from_secs(15 * 60);
+const DELETING_DBDELETE_SLA: Duration = Duration::from_secs(15 * 60);
+
+/// State of a VPC prefix as tracked by the controller.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum VpcPrefixControllerState {
+    Provisioning,
+    Ready,
+    Deleting {
+        deletion_state: VpcPrefixDeletionState,
+    },
+}
+
+/// Possible substates while deleting a VPC prefix.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum VpcPrefixDeletionState {
+    DrainNetworkPrefixes { delete_at: DateTime<Utc> },
+    DBDelete,
+}
+
+/// Returns the SLA for the current VPC prefix controller state.
+pub fn state_sla(state: &VpcPrefixControllerState, state_version: &ConfigVersion) -> StateSla {
+    // Compare the controller state's version timestamp against the current time.
+    let time_in_state = chrono::Utc::now()
+        .signed_duration_since(state_version.timestamp())
+        .to_std()
+        .unwrap_or(Duration::from_secs(60 * 60 * 24));
+
+    // Only bounded controller work has an SLA; dependency drains can wait indefinitely.
+    match state {
+        VpcPrefixControllerState::Provisioning => {
+            StateSla::with_sla(PROVISIONING_SLA, time_in_state)
+        }
+        VpcPrefixControllerState::Ready => StateSla::no_sla(),
+        VpcPrefixControllerState::Deleting {
+            deletion_state: VpcPrefixDeletionState::DrainNetworkPrefixes { .. },
+        } => StateSla::no_sla(),
+        VpcPrefixControllerState::Deleting {
+            deletion_state: VpcPrefixDeletionState::DBDelete,
+        } => StateSla::with_sla(DELETING_DBDELETE_SLA, time_in_state),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct VpcPrefix {
     pub id: VpcPrefixId,
+    pub site_prefix_id: Option<SitePrefixId>,
     pub vpc_id: VpcId,
     pub config: VpcPrefixConfig,
     pub metadata: Metadata,
     pub status: VpcPrefixStatus,
+    pub deleted: Option<DateTime<Utc>>,
+}
+
+impl VpcPrefix {
+    /// Returns whether the VPC prefix was marked for asynchronous deletion.
+    pub fn is_marked_as_deleted(&self) -> bool {
+        // A non-null deletion timestamp is the durable soft-delete marker.
+        self.deleted.is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +100,8 @@ pub struct VpcPrefixConfig {
 
 #[derive(Clone, Debug)]
 pub struct VpcPrefixStatus {
+    pub controller_state: Versioned<VpcPrefixControllerState>,
+    pub controller_state_outcome: Option<PersistentStateHandlerOutcome>,
     pub last_used_prefix: Option<IpNetwork>,
     pub total_31_segments: u32,
     pub available_31_segments: u32,
@@ -50,15 +112,21 @@ pub struct VpcPrefixStatus {
 impl<'r> sqlx::FromRow<'r, PgRow> for VpcPrefix {
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let id = row.try_get("id")?;
+        let site_prefix_id = row.try_get("site_prefix_id")?;
         let prefix = row.try_get("prefix")?;
         let name = row.try_get("name")?;
         let vpc_id = row.try_get("vpc_id")?;
         let last_used_prefix = row.try_get("last_used_prefix")?;
         let labels: sqlx::types::Json<HashMap<String, String>> = row.try_get("labels")?;
         let description: String = row.try_get("description")?;
+        let controller_state: sqlx::types::Json<VpcPrefixControllerState> =
+            row.try_get("controller_state")?;
+        let controller_state_outcome: Option<sqlx::types::Json<PersistentStateHandlerOutcome>> =
+            row.try_get("controller_state_outcome")?;
 
         Ok(VpcPrefix {
             id,
+            site_prefix_id,
             config: VpcPrefixConfig { prefix },
             metadata: Metadata {
                 name,
@@ -67,12 +135,18 @@ impl<'r> sqlx::FromRow<'r, PgRow> for VpcPrefix {
             },
             vpc_id,
             status: VpcPrefixStatus {
+                controller_state: Versioned::new(
+                    controller_state.0,
+                    row.try_get("controller_state_version")?,
+                ),
+                controller_state_outcome: controller_state_outcome.map(|outcome| outcome.0),
                 last_used_prefix,
                 total_31_segments: 0,
                 available_31_segments: 0,
                 total_linknet_segments: 0,
                 available_linknet_segments: 0,
             },
+            deleted: row.try_get("deleted")?,
         })
     }
 }
@@ -84,10 +158,20 @@ pub enum PrefixMatch {
     ContainedBy(IpNetwork),
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct VpcPrefixSearch {
+    pub vpc_id: Option<VpcId>,
+    pub site_prefix_id: Option<SitePrefixId>,
+    pub name: Option<String>,
+    pub prefix_match: Option<PrefixMatch>,
+    pub deleted_filter: DeletedFilter,
+}
+
 /// NewVpcPrefix represents a VPC prefix resource before it's persisted to the
 /// database.
 pub struct NewVpcPrefix {
     pub id: VpcPrefixId,
+    pub site_prefix_id: Option<SitePrefixId>,
     pub vpc_id: VpcId,
     pub config: VpcPrefixConfig,
     pub metadata: Metadata,
@@ -103,163 +187,4 @@ pub struct UpdateVpcPrefix {
 
 pub struct DeleteVpcPrefix {
     pub id: VpcPrefixId,
-}
-
-impl TryFrom<rpc::forge::VpcPrefixCreationRequest> for NewVpcPrefix {
-    type Error = RpcDataConversionError;
-
-    fn try_from(value: rpc::forge::VpcPrefixCreationRequest) -> Result<Self, Self::Error> {
-        let rpc::forge::VpcPrefixCreationRequest {
-            id,
-            prefix,
-            name,
-            vpc_id,
-            config,
-            metadata,
-        } = value;
-
-        let id = id.unwrap_or_else(VpcPrefixId::new);
-        let vpc_id = vpc_id.ok_or(RpcDataConversionError::MissingArgument("vpc_id"))?;
-        // let id = VpcPrefixId::new();
-
-        Ok(Self {
-            id,
-            config: match config {
-                Some(c) => VpcPrefixConfig::try_from(c)?,
-                // Deprecated fields support
-                None => VpcPrefixConfig {
-                    prefix: IpNetwork::try_from(prefix.as_str())?,
-                },
-            },
-            metadata: match metadata {
-                Some(m) => Metadata::try_from(m)?,
-                // Deprecated fields support
-                None => Metadata {
-                    name,
-                    ..Default::default()
-                },
-            },
-            vpc_id,
-        })
-    }
-}
-
-impl TryFrom<rpc::forge::VpcPrefixConfig> for VpcPrefixConfig {
-    type Error = RpcDataConversionError;
-
-    fn try_from(rpc_config: rpc::forge::VpcPrefixConfig) -> Result<Self, Self::Error> {
-        let rpc::forge::VpcPrefixConfig { prefix } = rpc_config;
-
-        Ok(Self {
-            prefix: IpNetwork::try_from(prefix.as_str())?,
-        })
-    }
-}
-
-impl TryFrom<rpc::forge::VpcPrefixUpdateRequest> for UpdateVpcPrefix {
-    type Error = RpcDataConversionError;
-
-    fn try_from(
-        rpc_update_prefix: rpc::forge::VpcPrefixUpdateRequest,
-    ) -> Result<Self, Self::Error> {
-        let rpc::forge::VpcPrefixUpdateRequest {
-            id,
-            prefix,
-            name,
-            config,
-            metadata,
-        } = rpc_update_prefix;
-
-        if prefix.is_some()
-            || config
-                .as_ref()
-                .map(|c| !c.prefix.is_empty())
-                .unwrap_or(false)
-        {
-            return Err(RpcDataConversionError::InvalidArgument(
-                "Resizing VPC prefixes is currently unsupported".to_owned(),
-            ));
-        }
-
-        let id = id.ok_or(RpcDataConversionError::MissingArgument("id"))?;
-
-        // At least one update field must be set
-        if metadata.is_none() && name.is_none() {
-            return Err(RpcDataConversionError::InvalidArgument(
-                "At least one updated field must be set".to_owned(),
-            ));
-        }
-
-        let metadata = match metadata {
-            Some(m) => Metadata::try_from(m)?,
-            // Deprecated field handling
-            None => Metadata {
-                name: name.unwrap_or_default(),
-                ..Default::default()
-            },
-        };
-
-        Ok(Self { id, metadata })
-    }
-}
-
-impl TryFrom<rpc::forge::VpcPrefixDeletionRequest> for DeleteVpcPrefix {
-    type Error = RpcDataConversionError;
-
-    fn try_from(
-        rpc_delete_prefix: rpc::forge::VpcPrefixDeletionRequest,
-    ) -> Result<Self, Self::Error> {
-        let id = rpc_delete_prefix
-            .id
-            .ok_or(RpcDataConversionError::MissingArgument("id"))?;
-        Ok(Self { id })
-    }
-}
-
-impl From<VpcPrefixStatus> for rpc::forge::VpcPrefixStatus {
-    fn from(db_status: VpcPrefixStatus) -> Self {
-        let VpcPrefixStatus {
-            total_31_segments,
-            available_31_segments,
-            total_linknet_segments,
-            available_linknet_segments,
-            ..
-        } = db_status;
-
-        Self {
-            total_31_segments,
-            available_31_segments,
-            total_linknet_segments,
-            available_linknet_segments,
-        }
-    }
-}
-
-impl From<VpcPrefix> for rpc::forge::VpcPrefix {
-    fn from(db_vpc_prefix: VpcPrefix) -> Self {
-        let VpcPrefix {
-            id,
-            config,
-            metadata,
-            status,
-            vpc_id,
-            ..
-        } = db_vpc_prefix;
-
-        let id = Some(id);
-        let prefix = config.prefix.to_string();
-        let vpc_id = Some(vpc_id);
-
-        Self {
-            id,
-            prefix: prefix.clone(),      // Deprecated
-            name: metadata.name.clone(), // Deprecated
-            vpc_id,
-            total_31_segments: status.total_31_segments, // Deprecated
-            available_31_segments: status.available_31_segments, // Deprecated
-            status: Some(status.into()),
-            metadata: Some(metadata.into()),
-            config: Some(rpc::forge::VpcPrefixConfig { prefix }),
-        }
-    }
 }

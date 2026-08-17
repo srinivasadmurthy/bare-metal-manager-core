@@ -17,9 +17,10 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use russh::ChannelMsg;
 use russh::server::Msg;
-use russh::{ChannelMsg, CryptoVec};
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
@@ -27,7 +28,7 @@ use tokio::task::JoinHandle;
 use crate::shutdown_handle::ShutdownHandle;
 
 /// Proxy messages from the BMC to the user's connection.
-pub fn spawn(
+pub(crate) fn spawn(
     mut from_bmc_rx: broadcast::Receiver<ToFrontendMessage>,
     to_frontend_tx: russh::ChannelWriteHalf<Msg>,
     peer_addr: String,
@@ -43,7 +44,7 @@ pub fn spawn(
                             Ok(()) => {}
                             Err(error) => {
                                 tracing::debug!(
-                                    peer_addr,
+                                    peer_address = peer_addr,
                                     %error,
                                     "error sending message to frontend, likely disconnected"
                                 );
@@ -52,7 +53,10 @@ pub fn spawn(
                         }
                     }
                     Err(_) => {
-                        tracing::debug!(peer_addr, "client channel closed when writing message from BMC");
+                        tracing::debug!(
+                            peer_address = peer_addr,
+                            "client channel closed when writing message from BMC"
+                        );
                         break;
                     }
                 },
@@ -70,7 +74,7 @@ pub fn spawn(
     }
 }
 
-pub struct Handle {
+pub(crate) struct Handle {
     shutdown_tx: oneshot::Sender<()>,
     join_handle: JoinHandle<()>,
 }
@@ -83,7 +87,7 @@ impl ShutdownHandle<()> for Handle {
 
 /// Holds messages to be sent to a frontend: Data from the BMC channel, or connection status messages.
 #[derive(Clone)]
-pub enum ToFrontendMessage {
+pub(crate) enum ToFrontendMessage {
     /// Data coming from the BMC
     Channel(Arc<ChannelMsg>),
     /// An alert that the console was connected or disconnected
@@ -93,7 +97,7 @@ pub enum ToFrontendMessage {
 }
 
 #[derive(Clone)]
-pub enum ConnectionChangeMessage {
+pub(crate) enum ConnectionChangeMessage {
     Disconnected,
     Connected {
         last_disconnect: Option<DateTime<Utc>>,
@@ -105,16 +109,15 @@ impl From<ToFrontendMessage> for Arc<ChannelMsg> {
         match msg {
             ToFrontendMessage::ConnectionChanged(connection_changed) => connection_changed.into(),
             ToFrontendMessage::InformDisconnectedSince(Some(disconnected_since)) => {
-                let data: CryptoVec = format!(
+                let data: Bytes = format!(
                     "--- Console disconnected since {} ---\r\n",
                     disconnected_since.to_rfc2822()
                 )
-                .into_bytes()
                 .into();
                 Arc::new(ChannelMsg::Data { data })
             }
             ToFrontendMessage::InformDisconnectedSince(None) => {
-                let data: CryptoVec = b"--- Console not connected ---\r\n".to_vec().into();
+                let data: Bytes = "--- Console not connected ---\r\n".into();
                 Arc::new(ChannelMsg::Data { data })
             }
             ToFrontendMessage::Channel(msg) => msg,
@@ -124,10 +127,8 @@ impl From<ToFrontendMessage> for Arc<ChannelMsg> {
 
 impl From<ConnectionChangeMessage> for Arc<ChannelMsg> {
     fn from(value: ConnectionChangeMessage) -> Self {
-        let data: CryptoVec = match value {
-            ConnectionChangeMessage::Disconnected => {
-                b"\r\n--- Console disconnected! ---\r\n".to_vec().into()
-            }
+        let data: Bytes = match value {
+            ConnectionChangeMessage::Disconnected => "\r\n--- Console disconnected! ---\r\n".into(),
             ConnectionChangeMessage::Connected { last_disconnect } => {
                 if let Some(last_disconnect) = last_disconnect {
                     format!(
@@ -152,7 +153,7 @@ impl From<ConnectionChangeMessage> for Arc<ChannelMsg> {
 /// This is the main proxy logic between the frontend SSH connection and the backend BMC connection.
 /// This whole thing would be unnecessary if [`russh::channels::ChanelWriteHalf::send_msg`] were
 /// public. :(
-pub(crate) async fn proxy_channel_message<S>(
+pub(super) async fn proxy_channel_message<S>(
     channel_msg: &russh::ChannelMsg,
     channel: &russh::ChannelWriteHalf<S>,
 ) -> Result<(), MessageProxyError>
@@ -250,7 +251,7 @@ where
                 })?;
         }
         _ => {
-            tracing::debug!("Ignoring unknown channel message {channel_msg:?}");
+            tracing::debug!(?channel_msg, "Ignoring unknown channel message");
         }
     }
 
@@ -258,7 +259,7 @@ where
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum MessageProxyError {
+pub(super) enum MessageProxyError {
     #[error("error sending {what}: {error}")]
     Sending {
         what: &'static str,
@@ -267,7 +268,7 @@ pub enum MessageProxyError {
 }
 
 #[derive(Debug)]
-pub enum ToBmcMessage {
+pub(crate) enum ToBmcMessage {
     /// Normal SSH message
     ChannelMsg(ChannelMsg),
     /// Exec request (e.g. power reset)
@@ -282,7 +283,7 @@ pub enum ToBmcMessage {
 }
 
 #[derive(Debug)]
-pub struct ExecReply {
-    pub output: Vec<u8>,
-    pub exit_status: u32,
+pub(crate) struct ExecReply {
+    pub(crate) output: Vec<u8>,
+    pub(crate) exit_status: u32,
 }

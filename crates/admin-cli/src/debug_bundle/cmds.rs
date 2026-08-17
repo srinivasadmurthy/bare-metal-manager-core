@@ -27,16 +27,16 @@ use std::fs::File;
 use std::io::Write;
 use std::str::FromStr;
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use ::rpc::forge::BmcEndpointRequest;
 use carbide_uuid::machine::MachineId;
 use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, Utc};
-use rpc::admin_cli::CarbideCliError::InvalidDateTimeFromUserInput;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zip::CompressionMethod;
 use zip::write::{FileOptions, ZipWriter};
 
+use crate::errors::CarbideCliError::InvalidDateTimeFromUserInput;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::managed_host::DebugBundle;
 use crate::rpc::ApiClient;
 
@@ -494,35 +494,35 @@ impl LogEntry {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GrafanaResponse {
-    pub results: GrafanaResults,
+struct GrafanaResponse {
+    results: GrafanaResults,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GrafanaResults {
+struct GrafanaResults {
     #[serde(rename = "A")]
-    pub a: GrafanaFrameResult,
+    a: GrafanaFrameResult,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GrafanaFrameResult {
-    pub status: u16,
-    pub frames: Vec<GrafanaFrame>,
+struct GrafanaFrameResult {
+    status: u16,
+    frames: Vec<GrafanaFrame>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GrafanaFrame {
-    pub data: GrafanaFrameData,
+struct GrafanaFrame {
+    data: GrafanaFrameData,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct GrafanaFrameData {
-    pub values: Vec<Vec<GrafanaValue>>,
+struct GrafanaFrameData {
+    values: Vec<Vec<GrafanaValue>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
-pub enum GrafanaValue {
+enum GrafanaValue {
     Int(i64),       // For timestamps (values[1])
     String(String), // For log messages (values[2]) and nanosecond timestamps (values[3])
     Object(serde_json::Value),
@@ -559,10 +559,10 @@ struct LokiDatasource {
 // Grafana Datasource API Response Structs
 #[derive(Deserialize, Debug)]
 struct GrafanaDatasource {
-    pub uid: String,
-    pub name: String,
+    uid: String,
+    name: String,
     #[serde(rename = "type")]
-    pub datasource_type: String,
+    datasource_type: String,
 }
 
 // Site Controller Details - Holds BMC endpoint exploration data
@@ -580,6 +580,7 @@ struct MachineAnalysis {
 }
 
 /// Helper function to get BMC IP and MAC address from machine_id
+#[allow(deprecated)]
 async fn get_bmc_ip_from_host_id(
     api_client: &ApiClient,
     host_id: &str,
@@ -783,7 +784,7 @@ async fn get_machine_analysis(
 /// let api_client = ApiClient::new(config).await?;
 /// handle_debug_bundle(bundle_config, &api_client).await?;
 /// ```
-pub async fn handle_debug_bundle(
+pub(crate) async fn handle_debug_bundle(
     debug_bundle: DebugBundle,
     api_client: &ApiClient,
 ) -> CarbideCliResult<()> {
@@ -1432,7 +1433,7 @@ impl<'a> ZipBundleCreator<'a> {
         zip: &mut ZipWriter<File>,
         filename: &str,
         logs: &[LogEntry],
-        options: FileOptions,
+        options: FileOptions<()>,
     ) -> CarbideCliResult<()> {
         zip.start_file(filename, options).map_err(|e| {
             CarbideCliError::GenericError(format!("Failed to create file {filename}: {e}"))
@@ -1447,7 +1448,7 @@ impl<'a> ZipBundleCreator<'a> {
         &self,
         zip: &mut ZipWriter<File>,
         health_alerts: &::rpc::forge::HealthHistories,
-        options: FileOptions,
+        options: FileOptions<()>,
     ) -> CarbideCliResult<()> {
         zip.start_file("health_alerts.json", options).map_err(|e| {
             CarbideCliError::GenericError(format!("Failed to create health_alerts.json: {e}"))
@@ -1517,7 +1518,7 @@ impl<'a> ZipBundleCreator<'a> {
         &self,
         zip: &mut ZipWriter<File>,
         alert_entries: &::rpc::forge::ListHealthReportResponse,
-        options: FileOptions,
+        options: FileOptions<()>,
     ) -> CarbideCliResult<()> {
         zip.start_file("health_alert_overrides.json", options)
             .map_err(|e| {
@@ -1576,7 +1577,7 @@ impl<'a> ZipBundleCreator<'a> {
         &self,
         zip: &mut ZipWriter<File>,
         analysis: &SiteControllerAnalysis,
-        options: FileOptions,
+        options: FileOptions<()>,
     ) -> CarbideCliResult<()> {
         zip.start_file("site_controller_details.json", options)
             .map_err(|e| {
@@ -1698,11 +1699,12 @@ impl<'a> ZipBundleCreator<'a> {
         Ok(())
     }
 
+    #[allow(deprecated)]
     fn add_machine_analysis_json(
         &self,
         zip: &mut ZipWriter<File>,
         analysis: &MachineAnalysis,
-        options: FileOptions,
+        options: FileOptions<()>,
     ) -> CarbideCliResult<()> {
         zip.start_file("machine_info.json", options).map_err(|e| {
             CarbideCliError::GenericError(format!("Failed to create machine_info.json: {e}"))
@@ -1801,6 +1803,7 @@ impl<'a> ZipBundleCreator<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
     fn add_metadata(
         &self,
         zip: &mut ZipWriter<File>,
@@ -1815,7 +1818,7 @@ impl<'a> ZipBundleCreator<'a> {
         alert_entries: &::rpc::forge::ListHealthReportResponse,
         site_controller_analysis: &SiteControllerAnalysis,
         machine_analysis: &MachineAnalysis,
-        options: FileOptions,
+        options: FileOptions<()>,
     ) -> CarbideCliResult<()> {
         zip.start_file("metadata.txt", options).map_err(|e| {
             CarbideCliError::GenericError(format!("Failed to create metadata file: {e}"))

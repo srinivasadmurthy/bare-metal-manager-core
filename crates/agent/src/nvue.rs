@@ -17,10 +17,11 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 
 use ::rpc::forge as rpc;
-use carbide_network::ip::prefix::{IpNet, Ipv4Net};
+use carbide_network::ip::prefix::IpNet;
 use carbide_network::sanitized_mac;
 use carbide_network::virtualization::VpcVirtualizationType;
 use eyre::WrapErr;
@@ -41,6 +42,18 @@ pub fn template_for(vtype: VpcVirtualizationType) -> eyre::Result<&'static str> 
         VpcVirtualizationType::EthernetVirtualizer
         | VpcVirtualizationType::EthernetVirtualizerWithNvue => Ok(TMPL_ETV_WITH_NVUE),
         VpcVirtualizationType::Fnn => Ok(TMPL_FNN),
+        // Flat VPCs attach instances via a plain NIC (the host's
+        // primary fabric interface is not a DPU), so there's no NVUE
+        // template to render for them -- this function is the DPU
+        // agent's template selector, and Flat instances don't run
+        // through a DPU agent at all.
+        //
+        // (NICo today doesn't model mixed-mode hosts that have a NIC
+        // primary plus secondary DPUs used for VFs; if that ever
+        // becomes a target, the dispatch here would need rethinking.)
+        VpcVirtualizationType::Flat => {
+            Err(eyre::eyre!("flat VPC virtualization type not supported",))
+        }
     }
 }
 
@@ -67,26 +80,60 @@ const NETWORK_SECURITY_GROUP_RULE_PRIORITY_START: u32 = 2000;
 /// associations per interface._*
 const NETWORK_SECURITY_GROUP_RULE_COUNT_MAX: usize = 10000;
 
-/// split_prefixes_by_family splits a list of CIDR prefix strings
+/// `split_prefixes_by_family` splits a list of CIDR prefix strings
 /// into IPv4 and IPv6 buckets. Each bucket gets sequential indices
 /// starting at `start_index`. Unparseable prefixes are warned and
 /// dropped (because NVUE would fail on invalid addresses anyway).
-fn split_prefixes_by_family(prefixes: &[String], start_index: usize) -> (Vec<Prefix>, Vec<Prefix>) {
-    let valid: Vec<_> = prefixes
-        .iter()
-        .filter_map(|s| match s.parse::<IpNet>() {
-            Ok(net) => Some((s.clone(), net)),
-            Err(e) => {
-                tracing::warn!(prefix = %s, error = %e, "dropping unparseable prefix");
-                None
-            }
-        })
-        .collect();
+///
+/// `filter` accepts a set of prefixes that can be compared to `prefixes`, and any prefix not
+/// found in `filter` will be removed.
+/// `start_index` should usually be set to 1 to avoid nvue config complaints when
+/// using the output as part of policy generation.
+fn split_prefixes_by_family(
+    prefixes: &[String],
+    filter: Option<&[IpNet]>,
+    start_index: usize,
+) -> (Vec<Prefix>, Vec<Prefix>) {
+    let valid: Vec<_> = if let Some(filter) = filter {
+        prefixes
+            .iter()
+            .filter_map(|s| match s.parse::<IpNet>() {
+                Ok(net) => {
+                    if filter.iter().any(|f| prefix_contains(f, &net)) {
+                        Some((s.clone(), net))
+                    } else {
+                        tracing::warn!(
+                            prefix = %net,
+                            "excluding prefix outside filter list");
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(prefix = %s, error = %e, "dropping unparseable prefix");
+                    None
+                }
+            })
+            .collect()
+    } else {
+        prefixes
+            .iter()
+            .filter_map(|s| match s.parse::<IpNet>() {
+                Ok(net) => Some((s.clone(), net)),
+                Err(e) => {
+                    tracing::warn!(prefix = %s, error = %e, "dropping unparseable prefix");
+                    None
+                }
+            })
+            .collect()
+    };
 
     let (v4, v6): (Vec<_>, Vec<_>) = valid
         .into_iter()
         .partition(|(_, net)| matches!(net, IpNet::V4(_)));
 
+    // NOTE: The implicit assumption here is that v4 and v6 prefixes will always be listed separately (in policies, etc),
+    // and so they can share the same index starting point.
+    // This is probably true, but might be good to not work under that assumption.
     let make_prefixes = |items: Vec<(String, IpNet)>| -> Vec<Prefix> {
         items
             .into_iter()
@@ -101,8 +148,44 @@ fn split_prefixes_by_family(prefixes: &[String], start_index: usize) -> (Vec<Pre
     (make_prefixes(v4), make_prefixes(v6))
 }
 
+/// Returns whether `candidate` is equal to or narrower than `allowed`.
+fn prefix_contains(allowed: &IpNet, candidate: &IpNet) -> bool {
+    match (allowed, candidate) {
+        (IpNet::V4(allowed), IpNet::V4(candidate)) => {
+            allowed.prefix_len() <= candidate.prefix_len() && allowed.contains(&candidate.network())
+        }
+        (IpNet::V6(allowed), IpNet::V6(candidate)) => {
+            allowed.prefix_len() <= candidate.prefix_len() && allowed.contains(&candidate.network())
+        }
+        _ => false,
+    }
+}
+
+/// Parses a list of strings to a Vec of IpNet, dropping
+/// and warning about parse failures.
+fn parse_prefixes(prefixes: &[String]) -> Vec<IpNet> {
+    prefixes
+        .iter()
+        .filter_map(|prefix| match prefix.parse::<IpNet>() {
+            Ok(prefix) => Some(prefix),
+            Err(e) => {
+                tracing::warn!(
+                    prefix = %prefix,
+                    error = %e,
+                    "dropping unparseable VPC anycast prefix"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 pub fn build(conf: NvueConfig) -> eyre::Result<String> {
     let template = template_for(conf.vpc_virtualization_type)?;
+    let is_dpu_os = conf.is_dpu_os;
+    let fmds_gateway_vlan = conf.fmds_gateway_vlan;
+    // HostInterfaces is the legacy template shape. The same host-facing values
+    // are mirrored into TmplConfigPort so templates can move off HostInterfaces.
     let host_interfaces: Vec<TmplHostInterfaces> = conf
         .ct_access_vlans
         .into_iter()
@@ -114,36 +197,10 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         })
         .collect();
 
-    // This assumes that the routing profile is expected to be same for
-    // all VPCs of a tenant _and_ for all VPCs that an instance might span.
-    // That should be ok for now, and a smaller MR later that moves
-    // profiles into FlatInterfaceConfig could change that.
-    // For now, we clone later so that we can put this into each TmplVpc
-    // and make a later transition easier.
-    let routing_profile = conf
-        .ct_routing_profile
+    let deprecated_routing_profile = conf.ct_routing_profile.clone();
+    let deprecated_tenant_routing_profile = deprecated_routing_profile
         .as_ref()
-        .map(|rt| TmplRoutingProfile {
-            TenantLeakCommunitiesAccepted: rt.tenant_leak_communities_accepted,
-            LeakDefaultRouteFromUnderlay: rt.leak_default_route_from_underlay,
-            LeakTenantHostRoutesToUnderlay: rt.leak_tenant_host_routes_to_underlay,
-            RouteTargetImports: rt
-                .route_target_imports
-                .iter()
-                .map(|rt| TmplRouteTargetConfig {
-                    ASN: rt.asn,
-                    VNI: rt.vni,
-                })
-                .collect(),
-            RouteTargetsOnExports: rt
-                .route_targets_on_exports
-                .iter()
-                .map(|rt| TmplRouteTargetConfig {
-                    ASN: rt.asn,
-                    VNI: rt.vni,
-                })
-                .collect(),
-        });
+        .map(TmplRoutingProfile::from);
 
     // There are two assumptions about pre-FNN...
     // 1 - ManagedHostNetworkConfigResponse only has rules inherited either from VPC or Instance,
@@ -206,7 +263,7 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         .ct_port_configs
         .iter()
         .find(|p| !p.vpc_peer_prefixes.is_empty())
-        .map(|p| split_prefixes_by_family(&p.vpc_peer_prefixes, 1))
+        .map(|p| split_prefixes_by_family(&p.vpc_peer_prefixes, None, 1))
         .unwrap_or_default();
     let vpc_peer_vnis: Vec<TmplVni> = conf
         .ct_port_configs
@@ -232,45 +289,130 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         );
     }
 
-    let mut has_any_vpc_tenant_host_leak_to_underlay = false;
+    let mut has_any_vpc_vrf_loopback = false;
+    let mut fmds_gateway_matched = false;
+    let mut vpc_anycast_prefix_cache = HashMap::<u32, Vec<IpNet>>::new();
 
     for (base_i, network) in conf.ct_port_configs.into_iter().enumerate() {
+        let l3_vni = network.l3_vni.unwrap_or_default();
+        // Prefer the per-port VPC routing profile, falling back to the deprecated tenant-level profile.
+        let vpc_routing_profile = network
+            .routing_profile
+            .as_ref()
+            .or(deprecated_routing_profile.as_ref());
+
+        // This check is already done in the primary caller, but it's cheap and it matters here,
+        // so just being extra defensive.
+        if conf.vpc_virtualization_type == VpcVirtualizationType::Fnn
+            && vpc_routing_profile.is_none()
+        {
+            return Err(eyre::eyre!(
+                "BUG: FNN config provided without routing-profile"
+            ));
+        }
+
+        // Cache the allowed_anycast_prefixes for the first VPC seen for this l3_vni
+        // so that we don't keep reparsing in the event that multiple interfaces are in the same VPC.
+        // l3_vni to VPC is 1:1, and the same l3_vni shouldn't see a different profile.
+        // This only matters for FNN, and we've just checked that a routing profile exists
+        // if this is an FNN config.
+        // Here's what we expect:
+        // - If a user wants to apply per-interface prefix filters, there must be a VPC-level
+        //   prefix list specified to compare for validity.
+        // - If the list in the VPC profile is empty, then we're going to end up intentionally
+        //   filtering out any per-interface anycast prefixes.
+        // - The template then, for now, provides a fallback that allows anything in site_anycast_prefixes,
+        //   which will soon be ignored for FNN.
+        // - Once that fallback is removed, an empty VPC profile prefix list filters out all interface-level prefixes.
+        // This continues the pattern of explicit opt-in for for anycast prefix filtering by VPC profile
+        // until we finally remove the site_anycast_prefix support for FNN.
+        vpc_anycast_prefix_cache.entry(l3_vni).or_insert_with(|| {
+            parse_prefixes(
+                vpc_routing_profile
+                    .map(|p| p.allowed_anycast_prefixes.as_slice())
+                    .unwrap_or_default(),
+            )
+        });
+
+        let routing_profile = vpc_routing_profile.map(TmplRoutingProfile::from);
+        let interface_profile = network.interface_routing_profile.as_ref();
+        let interface_routing_profile = {
+            match (vpc_routing_profile, interface_profile) {
+                // If there's an interface-specific profile, make sure it's a subset of what's
+                // on the VPC.
+                (Some(_), Some(interface_profile)) => {
+                    let filter = vpc_anycast_prefix_cache
+                        .get(&l3_vni)
+                        .map(|v| v.as_slice())
+                        .unwrap_or_default();
+
+                    let (v4, v6) = split_prefixes_by_family(
+                        &interface_profile.allowed_anycast_prefixes,
+                        Some(filter),
+                        1,
+                    );
+
+                    Some(TmplInterfaceRoutingProfile {
+                        HasAllowedAnycastPrefixesIpv4: !v4.is_empty(),
+                        HasAllowedAnycastPrefixesIpv6: !v6.is_empty(),
+                        AllowedAnycastPrefixesIpv4: v4,
+                        AllowedAnycastPrefixesIpv6: v6,
+                    })
+                }
+                // If there's no interface-specific profile, just inherit from the VPC.
+                // Let this happen in the template for now.
+                (Some(_), None) => None,
+
+                // If there's no VPC routing profile, then lock it down by default.
+                // For FNN, there should always be a routing profile.
+                // For the legacy ETV, it won't be referencing interface routing profiles.
+                (None, _) => None,
+            }
+        };
         let svi_mac = vni_to_svi_mac(network.vni.unwrap_or(0))?.to_string();
+
         let (vpc_ipv4, vpc_ipv6) =
-            split_prefixes_by_family(&network.vpc_prefixes, (base_i + 1) * 10);
+            split_prefixes_by_family(&network.vpc_prefixes, None, (base_i + 1) * 10);
+
         let port = TmplConfigPort {
             InterfaceName: network.interface_name.clone(),
             Index: format!("{}", (base_i + 1) * 10),
             VlanID: network.vlan,
+            HostIP: network.host_ip.clone(),
+            HostIPv6: network.host_ipv6.clone(),
+            HostRoute: network.host_route.clone(),
+            HostIPv6Route: network.host_ipv6_route.clone(),
+            // HasRoutingProfile means this port has an interface override; otherwise templates inherit from the VPC profile.
+            HasRoutingProfile: interface_routing_profile.is_some(),
+            RoutingProfile: interface_routing_profile.unwrap_or_default(),
             IsPhy: network.is_phy,
             L2VNI: network.vni.map(|x| x.to_string()).unwrap_or("".to_string()),
-            IPs: {
-                std::iter::once(network.gateway_cidr.clone())
-                    .chain(
-                        network
-                            .ipv6_port_config
-                            .as_ref()
-                            .map(|v6| v6.gateway_cidr.clone()),
-                    )
-                    .collect()
-            },
-            SviIPs: std::iter::once(network.svi_ip)
-                .chain(std::iter::once(
-                    network
-                        .ipv6_port_config
-                        .as_ref()
-                        .and_then(|v6| v6.svi_ip.clone()),
-                ))
-                .flatten()
+            IPs: std::iter::once(network.gateway_cidr.clone())
+                .filter(|address| !address.is_empty())
+                .collect(),
+            IPsIpv6: network
+                .ipv6_port_config
+                .as_ref()
+                .map(|v6| v6.gateway_cidr.clone())
+                .into_iter()
+                .collect(),
+            SviIPs: network.svi_ip.iter().cloned().collect(),
+            SviIPsIpv6: network
+                .ipv6_port_config
+                .as_ref()
+                .and_then(|v6| v6.svi_ip.clone())
+                .into_iter()
                 .collect(),
             SviMAC: svi_mac,
-            VrfName: format!("vpc_{}", network.l3_vni.unwrap_or_default()),
+            VrfName: format!("vpc_{l3_vni}"),
             HasVpcPeerPrefixes: !network.vpc_peer_prefixes.is_empty(),
             HasVpcPeerPrefixesIpv6: network
                 .vpc_peer_prefixes
                 .iter()
                 .any(|p| matches!(p.parse::<IpNet>(), Ok(IpNet::V6(_)))),
             HasVpcPrefixes: !vpc_ipv4.is_empty(),
+            // Only used directly by ETV template now.
+            // FNN template uses PortPrefixes, which is built from this.
             VpcPrefixes: vpc_ipv4,
             HasVpcPrefixesIpv6: !vpc_ipv6.is_empty(),
             VpcPrefixesIpv6: vpc_ipv6,
@@ -291,32 +433,42 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
                     })
                 })
                 .transpose()?,
+            HasFmdsGateway: !is_dpu_os && (fmds_gateway_vlan == Some(network.vlan)),
         };
+        if port.HasFmdsGateway {
+            fmds_gateway_matched = true;
+        }
 
-        has_any_vpc_tenant_host_leak_to_underlay = has_any_vpc_tenant_host_leak_to_underlay
-            || routing_profile
-                .as_ref()
-                .map(|p| p.LeakTenantHostRoutesToUnderlay)
-                .unwrap_or_default();
         let (vpc_peer_ipv4, vpc_peer_ipv6) =
-            split_prefixes_by_family(&network.vpc_peer_prefixes, 1);
+            split_prefixes_by_family(&network.vpc_peer_prefixes, None, 1);
+
+        has_any_vpc_vrf_loopback =
+            has_any_vpc_vrf_loopback || network.tenant_vrf_loopback_ip.is_some();
 
         vpc_configs
-            .entry(network.l3_vni.unwrap_or_default())
+            .entry(l3_vni)
             .and_modify(|v| {
+                if let (Some(existing_profile), Some(next_profile)) =
+                    (v.RoutingProfile.as_ref(), routing_profile.as_ref())
+                    && existing_profile != next_profile
+                {
+                    tracing::warn!(
+                        l3_vni,
+                        "found different routing profiles for the same VPC L3 VNI; using the first profile"
+                    );
+                }
+                if v.RoutingProfile.is_none() {
+                    v.RoutingProfile = routing_profile.clone();
+                }
                 v.PortPrefixes.extend_from_slice(&port.VpcPrefixes);
                 v.PortPrefixesIpv6.extend_from_slice(&port.VpcPrefixesIpv6);
                 v.PortConfigs.push(port.clone());
             })
             .or_insert_with(|| TmplVpc {
                 VrfName: port.VrfName.clone(),
-                L3VNI: network.l3_vni.unwrap_or_default(),
+                L3VNI: l3_vni,
+                HasVrfLoopback: network.tenant_vrf_loopback_ip.is_some(),
                 VrfLoopback: network.tenant_vrf_loopback_ip.unwrap_or_default(),
-                // TODO: This is wasteful because it should be specific to a VPC.
-                // Otherwise, all VPCs will have a BGP peer config for each
-                // interface, regardless of whether the interface is owned by
-                // that VPC.
-                HostInterfaces: host_interfaces.clone(),
                 PortConfigs: vec![port.clone()],
                 HasVpcPeerPrefixes: !vpc_peer_ipv4.is_empty(),
                 VpcPeerPrefixes: vpc_peer_ipv4,
@@ -336,6 +488,15 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         port_configs.push(port);
     }
 
+    if let Some(vlan) = fmds_gateway_vlan
+        && !fmds_gateway_matched
+    {
+        tracing::error!(
+            vlan,
+            "fmds_gateway_vlan not found in any port config; FMDS gateway address will not be configured"
+        );
+    }
+
     let include_bridge = !port_configs.is_empty() && port_configs.iter().all(|b| b.IsL2Segment);
 
     let (
@@ -350,98 +511,54 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
     // This is just an easy way to maintain the ordering of the original behavior.
     let deny_prefix_index_offset = conf.site_fabric_prefixes.len();
 
-    let has_static_advertisements = conf.secondary_overlay_vtep_ip.is_some();
-
-    let (
-        has_internal_bridging,
-        vf_intercept_bridge_ip,
-        vf_intercept_hbn_representor_ip,
-        public_prefix_internal_next_hop,
-        intercept_bridge_prefix_len,
-        // IPv4 only for now. Internal HBN bridge plumbing uses 169.254.x.x
-        // link-local addressing for DPU to HBN communication. An IPv6 equivalent
-        // (fe80:: or similar) may be needed in the future for dual-stack bridging.
-    ) = if let Some(bridge_prefix) = conf
-        .internal_bridge_routing_prefix
-        .map(|p| p.parse::<Ipv4Net>())
-        .transpose()?
-    {
-        let prefix_len = bridge_prefix.prefix_len();
-        let mut hosts = bridge_prefix.hosts();
-
-        // 1st host is for the VF intercept bridge.
-        let Some(vf_intercept_bridge_ip) = hosts.next() else {
-            return Err(eyre::eyre!(
-                "expected VF intercept bridge IP not found in bridge routing prefix supplied by internal_bridge_routing_prefix",
-            ));
-        };
-
-        // 2nd host address is used within the HBN container on the SF being used for
-        // intercepted VF traffic.
-        let Some(vf_intercept_hbn_representor_ip) = hosts.next() else {
-            return Err(eyre::eyre!(
-                "expected VF intercept HBN representor IP not found in bridge routing prefix supplied by internal_bridge_routing_prefix",
-            ));
-        };
-
-        // 3rd host is for use by a traffic intercept user.  This lets the user know, a priori, of an IP
-        // within the stretched L2 domain of the combined br-hbn and custom bridges.
-        // This allows them to route traffic directly to and out of the HBN pod.
-        let Some(public_prefix_internal_next_hop) = hosts.next() else {
-            return Err(eyre::eyre!(
-                "expected public_prefix_internal_next_hop bridge IP not found in bridge routing prefix supplied by internal_bridge_routing_prefix",
-            ));
-        };
-
-        // >= 4th host is currently unused.
-
-        (
-            true,
-            format!("{vf_intercept_bridge_ip}"),
-            format!("{vf_intercept_hbn_representor_ip}"),
-            format!("{public_prefix_internal_next_hop}"),
-            prefix_len,
-        )
-    } else {
-        (
-            false,
-            String::default(),
-            String::default(),
-            String::default(),
-            0,
-        )
-    };
-
     let mut vpcs = vpc_configs.into_values().collect::<Vec<TmplVpc>>();
-    vpcs.sort_by(|a, b| a.L3VNI.cmp(&b.L3VNI));
+    vpcs.sort_by_key(|a| a.L3VNI);
 
-    let (traffic_intercept_ipv4, traffic_intercept_ipv6) =
-        split_prefixes_by_family(&conf.traffic_intercept_public_prefixes, 1);
-    let (anycast_ipv4, anycast_ipv6) = split_prefixes_by_family(&conf.anycast_site_prefixes, 1000);
+    let mut tenant_host_routes_to_underlay = Vec::new();
+    let mut tenant_host_routes_to_underlay_ipv6 = Vec::new();
+    for vpc in vpcs.iter().filter(|vpc| {
+        vpc.RoutingProfile
+            .as_ref()
+            .is_some_and(|profile| profile.LeakTenantHostRoutesToUnderlay)
+    }) {
+        for port in &vpc.PortConfigs {
+            // IPv4 already leaks the configured gateway CIDR from `IPs`; changing
+            // that would alter existing prefix-list matches. IPv6 deliberately
+            // uses `HostIPv6Route`, the interface prefix the underlay needs.
+            tenant_host_routes_to_underlay.extend_from_slice(&port.IPs);
+            tenant_host_routes_to_underlay_ipv6.extend(
+                port.HostIPv6Route
+                    .iter()
+                    .filter(|route| !route.is_empty())
+                    .cloned(),
+            );
+        }
+    }
+
+    let (anycast_ipv4, anycast_ipv6) =
+        split_prefixes_by_family(&conf.anycast_site_prefixes, None, 1000);
     let (site_fabric_ipv4, site_fabric_ipv6) =
-        split_prefixes_by_family(&conf.site_fabric_prefixes, 1000);
+        split_prefixes_by_family(&conf.site_fabric_prefixes, None, 1000);
     let (deny_ipv4, deny_ipv6) =
-        split_prefixes_by_family(&conf.deny_prefixes, 1000 + deny_prefix_index_offset);
+        split_prefixes_by_family(&conf.deny_prefixes, None, 1000 + deny_prefix_index_offset);
 
     let params = TmplNvue {
         HasBgpLeafSessionPassword: conf.bgp_leaf_session_password.is_some(),
         BgpLeafSessionPassword: conf.bgp_leaf_session_password.unwrap_or_default(),
         UseAdminNetwork: conf.use_admin_network,
-        LoopbackIP: conf.loopback_ip,
+        LoopbackIP: conf.loopback_ip.to_string(),
+        HasLoopbackIpv6: conf.loopback_ip_v6.is_some(),
+        LoopbackIpv6: conf
+            .loopback_ip_v6
+            .map(|ip| ip.to_string())
+            .unwrap_or_default(),
         HasSiteGlobalVpcVni: conf.site_global_vpc_vni.is_some(),
         SiteGlobalVpcVni: conf.site_global_vpc_vni.unwrap_or_default(),
-        HasStaticAdvertisements: has_static_advertisements,
-        HasSecondaryOverlayVTEP: conf.secondary_overlay_vtep_ip.is_some(),
-        SecondaryOverlayVtepIP: conf.secondary_overlay_vtep_ip.unwrap_or_default(),
-        HasInternalBridgeRouting: has_internal_bridging,
-        VfInterceptBridgeIP: vf_intercept_bridge_ip,
-        InterceptBridgePrefixLen: intercept_bridge_prefix_len,
-        PublicPrefixInternalNextHop: public_prefix_internal_next_hop,
-        VfInterceptHbnRepresentorIp: vf_intercept_hbn_representor_ip,
-        VfInterceptBridgeSf: conf.vf_intercept_bridge_sf.unwrap_or_default(),
-        HasAnyVpcTenantHostLeakToUnderlay: has_any_vpc_tenant_host_leak_to_underlay,
-        TrafficInterceptPublicPrefixes: traffic_intercept_ipv4,
-        TrafficInterceptPublicPrefixesIpv6: traffic_intercept_ipv6,
+        HasAnyVpcTenantHostLeakToUnderlay: !tenant_host_routes_to_underlay.is_empty(),
+        TenantHostRoutesToUnderlay: tenant_host_routes_to_underlay,
+        HasAnyVpcTenantHostLeakToUnderlayIpv6: !tenant_host_routes_to_underlay_ipv6.is_empty(),
+        TenantHostRoutesToUnderlayIpv6: tenant_host_routes_to_underlay_ipv6,
+        HasAnyVpcVrfLoopback: has_any_vpc_vrf_loopback,
         ASN: conf.asn,
         DatacenterASN: conf.datacenter_asn,
         UseCommonInternalTenantRouteTarget: conf.common_internal_route_target.is_some(),
@@ -462,8 +579,8 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         DPUHostname: conf.dpu_hostname,
         SearchDomain: conf.dpu_search_domain,
         Uplinks: conf.uplinks.clone(),
-        RouteServers: conf.route_servers.clone(),
-        DHCPServers: conf.dhcp_servers.clone(),
+        RouteServers: conf.route_servers.iter().map(|ip| ip.to_string()).collect(),
+        DHCPServers: conf.dhcp_servers.iter().map(|ip| ip.to_string()).collect(),
         AnycastSitePrefixes: anycast_ipv4,
         AnycastSitePrefixesIpv6: anycast_ipv6,
         HasSiteFabricPrefixes: !site_fabric_ipv4.is_empty(),
@@ -486,13 +603,14 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         Ipv6EgressNetworkSecurityPolicyOverrideRules: egress_ipv6_override_rules,
         HbnVersion: conf.hbn_version,
         Tenant: TmplComputeTenant {
-            RoutingProfile: routing_profile,
+            RoutingProfile: deprecated_tenant_routing_profile,
             Vpcs: vpcs,
             VrfName: conf.ct_vrf_name,
             L3VNI: conf.ct_l3_vni.unwrap_or_default().to_string(),
             PortConfigs: port_configs,
             HasHostASN: conf.tenant_host_asn.is_some(),
             HostASN: conf.tenant_host_asn.unwrap_or_default(),
+            // Keep legacy tenant-wide HostInterfaces for pre-FNN templates; new templates should use PortConfigs.
             HostInterfaces: host_interfaces,
             NetworkSecurityGroups: network_security_groups,
             HasNetworkSecurityGroup: has_network_security_group,
@@ -519,6 +637,7 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         StorageLoopback: "127.8.8.8".to_string(), // XXX (Classic, L3)
         DPUstorageprefix: "127.7.7.7/32".to_string(),
         IncludeBridge: include_bridge,
+        IsDpuOs: is_dpu_os,
     };
 
     gtmpl::template(template, params).map_err(|e| {
@@ -766,7 +885,11 @@ pub async fn apply(hbn_root: &Path, config_path: &super::FPath) -> eyre::Result<
             Ok(applied)
         }
         Err(err) => {
-            tracing::error!("update_nvue post command failed: {err:#}");
+            tracing::error!(
+                error = %err,
+                error_chain = format!("{err:#}").replace('\n', "; "),
+                "NVUE post command failed"
+            );
 
             // If the config apply failed, we won't be using it, so move it out
             // of the way to an .error file for others to enjoy (while attempting
@@ -776,8 +899,9 @@ pub async fn apply(hbn_root: &Path, config_path: &super::FPath) -> eyre::Result<
                 && let Err(e) = fs::remove_file(path_error.clone())
             {
                 tracing::warn!(
-                    "Failed to remove previous error file ({}): {e}",
-                    path_error.display()
+                    error_file_path = %path_error.display(),
+                    error = %e,
+                    "Failed to remove previous error file"
                 );
             }
 
@@ -808,7 +932,7 @@ pub async fn apply(hbn_root: &Path, config_path: &super::FPath) -> eyre::Result<
 async fn run_apply(hbn_root: &Path, path: &Path) -> eyre::Result<bool> {
     let mut in_container_path = path
         .strip_prefix(hbn_root)
-        .wrap_err("Stripping hbn_root prefix from path to make in-container path")?
+        .wrap_err("stripping hbn_root prefix from path to make in-container path")?
         .to_path_buf();
     // If hbn_root ends with "/", the stripped path will have it removed from start. Add back.
     if !in_container_path.has_root() {
@@ -836,6 +960,13 @@ async fn run_apply(hbn_root: &Path, path: &Path) -> eyre::Result<bool> {
     // Compare pending to applied config at NVUE layer.
     // This avoids no-op apply cycles when textual YAML ordering changes but
     // semantic config does not.
+    //
+    // BUG: It seems like under some conditions (which I don't really
+    // understand) this diff can return some output, but then the subsequent
+    // `nv config apply` will warn about "config apply executed with no config
+    // diff". This can result in needless PostConfigCheckWait health alerts, so
+    // we're working around this by avoiding even calling this code if we see
+    // unchanged config versions in the main loop. -drew
     let stdout =
         super::hbn::run_in_container(&container_id, &["nv", "config", "diff"], true).await?;
     if stdout.is_empty() {
@@ -846,6 +977,7 @@ async fn run_apply(hbn_root: &Path, path: &Path) -> eyre::Result<bool> {
         }
         return Ok(false);
     }
+    let config_diff_stdout = stdout;
 
     // Apply the pending config.
     //
@@ -862,6 +994,9 @@ async fn run_apply(hbn_root: &Path, path: &Path) -> eyre::Result<bool> {
         super::hbn::run_in_container(&container_id, &["nv", "config", "apply", "-y"], true).await?;
     if !stdout.is_empty() {
         tracing::info!("nv config apply: {stdout}");
+        // We're logging this just to see what was in there, in case it can help
+        // explain the "config apply executed with no config diff" message.
+        tracing::info!("nv config diff: {config_diff_stdout}");
     }
 
     // Restart nl2doca
@@ -891,19 +1026,69 @@ fn vni_to_svi_mac(vni: u32) -> eyre::Result<MacAddress> {
     sanitized_mac(&format!("{vni:012}"))
 }
 
-#[derive(Clone, Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug, PartialEq)]
 pub struct RouteTargetConfig {
     pub asn: u32,
     pub vni: u32,
 }
 
+/// Converts an agent routing profile into the template-ready routing profile.
+impl From<&RoutingProfile> for TmplRoutingProfile {
+    fn from(profile: &RoutingProfile) -> Self {
+        // Split mixed-family prefix lists before passing them to the template.
+        let (v4leaks, v6leaks) =
+            split_prefixes_by_family(&profile.accepted_leaks_from_underlay, None, 1);
+        let (v4allowed_anycast, v6allowed_anycast) =
+            split_prefixes_by_family(&profile.allowed_anycast_prefixes, None, 1);
+        let has_leaks_from_underlay_ipv4 =
+            profile.leak_default_route_from_underlay || !v4leaks.is_empty();
+        let has_leaks_from_underlay_ipv6 =
+            profile.leak_default_route_from_underlay || !v6leaks.is_empty();
+
+        TmplRoutingProfile {
+            TenantLeakCommunitiesAccepted: profile.tenant_leak_communities_accepted,
+            LeakDefaultRouteFromUnderlay: profile.leak_default_route_from_underlay,
+            LeakTenantHostRoutesToUnderlay: profile.leak_tenant_host_routes_to_underlay,
+            HasLeaksFromUnderlayIpv4: has_leaks_from_underlay_ipv4,
+            HasLeaksFromUnderlayIpv6: has_leaks_from_underlay_ipv6,
+            AcceptedLeaksFromUnderlayIpv4: v4leaks,
+            AcceptedLeaksFromUnderlayIpv6: v6leaks,
+            HasAllowedAnycastPrefixesIpv4: !v4allowed_anycast.is_empty(),
+            HasAllowedAnycastPrefixesIpv6: !v6allowed_anycast.is_empty(),
+            AllowedAnycastPrefixesIpv4: v4allowed_anycast,
+            AllowedAnycastPrefixesIpv6: v6allowed_anycast,
+            RouteTargetImports: profile
+                .route_target_imports
+                .iter()
+                .map(|rt| TmplRouteTargetConfig {
+                    ASN: rt.asn,
+                    VNI: rt.vni,
+                })
+                .collect(),
+            RouteTargetsOnExports: profile
+                .route_targets_on_exports
+                .iter()
+                .map(|rt| TmplRouteTargetConfig {
+                    ASN: rt.asn,
+                    VNI: rt.vni,
+                })
+                .collect(),
+        }
+    }
+}
+
 // What we need to configure NVUE
 pub struct NvueConfig {
     pub is_fnn: bool,
+    pub is_dpu_os: bool,
+    /// In containerized mode, the vlan ID of the pf0hpf-facing SVI that should
+    /// carry 169.254.169.253/30 as the FMDS gateway address.
+    pub fmds_gateway_vlan: Option<u16>,
     pub vpc_virtualization_type: VpcVirtualizationType,
     pub use_admin_network: bool,
     pub tenancy_enabled: bool,
-    pub loopback_ip: String,
+    pub loopback_ip: IpAddr,
+    pub loopback_ip_v6: Option<Ipv6Addr>,
     pub asn: u32,
     pub datacenter_asn: u32,
     pub site_global_vpc_vni: Option<u32>,
@@ -911,19 +1096,12 @@ pub struct NvueConfig {
     pub additional_route_target_imports: Vec<RouteTargetConfig>,
     pub bgp_leaf_session_password: Option<String>,
 
-    pub secondary_overlay_vtep_ip: Option<String>,
-    pub vf_intercept_bridge_port_name: Option<String>,
-    pub vf_intercept_bridge_sf: Option<String>,
-    pub host_intercept_bridge_port_name: Option<String>,
-    pub internal_bridge_routing_prefix: Option<String>,
-    pub traffic_intercept_public_prefixes: Vec<String>,
-
     pub dpu_hostname: String,
     pub dpu_search_domain: String,
     pub hbn_version: Option<String>,
     pub uplinks: Vec<String>,
-    pub route_servers: Vec<String>,
-    pub dhcp_servers: Vec<String>,
+    pub route_servers: Vec<IpAddr>,
+    pub dhcp_servers: Vec<IpAddr>,
     pub l3_domains: Vec<L3Domain>,
     pub deny_prefixes: Vec<String>,
     pub site_fabric_prefixes: Vec<String>,
@@ -953,13 +1131,21 @@ pub struct NvueConfig {
     pub ct_routing_profile: Option<RoutingProfile>,
 }
 
-#[derive(Clone, Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug, PartialEq)]
 pub struct RoutingProfile {
     pub leak_default_route_from_underlay: bool,
     pub leak_tenant_host_routes_to_underlay: bool,
     pub route_target_imports: Vec<RouteTargetConfig>,
     pub route_targets_on_exports: Vec<RouteTargetConfig>,
     pub tenant_leak_communities_accepted: bool,
+    pub accepted_leaks_from_underlay: Vec<String>,
+    #[serde(default)]
+    pub allowed_anycast_prefixes: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Debug, PartialEq)]
+pub struct InterfaceRoutingProfile {
+    pub allowed_anycast_prefixes: Vec<String>,
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -1071,10 +1257,14 @@ pub struct Ipv6PortConfig {
 pub struct PortConfig {
     pub interface_name: String,
     pub vlan: u16,
+    pub host_ip: String,
+    pub host_route: String,
+    pub host_ipv6: Option<String>,
+    pub host_ipv6_route: Option<String>,
     pub vni: Option<u32>, // In FNN, admin network has both an l2vni and an l3vni
     pub l3_vni: Option<u32>,
     pub gateway_cidr: String,
-    /// Optional IPv6 configuration for dual-stack interfaces.
+    /// Optional IPv6 configuration for interfaces that include IPv6.
     pub ipv6_port_config: Option<Ipv6PortConfig>,
     pub vpc_prefixes: Vec<String>,
     pub vpc_peer_prefixes: Vec<String>,
@@ -1085,6 +1275,9 @@ pub struct PortConfig {
     pub is_l2_segment: bool,
     pub is_phy: bool,
     pub network_security_group_id: Option<String>,
+    #[serde(default)]
+    pub routing_profile: Option<RoutingProfile>,
+    pub interface_routing_profile: Option<InterfaceRoutingProfile>,
 }
 
 //
@@ -1098,32 +1291,20 @@ struct TmplNvue {
     HasSiteGlobalVpcVni: bool,
     SiteGlobalVpcVni: u32,
     LoopbackIP: String,
-    HasSecondaryOverlayVTEP: bool,
-    HasStaticAdvertisements: bool,
-    SecondaryOverlayVtepIP: String,
-    HasInternalBridgeRouting: bool,
-    /// This IP is used in a static route in NVUE
-    /// to send traffic over to a bridge used by a traffic
-    /// intercept user for further processing.
-    VfInterceptBridgeIP: String,
-    /// This _might_ be the same IP as VfInterceptBridgeIP,
-    /// or it might not.  See the details of VfInterceptBridgeIP.
-    PublicPrefixInternalNextHop: String,
-    /// An IP from the same subnet as VfInterceptBridgeIP
-    VfInterceptHbnRepresentorIp: String,
-    /// The SF used to route traffic VF traffic to the HBN pod.
-    VfInterceptBridgeSf: String,
-
-    /// Does any VPC at all have a routing profile that says
-    /// tenant routes should leak to the underlay?
+    HasLoopbackIpv6: bool,
+    LoopbackIpv6: String,
+    /// Does any opted-in VPC have an IPv4 host route to leak to the underlay?
     HasAnyVpcTenantHostLeakToUnderlay: bool,
+    /// IPv4 host routes prepared for the underlay prefix list.
+    TenantHostRoutesToUnderlay: Vec<String>,
 
-    /// The size of the of the prefix used for the internal
-    /// bridge routing.
-    InterceptBridgePrefixLen: u8,
+    /// Does any opted-in VPC have an IPv6 host route to leak to the underlay?
+    HasAnyVpcTenantHostLeakToUnderlayIpv6: bool,
+    /// IPv6 host routes prepared for the underlay prefix list.
+    TenantHostRoutesToUnderlayIpv6: Vec<String>,
 
-    TrafficInterceptPublicPrefixes: Vec<Prefix>,
-    TrafficInterceptPublicPrefixesIpv6: Vec<Prefix>,
+    /// Does any VPC have a VRF loopback?
+    HasAnyVpcVrfLoopback: bool,
 
     ASN: u32,
     DatacenterASN: u32,
@@ -1196,6 +1377,7 @@ struct TmplNvue {
     StorageLoopback: String,  // XXX (Classic, L3)
     DPUstorageprefix: String, // XXX (Classic, L3)
     IncludeBridge: bool,
+    IsDpuOs: bool,
 
     HasBgpLeafSessionPassword: bool,
     /// A password to use for the BGP session with the
@@ -1204,7 +1386,7 @@ struct TmplNvue {
 }
 
 #[allow(non_snake_case)]
-#[derive(Clone, Gtmpl, Debug)]
+#[derive(Clone, Gtmpl, Debug, PartialEq)]
 struct TmplRouteTargetConfig {
     ASN: u32,
     VNI: u32,
@@ -1236,13 +1418,32 @@ struct TmplNetworkSecurityGroupRule {
 }
 
 #[allow(non_snake_case)]
-#[derive(Clone, Gtmpl, Debug)]
+#[derive(Clone, Gtmpl, Debug, PartialEq)]
 struct TmplRoutingProfile {
     LeakTenantHostRoutesToUnderlay: bool,
     LeakDefaultRouteFromUnderlay: bool,
     RouteTargetImports: Vec<TmplRouteTargetConfig>,
     RouteTargetsOnExports: Vec<TmplRouteTargetConfig>,
     TenantLeakCommunitiesAccepted: bool,
+    /// Whether there are _any_ leaks from the default
+    /// VRF into the tenant VRF being used.
+    HasLeaksFromUnderlayIpv4: bool,
+    HasLeaksFromUnderlayIpv6: bool,
+    AcceptedLeaksFromUnderlayIpv4: Vec<Prefix>,
+    AcceptedLeaksFromUnderlayIpv6: Vec<Prefix>,
+    HasAllowedAnycastPrefixesIpv4: bool,
+    HasAllowedAnycastPrefixesIpv6: bool,
+    AllowedAnycastPrefixesIpv4: Vec<Prefix>,
+    AllowedAnycastPrefixesIpv6: Vec<Prefix>,
+}
+
+#[allow(non_snake_case)]
+#[derive(Clone, Gtmpl, Debug, PartialEq, Default)]
+struct TmplInterfaceRoutingProfile {
+    HasAllowedAnycastPrefixesIpv4: bool,
+    HasAllowedAnycastPrefixesIpv6: bool,
+    AllowedAnycastPrefixesIpv4: Vec<Prefix>,
+    AllowedAnycastPrefixesIpv6: Vec<Prefix>,
 }
 
 #[allow(non_snake_case)]
@@ -1327,9 +1528,9 @@ struct TmplVpc {
     // from a dedicated resource-pool, handed out as un-related /32s, and
     // interfaces in FNN get /31s.
     /// The tenant loopback IP assigned to each DPU.
+    HasVrfLoopback: bool,
     VrfLoopback: String,
 
-    HostInterfaces: Vec<TmplHostInterfaces>,
     PortConfigs: Vec<TmplConfigPort>,
 
     HasVpcPeerPrefixes: bool,
@@ -1355,10 +1556,10 @@ struct TmplVpc {
 struct TmplHostInterfaces {
     ID: u32,
     HostIP: String,
-    /// IPv6 host address (if dual-stack).
+    /// IPv6 host address, when configured.
     HostIPv6: Option<String>,
 
-    // HostRoute in the context of FNN-L3 is the /30 prefix allocation.
+    // HostRoute in the context of FNN-L3 is the /31 prefix allocation.
     // This used to be populated as the HostIP + "/32", but then with
     // the advent of interface prefix allocations (where ETV is just a /32,
     // and FNN-L3 is a /31), HostRoute became the allocation (which was
@@ -1372,17 +1573,26 @@ struct TmplConfigPort {
     InterfaceName: String,
     Index: String,
     VlanID: u16,
+    HostIP: String,
+    HostIPv6: Option<String>,
+    HostRoute: String,
+    HostIPv6Route: Option<String>,
+    HasRoutingProfile: bool,
+    RoutingProfile: TmplInterfaceRoutingProfile,
 
     /// Format: 24bit integer (usable range: 4096 to 16777215).
     /// Empty string if no tenant
     L2VNI: String, // Previously called VNIDevice
-    IPs: Vec<String>, // with mask, 1.1.1.1/20
+    /// DPU-side IPv4 addresses with their prefix lengths.
+    IPs: Vec<String>,
+    /// DPU-side IPv6 addresses with their prefix lengths.
+    IPsIpv6: Vec<String>,
 
-    /// In a symmetrical EVPN configuration, an SVI (vlan interfaces) requires a separate IP that
-    /// is not the gateway address. Typically the 2nd usable ip in the prefix is being used,
-    /// e.g 10.1.1.2 in the 10.1.1.0/24 prefix.
-    /// Format: Standard IPv4 notation
+    /// IPv4 SVI addresses for symmetrical EVPN. These are plain addresses
+    /// without prefix lengths, typically the second usable address in the prefix.
     SviIPs: Vec<String>,
+    /// IPv6 SVI addresses for symmetrical EVPN, without prefix lengths.
+    SviIPsIpv6: Vec<String>,
 
     /// VRR, the distributed gateway, needs a manually defined MAC address. This can be overlapping
     /// on the different VTEPs, but it is very convenient to be unique on the same VTEP.
@@ -1422,10 +1632,11 @@ struct TmplConfigPort {
 
     HasNetworkSecurityGroup: bool,
     NetworkSecurityGroupIndex: Option<u16>,
+    HasFmdsGateway: bool,
 }
 
 #[allow(non_snake_case)]
-#[derive(Clone, Gtmpl, Debug)]
+#[derive(Clone, Gtmpl, Debug, PartialEq)]
 struct Prefix {
     Index: String,
     Prefix: String,
@@ -1439,86 +1650,120 @@ struct TmplVni {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use carbide_test_support::value_scenarios;
+
     use super::*;
+
+    /// One `split_prefixes_by_family` scenario: the input prefixes, an optional
+    /// VPC allow-list `filter` (as prefix strings, parsed inside the run), the
+    /// `start_index` each family bucket counts from, and the `(ipv4, ipv6)`
+    /// `Prefix` buckets the split should yield.
+    struct SplitRow {
+        prefixes: Vec<&'static str>,
+        filter: Option<Vec<&'static str>>,
+        start_index: usize,
+    }
+
+    /// Builds a `Prefix` from its index and CIDR string -- the shape
+    /// `split_prefixes_by_family` produces -- so expected buckets read as a list
+    /// of `(index, prefix)` pairs.
+    fn prefix(index: &str, cidr: &str) -> Prefix {
+        Prefix {
+            Index: index.to_string(),
+            Prefix: cidr.to_string(),
+        }
+    }
 
     #[test]
     fn test_split_prefixes_by_family() {
-        let prefixes = vec![
-            "10.0.0.0/8".to_string(),
-            "2001:db8::/32".to_string(),
-            "192.168.0.0/16".to_string(),
-            "fd00::/8".to_string(),
-        ];
-        let (ipv4, ipv6) = split_prefixes_by_family(&prefixes, 1000);
+        value_scenarios!(run = |row: SplitRow| {
+            let prefixes: Vec<String> = row.prefixes.iter().map(|s| s.to_string()).collect();
+            let filter = row
+                .filter
+                .map(|f| parse_prefixes(&f.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
+            split_prefixes_by_family(&prefixes, filter.as_deref(), row.start_index)
+        };
+            "mixed families share the start index" {
+                SplitRow {
+                    prefixes: vec!["10.0.0.0/8", "2001:db8::/32", "192.168.0.0/16", "fd00::/8"],
+                    filter: None,
+                    start_index: 1000,
+                } => (
+                    vec![prefix("1000", "10.0.0.0/8"), prefix("1001", "192.168.0.0/16")],
+                    vec![prefix("1000", "2001:db8::/32"), prefix("1001", "fd00::/8")],
+                ),
+            }
 
-        assert_eq!(ipv4.len(), 2);
-        assert_eq!(ipv6.len(), 2);
+            "ipv4 only" {
+                SplitRow {
+                    prefixes: vec!["10.0.0.0/8", "172.16.0.0/12"],
+                    filter: None,
+                    start_index: 1,
+                } => (
+                    vec![prefix("1", "10.0.0.0/8"), prefix("2", "172.16.0.0/12")],
+                    vec![],
+                ),
+            }
 
-        assert_eq!(ipv4[0].Index, "1000");
-        assert_eq!(ipv4[0].Prefix, "10.0.0.0/8");
-        assert_eq!(ipv4[1].Index, "1001");
-        assert_eq!(ipv4[1].Prefix, "192.168.0.0/16");
+            "ipv6 only" {
+                SplitRow {
+                    prefixes: vec!["2001:db8::/32", "fd00::/8"],
+                    filter: None,
+                    start_index: 1,
+                } => (
+                    vec![],
+                    vec![prefix("1", "2001:db8::/32"), prefix("2", "fd00::/8")],
+                ),
+            }
 
-        assert_eq!(ipv6[0].Index, "1000");
-        assert_eq!(ipv6[0].Prefix, "2001:db8::/32");
-        assert_eq!(ipv6[1].Index, "1001");
-        assert_eq!(ipv6[1].Prefix, "fd00::/8");
-    }
+            "empty input" {
+                SplitRow {
+                    prefixes: vec![],
+                    filter: None,
+                    start_index: 1000,
+                } => (vec![], vec![]),
+            }
 
-    #[test]
-    fn test_split_prefixes_ipv4_only() {
-        let prefixes = vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()];
-        let (ipv4, ipv6) = split_prefixes_by_family(&prefixes, 1);
+            "unparseable prefixes are dropped" {
+                SplitRow {
+                    prefixes: vec!["not-a-cidr", "10.0.0.0/8"],
+                    filter: None,
+                    start_index: 1,
+                } => (vec![prefix("1", "10.0.0.0/8")], vec![]),
+            }
 
-        assert_eq!(ipv4.len(), 2);
-        assert!(ipv6.is_empty());
-    }
+            "ipv4-mapped ipv6 sorts into the v6 bucket" {
+                // IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) parse as V6.
+                SplitRow {
+                    prefixes: vec!["::ffff:192.0.2.33/128", "10.0.0.0/8", "2001:db8::/32"],
+                    filter: None,
+                    start_index: 1,
+                } => (
+                    vec![prefix("1", "10.0.0.0/8")],
+                    vec![prefix("1", "::ffff:192.0.2.33/128"), prefix("2", "2001:db8::/32")],
+                ),
+            }
 
-    #[test]
-    fn test_split_prefixes_ipv6_only() {
-        let prefixes = vec!["2001:db8::/32".to_string(), "fd00::/8".to_string()];
-        let (ipv4, ipv6) = split_prefixes_by_family(&prefixes, 1);
-
-        assert!(ipv4.is_empty());
-        assert_eq!(ipv6.len(), 2);
-    }
-
-    #[test]
-    fn test_split_prefixes_empty() {
-        let prefixes: Vec<String> = vec![];
-        let (ipv4, ipv6) = split_prefixes_by_family(&prefixes, 1000);
-
-        assert!(ipv4.is_empty());
-        assert!(ipv6.is_empty());
-    }
-
-    #[test]
-    fn test_split_prefixes_unparseable_dropped() {
-        let prefixes = vec!["not-a-cidr".to_string(), "10.0.0.0/8".to_string()];
-        let (ipv4, ipv6) = split_prefixes_by_family(&prefixes, 1);
-
-        assert_eq!(ipv4.len(), 1);
-        assert_eq!(ipv4[0].Prefix, "10.0.0.0/8");
-        assert_eq!(ipv4[0].Index, "1");
-        assert!(ipv6.is_empty());
-    }
-
-    #[test]
-    fn test_split_prefixes_ipv4_mapped_ipv6() {
-        // IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) parse as V6
-        let prefixes = vec![
-            "::ffff:192.0.2.33/128".to_string(),
-            "10.0.0.0/8".to_string(),
-            "2001:db8::/32".to_string(),
-        ];
-        let (ipv4, ipv6) = split_prefixes_by_family(&prefixes, 1);
-
-        assert_eq!(ipv4.len(), 1);
-        assert_eq!(ipv4[0].Prefix, "10.0.0.0/8");
-
-        assert_eq!(ipv6.len(), 2);
-        assert_eq!(ipv6[0].Prefix, "::ffff:192.0.2.33/128");
-        assert_eq!(ipv6[1].Prefix, "2001:db8::/32");
+            "filter keeps only prefixes contained by the allow-list" {
+                // One contained and one excluded prefix per family; family-specific
+                // indexes are preserved.
+                SplitRow {
+                    prefixes: vec![
+                        "192.0.2.64/26",
+                        "198.51.100.0/24",
+                        "2001:db8:1::/64",
+                        "2001:db9::/48",
+                    ],
+                    filter: Some(vec!["192.0.2.0/24", "2001:db8::/32"]),
+                    start_index: 1,
+                } => (
+                    vec![prefix("1", "192.0.2.64/26")],
+                    vec![prefix("1", "2001:db8:1::/64")],
+                ),
+            }
+        );
     }
 
     /// Helper to build a minimal NvueConfig for template rendering tests.
@@ -1527,21 +1772,18 @@ mod tests {
         NvueConfig {
             bgp_leaf_session_password: None,
             is_fnn: false,
+            is_dpu_os: true,
+            fmds_gateway_vlan: None,
             vpc_virtualization_type: VpcVirtualizationType::EthernetVirtualizer,
             use_admin_network: false,
             tenancy_enabled: true,
-            loopback_ip: "10.0.0.1".to_string(),
+            loopback_ip: "10.0.0.1".parse().unwrap(),
+            loopback_ip_v6: None,
             asn: 65000,
             datacenter_asn: 11414,
             site_global_vpc_vni: None,
             common_internal_route_target: None,
             additional_route_target_imports: vec![],
-            secondary_overlay_vtep_ip: None,
-            vf_intercept_bridge_port_name: None,
-            vf_intercept_bridge_sf: None,
-            host_intercept_bridge_port_name: None,
-            internal_bridge_routing_prefix: None,
-            traffic_intercept_public_prefixes: vec![],
             dpu_hostname: "test-dpu".to_string(),
             dpu_search_domain: "test.local".to_string(),
             hbn_version: None,
@@ -1564,6 +1806,97 @@ mod tests {
             ct_access_vlans: vec![],
             ct_routing_profile: None,
         }
+    }
+
+    struct LoopbackRenderRow {
+        virtualization_type: VpcVirtualizationType,
+        loopback_ip_v6: Option<Ipv6Addr>,
+    }
+
+    fn address_set(addresses: &[&str]) -> BTreeSet<String> {
+        addresses
+            .iter()
+            .map(|address| (*address).to_string())
+            .collect()
+    }
+
+    fn yaml_mapping_keys(value: &serde_yaml::Value) -> BTreeSet<String> {
+        match value {
+            serde_yaml::Value::Null => BTreeSet::new(),
+            serde_yaml::Value::Mapping(mapping) => mapping
+                .keys()
+                .map(|key| {
+                    key.as_str()
+                        .expect("mapping key should be a string")
+                        .to_string()
+                })
+                .collect(),
+            value => panic!("expected a YAML mapping or null, got {value:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_renders_ipv6_loopback_only_for_fnn() {
+        value_scenarios!(run = |row: LoopbackRenderRow| {
+            let mut conf = minimal_nvue_config();
+            conf.is_fnn = row.virtualization_type == VpcVirtualizationType::Fnn;
+            conf.vpc_virtualization_type = row.virtualization_type;
+            conf.loopback_ip_v6 = row.loopback_ip_v6;
+
+            let rendered = build(conf).unwrap();
+            let rendered_yaml: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+            let loopback_addresses = rendered_yaml.as_sequence().unwrap()[1]["set"]["interface"]
+                ["lo"]["ip"]["address"]
+                .as_mapping()
+                .unwrap()
+                .keys()
+                .map(|address| address.as_str().unwrap().to_string())
+                .collect();
+            let ipv6_underlay_prefixes = rendered_yaml.as_sequence().unwrap()[1]["set"]["router"]
+                ["policy"]["prefix-list"]["ALLOW_TO_UNDERLAY_PREFIX_LIST_IPV6"]["rule"]["65000"]
+                ["match"]
+                .as_mapping()
+                .into_iter()
+                .flat_map(|mapping| mapping.keys())
+                .map(|address| address.as_str().unwrap().to_string())
+                .collect();
+
+            assert!(
+                rendered.contains("address: 10.0.0.1"),
+                "the IPv4 loopback must remain the VXLAN VTEP"
+            );
+            assert!(
+                rendered.contains("router-id: 10.0.0.1"),
+                "the IPv4 loopback must remain the BGP router ID"
+            );
+
+            (loopback_addresses, ipv6_underlay_prefixes)
+        };
+            "FNN loopback rendering" {
+                LoopbackRenderRow {
+                    virtualization_type: VpcVirtualizationType::Fnn,
+                    loopback_ip_v6: Some("2001:db8::1".parse().unwrap()),
+                } => (
+                    address_set(&["10.0.0.1/32", "2001:db8::1/128"]),
+                    address_set(&["2001:db8::1/128"]),
+                ),
+                LoopbackRenderRow {
+                    virtualization_type: VpcVirtualizationType::Fnn,
+                    loopback_ip_v6: None,
+                } => (address_set(&["10.0.0.1/32"]), address_set(&[])),
+            }
+
+            "ETV ignores the IPv6 loopback" {
+                LoopbackRenderRow {
+                    virtualization_type: VpcVirtualizationType::EthernetVirtualizer,
+                    loopback_ip_v6: Some("2001:db8::1".parse().unwrap()),
+                } => (address_set(&["10.0.0.1/32"]), address_set(&[])),
+                LoopbackRenderRow {
+                    virtualization_type: VpcVirtualizationType::EthernetVirtualizerWithNvue,
+                    loopback_ip_v6: Some("2001:db8::1".parse().unwrap()),
+                } => (address_set(&["10.0.0.1/32"]), address_set(&[])),
+            }
+        );
     }
 
     #[test]
@@ -1614,6 +1947,10 @@ mod tests {
         conf.ct_port_configs = vec![PortConfig {
             interface_name: "pf0vf0_if".into(),
             vlan: 100,
+            host_ip: "10.0.1.2".into(),
+            host_route: "10.0.1.0/24".into(),
+            host_ipv6: None,
+            host_ipv6_route: None,
             vni: Some(1000),
             l3_vni: Some(100),
             gateway_cidr: "10.0.1.1/24".into(),
@@ -1625,6 +1962,8 @@ mod tests {
             is_l2_segment: true,
             is_phy: false,
             network_security_group_id: None,
+            routing_profile: None,
+            interface_routing_profile: None,
             ipv6_port_config: None,
         }];
         conf.ct_access_vlans = vec![VlanConfig {
@@ -1653,10 +1992,16 @@ mod tests {
             leak_tenant_host_routes_to_underlay: false,
             route_target_imports: vec![],
             route_targets_on_exports: vec![],
+            accepted_leaks_from_underlay: vec![],
+            allowed_anycast_prefixes: vec![],
         });
         conf.ct_port_configs = vec![PortConfig {
             interface_name: "pf0vf0_if".into(),
             vlan: 100,
+            host_ip: "10.0.1.2".into(),
+            host_route: "10.0.1.0/24".into(),
+            host_ipv6: None,
+            host_ipv6_route: None,
             vni: Some(1000),
             l3_vni: Some(100),
             gateway_cidr: "10.0.1.1/24".into(),
@@ -1668,6 +2013,8 @@ mod tests {
             is_l2_segment: false,
             is_phy: false,
             network_security_group_id: None,
+            routing_profile: None,
+            interface_routing_profile: None,
             ipv6_port_config: None,
         }];
         conf.ct_access_vlans = vec![VlanConfig {
@@ -1691,6 +2038,10 @@ mod tests {
         conf.ct_port_configs = vec![PortConfig {
             interface_name: "pf0vf0_if".into(),
             vlan: 100,
+            host_ip: "10.0.1.2".into(),
+            host_route: "10.0.1.0/24".into(),
+            host_ipv6: None,
+            host_ipv6_route: None,
             vni: Some(1000),
             l3_vni: Some(100),
             gateway_cidr: "10.0.1.1/24".into(),
@@ -1702,6 +2053,8 @@ mod tests {
             is_l2_segment: true,
             is_phy: false,
             network_security_group_id: None,
+            routing_profile: None,
+            interface_routing_profile: None,
             ipv6_port_config: None,
         }];
         conf.ct_access_vlans = vec![VlanConfig {
@@ -1733,10 +2086,16 @@ mod tests {
 
             route_target_imports: vec![],
             route_targets_on_exports: vec![],
+            accepted_leaks_from_underlay: vec![],
+            allowed_anycast_prefixes: vec![],
         });
         conf.ct_port_configs = vec![PortConfig {
             interface_name: "pf0vf0_if".into(),
             vlan: 100,
+            host_ip: "10.0.1.2".into(),
+            host_route: "10.0.1.0/24".into(),
+            host_ipv6: None,
+            host_ipv6_route: None,
             vni: Some(1000),
             l3_vni: Some(100),
             gateway_cidr: "10.0.1.1/24".into(),
@@ -1748,6 +2107,8 @@ mod tests {
             is_l2_segment: false,
             is_phy: false,
             network_security_group_id: None,
+            routing_profile: None,
+            interface_routing_profile: None,
             ipv6_port_config: None,
         }];
         conf.ct_access_vlans = vec![VlanConfig {
@@ -1776,6 +2137,10 @@ mod tests {
         conf.ct_port_configs = vec![PortConfig {
             interface_name: "pf0vf0_if".into(),
             vlan: 100,
+            host_ip: "10.0.1.2".into(),
+            host_route: "10.0.1.0/24".into(),
+            host_ipv6: None,
+            host_ipv6_route: None,
             vni: Some(1000),
             l3_vni: Some(100),
             gateway_cidr: "10.0.1.1/24".into(),
@@ -1787,6 +2152,8 @@ mod tests {
             is_l2_segment: true,
             is_phy: false,
             network_security_group_id: None,
+            routing_profile: None,
+            interface_routing_profile: None,
             ipv6_port_config: None,
         }];
         conf.ct_access_vlans = vec![VlanConfig {
@@ -1816,11 +2183,17 @@ mod tests {
             leak_tenant_host_routes_to_underlay: false,
             route_target_imports: vec![],
             route_targets_on_exports: vec![],
+            accepted_leaks_from_underlay: vec![],
+            allowed_anycast_prefixes: vec![],
         });
         conf.ct_port_configs = vec![
             PortConfig {
                 interface_name: "pf0vf0_if".into(),
                 vlan: 100,
+                host_ip: "10.0.1.2".into(),
+                host_route: "10.0.1.0/24".into(),
+                host_ipv6: None,
+                host_ipv6_route: None,
                 vni: Some(1000),
                 l3_vni: Some(200),
                 gateway_cidr: "10.0.1.1/24".into(),
@@ -1832,11 +2205,17 @@ mod tests {
                 is_l2_segment: false,
                 is_phy: false,
                 network_security_group_id: None,
+                routing_profile: None,
+                interface_routing_profile: None,
                 ipv6_port_config: None,
             },
             PortConfig {
                 interface_name: "pf0hpf_if".into(),
                 vlan: 101,
+                host_ip: "10.0.2.2".into(),
+                host_route: "10.0.2.0/24".into(),
+                host_ipv6: None,
+                host_ipv6_route: None,
                 vni: Some(1001),
                 l3_vni: Some(200),
                 gateway_cidr: "10.0.2.1/24".into(),
@@ -1848,6 +2227,8 @@ mod tests {
                 is_l2_segment: false,
                 is_phy: false,
                 network_security_group_id: None,
+                routing_profile: None,
+                interface_routing_profile: None,
                 ipv6_port_config: None,
             },
         ];
@@ -1871,10 +2252,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_fnn_dual_stack_interface() {
-        // When ipv6.gateway_cidr is set, the NVUE template should configure
-        // both IPv4 and IPv6 addresses on the interface.
+    /// Builds the dual-stack FNN fixture shared by the address and route-leak tests.
+    fn dual_stack_fnn_config() -> NvueConfig {
         let mut conf = minimal_nvue_config();
         conf.is_fnn = true;
         conf.vpc_virtualization_type = VpcVirtualizationType::Fnn;
@@ -1886,10 +2265,16 @@ mod tests {
             tenant_leak_communities_accepted: false,
             route_target_imports: vec![],
             route_targets_on_exports: vec![],
+            accepted_leaks_from_underlay: vec![],
+            allowed_anycast_prefixes: vec![],
         });
         conf.ct_port_configs = vec![PortConfig {
             interface_name: "pf0vf0_if".into(),
             vlan: 100,
+            host_ip: "10.0.1.1".into(),
+            host_route: "10.0.1.0/31".into(),
+            host_ipv6: Some("2001:db8::1".into()),
+            host_ipv6_route: Some("2001:db8::0/127".into()),
             vni: Some(1000),
             l3_vni: Some(100),
             gateway_cidr: "10.0.1.0/31".into(),
@@ -1905,6 +2290,8 @@ mod tests {
             is_l2_segment: false,
             is_phy: false,
             network_security_group_id: None,
+            routing_profile: None,
+            interface_routing_profile: None,
         }];
         conf.ct_access_vlans = vec![VlanConfig {
             vlan_id: 100,
@@ -1915,9 +2302,207 @@ mod tests {
                 ip: "2001:db8::1".into(),
             }),
         }];
+        conf
+    }
+
+    #[test]
+    fn test_build_fnn_dual_stack_interface() {
+        let mut conf = dual_stack_fnn_config();
+        conf.ct_routing_profile
+            .as_mut()
+            .expect("fixture should have a routing profile")
+            .leak_tenant_host_routes_to_underlay = true;
         assert_build_matches_golden(
             conf,
             include_str!("../templates/tests/nvue_build_fnn_dual_stack.yaml.expected"),
+        );
+    }
+
+    #[test]
+    fn test_build_fnn_ipv6_only_interface() {
+        let mut conf = dual_stack_fnn_config();
+        let port = conf
+            .ct_port_configs
+            .first_mut()
+            .expect("fixture should have a port");
+        port.host_ip.clear();
+        port.host_route.clear();
+        port.gateway_cidr.clear();
+        port.svi_ip = None;
+        port.vpc_prefixes
+            .retain(|prefix| matches!(prefix.parse::<IpNet>(), Ok(IpNet::V6(_))));
+
+        let vlan = conf
+            .ct_access_vlans
+            .first_mut()
+            .expect("fixture should have an access VLAN");
+        vlan.ip.clear();
+        vlan.network.clear();
+
+        let output = build(conf).expect("build should succeed");
+        let docs: serde_yaml::Value =
+            serde_yaml::from_str(&output).expect("output should be valid YAML");
+        let set = &docs.as_sequence().unwrap()[1]["set"];
+
+        assert_eq!(
+            yaml_mapping_keys(&set["interface"]["pf0vf0_if"]["ip"]["address"]),
+            address_set(&["2001:db8::0/127"]),
+        );
+        let neighbors = &set["vrf"]["vpc_100"]["router"]["bgp"]["neighbor"];
+        assert_eq!(yaml_mapping_keys(neighbors), address_set(&["2001:db8::1"]),);
+    }
+
+    #[test]
+    fn test_build_fnn_dual_stack_l2_interface() {
+        let mut conf = dual_stack_fnn_config();
+        let port = conf
+            .ct_port_configs
+            .first_mut()
+            .expect("fixture should have a port");
+        port.is_l2_segment = true;
+        port.gateway_cidr = "10.0.1.1/24".into();
+        port.svi_ip = Some("10.0.1.2".into());
+        let ipv6 = port
+            .ipv6_port_config
+            .as_mut()
+            .expect("fixture should have IPv6 port config");
+        ipv6.gateway_cidr = "2001:db8::1/64".into();
+        ipv6.svi_ip = Some("2001:db8::2".into());
+
+        let output = build(conf).expect("build should succeed");
+        let docs: serde_yaml::Value =
+            serde_yaml::from_str(&output).expect("output should be valid YAML");
+        let vlan = &docs.as_sequence().unwrap()[1]["set"]["interface"]["vlan100"];
+
+        assert_eq!(
+            yaml_mapping_keys(&vlan["ip"]["address"]),
+            address_set(&["10.0.1.2", "2001:db8::2"]),
+        );
+        assert_eq!(
+            yaml_mapping_keys(&vlan["ip"]["vrr"]["address"]),
+            address_set(&["10.0.1.1/24", "2001:db8::1/64"]),
+        );
+    }
+
+    #[test]
+    fn test_build_etv_dual_stack_interface() {
+        let mut conf = dual_stack_fnn_config();
+        conf.is_fnn = false;
+        conf.vpc_virtualization_type = VpcVirtualizationType::EthernetVirtualizer;
+        conf.ct_routing_profile = None;
+
+        let output = build(conf).expect("build should succeed");
+        let docs: serde_yaml::Value =
+            serde_yaml::from_str(&output).expect("output should be valid YAML");
+        let addresses =
+            &docs.as_sequence().unwrap()[1]["set"]["interface"]["vlan100"]["ip"]["address"];
+
+        assert_eq!(
+            yaml_mapping_keys(addresses),
+            address_set(&["10.0.1.0/31", "2001:db8::0/127"]),
+        );
+    }
+
+    struct FnnUnderlayLeakRow {
+        leak_tenant_host_routes_to_underlay: bool,
+        include_ipv6: bool,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct FnnUnderlayLeakResult {
+        interface_addresses: BTreeSet<String>,
+        has_ipv4_leak_rule: bool,
+        ipv4_leak_prefixes: BTreeSet<String>,
+        has_ipv6_leak_rule: bool,
+        ipv6_leak_prefixes: BTreeSet<String>,
+    }
+
+    #[test]
+    fn test_build_fnn_underlay_leaks_follow_profile_and_address_family() {
+        value_scenarios!(run = |row: FnnUnderlayLeakRow| {
+            let mut conf = dual_stack_fnn_config();
+            conf.ct_routing_profile
+                .as_mut()
+                .expect("fixture should have a routing profile")
+                .leak_tenant_host_routes_to_underlay =
+                row.leak_tenant_host_routes_to_underlay;
+            if !row.include_ipv6 {
+                let port = conf
+                    .ct_port_configs
+                    .first_mut()
+                    .expect("fixture should have a port");
+                port.host_ipv6 = None;
+                port.host_ipv6_route = None;
+                port.ipv6_port_config = None;
+                conf.ct_access_vlans
+                    .first_mut()
+                    .expect("fixture should have an access VLAN")
+                    .ipv6_vlan_config = None;
+            }
+
+            let output = build(conf).expect("build should succeed");
+            let docs: serde_yaml::Value =
+                serde_yaml::from_str(&output).expect("output should be valid YAML");
+            let set = &docs.as_sequence().unwrap()[1]["set"];
+            let prefix_lists = &set["router"]["policy"]["prefix-list"];
+            let ipv4_leak_rule =
+                &prefix_lists["ALLOW_TO_UNDERLAY_PREFIX_LIST"]["rule"]["65002"];
+            let ipv6_prefix_list = &prefix_lists["ALLOW_TO_UNDERLAY_PREFIX_LIST_IPV6"];
+            let ipv6_leak_rule = &ipv6_prefix_list["rule"]["65002"];
+            assert_eq!(
+                ipv6_prefix_list["rule"]["65535"]["action"].as_str(),
+                Some("deny"),
+                "IPv6 underlay prefix list should retain its default deny",
+            );
+            assert!(
+                ipv6_prefix_list["rule"]["65535"]["match"]["any"]
+                    .as_mapping()
+                    .is_some(),
+                "IPv6 default deny should match any route",
+            );
+
+            FnnUnderlayLeakResult {
+                interface_addresses: yaml_mapping_keys(
+                    &set["interface"]["pf0vf0_if"]["ip"]["address"],
+                ),
+                has_ipv4_leak_rule: !ipv4_leak_rule.is_null(),
+                ipv4_leak_prefixes: yaml_mapping_keys(&ipv4_leak_rule["match"]),
+                has_ipv6_leak_rule: !ipv6_leak_rule.is_null(),
+                ipv6_leak_prefixes: yaml_mapping_keys(&ipv6_leak_rule["match"]),
+            }
+        };
+            "the routing profile and interface family select leak rules" {
+                FnnUnderlayLeakRow {
+                    leak_tenant_host_routes_to_underlay: false,
+                    include_ipv6: true,
+                } => FnnUnderlayLeakResult {
+                    interface_addresses: address_set(&["10.0.1.0/31", "2001:db8::0/127"]),
+                    has_ipv4_leak_rule: false,
+                    ipv4_leak_prefixes: address_set(&[]),
+                    has_ipv6_leak_rule: false,
+                    ipv6_leak_prefixes: address_set(&[]),
+                },
+                FnnUnderlayLeakRow {
+                    leak_tenant_host_routes_to_underlay: true,
+                    include_ipv6: true,
+                } => FnnUnderlayLeakResult {
+                    interface_addresses: address_set(&["10.0.1.0/31", "2001:db8::0/127"]),
+                    has_ipv4_leak_rule: true,
+                    ipv4_leak_prefixes: address_set(&["10.0.1.0/31"]),
+                    has_ipv6_leak_rule: true,
+                    ipv6_leak_prefixes: address_set(&["2001:db8::0/127"]),
+                },
+                FnnUnderlayLeakRow {
+                    leak_tenant_host_routes_to_underlay: true,
+                    include_ipv6: false,
+                } => FnnUnderlayLeakResult {
+                    interface_addresses: address_set(&["10.0.1.0/31"]),
+                    has_ipv4_leak_rule: true,
+                    ipv4_leak_prefixes: address_set(&["10.0.1.0/31"]),
+                    has_ipv6_leak_rule: false,
+                    ipv6_leak_prefixes: address_set(&[]),
+                },
+            }
         );
     }
 
@@ -1957,5 +2542,239 @@ mod tests {
             !has_null_leaf(&parsed),
             "rendered YAML contains a null leaf:\n\n{output}"
         );
+    }
+
+    fn phy_port_config(vlan: u16) -> PortConfig {
+        PortConfig {
+            interface_name: "pf0hpf_if".into(),
+            vlan,
+            host_ip: "10.0.1.2".into(),
+            host_route: "10.0.1.0/24".into(),
+            host_ipv6: None,
+            host_ipv6_route: None,
+            vni: Some(1000),
+            l3_vni: Some(100),
+            gateway_cidr: "10.0.1.1/24".into(),
+            vpc_prefixes: vec![],
+            vpc_peer_prefixes: vec![],
+            vpc_peer_vnis: vec![],
+            svi_ip: Some("10.0.1.2".into()),
+            tenant_vrf_loopback_ip: None,
+            is_l2_segment: true,
+            is_phy: true,
+            network_security_group_id: None,
+            routing_profile: None,
+            interface_routing_profile: None,
+            ipv6_port_config: None,
+        }
+    }
+
+    // In container mode with fmds_gateway_vlan matching the phy port vlan, the
+    // FMDS gateway address should appear in the rendered output.
+    #[test]
+    fn test_fmds_gateway_etv_container_mode_emits_address() {
+        let mut conf = minimal_nvue_config();
+        conf.is_dpu_os = false;
+        conf.fmds_gateway_vlan = Some(274);
+        conf.ct_port_configs = vec![phy_port_config(274)];
+        let output = build(conf).expect("build should succeed");
+        assert!(
+            output.contains("169.254.169.253/30"),
+            "expected FMDS gateway address in output:\n{output}"
+        );
+    }
+
+    // In DPU-OS mode the FMDS gateway address must NOT appear on the vlan SVI
+    // (it lives on pf0dpu1_if instead, managed by the startup template).
+    #[test]
+    fn test_fmds_gateway_etv_dpu_os_mode_suppressed() {
+        let mut conf = minimal_nvue_config();
+        conf.is_dpu_os = true;
+        // Even if fmds_gateway_vlan is accidentally set, DPU-OS mode must ignore it.
+        conf.fmds_gateway_vlan = Some(274);
+        conf.ct_port_configs = vec![phy_port_config(274)];
+        let output = build(conf).expect("build should succeed");
+        // The ETV template uses pf0dpu1_if for the gateway in DPU-OS mode, not the vlan SVI.
+        assert!(
+            !output.contains("169.254.169.253/30") || output.contains("pf0dpu1_if"),
+            "DPU-OS mode should not put 169.254.169.253/30 on the vlan SVI"
+        );
+    }
+
+    // fmds_gateway_vlan pointing at a vlan that does not exist in ct_port_configs
+    // should log an error but still return a valid (if incomplete) config.
+    #[test]
+    fn test_fmds_gateway_vlan_not_in_port_configs_still_builds() {
+        let mut conf = minimal_nvue_config();
+        conf.is_dpu_os = false;
+        conf.fmds_gateway_vlan = Some(999); // no port has vlan 999
+        conf.ct_port_configs = vec![phy_port_config(274)];
+        // Should succeed (just logs an error, does not fail the build).
+        let output = build(conf).expect("build should succeed even when vlan is missing");
+        assert!(
+            !output.contains("169.254.169.253/30"),
+            "mismatched vlan should not produce FMDS address in output"
+        );
+    }
+
+    // fmds_gateway_vlan=None should never emit the FMDS gateway address.
+    #[test]
+    fn test_fmds_gateway_none_emits_no_address() {
+        let mut conf = minimal_nvue_config();
+        conf.is_dpu_os = false;
+        conf.fmds_gateway_vlan = None;
+        conf.ct_port_configs = vec![phy_port_config(274)];
+        let output = build(conf).expect("build should succeed");
+        assert!(
+            !output.contains("169.254.169.253/30"),
+            "no fmds_gateway_vlan should not produce FMDS address in output"
+        );
+    }
+
+    fn minimal_fnn_routing_profile() -> RoutingProfile {
+        RoutingProfile {
+            tenant_leak_communities_accepted: false,
+            leak_default_route_from_underlay: false,
+            leak_tenant_host_routes_to_underlay: false,
+            route_target_imports: vec![],
+            route_targets_on_exports: vec![],
+            accepted_leaks_from_underlay: vec![],
+            allowed_anycast_prefixes: vec![],
+        }
+    }
+
+    // Same checks for FNN template.
+    #[test]
+    fn test_fmds_gateway_fnn_container_mode_emits_address() {
+        let mut conf = minimal_nvue_config();
+        conf.is_fnn = true;
+        conf.vpc_virtualization_type = VpcVirtualizationType::Fnn;
+        conf.is_dpu_os = false;
+        conf.fmds_gateway_vlan = Some(274);
+        conf.ct_routing_profile = Some(minimal_fnn_routing_profile());
+        conf.ct_port_configs = vec![phy_port_config(274)];
+        let output = build(conf).expect("build should succeed");
+        assert!(
+            output.contains("169.254.169.253/30"),
+            "expected FMDS gateway address in FNN output:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_fmds_gateway_fnn_dpu_os_mode_suppressed() {
+        let mut conf = minimal_nvue_config();
+        conf.is_fnn = true;
+        conf.vpc_virtualization_type = VpcVirtualizationType::Fnn;
+        conf.is_dpu_os = true;
+        conf.fmds_gateway_vlan = Some(274);
+        conf.ct_routing_profile = Some(minimal_fnn_routing_profile());
+        conf.ct_port_configs = vec![phy_port_config(274)];
+        let output = build(conf).expect("build should succeed");
+        assert!(
+            !output.contains("169.254.169.253/30") || output.contains("pf0dpu1_if"),
+            "DPU-OS mode should not put 169.254.169.253/30 on the vlan SVI in FNN"
+        );
+    }
+
+    fn l3_phy_port_config(vlan: u16) -> PortConfig {
+        PortConfig {
+            is_l2_segment: false,
+            svi_ip: None,
+            ..phy_port_config(vlan)
+        }
+    }
+
+    // FNN L3 (is_l2_segment=false): in container mode the FMDS gateway address
+    // must appear on the L3 interface's ip block, not an SVI.
+    #[test]
+    fn test_fmds_gateway_fnn_l3_container_mode_emits_address() {
+        let mut conf = minimal_nvue_config();
+        conf.is_fnn = true;
+        conf.vpc_virtualization_type = VpcVirtualizationType::Fnn;
+        conf.is_dpu_os = false;
+        conf.fmds_gateway_vlan = Some(274);
+        conf.ct_routing_profile = Some(minimal_fnn_routing_profile());
+        conf.ct_port_configs = vec![l3_phy_port_config(274)];
+        let output = build(conf).expect("build should succeed");
+        assert!(
+            output.contains("169.254.169.253/30"),
+            "expected FMDS gateway address on FNN L3 interface:\n{output}"
+        );
+    }
+
+    // FNN L3 in DPU-OS mode: 169.254.169.253/30 must NOT appear on pf0hpf_if
+    // (the startup template puts it on pf0dpu1_if instead). The naive
+    // `!contains(addr) || contains(pf0dpu1_if)` check is vacuously true because
+    // the FNN template always renders pf0dpu1_if in DPU-OS mode, so we parse the
+    // YAML and assert at the per-interface level.
+    #[test]
+    fn test_fmds_gateway_fnn_l3_dpu_os_mode_suppressed() {
+        let mut conf = minimal_nvue_config();
+        conf.is_fnn = true;
+        conf.vpc_virtualization_type = VpcVirtualizationType::Fnn;
+        conf.is_dpu_os = true;
+        conf.fmds_gateway_vlan = Some(274);
+        conf.ct_routing_profile = Some(minimal_fnn_routing_profile());
+        conf.ct_port_configs = vec![l3_phy_port_config(274)];
+        let output = build(conf).expect("build should succeed");
+        let docs: serde_yaml::Value =
+            serde_yaml::from_str(&output).expect("output should be valid YAML");
+        let interfaces = &docs.as_sequence().unwrap()[1]["set"]["interface"];
+        // The L3 interface must not carry the FMDS address.
+        assert!(
+            interfaces["pf0hpf_if"]["ip"]["address"]["169.254.169.253/30"].is_null(),
+            "DPU-OS mode must not put 169.254.169.253/30 on pf0hpf_if:\n{output}"
+        );
+        // The startup-template interface (pf0dpu1_if) must carry it instead.
+        assert!(
+            !interfaces["pf0dpu1_if"]["ip"]["address"]["169.254.169.253/30"].is_null(),
+            "DPU-OS mode must put 169.254.169.253/30 on pf0dpu1_if:\n{output}"
+        );
+    }
+
+    // FNN with an L3 Physical port and a mismatched fmds_gateway_vlan should not
+    // emit the FMDS address (and should not panic).
+    #[test]
+    fn test_fmds_gateway_fnn_l3_vlan_mismatch_emits_nothing() {
+        let mut conf = minimal_nvue_config();
+        conf.is_fnn = true;
+        conf.vpc_virtualization_type = VpcVirtualizationType::Fnn;
+        conf.is_dpu_os = false;
+        conf.fmds_gateway_vlan = Some(999); // no port has vlan 999
+        conf.ct_routing_profile = Some(minimal_fnn_routing_profile());
+        conf.ct_port_configs = vec![l3_phy_port_config(274)];
+        let output = build(conf).expect("build should succeed even with mismatched vlan");
+        assert!(
+            !output.contains("169.254.169.253/30"),
+            "mismatched vlan should not produce FMDS address on FNN L3 interface:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_fnn_no_interface_routing_profile_uses_vpc_allowed_anycast_prefixes() {
+        // Build an FNN config with a VPC routing profile and no interface override.
+        let mut conf = minimal_nvue_config();
+        conf.is_fnn = true;
+        conf.vpc_virtualization_type = VpcVirtualizationType::Fnn;
+        conf.ct_routing_profile = Some(RoutingProfile {
+            allowed_anycast_prefixes: vec!["192.0.2.0/24".into(), "2001:db8::/32".into()],
+            ..minimal_fnn_routing_profile()
+        });
+        conf.ct_port_configs = vec![phy_port_config(274)];
+
+        // Render through the template to exercise the VPC-level fallback path.
+        let output = build(conf).expect("build should succeed");
+
+        // Verify the VPC allow-list is emitted for both IPv4 and IPv6.
+        assert!(
+            output.contains("DPU_FROM_INSTANCE_PREFIX_LIST_vpc_100_if_10:"),
+            "expected IPv4 VPC prefix-list in output:\n{output}"
+        );
+        assert!(output.contains("192.0.2.0/24:"));
+        assert!(
+            output.contains("DPU_FROM_INSTANCE_PREFIX_LIST_IPV6_vpc_100_if_10:"),
+            "expected IPv6 VPC prefix-list in output:\n{output}"
+        );
+        assert!(output.contains("2001:db8::/32:"));
     }
 }

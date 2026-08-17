@@ -19,9 +19,16 @@ REPO_ROOT = { script = [
   "dirname $(cargo locate-project --message-format plain --workspace)",
 ] }
 PKG_VERSION = { script = [
-  "echo $(git describe --tags --first-parent --always --long | cut -c 2-)",
-] }
+  "if [ -n \"$VERSION\" ]; then echo \"$VERSION\" | sed 's/^v//'; else v=$(git describe --tags --first-parent --always --long | sed 's/^v//'); case \"$v\" in [0-9]*) echo \"$v\" ;; *) echo \"0.0.0-$v\" ;; esac; fi",
+], condition = { env_not_set = ["PKG_VERSION"] } }
 FORGE_CA_PATH = { value = "${REPO_ROOT}/dev/forge_prodroot.pem" }
+
+# Where mkosi keeps downloaded distro packages. Without this mkosi re-downloads
+# the full package set on every build, which dominated the ephemeral image jobs
+# in CI. Purely a download cache -- mkosi still revalidates package metadata, so
+# a stale entry cannot silently change what lands in the image. CI persists this
+# across runs with actions/cache; locally it just makes rebuilds faster.
+MKOSI_PACKAGE_CACHE_DIR = { value = "${REPO_ROOT}/pxe/.mkosi-package-cache", condition = { env_not_set = ["MKOSI_PACKAGE_CACHE_DIR"] } }
 
 # BlueField Bundle (BFB) Version
 # NOTE: Update `crates/api/src/cfg/file.rs` to set the DOCA BFB component versions (BMC, NIC, CEC fw)
@@ -108,10 +115,18 @@ dependencies = [
 ]
 
 [tasks.stage-scout-loader-rclocal]
-description = "Copies the rc.local script to the scout loader profile directories"
+description = "Copies the Scout loader helpers to the scout loader profile directories"
 script = '''
+  set -e
+
   cp ${REPO_ROOT}/pxe/common_files/scout-loader-rclocal ${REPO_ROOT}/pxe/mkosi.profiles/scout-loader-aarch64/mkosi.extra/etc/rc.local
   cp ${REPO_ROOT}/pxe/common_files/scout-loader-rclocal ${REPO_ROOT}/pxe/mkosi.profiles/scout-loader-x86_64/mkosi.extra/etc/rc.local
+
+  mkdir -p ${REPO_ROOT}/pxe/mkosi.profiles/scout-loader-aarch64/mkosi.extra/opt/forge/
+  cp ${REPO_ROOT}/pxe/common_files/forge-scout-network.sh ${REPO_ROOT}/pxe/mkosi.profiles/scout-loader-aarch64/mkosi.extra/opt/forge/
+
+  mkdir -p ${REPO_ROOT}/pxe/mkosi.profiles/scout-loader-x86_64/mkosi.extra/opt/forge/
+  cp ${REPO_ROOT}/pxe/common_files/forge-scout-network.sh ${REPO_ROOT}/pxe/mkosi.profiles/scout-loader-x86_64/mkosi.extra/opt/forge/
 '''
 
 [tasks.stage-scout-update-check]
@@ -130,13 +145,15 @@ script = '''
 '''
 
 [tasks.stage-scout-module-loader]
-description = "Copies the scout module loader to build-output"
+description = "Copies the Scout helper scripts to build-output"
 script = '''
   mkdir -p ${REPO_ROOT}/pxe/mkosi.profiles/scout-oss-aarch64/mkosi.extra/build-output/
   cp ${REPO_ROOT}/pxe/common_files/load_modules.sh ${REPO_ROOT}/pxe/mkosi.profiles/scout-oss-aarch64/mkosi.extra/build-output/
+  cp ${REPO_ROOT}/pxe/common_files/forge-scout-network.sh ${REPO_ROOT}/pxe/mkosi.profiles/scout-oss-aarch64/mkosi.extra/build-output/
 
   mkdir -p ${REPO_ROOT}/pxe/mkosi.profiles/scout-oss-x86_64/mkosi.extra/build-output/
   cp ${REPO_ROOT}/pxe/common_files/load_modules.sh ${REPO_ROOT}/pxe/mkosi.profiles/scout-oss-x86_64/mkosi.extra/build-output/
+  cp ${REPO_ROOT}/pxe/common_files/forge-scout-network.sh ${REPO_ROOT}/pxe/mkosi.profiles/scout-oss-x86_64/mkosi.extra/build-output/
 '''
 
 [tasks.build-boot-artifacts-x86-host]
@@ -174,6 +191,7 @@ dependencies = [
   "mkdir-static",
   "cleanup-pxe-submodule",
   { name = "package-scout-aarch64-release-cross", path = "${REPO_ROOT}" },
+  { name = "build-forge-dpu-deb-local", path = "${REPO_ROOT}/bluefield" },
   "build",
   "create-ephemeral-image-arm-host",
   "ipxe-aarch64",
@@ -185,6 +203,7 @@ dependencies = [
   "mkdir-static",
   { name = "package-scout-aarch64-release-local", path = "${REPO_ROOT}" },
   "ipxe-aarch64-ci",
+  { name = "build-forge-dpu-deb-ci", path = "${REPO_ROOT}/bluefield" },
   "setup-apt-repo-arm64",
 ]
 
@@ -192,6 +211,7 @@ dependencies = [
 dependencies = [
   "mkdir-static",
   { name = "package-scout-aarch64-release-cross", path = "${REPO_ROOT}" },
+  "create-ephemeral-image-arm-host",
   "bfb-aarch64-sa",
   "ipxe-aarch64-sa",
   "setup-apt-repo-arm64",
@@ -207,8 +227,6 @@ description = "Build iPXE kernel for aarch64 (EFI) for SA builds"
 dependencies = [
   "ipxe-config",
   "ipxe-patch-mlnx",
-  "ipxe-patch-grace-grace",
-  "ipxe-patch-efi-rng",
   "ipxe-install-efi-aarch64",
 ]
 
@@ -232,6 +250,17 @@ dependencies = [
   "ipxe-aarch64-ci",
   "setup-apt-repo-arm64",
   "add-secure-boot-pk-pem",
+]
+
+# CI wrapper: build and package only the aarch64 forge-scout `.deb`. The
+# ephemeral-image build consumes exactly this one file from the boot stage
+# (see `copy-forge-scout-aarch64`), so CI runs this on its own to unblock the
+# mkosi build instead of serializing it behind the full bfb assembly above.
+# The bfb task keeps its own package-scout dependency: its apt repo ships the
+# deb inside the boot image.
+[tasks.package-scout-aarch64-ci]
+dependencies = [
+  { name = "package-scout-aarch64-release-local", path = "${REPO_ROOT}" },
 ]
 
 [tasks.create-ephemeral-image-x86-host-ci]
@@ -387,6 +416,16 @@ args = [
   "mkosi.profiles/scout-oss-aarch64/mkosi.extra/opt/forge/forge_root.pem",
 ]
 
+[tasks.test-stage-bootstrap-ca]
+category = "Copy DPU bootstrap CA"
+command = "sh"
+args = ["${REPO_ROOT}/pxe/common_files/stage-bootstrap-ca_test.sh"]
+
+[tasks.test-runtime-bootstrap-ca]
+category = "Copy DPU bootstrap CA"
+command = "sh"
+args = ["${REPO_ROOT}/pxe/common_files/runtime-bootstrap-ca_test.sh"]
+
 [tasks.copy-forge-scout-x86_64]
 category = "Copy Forge Scout locally"
 script = '''
@@ -490,7 +529,8 @@ category = "Ephemeral Image"
 script = '''
   PROFILE="scout-oss-x86_64"
   export PATH=${PATH}:/sbin
-  ${REPO_ROOT}/pxe/mkosi/bin/mkosi -E PKG_VERSION="${PKG_VERSION}" --profile ${PROFILE} --output-dir=${MKOSI_BUILD_TMP} --with-network build
+  mkdir -p "${MKOSI_PACKAGE_CACHE_DIR}"
+  ${REPO_ROOT}/pxe/mkosi/bin/mkosi -E PKG_VERSION="${PKG_VERSION}" --profile ${PROFILE} --output-dir=${MKOSI_BUILD_TMP} --package-cache-directory=${MKOSI_PACKAGE_CACHE_DIR} --with-network build
 '''
 
 [tasks.mkosi-build-scout-loader-x86_64]
@@ -498,7 +538,7 @@ category = "Ephemeral Image"
 command = "/bin/bash"
 args = [
   "-c",
-  "export PATH=${PATH}:/sbin && ${REPO_ROOT}/pxe/mkosi/bin/mkosi --profile scout-loader-x86_64 --output-dir=${MKOSI_BUILD_TMP} build",
+  "export PATH=${PATH}:/sbin && mkdir -p ${MKOSI_PACKAGE_CACHE_DIR} && ${REPO_ROOT}/pxe/mkosi/bin/mkosi --profile scout-loader-x86_64 --output-dir=${MKOSI_BUILD_TMP} --package-cache-directory=${MKOSI_PACKAGE_CACHE_DIR} build",
 ]
 
 [tasks.mkosi-build-scout-aarch64]
@@ -506,7 +546,8 @@ category = "Ephemeral Image"
 script = '''
   PROFILE="scout-oss-aarch64"
   export PATH=${PATH}:/sbin
-  ${REPO_ROOT}/pxe/mkosi/bin/mkosi -E PKG_VERSION="${PKG_VERSION}" --profile ${PROFILE} --output-dir=${MKOSI_BUILD_TMP} build
+  mkdir -p "${MKOSI_PACKAGE_CACHE_DIR}"
+  ${REPO_ROOT}/pxe/mkosi/bin/mkosi -E PKG_VERSION="${PKG_VERSION}" --profile ${PROFILE} --output-dir=${MKOSI_BUILD_TMP} --package-cache-directory=${MKOSI_PACKAGE_CACHE_DIR} build
 '''
 
 [tasks.mkosi-build-scout-loader-aarch64]
@@ -514,7 +555,7 @@ category = "Ephemeral Image"
 command = "/bin/bash"
 args = [
   "-c",
-  "export PATH=${PATH}:/sbin && ${REPO_ROOT}/pxe/mkosi/bin/mkosi --profile scout-loader-aarch64 --output-dir=${MKOSI_BUILD_TMP} build",
+  "export PATH=${PATH}:/sbin && mkdir -p ${MKOSI_PACKAGE_CACHE_DIR} && ${REPO_ROOT}/pxe/mkosi/bin/mkosi --profile scout-loader-aarch64 --output-dir=${MKOSI_BUILD_TMP} --package-cache-directory=${MKOSI_PACKAGE_CACHE_DIR} build",
 ]
 
 [tasks.mkosi-build-qcow-imager]
@@ -522,7 +563,7 @@ category = "Ephemeral Image"
 command = "/bin/bash"
 args = [
   "-c",
-  "export PATH=${PATH}:/sbin && ${REPO_ROOT}/pxe/mkosi/bin/mkosi --profile qcow-imager --output-dir=${MKOSI_BUILD_TMP} build",
+  "export PATH=${PATH}:/sbin && mkdir -p ${MKOSI_PACKAGE_CACHE_DIR} && ${REPO_ROOT}/pxe/mkosi/bin/mkosi --profile qcow-imager --output-dir=${MKOSI_BUILD_TMP} --package-cache-directory=${MKOSI_PACKAGE_CACHE_DIR} build",
 ]
 
 [tasks.mkosi-build-qcow-imager-aarch64]
@@ -530,7 +571,7 @@ category = "Ephemeral Image"
 command = "/bin/bash"
 args = [
   "-c",
-  "export PATH=${PATH}:/sbin && ${REPO_ROOT}/pxe/mkosi/bin/mkosi --profile qcow-imager-aarch64 --output-dir=${MKOSI_BUILD_TMP} build",
+  "export PATH=${PATH}:/sbin && mkdir -p ${MKOSI_PACKAGE_CACHE_DIR} && ${REPO_ROOT}/pxe/mkosi/bin/mkosi --profile qcow-imager-aarch64 --output-dir=${MKOSI_BUILD_TMP} --package-cache-directory=${MKOSI_PACKAGE_CACHE_DIR} build",
 ]
 
 [tasks.mkosi-copy-qcow-imager-to-webroot-x86_64]
@@ -555,8 +596,8 @@ dependencies = ["mkdir-static"]
 category = "Ephemeral Image"
 command = "cp"
 args = [
-  "${MKOSI_BUILD_TMP}/scout.cpio.zst",
-  "static/blobs/internal/x86_64/scout.cpio.zst",
+  "${MKOSI_BUILD_TMP}/scout.squashfs",
+  "static/blobs/internal/x86_64/scout.squashfs",
 ]
 dependencies = ["mkdir-static"]
 
@@ -573,8 +614,8 @@ dependencies = ["mkdir-static"]
 category = "Ephemeral Image"
 command = "cp"
 args = [
-  "${MKOSI_BUILD_TMP}/scout.cpio.zst",
-  "static/blobs/internal/aarch64/scout.cpio.zst",
+  "${MKOSI_BUILD_TMP}/scout.squashfs",
+  "static/blobs/internal/aarch64/scout.squashfs",
 ]
 dependencies = ["mkdir-static"]
 
@@ -608,36 +649,6 @@ description = "Patch the iPXE for Mellanox DPU NIC"
 cwd = "${REPO_ROOT}/pxe/ipxe/upstream"
 script = '''
     PATCH="${REPO_ROOT}/pxe/ipxe/local/0001-fix-update-to-allow-iPXE-to-boot-on-BlueField-NICs.patch"
-    echo "Testing if patch is reversible (i.e. already applied)"
-    if ! patch --dry-run -p1 --reverse --forward -i "${PATCH}" >/dev/null; then
-      echo "Reversing the patch failed, forward applying it."
-      patch -p1 --forward -i "${PATCH}"
-    else
-      echo "Reversing would be successful, assuming patch is already applied"
-    fi
-'''
-
-[tasks.ipxe-patch-grace-grace]
-category = "iPXE Kernel"
-description = "Patch iPXE for the Supermicro Grace/Grace servers"
-cwd = "${REPO_ROOT}/pxe/ipxe/upstream"
-script = '''
-    PATCH="${REPO_ROOT}/pxe/ipxe/local/0002-fix-for-grace-grace.patch"
-    echo "Testing if patch is reversible (i.e. already applied)"
-    if ! patch --dry-run -p1 --reverse --forward -i "${PATCH}" >/dev/null; then
-      echo "Reversing the patch failed, forward applying it."
-      patch -p1 --forward -i "${PATCH}"
-    else
-      echo "Reversing would be successful, assuming patch is already applied"
-    fi
-'''
-
-[tasks.ipxe-patch-efi-rng]
-category = "iPXE Kernel"
-description = "Patch iPXE for the ARM servers to retry EFI_RNG"
-cwd = "${REPO_ROOT}/pxe/ipxe/upstream"
-script = '''
-    PATCH="${REPO_ROOT}/pxe/ipxe/local/0004-efi-retry-rng.patch"
     echo "Testing if patch is reversible (i.e. already applied)"
     if ! patch --dry-run -p1 --reverse --forward -i "${PATCH}" >/dev/null; then
       echo "Reversing the patch failed, forward applying it."
@@ -685,8 +696,6 @@ description = "Build iPXE kernel for aarch64 (EFI) and move to the carbide stati
 dependencies = [
   "ipxe-config",
   "ipxe-patch-mlnx",
-  "ipxe-patch-grace-grace",
-  "ipxe-patch-efi-rng",
   "ipxe-install-efi-aarch64",
 ]
 
@@ -696,8 +705,6 @@ description = "Build iPXE kernel for aarch64 (EFI) and move to the carbide stati
 dependencies = [
   "ipxe-config",
   "ipxe-patch-mlnx",
-  "ipxe-patch-grace-grace",
-  "ipxe-patch-efi-rng",
   "ipxe-install-efi-aarch64-ci",
 ]
 
@@ -705,7 +712,7 @@ dependencies = [
 category = "iPXE Kernel"
 description = "Copy the aarch64 EFI iPXE kernel to the boot controller static files directory"
 script = '''
-  mv "ipxe/upstream/src/bin-arm64-efi/ipxe.efi" "static/blobs/internal/aarch64/ipxe.efi"
+  mv "ipxe/upstream/src/bin-arm64-efi/snponly.efi" "static/blobs/internal/aarch64/ipxe.efi"
   mv "ipxe/upstream/src/bin-arm64-efi/golan.efi" "static/blobs/internal/aarch64/golan.efi"
 '''
 dependencies = ["ipxe-build-efi-aarch64"]
@@ -715,7 +722,7 @@ category = "iPXE Kernel"
 description = "Copy the aarch64 EFI iPXE kernel to the boot controller static files directory"
 command = "mv"
 args = [
-  "ipxe/upstream/src/bin-arm64-efi/ipxe.efi",
+  "ipxe/upstream/src/bin-arm64-efi/snponly.efi",
   "static/blobs/internal/aarch64/ipxe.efi",
 ]
 dependencies = ["ipxe-build-efi-aarch64-ci"]
@@ -754,7 +761,7 @@ script = '''
     build-artifacts-container-cross-aarch64 \
     make -j \
       CROSS_COMPILE=aarch64-linux-gnu- \
-      bin-arm64-efi/ipxe.efi \
+      bin-arm64-efi/snponly.efi \
       VERSION=${IPXE_BANNER_VERSION} \
       EMBED=/src/pxe/ipxe/local/embed.ipxe \
       DEBUG=snp,tls \
@@ -774,7 +781,7 @@ script = '''
   else
     make -j \
       CROSS_COMPILE=aarch64-linux-gnu- \
-      bin-arm64-efi/ipxe.efi \
+      bin-arm64-efi/snponly.efi \
       VERSION=${IPXE_BANNER_VERSION} \
       EMBED=${REPO_ROOT}/pxe/ipxe/local/embed.ipxe \
       DEBUG=snp,tls
@@ -794,7 +801,7 @@ description = "Build the aarch64 EFI iPXE kernel on aarch64 gitlab runner"
 command = "make"
 args = [
   "-j",
-  "bin-arm64-efi/ipxe.efi",
+  "bin-arm64-efi/snponly.efi",
   "VERSION=${IPXE_BANNER_VERSION}",
   "EMBED=${REPO_ROOT}/pxe/ipxe/local/embed.ipxe",
   "DEBUG=snp,tls",
@@ -839,6 +846,7 @@ dependencies = [
   "bfb-add-debs-to-bfb",
   "bfb-add-nvinit-setup-to-bfb",
   "bfb-add-prod-forge-root-ca-to-bfb",
+  "bfb-stage-embedded-bootstrap-ca",
   "mkdir-hbn-folder-in-bfb",
   "download-hbn-installer-to-bfb",
   "mv-hbn-configs-to-bfb",
@@ -871,6 +879,7 @@ dependencies = [
   "bfb-add-debs-to-bfb",
   "bfb-add-nvinit-setup-to-bfb",
   "bfb-add-prod-forge-root-ca-to-bfb",
+  "bfb-stage-embedded-bootstrap-ca",
   "mkdir-hbn-folder-in-bfb",
   "download-hbn-installer-to-bfb",
   "mv-hbn-configs-to-bfb",
@@ -905,6 +914,7 @@ dependencies = [
   "bfb-add-debs-to-bfb",
   "bfb-add-nvinit-setup-to-bfb",
   "bfb-add-dev-forge-root-ca-to-bfb",
+  "bfb-stage-embedded-bootstrap-ca",
   "mkdir-hbn-folder-in-bfb",
   "download-hbn-installer-to-bfb",
   "mv-hbn-configs-to-bfb",
@@ -959,7 +969,9 @@ cwd = "/tmp/bfb-dump"
 [tasks.bfb-extract-efi-sa]
 category = "iPXE Kernel"
 description = "Extract the BFB initramfs using fakeroot"
-script = ["gzip -d < /tmp/bfb-dump/dump-initramfs-v0 | fakeroot -s /tmp/bfb-dump/fakeroot.env cpio -id"]
+script = [
+  "gzip -d < /tmp/bfb-dump/dump-initramfs-v0 | fakeroot -s /tmp/bfb-dump/fakeroot.env cpio -id",
+]
 cwd = "${BUILD_LOCATION}"
 
 [tasks.bfb-extract-efi]
@@ -1012,6 +1024,15 @@ args = [
   "${REPO_ROOT}/dev/certs/forge_developer_local_only_root_cert_pem",
   "${BUILD_LOCATION}/forge_root.pem",
 ]
+
+[tasks.bfb-stage-embedded-bootstrap-ca]
+category = "iPXE Kernel"
+description = "Stage an explicitly supplied DPU bootstrap CA in the BFB"
+dependencies = ["test-stage-bootstrap-ca", "test-runtime-bootstrap-ca"]
+script = '''
+  sh "${REPO_ROOT}/pxe/common_files/stage-bootstrap-ca.sh" \
+    "${BUILD_LOCATION}/embedded_forge_root.pem"
+'''
 
 [tasks.cleanup-old-debs]
 category = "iPXE Kernel"

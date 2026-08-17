@@ -18,7 +18,17 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Cmd {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Print the Ansible inventory to stdout:
+    $ nico-admin-cli inventory
+
+Write the Ansible inventory to a file:
+    $ nico-admin-cli inventory --filename ./inventory.ini
+
+")]
+pub(crate) struct Cmd {
     #[clap(short, long, help = "Write to file")]
-    pub filename: Option<String>,
+    pub(super) filename: Option<String>,
 }

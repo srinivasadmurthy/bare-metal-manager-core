@@ -16,9 +16,12 @@
 #
 
 [env]
+REPO_ROOT = { script = [
+  "dirname $(cargo locate-project --message-format plain --workspace)",
+] }
 # e.g. 2024.05.24-rc1-0-0-g786e94757
 DPU_AGENT_PKG_VERSION = { script = [
-  "echo $(git describe --tags --first-parent --always --long | cut -c 2-)",
+  "if [ -n \"$VERSION\" ]; then echo \"$VERSION\" | sed 's/^v//'; else v=$(git describe --tags --first-parent --always --long | sed 's/^v//'); case \"$v\" in [0-9]*) echo \"$v\" ;; *) echo \"0.0.0-$v\" ;; esac; fi",
 ] }
 
 [tasks.cleanup-local-pkg-files]
@@ -78,6 +81,8 @@ category = "Build"
 description = "cross compile forge-dpu-agent and dhcp server locally"
 workspace = false
 script = '''
+set -e
+
 docker run --rm -v $REPO_ROOT:/carbide --user $(id -u):$(id -g) \
     --env CARGO_HOME=/cargo \
     -v $CARGO_HOME:/cargo \
@@ -94,6 +99,13 @@ docker run --rm -v $REPO_ROOT:/carbide --user $(id -u):$(id -g) \
     "/carbide/target/aarch64-unknown-linux-gnu/release/forge-dpu-agent"
     docker run --rm -v $REPO_ROOT:/carbide --user $(id -u):$(id -g) build-artifacts-container-cross-aarch64:latest "aarch64-linux-gnu-strip" \
     "/carbide/target/aarch64-unknown-linux-gnu/release/forge-dhcp-server"
+for path in \
+    "${REPO_ROOT}/target/aarch64-unknown-linux-gnu/release/forge-dpu-agent" \
+    "${REPO_ROOT}/target/release/forge-dpu-agent" \
+    "${REPO_ROOT}/target/aarch64-unknown-linux-gnu/release/forge-dhcp-server" \
+    "${REPO_ROOT}/target/release/forge-dhcp-server"; do
+    bash "${REPO_ROOT}/scripts/check-aarch64-pagesize.sh" --allow-empty "${path}"
+done
 '''
 dependencies = [
   { name = "build-cross-docker-image", path = "${REPO_ROOT}" },
@@ -104,21 +116,26 @@ dependencies = [
 category = "Build"
 workspace = false
 description = "Referring to the prebuilt 'build' task doesn't work here, since it always tries to build the full workspace - including targets that are not aarch64 compatible"
-command = "cargo"
-args = [
-  "build",
-  "--release",
-  "--bin",
-  "forge-dpu-agent",
-  "--bin",
-  "forge-dhcp-server",
-]
+script = '''
+set -e
+
+cargo build --release --bin forge-dpu-agent --bin forge-dhcp-server
+for path in \
+    "${REPO_ROOT}/target/aarch64-unknown-linux-gnu/release/forge-dpu-agent" \
+    "${REPO_ROOT}/target/release/forge-dpu-agent" \
+    "${REPO_ROOT}/target/aarch64-unknown-linux-gnu/release/forge-dhcp-server" \
+    "${REPO_ROOT}/target/release/forge-dhcp-server"; do
+    bash "${REPO_ROOT}/scripts/check-aarch64-pagesize.sh" --allow-empty "${path}"
+done
+'''
 
 [tasks.build-fmds]
 category = "Build"
 description = "cross compile carbide-fmds locally"
 workspace = false
 script = '''
+set -e
+
 docker run --rm -v $REPO_ROOT:/carbide --user $(id -u):$(id -g) \
     --env CARGO_HOME=/cargo \
     -v $CARGO_HOME:/cargo \
@@ -131,6 +148,11 @@ docker run --rm -v $REPO_ROOT:/carbide --user $(id -u):$(id -g) \
     "carbide-fmds"
     docker run --rm -v $REPO_ROOT:/carbide --user $(id -u):$(id -g) build-artifacts-container-cross-aarch64:latest "aarch64-linux-gnu-strip" \
     "/carbide/target/aarch64-unknown-linux-gnu/release/carbide-fmds"
+for path in \
+    "${REPO_ROOT}/target/aarch64-unknown-linux-gnu/release/carbide-fmds" \
+    "${REPO_ROOT}/target/release/carbide-fmds"; do
+    bash "${REPO_ROOT}/scripts/check-aarch64-pagesize.sh" --allow-empty "${path}"
+done
 '''
 dependencies = [
   { name = "build-cross-docker-image", path = "${REPO_ROOT}" },
@@ -141,14 +163,24 @@ dependencies = [
 category = "Build"
 workspace = false
 description = "Build carbide-fmds for CI"
-command = "cargo"
-args = ["build", "--release", "--bin", "carbide-fmds"]
+script = '''
+set -e
+
+cargo build --release --bin carbide-fmds
+for path in \
+    "${REPO_ROOT}/target/aarch64-unknown-linux-gnu/release/carbide-fmds" \
+    "${REPO_ROOT}/target/release/carbide-fmds"; do
+    bash "${REPO_ROOT}/scripts/check-aarch64-pagesize.sh" --allow-empty "${path}"
+done
+'''
 
 [tasks.build-dpu-otel-agent]
 category = "Build"
 description = "cross compile forge-dpu-otel-agent locally"
 workspace = false
 script = '''
+set -e
+
 docker run --rm -v $REPO_ROOT:/carbide --user $(id -u):$(id -g) \
     --env CARGO_HOME=/cargo \
     -v $CARGO_HOME:/cargo \
@@ -161,6 +193,11 @@ docker run --rm -v $REPO_ROOT:/carbide --user $(id -u):$(id -g) \
     "forge-dpu-otel-agent"
     docker run --rm -v $REPO_ROOT:/carbide --user $(id -u):$(id -g) build-artifacts-container-cross-aarch64:latest "aarch64-linux-gnu-strip" \
     "/carbide/target/aarch64-unknown-linux-gnu/release/forge-dpu-otel-agent"
+for path in \
+    "${REPO_ROOT}/target/aarch64-unknown-linux-gnu/release/forge-dpu-otel-agent" \
+    "${REPO_ROOT}/target/release/forge-dpu-otel-agent"; do
+    bash "${REPO_ROOT}/scripts/check-aarch64-pagesize.sh" --allow-empty "${path}"
+done
 '''
 dependencies = [
   { name = "build-cross-docker-image", path = "${REPO_ROOT}" },
@@ -171,8 +208,16 @@ dependencies = [
 category = "Build"
 workspace = false
 description = "Referring to the prebuilt 'build' task doesn't work here, since it always tries to build the full workspace - including targets that are not aarch64 compatible"
-command = "cargo"
-args = ["build", "--release", "--bin", "forge-dpu-otel-agent"]
+script = '''
+set -e
+
+cargo build --release --bin forge-dpu-otel-agent
+for path in \
+    "${REPO_ROOT}/target/aarch64-unknown-linux-gnu/release/forge-dpu-otel-agent" \
+    "${REPO_ROOT}/target/release/forge-dpu-otel-agent"; do
+    bash "${REPO_ROOT}/scripts/check-aarch64-pagesize.sh" --allow-empty "${path}"
+done
+'''
 
 [tasks.download-otelcol-builder]
 category = "Build"
@@ -204,7 +249,7 @@ description = "Download go"
 workspace = false
 condition = { files_not_exist = ["{REPO_ROOT}/bluefield/otel/go"] }
 script = '''
-  GO_VERSION="1.22.0"
+  GO_VERSION="1.26.4"
   PLATFORM=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
   TARFILE=go${GO_VERSION}.linux-${PLATFORM}.tar.gz
   OTEL=${REPO_ROOT}/bluefield/otel
@@ -243,9 +288,16 @@ script = '''
       otelcol_builder_config_yaml.txt > ocb_config.yaml
   export GOROOT="${OTEL}/go"
   export PATH="${GOROOT}/bin:${PATH}"
-  export GOPATH="${GOROOT}/gopath"
-  export GOCACHE="${GOROOT}/gocache"
-  GOOS=linux GOARCH=arm64 ./ocb --config ocb_config.yaml
+  export GOPATH="${OTEL}/go/gopath"
+  export GOCACHE="${OTEL}/go/gocache"
+  # Generate Go source only — skip go mod tidy to keep the module graph
+  # deterministic. The committed ocb-generated/go.mod and go.sum (produced by
+  # update-ocb-modules.sh) are copied in afterwards to pin exact versions.
+  ./ocb --config ocb_config.yaml --skip-compilation --skip-get-modules
+  cp ${OTEL}/ocb-generated/go.mod ${OTEL}/ocb-build/go.mod
+  cp ${OTEL}/ocb-generated/go.sum ${OTEL}/ocb-build/go.sum
+  cd ${OTEL}/ocb-build
+  CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=readonly -o otelcol-contrib .
 '''
 dependencies = ["check-otelcol-builder", "download-go"]
 
@@ -275,6 +327,8 @@ condition = { files_modified = { input = [
   "${REPO_ROOT}/bluefield/Makefile.toml",
   "${REPO_ROOT}/bluefield/otel/ocb_url.txt",
   "${REPO_ROOT}/bluefield/otel/otelcol_version.txt",
+  "${REPO_ROOT}/bluefield/otel/ocb-generated/go.mod",
+  "${REPO_ROOT}/bluefield/otel/ocb-generated/go.sum",
   "${REPO_ROOT}/bluefield/otel/fileresourceprocessor/go.mod",
   "${REPO_ROOT}/bluefield/otel/fileresourceprocessor/config.go",
   "${REPO_ROOT}/bluefield/otel/fileresourceprocessor/factory.go",
@@ -591,15 +645,6 @@ script = '''
     helm package ${REPO_ROOT}/bluefield/charts/carbide-dhcp-server -d ${REPO_ROOT}/target/charts/
 '''
 
-[tasks.helm-package-carbide-dpu-otel-agent]
-category = "Build"
-description = "Package the carbide-dpu-otel-agent Helm chart"
-workspace = false
-script = '''
-    mkdir -p ${REPO_ROOT}/target/charts/
-    helm package ${REPO_ROOT}/bluefield/charts/carbide-dpu-otel-agent -d ${REPO_ROOT}/target/charts/
-'''
-
 [tasks.helm-package-carbide-fmds]
 category = "Build"
 description = "Package the carbide-fmds Helm chart"
@@ -617,7 +662,6 @@ dependencies = [
   "helm-package-carbide-otelcol",
   "helm-package-carbide-dpu-agent",
   "helm-package-carbide-dhcp-server",
-  "helm-package-carbide-dpu-otel-agent",
   "helm-package-carbide-fmds",
 ]
 

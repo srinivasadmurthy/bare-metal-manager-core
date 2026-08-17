@@ -18,7 +18,7 @@ environment.
 
    Fedora - `sudo dnf -y install gcc-c++ systemd-devel binutils-aarch64-linux-gnu`
     - systemd-devel is needed for libudev-devel
-    - binutils-aarch64-linux-gnu is for stripping the cross-compiled forge-dpu-agent - don't worry if you don't have this
+    - binutils-aarch64-linux-gnu is for stripping the cross-compiled nico-dpu-agent - don't worry if you don't have this
 
 2. Install additional cargo utilities
 
@@ -76,7 +76,7 @@ environment.
 8. Install `direnv` using your package manager
 
    It would be best to install `direnv` on your host. `direnv` requires a shell hook to work.  See `man direnv` (after install) for
-   more information on setting it up. Once you clone the `infra-controller-core` repo, you need to run `direnv allow` the first time you cd into your local copy.
+   more information on setting it up. Once you clone the `infra-controller` repo, you need to run `direnv allow` the first time you cd into your local copy.
    Running `direnv allow` exports the necessary environmental variables while in the repo and cleans up when not in the repo.
 
    There are preset environment variables that are used throughout the repo. `${REPO_ROOT}` represents the top of the repo.
@@ -90,7 +90,7 @@ environment.
 
    Fedora - `sudo dnf install -y direnv`
 
-9. Install golang using whatever method is most convenient for you. `forge-vpc` (which is in a subtree of the `forge-provisioner` repo uses golang)
+9. Install golang using whatever method is most convenient for you. `nico-vpc` (which is in a subtree of the `nico-provisioner` repo uses golang)
 
 10. Install GRPC client `grpcurl`.
 
@@ -189,7 +189,7 @@ of complications in the C lib linking between the IDE and your system and frankl
 
 ## Cross-compiling for aarch64 (rough notes)
 
-The DPU has an ARM core. To build software that runs there such as `forge-dpu-agent` you need an ARM8 machine. QEMU/libvirt can provide that.
+The DPU has an ARM core. To build software that runs there such as `nico-dpu-agent` you need an ARM8 machine. QEMU/libvirt can provide that.
 
 Here's how I did it.
 
@@ -202,21 +202,21 @@ One time build:
  RUN cd /usr/local/bin && curl -fL https://getcli.jfrog.io | sh
 ```
  - `docker build -t myarm myarm` # give it a cooler name
- - `docker run -it -v /home/user/src/infra-controller-core:/infra-controller-core myarm /bin/bash`
+ - `docker run -it -v /home/user/src/infra-controller:/infra-controller myarm /bin/bash`
 
 Daily usage:
  - `docker start <container id or name>`
  - `docker attach <container id or name>`
 
-Now that you're in the container go into `/infra-controller-core` and work normally (`cargo build --release`). The binary rust produces will be aarch64. You can `scp` it to a DPU and run it.
+Now that you're in the container go into `/infra-controller` and work normally (`cargo build --release`). The binary rust produces will be aarch64. You can `scp` it to a DPU and run it.
 
 The build may hang the first time. I don't know why. Ctrl-C and try again. You may want to `docker commit` after it succeeds to update the image.
 
-Remember to `strip` before you scp so that scp goes faster. scp to DPU example (`nvinit` first): `scp -v /path/to/target/release/forge-dpu-agent ubuntu@<DPU_OOB_IP>:.`
+Remember to `strip` before you scp so that scp goes faster. scp to DPU example (`nvinit` first): `scp -v /path/to/target/release/nico-dpu-agent ubuntu@<DPU_OOB_IP>:.`
 
 ## Next steps
 
 Set up a QEMU host for your docker-compose services to manage:
 
 1. [Build iPXE and bootable artifacts image](bootable_artifacts.md)
-1. [Start QEMU server](vm_pxe_client.md)
+1. [Start QEMU server](development/vm_pxe_client.md)

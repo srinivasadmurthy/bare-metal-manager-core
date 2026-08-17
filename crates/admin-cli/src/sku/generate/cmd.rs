@@ -15,13 +15,14 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 use crate::sku::show::cmd::show_sku_details;
 
-pub async fn generate(
+pub(super) async fn generate(
     args: Args,
     api_client: &ApiClient,
     output: &mut Box<dyn tokio::io::AsyncWrite + Unpin>,

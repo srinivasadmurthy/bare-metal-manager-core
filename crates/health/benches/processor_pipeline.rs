@@ -20,15 +20,14 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use carbide_health::endpoint::{BmcAddr, EndpointMetadata, MachineData};
+use carbide_health::endpoint::{BmcAddr, EndpointMetadata, MachineData, SharedSystemUuid};
 use carbide_health::metrics::MetricsManager;
 use carbide_health::processor::{
     EventProcessingPipeline, EventProcessor, HealthReportProcessor, LeakEventProcessor,
     RackLeakProcessor,
 };
 use carbide_health::sink::{
-    CollectorEvent, CompositeDataSink, DataSink, EventContext, SensorHealthContext,
-    SensorHealthData,
+    CollectorEvent, CompositeDataSink, DataSink, EventContext, MetricSample, SensorThresholdContext,
 };
 use carbide_uuid::rack::RackId;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -44,9 +43,14 @@ impl DataSink for CountingSink {
         "counting_sink"
     }
 
-    fn handle_event(&self, context: &EventContext, event: &CollectorEvent) {
+    fn try_handle_event(
+        &self,
+        context: &EventContext,
+        event: &CollectorEvent,
+    ) -> Result<(), carbide_health::HealthError> {
         std::hint::black_box(context);
         std::hint::black_box(event);
+        Ok(())
     }
 }
 
@@ -91,9 +95,15 @@ fn event_context() -> EventContext {
             mac: MacAddress::from_str("42:9e:b1:bd:9d:dd").unwrap(),
         },
         collector_type: "sensor_collector",
+        labels: Default::default(),
         metadata: Some(EndpointMetadata::Machine(MachineData {
-            machine_id: MACHINE_ID.parse().expect("valid machine id"),
+            machine_id: Some(MACHINE_ID.parse().expect("valid machine id")),
             machine_serial: None,
+            system_uuid: SharedSystemUuid::default(),
+            slot_number: None,
+            tray_index: None,
+            nvlink_domain_uuid: None,
+            driver_version: None,
         })),
         rack_id: None,
     }
@@ -120,7 +130,7 @@ fn metric_events(
             let sensor_name = format!("sensor-{sensor_idx}");
             let reading = 20.0 + ((idx % 90) as f64);
 
-            let mut metric = SensorHealthData {
+            let mut metric = MetricSample {
                 key: sensor_name.clone(),
                 name: "hw_sensor".to_string(),
                 metric_type: "temperature".to_string(),
@@ -134,7 +144,7 @@ fn metric_events(
             };
 
             if with_health_context {
-                metric.context = Some(SensorHealthContext {
+                metric.context = Some(SensorThresholdContext {
                     entity_type: "sensor".to_string(),
                     sensor_id: sensor_name,
                     upper_fatal: Some(90.0),
@@ -265,9 +275,15 @@ fn rack_event_contexts(rack_id: &str, tray_count: usize) -> Vec<EventContext> {
                     mac: MacAddress::from_str(&mac).unwrap(),
                 },
                 collector_type: "sensor_collector",
+                labels: Default::default(),
                 metadata: Some(EndpointMetadata::Machine(MachineData {
-                    machine_id: MACHINE_ID.parse().expect("valid machine id"),
+                    machine_id: Some(MACHINE_ID.parse().expect("valid machine id")),
                     machine_serial: None,
+                    system_uuid: SharedSystemUuid::default(),
+                    slot_number: None,
+                    tray_index: None,
+                    nvlink_domain_uuid: None,
+                    driver_version: None,
                 })),
                 rack_id: Some(RackId::new(rack_id)),
             }

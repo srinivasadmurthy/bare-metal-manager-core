@@ -21,7 +21,7 @@ use rpc::forge as forgerpc;
 
 /// Enable or disable quarantine mode on a managed host.
 #[derive(Parser, Debug)]
-pub enum Args {
+pub(crate) enum Args {
     /// Put this machine into quarantine. Prevents any network access on the host machine.
     On(QuarantineOn),
     /// Take this machine out of quarantine
@@ -29,9 +29,17 @@ pub enum Args {
 }
 
 #[derive(Parser, Debug)]
-pub struct QuarantineOn {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Quarantine a host (blocks all host network traffic):
+    $ nico-admin-cli managed-host quarantine on --host 12345678-1234-5678-90ab-cdef01234567 \
+    --reason \"suspected compromise\"
+
+")]
+pub(crate) struct QuarantineOn {
     #[clap(long, required(true), help = "Managed Host ID")]
-    pub host: MachineId,
+    pub(super) host: MachineId,
 
     #[clap(
         long,
@@ -39,7 +47,7 @@ pub struct QuarantineOn {
         required(true),
         help = "Reason for quarantining this host"
     )]
-    pub reason: String,
+    reason: String,
 }
 
 impl From<QuarantineOn> for forgerpc::SetManagedHostQuarantineStateRequest {
@@ -55,9 +63,16 @@ impl From<QuarantineOn> for forgerpc::SetManagedHostQuarantineStateRequest {
 }
 
 #[derive(Parser, Debug)]
-pub struct QuarantineOff {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Take a host out of quarantine:
+    $ nico-admin-cli managed-host quarantine off --host 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct QuarantineOff {
     #[clap(long, required(true), help = "Managed Host ID")]
-    pub host: MachineId,
+    pub(super) host: MachineId,
 }
 
 impl From<QuarantineOff> for forgerpc::ClearManagedHostQuarantineStateRequest {

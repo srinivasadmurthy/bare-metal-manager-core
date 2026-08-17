@@ -22,9 +22,21 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 use rpc::protos::mlx_device as mlx_device_pb;
 
+use crate::cfg::dispatch::Dispatch;
+
 // InfoCommand are the info subcommands.
-#[derive(Parser, Debug)]
-pub enum InfoCommand {
+#[derive(Parser, Debug, Dispatch)]
+#[command(after_long_help = "\
+EXAMPLES:
+
+Get device info for one device on a machine:
+    $ nico-admin-cli mlx info device 12345678-1234-5678-90ab-cdef01234567 0000:01:00.0
+
+Get the full device report for a machine:
+    $ nico-admin-cli mlx info machine 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) enum InfoCommand {
     #[clap(about = "Get MlxDeviceInfo for a device on a machine")]
     Device(InfoDeviceCommand),
 
@@ -34,19 +46,19 @@ pub enum InfoCommand {
 
 // InfoDeviceCommand shows device information.
 #[derive(Parser, Debug)]
-pub struct InfoDeviceCommand {
+pub(crate) struct InfoDeviceCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 
     #[arg(help = "Device ID is the PCI or mst path on the target machine")]
-    pub device_id: String,
+    device_id: String,
 }
 
 // InfoMachineCommand shows machine information.
 #[derive(Parser, Debug)]
-pub struct InfoMachineCommand {
+pub(crate) struct InfoMachineCommand {
     #[arg(help = "Carbide Machine ID")]
-    pub machine_id: MachineId,
+    machine_id: MachineId,
 }
 
 impl From<InfoDeviceCommand> for mlx_device_pb::MlxAdminDeviceInfoRequest {

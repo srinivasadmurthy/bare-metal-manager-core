@@ -20,9 +20,16 @@ use clap::Parser;
 use rpc::forge::VpcPrefixDeletionRequest;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Delete a VPC prefix by ID:
+    $ nico-admin-cli vpc-prefix delete 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(value_name = "VpcPrefixId")]
-    pub vpc_prefix_id: VpcPrefixId,
+    pub(super) vpc_prefix_id: VpcPrefixId,
 }
 
 impl From<Args> for VpcPrefixDeletionRequest {

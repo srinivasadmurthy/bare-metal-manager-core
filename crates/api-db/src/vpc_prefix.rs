@@ -15,62 +15,100 @@
  * limitations under the License.
  */
 
+use std::collections::HashMap;
+
 pub use carbide_uuid::vpc::{VpcId, VpcPrefixId};
+use config_version::ConfigVersion;
 use ipnetwork::IpNetwork;
-use itertools::Itertools;
+use model::DeletedFilter;
+use model::controller_outcome::PersistentStateHandlerOutcome;
 use model::network_prefix::NetworkPrefix;
-use model::vpc_prefix::{DeleteVpcPrefix, NewVpcPrefix, PrefixMatch, UpdateVpcPrefix, VpcPrefix};
+use model::site_prefix::SitePrefixAuthority;
+use model::vpc_prefix::{
+    DeleteVpcPrefix, NewVpcPrefix, UpdateVpcPrefix, VpcPrefix, VpcPrefixControllerState,
+    VpcPrefixSearch,
+};
 use sqlx::{FromRow, PgConnection, QueryBuilder, Row};
 
 use super::{ColumnInfo, DatabaseError, ObjectColumnFilter};
 use crate::vpc::increment_vpc_version;
 
+async fn network_prefix_occupancy_by_vpc_prefix_id(
+    vpc_prefix_ids: &[VpcPrefixId],
+    txn: &mut PgConnection,
+) -> Result<HashMap<VpcPrefixId, Vec<IpNetwork>>, DatabaseError> {
+    if vpc_prefix_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let query = r#"
+        SELECT vpc_prefix.id, network_prefix.prefix
+        FROM network_vpc_prefixes AS vpc_prefix
+        INNER JOIN network_prefixes AS network_prefix
+            ON network_prefix.prefix && vpc_prefix.prefix
+        WHERE vpc_prefix.id = ANY($1)
+          AND (
+              network_prefix.vpc_prefix_id = vpc_prefix.id
+              OR network_prefix.vpc_prefix_id IS NULL
+          )
+        ORDER BY vpc_prefix.id, network_prefix.id
+    "#;
+    let occupied_prefixes: Vec<(VpcPrefixId, IpNetwork)> = sqlx::query_as(query)
+        .bind(vpc_prefix_ids)
+        .fetch_all(&mut *txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))?;
+
+    Ok(occupied_prefixes.into_iter().fold(
+        HashMap::<VpcPrefixId, Vec<IpNetwork>>::new(),
+        |mut occupancy, (vpc_prefix_id, prefix)| {
+            occupancy.entry(vpc_prefix_id).or_default().push(prefix);
+            occupancy
+        },
+    ))
+}
+
 async fn update_stats(
     prefixes: &mut [VpcPrefix],
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
-    let nw_prefixes = prefixes.iter().map(|x| x.config.prefix).collect_vec();
-    let sub_prefixes = crate::network_prefix::containing_prefixes(txn, &nw_prefixes).await?;
+    let vpc_prefix_ids: Vec<VpcPrefixId> = prefixes.iter().map(|prefix| prefix.id).collect();
+    let network_prefix_occupancy =
+        network_prefix_occupancy_by_vpc_prefix_id(&vpc_prefix_ids, txn).await?;
 
     for vpc_prefix in prefixes {
-        let used_prefixes = sub_prefixes.get(&vpc_prefix.config.prefix);
-        let used_count = used_prefixes.map(|v| v.len() as u64).unwrap_or(0);
+        let occupied_prefixes = network_prefix_occupancy
+            .get(&vpc_prefix.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
 
-        // Legacy IPv4-only stats (kept for backwards compatibility).
-        if let IpNetwork::V4(ipv4_network) = vpc_prefix.config.prefix
-            && let Some(used_prefixes) = used_prefixes
-        {
-            let ip_net = carbide_network::ip::prefix::Ipv4Net::new(
-                ipv4_network.network(),
-                ipv4_network.prefix(),
-            )
-            .map_err(|err| {
-                DatabaseError::new(
-                    "vpc_prefix_update_stats_ipv4_conversion",
-                    sqlx::Error::Protocol(err.to_string()),
-                )
-            })?;
-
-            let total_31_segments = ip_net
-                .subnets(31)
-                .map_err(|err| {
-                    DatabaseError::new(
-                        "vpc_prefix_update_stats_subnet_count",
-                        sqlx::Error::Protocol(err.to_string()),
-                    )
-                })?
-                .collect::<Vec<carbide_network::ip::prefix::Ipv4Net>>();
-            vpc_prefix.status.total_31_segments = total_31_segments.len() as u32;
-            vpc_prefix.status.available_31_segments =
-                vpc_prefix.status.total_31_segments - used_prefixes.len() as u32;
-        }
-
-        // Family-aware linknet stats: /31 for IPv4 (RFC 3021), /127 for IPv6 (RFC 6164).
         let linknet_prefix: u8 = if vpc_prefix.config.prefix.is_ipv4() {
             31
         } else {
             127
         };
+        let vpc_prefix_len = vpc_prefix.config.prefix.prefix();
+        let supports_full_root_linknet =
+            vpc_prefix.config.prefix.is_ipv4() && vpc_prefix_len == linknet_prefix;
+        let total = if linknet_prefix > vpc_prefix_len || supports_full_root_linknet {
+            1u128 << u32::from(linknet_prefix - vpc_prefix_len)
+        } else {
+            0
+        };
+        let occupied = crate::network_prefix::occupied_prefix_count(
+            vpc_prefix.config.prefix,
+            linknet_prefix,
+            occupied_prefixes.iter().copied(),
+        );
+        let available = total.saturating_sub(occupied);
+
+        // Legacy IPv4-only stats (kept for backwards compatibility).
+        if vpc_prefix.config.prefix.is_ipv4() {
+            vpc_prefix.status.total_31_segments = u32::try_from(total).unwrap_or(u32::MAX);
+            vpc_prefix.status.available_31_segments = u32::try_from(available).unwrap_or(u32::MAX);
+        }
+
+        // Family-aware linknet stats: /31 for IPv4 (RFC 3021), /127 for IPv6 (RFC 6164).
         // Compute total and available linknet segments using math rather than
         // enumeration. A VPC prefix of length L can hold 2^(linknet_prefix - L)
         // linknets. For example, a /24 VPC holds 2^(31-24) = 128 possible /31
@@ -80,13 +118,8 @@ async fn update_stats(
         // because we're building these values for metrics/display purposes,
         // and these values get packed into a protobuf, which only supports
         // u64. If it's a problem, we can split it over two u64.
-        let vpc_prefix_len = vpc_prefix.config.prefix.prefix();
-        if linknet_prefix > vpc_prefix_len {
-            let shift = (linknet_prefix - vpc_prefix_len) as u64;
-            let total = if shift >= 64 { u64::MAX } else { 1u64 << shift };
-            vpc_prefix.status.total_linknet_segments = total;
-            vpc_prefix.status.available_linknet_segments = total.saturating_sub(used_count);
-        }
+        vpc_prefix.status.total_linknet_segments = u64::try_from(total).unwrap_or(u64::MAX);
+        vpc_prefix.status.available_linknet_segments = u64::try_from(available).unwrap_or(u64::MAX);
     }
 
     Ok(())
@@ -96,12 +129,22 @@ async fn update_stats(
 pub async fn get_by_id<'a, C>(
     txn: &mut PgConnection,
     filter: ObjectColumnFilter<'a, C>,
+    deleted_filter: DeletedFilter,
 ) -> Result<Vec<VpcPrefix>, DatabaseError>
 where
     C: ColumnInfo<'a, TableType = VpcPrefix>,
 {
     let mut query =
         super::FilterableQueryBuilder::new("SELECT * FROM network_vpc_prefixes").filter(&filter);
+    match deleted_filter {
+        DeletedFilter::Exclude => {
+            query.push(" AND deleted IS NULL");
+        }
+        DeletedFilter::Only => {
+            query.push(" AND deleted IS NOT NULL");
+        }
+        DeletedFilter::Include => {}
+    }
     let mut container = query
         .build_query_as()
         .fetch_all(&mut *txn)
@@ -112,20 +155,86 @@ where
     Ok(container)
 }
 
-// Get a list of prefixes matching a filter on the ID column with ROW based lock.
-pub async fn get_by_id_with_row_lock(
+/// Loads explicit VPC-prefix selections for allocation validation.
+///
+/// Deleted rows are deliberately included so the caller can distinguish an
+/// unknown prefix from one that became unavailable through soft deletion.
+/// This discovery query does not lock rows; allocation locks one candidate at
+/// a time through [`lock_for_allocation`].
+pub async fn get_for_allocation_by_ids(
     txn: &mut PgConnection,
-    filter: &[VpcPrefixId],
+    vpc_prefix_ids: &[VpcPrefixId],
 ) -> Result<Vec<VpcPrefix>, DatabaseError> {
-    let query = "SELECT * FROM network_vpc_prefixes WHERE id=ANY($1) FOR NO KEY UPDATE";
-    let mut container = sqlx::query_as(query)
-        .bind(filter)
+    let query = r#"
+        SELECT *
+        FROM network_vpc_prefixes
+        -- Omit a deletion predicate so allocation validation can distinguish
+        -- deleted prefixes from unknown IDs.
+        WHERE id = ANY($1)
+        ORDER BY id
+    "#;
+    sqlx::query_as(query)
+        .bind(vpc_prefix_ids)
         .fetch_all(&mut *txn)
         .await
-        .map_err(|e| DatabaseError::query(query, e))?;
+        .map_err(|e| DatabaseError::query(query, e))
+}
 
-    update_stats(&mut container, txn).await?;
-    Ok(container)
+/// Loads active automatic-allocation candidates for the requested VPCs.
+///
+/// Rows are returned in stable VPC/ID order so caller grouping preserves
+/// ascending IDs within each `(vpc_id, family)` lock group. Callers must freeze
+/// this result rather than re-ranking it using mutable capacity statistics.
+pub async fn find_allocation_candidates(
+    txn: &mut PgConnection,
+    vpc_ids: &[VpcId],
+) -> Result<Vec<VpcPrefix>, DatabaseError> {
+    let query = r#"
+        SELECT *
+        FROM network_vpc_prefixes
+        WHERE vpc_id = ANY($1)
+          -- Soft-deleted prefixes are not eligible automatic candidates.
+          AND deleted IS NULL
+          -- IPv4 supports a full-root /31 as its one generated linknet. IPv6
+          -- parents must remain wider than their generated /127 linknets.
+          AND (
+            (family(prefix) = 4 AND masklen(prefix) <= 31)
+            OR (family(prefix) = 6 AND masklen(prefix) < 127)
+          )
+        -- Preserve ascending candidate IDs within each VPC/family lock group.
+        ORDER BY vpc_id, id
+    "#;
+    sqlx::query_as(query)
+        .bind(vpc_ids)
+        .fetch_all(&mut *txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))
+}
+
+/// Locks and re-reads one allocation candidate.
+///
+/// Returning `None` means the prefix was deleted after candidate discovery.
+/// This helper does not open a transaction. Callers that need the row lock
+/// beyond this query must invoke it within one; releasing a nested savepoint
+/// retains the lock until the containing transaction ends.
+pub async fn lock_for_allocation(
+    txn: &mut PgConnection,
+    vpc_prefix_id: VpcPrefixId,
+) -> Result<Option<VpcPrefix>, DatabaseError> {
+    let query = r#"
+        SELECT *
+        FROM network_vpc_prefixes
+        WHERE id = $1
+          -- Deletion can race discovery, so re-check it while taking the row lock.
+          AND deleted IS NULL
+        -- Serialize allocations that share this candidate's persisted cursor.
+        FOR NO KEY UPDATE
+    "#;
+    sqlx::query_as(query)
+        .bind(vpc_prefix_id)
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))
 }
 
 // Find the prefixes associated with a VPC.
@@ -134,6 +243,7 @@ pub async fn find_by_vpc(
     vpc_id: VpcId,
 ) -> Result<Vec<VpcPrefix>, DatabaseError> {
     let query = "SELECT * FROM network_vpc_prefixes WHERE vpc_id=$1 \
+            AND deleted IS NULL \
             ORDER BY prefix";
     let mut container = sqlx::query_as(query)
         .bind(vpc_id)
@@ -151,6 +261,7 @@ pub async fn find_by_vpcs(
     vpc_ids: &Vec<VpcId>,
 ) -> Result<Vec<VpcPrefix>, DatabaseError> {
     let query = "SELECT * FROM network_vpc_prefixes WHERE vpc_id=ANY($1) \
+                AND deleted IS NULL \
                 ORDER BY prefix";
     sqlx::query_as(query)
         .bind(vpc_ids)
@@ -165,7 +276,7 @@ pub async fn update_last_used_prefix(
     vpc_prefix_id: &VpcPrefixId,
     last_used_prefix: IpNetwork,
 ) -> Result<(), DatabaseError> {
-    let query = "UPDATE network_vpc_prefixes SET last_used_prefix=$1 WHERE id=$2 RETURNING *";
+    let query = "UPDATE network_vpc_prefixes SET last_used_prefix=$1 WHERE id=$2 AND deleted IS NULL RETURNING *";
     sqlx::query_as::<_, VpcPrefix>(query)
         .bind(last_used_prefix)
         .bind(vpc_prefix_id)
@@ -180,15 +291,36 @@ pub async fn update_last_used_prefix(
 // the prefix (or some combination). Returns just the IDs.
 pub async fn search(
     txn: &mut PgConnection,
-    vpc_id: Option<VpcId>,
-    name: Option<String>,
-    prefix_match: Option<PrefixMatch>,
+    search: VpcPrefixSearch,
 ) -> Result<Vec<VpcPrefixId>, DatabaseError> {
+    let VpcPrefixSearch {
+        vpc_id,
+        site_prefix_id,
+        name,
+        prefix_match,
+        deleted_filter,
+    } = search;
+
     let mut query = QueryBuilder::new("SELECT id FROM network_vpc_prefixes WHERE true");
+
+    match deleted_filter {
+        DeletedFilter::Exclude => {
+            query.push(" AND deleted IS NULL");
+        }
+        DeletedFilter::Only => {
+            query.push(" AND deleted IS NOT NULL");
+        }
+        DeletedFilter::Include => {}
+    }
 
     if let Some(vpc_id) = vpc_id {
         query.push(" AND vpc_id=");
         query.push_bind(vpc_id);
+    }
+
+    if let Some(site_prefix_id) = site_prefix_id {
+        query.push(" AND site_prefix_id=");
+        query.push_bind(site_prefix_id);
     }
 
     if let Some(name) = name {
@@ -234,30 +366,69 @@ impl ColumnInfo<'_> for IdColumn {
 
 pub async fn persist(
     value: NewVpcPrefix,
+    expected_vpc_version: ConfigVersion,
     txn: &mut PgConnection,
 ) -> Result<VpcPrefix, DatabaseError> {
-    let insert_query = "INSERT INTO network_vpc_prefixes (id, prefix, name, labels, description, vpc_id) VALUES ($1, $2, $3, $4::json, $5, $6) RETURNING *";
-    let vpc_prefix: VpcPrefix = sqlx::query_as(insert_query)
+    let initial_version = ConfigVersion::initial();
+    let initial_state = VpcPrefixControllerState::Provisioning;
+
+    let insert_query = "INSERT INTO network_vpc_prefixes (
+                id,
+                prefix,
+                name,
+                labels,
+                description,
+                vpc_id,
+                site_prefix_id,
+                controller_state,
+                controller_state_version)
+            VALUES ($1, $2, $3, $4::json, $5, $6, $7, $8::json, $9)
+            RETURNING *";
+    let vpc_prefix: VpcPrefix = match sqlx::query_as(insert_query)
         .bind(value.id)
         .bind(value.config.prefix)
         .bind(&value.metadata.name)
         .bind(sqlx::types::Json(&value.metadata.labels))
         .bind(&value.metadata.description)
         .bind(value.vpc_id)
+        .bind(value.site_prefix_id)
+        .bind(sqlx::types::Json(&initial_state))
+        .bind(initial_version)
         .fetch_one(&mut *txn)
         .await
-        .map_err(|e| DatabaseError::query(insert_query, e))?;
+    {
+        Ok(vpc_prefix) => vpc_prefix,
+        Err(sqlx::Error::Database(error))
+            if error.constraint() == Some("network_vpc_prefixes_globally_unique") =>
+        {
+            return Err(DatabaseError::InvalidArgument(format!(
+                "The requested VPC prefix ({}) overlaps an existing or deleting VPC prefix",
+                value.config.prefix
+            )));
+        }
+        Err(e) => return Err(DatabaseError::query(insert_query, e)),
+    };
 
-    increment_vpc_version(txn, value.vpc_id).await?;
+    crate::state_history::persist(
+        txn,
+        crate::state_history::StateHistoryTableId::VpcPrefix,
+        &vpc_prefix.id,
+        &initial_state,
+        initial_version,
+    )
+    .await?;
+
+    increment_vpc_version(txn, value.vpc_id, expected_vpc_version).await?;
 
     Ok(vpc_prefix)
 }
 
-// Check for existing VPC prefixes using any of our address space.
+/// Checks for existing or deleting VPC prefixes using any of the address space.
 pub async fn probe(
     network: IpNetwork,
     txn: &mut PgConnection,
 ) -> Result<Vec<VpcPrefix>, DatabaseError> {
+    // Include soft-deleted rows because the global exclusion constraint still reserves them.
     let query = "SELECT * FROM network_vpc_prefixes WHERE prefix && $1";
     sqlx::query_as(query)
         .bind(network)
@@ -295,7 +466,7 @@ pub async fn update(
     update: &UpdateVpcPrefix,
     txn: &mut PgConnection,
 ) -> Result<VpcPrefix, DatabaseError> {
-    let query = "UPDATE network_vpc_prefixes SET name=$1, labels=$2::json, description=$3 WHERE id=$4 RETURNING *";
+    let query = "UPDATE network_vpc_prefixes SET name=$1, labels=$2::json, description=$3 WHERE id=$4 AND deleted IS NULL RETURNING *";
     sqlx::query_as(query)
         .bind(&update.metadata.name)
         .bind(sqlx::types::Json(&update.metadata.labels))
@@ -308,18 +479,328 @@ pub async fn update(
     // call increment_vpc_version() here.
 }
 
-pub async fn delete(
+/// Marks an active VPC prefix for asynchronous deletion and bumps the parent VPC version.
+pub async fn mark_as_deleted(
     value: &DeleteVpcPrefix,
+    expected_vpc_version: ConfigVersion,
     txn: &mut PgConnection,
 ) -> Result<VpcPrefixId, DatabaseError> {
-    let query = "DELETE FROM network_vpc_prefixes WHERE id=$1 RETURNING *";
+    // Mark the prefix deleted while keeping its address space reserved for the controller.
+    let query =
+        "UPDATE network_vpc_prefixes SET deleted=NOW() WHERE id=$1 AND deleted IS NULL RETURNING *";
     let deleted_prefix: VpcPrefix = sqlx::query_as(query)
         .bind(value.id)
         .fetch_one(&mut *txn)
         .await
-        .map_err(|e| DatabaseError::query(query, e))?;
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => DatabaseError::NotFoundError {
+                kind: "vpc_prefix",
+                id: value.id.to_string(),
+            },
+            e => DatabaseError::query(query, e),
+        })?;
 
-    increment_vpc_version(txn, deleted_prefix.vpc_id).await?;
+    increment_vpc_version(txn, deleted_prefix.vpc_id, expected_vpc_version).await?;
 
     Ok(deleted_prefix.id)
+}
+
+/// Hard-deletes a VPC prefix after the controller has drained all dependencies.
+pub async fn final_delete(
+    vpc_prefix_id: VpcPrefixId,
+    txn: &mut PgConnection,
+) -> Result<VpcPrefixId, DatabaseError> {
+    // Remove the terminal row without bumping the parent VPC version again.
+    let query = "DELETE FROM network_vpc_prefixes WHERE id=$1 RETURNING id";
+    let deleted_id = sqlx::query_as::<_, VpcPrefixId>(query)
+        .bind(vpc_prefix_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(deleted_id)
+}
+
+/// Updates the controller-owned VPC prefix state if the version still matches.
+pub async fn try_update_controller_state(
+    txn: &mut PgConnection,
+    vpc_prefix_id: VpcPrefixId,
+    expected_version: ConfigVersion,
+    new_version: ConfigVersion,
+    new_state: &VpcPrefixControllerState,
+) -> Result<bool, DatabaseError> {
+    // Use optimistic locking so concurrent controller attempts cannot overwrite each other.
+    let query = "UPDATE network_vpc_prefixes SET controller_state_version=$1, controller_state=$2::json WHERE id=$3 AND controller_state_version=$4 RETURNING id";
+    let result = sqlx::query_as::<_, VpcPrefixId>(query)
+        .bind(new_version)
+        .bind(sqlx::types::Json(new_state))
+        .bind(vpc_prefix_id)
+        .bind(expected_version)
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(result.is_some())
+}
+
+/// Stores the result of the most recent VPC prefix controller handling attempt.
+pub async fn update_controller_state_outcome(
+    txn: &mut PgConnection,
+    vpc_prefix_id: VpcPrefixId,
+    outcome: PersistentStateHandlerOutcome,
+) -> Result<(), DatabaseError> {
+    // Persist the outcome separately from state so waits/errors remain visible.
+    let query = "UPDATE network_vpc_prefixes SET controller_state_outcome=$1::json WHERE id=$2";
+    sqlx::query(query)
+        .bind(sqlx::types::Json(outcome))
+        .bind(vpc_prefix_id)
+        .execute(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+    Ok(())
+}
+
+/// Counts network-prefix rows that still reference a VPC prefix.
+pub async fn count_network_prefixes_by_vpc_prefix_id(
+    txn: &mut PgConnection,
+    vpc_prefix_id: &VpcPrefixId,
+) -> Result<usize, DatabaseError> {
+    // The controller uses this durable dependency as the deletion drain gate.
+    let query = "SELECT count(*) FROM network_prefixes WHERE vpc_prefix_id=$1";
+    let (network_prefix_count,): (i64,) = sqlx::query_as(query)
+        .bind(vpc_prefix_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(network_prefix_count.max(0) as usize)
+}
+
+/// Reports whether one VPC retains address space from a tenant-managed root.
+///
+/// Soft-deleted VpcPrefixes remain relevant until their controller completes
+/// physical deletion, so this check deliberately includes them.
+pub async fn has_tenant_managed_site_prefix(
+    txn: &mut PgConnection,
+    vpc_id: VpcId,
+) -> Result<bool, DatabaseError> {
+    let query = r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM network_vpc_prefixes AS vpc_prefix
+            INNER JOIN site_prefixes AS site_prefix
+                ON site_prefix.id = vpc_prefix.site_prefix_id
+            WHERE vpc_prefix.vpc_id = $1
+              AND site_prefix.authority = $2
+        )
+    "#;
+    sqlx::query_scalar(query)
+        .bind(vpc_id)
+        .bind(SitePrefixAuthority::TenantManaged)
+        .fetch_one(txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_uuid::network::NetworkSegmentId;
+    use carbide_uuid::site_prefix::SitePrefixId;
+    use model::metadata::Metadata;
+    use model::vpc_prefix::{NewVpcPrefix, VpcPrefixConfig, VpcPrefixSearch};
+
+    use super::*;
+
+    #[crate::sqlx_test]
+    async fn exact_lineage_drives_persistence_search_candidates_and_stats(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root: IpNetwork = "10.0.0.0/8".parse()?;
+        let full_root_linknet: IpNetwork = "10.0.0.0/31".parse()?;
+        let mut txn = pool.begin().await?;
+        crate::site_prefix::reconcile_configured(&mut txn, &[root]).await?;
+        let site_prefix_id: SitePrefixId =
+            sqlx::query_scalar("SELECT id FROM site_prefixes WHERE prefix = $1")
+                .bind(root)
+                .fetch_one(&mut *txn)
+                .await?;
+
+        let vpc_id = VpcId::new();
+        let vpc_version = ConfigVersion::initial();
+        sqlx::query(
+            "INSERT INTO vpcs (id, name, organization_id, version) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(vpc_id)
+        .bind("exact-lineage-stats")
+        .bind("tenant-a")
+        .bind(vpc_version)
+        .execute(&mut *txn)
+        .await?;
+
+        let vpc_prefix_id = VpcPrefixId::new();
+        let persisted = persist(
+            NewVpcPrefix {
+                id: vpc_prefix_id,
+                site_prefix_id: Some(site_prefix_id),
+                vpc_id,
+                config: VpcPrefixConfig {
+                    prefix: full_root_linknet,
+                },
+                metadata: Metadata {
+                    name: "full-root linknet".to_string(),
+                    ..Metadata::default()
+                },
+            },
+            vpc_version,
+            &mut txn,
+        )
+        .await?;
+        assert_eq!(persisted.site_prefix_id, Some(site_prefix_id));
+
+        let found = search(
+            &mut txn,
+            VpcPrefixSearch {
+                site_prefix_id: Some(site_prefix_id),
+                ..VpcPrefixSearch::default()
+            },
+        )
+        .await?;
+        assert_eq!(found, vec![vpc_prefix_id]);
+
+        let ipv6_vpc_prefix_id = VpcPrefixId::new();
+        sqlx::query(
+            "INSERT INTO network_vpc_prefixes (id, prefix, name, vpc_id) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(ipv6_vpc_prefix_id)
+        .bind("2001:db8::/127".parse::<IpNetwork>()?)
+        .bind("IPv6 full-root linknet")
+        .bind(vpc_id)
+        .execute(&mut *txn)
+        .await?;
+        let candidates = find_allocation_candidates(&mut txn, &[vpc_id]).await?;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            vec![vpc_prefix_id]
+        );
+
+        let network_segment_id = NetworkSegmentId::new();
+        sqlx::query("INSERT INTO network_segments (id, name, version) VALUES ($1, $2, $3)")
+            .bind(network_segment_id)
+            .bind("full-root linknet")
+            .bind(ConfigVersion::initial())
+            .execute(&mut *txn)
+            .await?;
+        sqlx::query(
+            r#"
+                INSERT INTO network_prefixes (
+                    segment_id,
+                    prefix,
+                    vpc_prefix_id,
+                    vpc_prefix
+                )
+                VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(network_segment_id)
+        .bind(full_root_linknet)
+        .bind(vpc_prefix_id)
+        .bind(full_root_linknet)
+        .execute(&mut *txn)
+        .await?;
+
+        let with_occupancy = get_by_id(
+            &mut txn,
+            ObjectColumnFilter::One(IdColumn, &vpc_prefix_id),
+            DeletedFilter::Exclude,
+        )
+        .await?
+        .pop()
+        .unwrap();
+        assert_eq!(with_occupancy.status.total_31_segments, 1);
+        assert_eq!(with_occupancy.status.available_31_segments, 0);
+        assert_eq!(with_occupancy.status.total_linknet_segments, 1);
+        assert_eq!(with_occupancy.status.available_linknet_segments, 0);
+
+        let capacity_parent_id = VpcPrefixId::new();
+        let capacity_parent: IpNetwork = "10.2.0.0/24".parse()?;
+        sqlx::query(
+            r#"
+                INSERT INTO network_vpc_prefixes (
+                    id,
+                    prefix,
+                    name,
+                    vpc_id,
+                    site_prefix_id
+                )
+                VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(capacity_parent_id)
+        .bind(capacity_parent)
+        .bind("capacity parent")
+        .bind(vpc_id)
+        .bind(site_prefix_id)
+        .execute(&mut *txn)
+        .await?;
+
+        for (name, prefix, parent_association) in [
+            (
+                "broad generated child",
+                "10.2.0.0/25".parse::<IpNetwork>()?,
+                Some((capacity_parent_id, capacity_parent)),
+            ),
+            (
+                "direct unparented child",
+                "10.2.0.128/31".parse::<IpNetwork>()?,
+                None,
+            ),
+        ] {
+            let segment_id = NetworkSegmentId::new();
+            sqlx::query(
+                "INSERT INTO network_segments (id, name, vpc_id, version) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(segment_id)
+            .bind(name)
+            .bind(vpc_id)
+            .bind(ConfigVersion::initial())
+            .execute(&mut *txn)
+            .await?;
+            sqlx::query(
+                r#"
+                    INSERT INTO network_prefixes (
+                        segment_id,
+                        prefix,
+                        vpc_prefix_id,
+                        vpc_prefix
+                    )
+                    VALUES ($1, $2, $3, $4)
+                "#,
+            )
+            .bind(segment_id)
+            .bind(prefix)
+            .bind(parent_association.map(|(id, _)| id))
+            .bind(parent_association.map(|(_, prefix)| prefix))
+            .execute(&mut *txn)
+            .await?;
+        }
+
+        let capacity = get_by_id(
+            &mut txn,
+            ObjectColumnFilter::One(IdColumn, &capacity_parent_id),
+            DeletedFilter::Exclude,
+        )
+        .await?
+        .pop()
+        .unwrap();
+        assert_eq!(capacity.status.total_31_segments, 128);
+        assert_eq!(capacity.status.available_31_segments, 63);
+        assert_eq!(capacity.status.total_linknet_segments, 128);
+        assert_eq!(capacity.status.available_linknet_segments, 63);
+
+        txn.commit().await?;
+        Ok(())
+    }
 }

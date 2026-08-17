@@ -53,7 +53,56 @@ spec:
             description: DPUServiceIPAMSpec defines the desired state of DPUServiceIPAM
             properties:
               clusterSelector:
-                description: ClusterSelector determines in which clusters the DPUServiceIPAM
+                description: |-
+                  ClusterSelector determines in which clusters the DPUServiceIPAM controller should apply the configuration.
+
+                  Deprecated: This field is deprecated and will be removed with v26.7.0. Use DPUClusterSelector instead.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              dpuClusterSelector:
+                description: DPUClusterSelector determines in which clusters the DPUServiceIPAM
                   controller should apply the configuration.
                 properties:
                   matchExpressions:
@@ -113,9 +162,28 @@ spec:
                     description: DefaultGateway adds gateway as default gateway in
                       the routes list if true.
                     type: boolean
+                  excludeRanges:
+                    description: |-
+                      ExcludeRanges is a list of IP ranges that should be excluded from the allocation.
+                      startIP and endIP are part of the Excluded range.
+                    items:
+                      properties:
+                        endIP:
+                          description: EndIP is the end of the range.
+                          type: string
+                        startIP:
+                          description: StartIP is the start of the range.
+                          type: string
+                      required:
+                      - endIP
+                      - startIP
+                      type: object
+                    type: array
                   exclusions:
-                    description: Exclusions is a list of IPs that should be excluded
-                      when splitting the CIDR into subnets per node.
+                    description: |-
+                      Exclusions is a list of IPs that should be excluded when splitting the CIDR into subnets per node.
+
+                      Deprecated: This field is deprecated and will be removed with v26.10.0. Use ExcludeRanges instead.
                     items:
                       type: string
                     type: array
@@ -147,6 +215,14 @@ spec:
                       - dst
                       type: object
                     type: array
+                  subnetsPerDPUCluster:
+                    description: |-
+                      SubnetsPerDPUCluster is the number of PrefixSize-sized subnets each DPUCluster should receive.
+                      When specified, the controller will take care of assigning non-overlapping subnets part of the Network in each
+                      DPUCluster that the DPUServiceIPAM is targeting. Leave empty in case you want the whole Network to be consumed
+                      by a single DPUCluster.
+                    format: int32
+                    type: integer
                 required:
                 - network
                 - prefixSize
@@ -156,11 +232,36 @@ spec:
                   IPV4Subnet is the configuration related to splitting a subnet into blocks per node. In this setup, there is a
                   single gateway.
                 properties:
+                  blocksPerDPUCluster:
+                    description: |-
+                      BlocksPerDPUCluster is the number of PerNodeIPCount-sized blocks each DPUCluster should receive.
+                      When specified, the controller will take care of assigning non-overlapping IP blocks part of the Subnet in each
+                      DPUCluster that the DPUServiceIPAM is targeting. Leave empty in case you want the whole Subnet to be consumed by
+                      a single DPUCluster.
+                    format: int32
+                    type: integer
                   defaultGateway:
                     description: |-
                       if true, add gateway as default gateway in the routes list
                       DefaultGateway adds gateway as default gateway in the routes list if true.
                     type: boolean
+                  excludeRanges:
+                    description: |-
+                      ExcludeRanges is a list of IP ranges that should be excluded from the allocation.
+                      startIP and endIP are part of the Excluded range.
+                    items:
+                      properties:
+                        endIP:
+                          description: EndIP is the end of the range.
+                          type: string
+                        startIP:
+                          description: StartIP is the start of the range.
+                          type: string
+                      required:
+                      - endIP
+                      - startIP
+                      type: object
+                    type: array
                   gateway:
                     description: Gateway is the IP in the subnet that should be the
                       gateway of the subnet.
@@ -355,6 +456,40 @@ spec:
                   - type
                   type: object
                 type: array
+              dpuClusterAllocations:
+                description: DPUClusterAllocations contains the IPV4Network/IPV4Subnet
+                  allocations per DPUCluster as calculated by the controller.
+                items:
+                  description: DPUClusterAllocation contains the IP range allocations
+                    for a specific DPUCluster.
+                  properties:
+                    dpuCluster:
+                      description: DPUCluster is the NamespacedName of the DPUCluster
+                        in the format `<namespace>/<name>`.
+                      type: string
+                    ipRanges:
+                      description: IPRanges contains the IP ranges allocated to this
+                        DPUCluster.
+                      items:
+                        properties:
+                          endIP:
+                            description: EndIP is the end of the range.
+                            type: string
+                          startIP:
+                            description: StartIP is the start of the range.
+                            type: string
+                        required:
+                        - endIP
+                        - startIP
+                        type: object
+                      type: array
+                  required:
+                  - dpuCluster
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - dpuCluster
+                x-kubernetes-list-type: map
               observedGeneration:
                 description: ObservedGeneration records the Generation observed on
                   the object the last time it was patched.

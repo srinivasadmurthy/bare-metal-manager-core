@@ -15,17 +15,18 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge::FindInstanceTypesByIdsRequest;
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::instance_type::common::convert_itypes_to_table;
 use crate::rpc::ApiClient;
 
 /// Show one or more InstanceTypes.
 /// If only a single InstanceType is found, verbose output is used
 /// automatically.
-pub async fn show(
+pub(super) async fn show(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,

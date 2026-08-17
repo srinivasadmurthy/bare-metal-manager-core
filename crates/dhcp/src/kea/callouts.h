@@ -1,12 +1,32 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #ifndef CALLOUTS_H
 #define CALLOUTS_H
 
 #include <asiolink/io_address.h>
+#include <dhcp/dhcp6.h>
 #include <dhcp/pkt4.h>
+#include <dhcp/pkt6.h>
 #include <dhcpsrv/lease.h>
 #include <hooks/hooks.h>
 #include <log/logger.h>
 #include <log/macros.h>
+#include <sys/socket.h>
 #include <string>
 
 #include <dhcp/option4_addrlst.h>
@@ -88,8 +108,14 @@ extern "C" {
 int pkt4_receive(CalloutHandle &handle);
 int subnet4_select(CalloutHandle &handle);
 int lease4_select(CalloutHandle &handle);
+int lease4_renew(CalloutHandle &handle);
 int pkt4_send(CalloutHandle &handle);
 int lease4_expire(CalloutHandle &handle);
+int pkt6_receive(CalloutHandle &handle);
+int lease6_select(CalloutHandle &handle);
+int lease6_renew(CalloutHandle &handle);
+int lease6_rebind(CalloutHandle &handle);
+int pkt6_send(CalloutHandle &handle);
 int lease6_expire(CalloutHandle &handle);
 }
 

@@ -15,26 +15,44 @@
  * limitations under the License.
  */
 
+use std::borrow::Cow;
+use std::net::Ipv6Addr;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use carbide_instrument::red;
+use carbide_secrets::credentials::{CredentialReader, Credentials};
 use carbide_utils::HostPortPair;
-use forge_secrets::credentials::{CredentialReader, Credentials};
+use carbide_utils::redfish::format_forwarded_host_parameter;
 use libredfish::model::service_root::RedfishVendor;
 use libredfish::{Endpoint, Redfish};
 
+use crate::libredfish::instrumented::{InstrumentedRedfish, REDFISH_BACKEND};
 use crate::libredfish::{RedfishAuth, RedfishClientCreationError, RedfishClientPool};
 
-pub struct RedfishClientPoolImpl {
+/// Formats a host for the URL authority that `libredfish` constructs internally.
+///
+/// `libredfish::Endpoint` accepts a host and port separately, but the pinned
+/// implementation interpolates them into a URL string. Keep callers' host values
+/// bare and add IPv6 brackets only at this external serialization boundary.
+fn libredfish_endpoint_host(host: &str) -> Cow<'_, str> {
+    if host.parse::<Ipv6Addr>().is_ok() {
+        Cow::Owned(format!("[{host}]"))
+    } else {
+        Cow::Borrowed(host)
+    }
+}
+
+pub(super) struct RedfishClientPoolImpl {
     pool: libredfish::RedfishClientPool,
     credential_reader: Arc<dyn CredentialReader>,
     proxy_address: Arc<ArcSwap<Option<HostPortPair>>>,
 }
 
 impl RedfishClientPoolImpl {
-    pub fn new(
+    pub(super) fn new(
         credential_reader: Arc<dyn CredentialReader>,
         pool: libredfish::RedfishClientPool,
         proxy_address: Arc<ArcSwap<Option<HostPortPair>>>,
@@ -95,7 +113,7 @@ impl RedfishClientPool for RedfishClientPoolImpl {
         };
 
         let endpoint = Endpoint {
-            host: host.to_string(),
+            host: libredfish_endpoint_host(host).into_owned(),
             port,
             user: username,
             password,
@@ -110,40 +128,75 @@ impl RedfishClientPool for RedfishClientPoolImpl {
             vec![(
                 http::HeaderName::from_str("forwarded")
                     .map_err(|err| RedfishClientCreationError::InvalidHeader(err.to_string()))?,
-                format!("host={original_host}"),
+                format_forwarded_host_parameter(original_host),
             )]
         } else {
             Vec::default()
         };
 
-        match vendor {
+        // The initializing paths below make HTTP calls of their own, so they
+        // are metered like any other Redfish operation.
+        let client = match vendor {
             // Auto-detect vendor from the service root.
-            None => self
-                .pool
-                .create_client_with_custom_headers(endpoint, custom_headers)
-                .await
-                .map_err(RedfishClientCreationError::RedfishError),
+            None => red::instrumented(
+                REDFISH_BACKEND,
+                "create_client",
+                self.pool
+                    .create_client_with_custom_headers(endpoint, custom_headers),
+            )
+            .await
+            .map_err(RedfishClientCreationError::RedfishError)?,
             // Unknown means "no vendor" — return a standard client without
             // making any HTTP calls (used by the anonymous probe client).
             // This restores the behavior of the old `initialize: false` path
             // which called create_standard_client. The full initialization
             // path (create_client_with_vendor) makes HTTP calls to /Systems,
             // /Managers, etc. that fail with 401 on BMCs requiring auth.
+            // With no I/O here, there is no external call to meter either.
             Some(RedfishVendor::Unknown) => self
                 .pool
                 .create_standard_client_with_custom_headers(endpoint, custom_headers)
                 .map_err(RedfishClientCreationError::RedfishError)
-                .map(|c| c as Box<dyn Redfish>),
+                .map(|c| c as Box<dyn Redfish>)?,
             // Use the provided vendor directly.
-            Some(vendor) => self
-                .pool
-                .create_client_with_vendor(endpoint, vendor, custom_headers)
-                .await
-                .map_err(RedfishClientCreationError::RedfishError),
-        }
+            Some(vendor) => red::instrumented(
+                REDFISH_BACKEND,
+                "create_client",
+                self.pool
+                    .create_client_with_vendor(endpoint, vendor, custom_headers),
+            )
+            .await
+            .map_err(RedfishClientCreationError::RedfishError)?,
+        };
+
+        // Every client the pool creates goes out decorated, so each Redfish
+        // call records the per-operation RED triad no matter the call site.
+        Ok(Box::new(InstrumentedRedfish::new(client)))
     }
 
     fn credential_reader(&self) -> &dyn CredentialReader {
         &*self.credential_reader
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::value_scenarios;
+
+    use super::libredfish_endpoint_host;
+
+    #[test]
+    fn endpoint_host_brackets_only_bare_ipv6_literals() {
+        value_scenarios!(run = |host| libredfish_endpoint_host(host).into_owned();
+            "unchanged hosts" {
+                "bmc.example.com" => "bmc.example.com".to_string(),
+                "192.0.2.10" => "192.0.2.10".to_string(),
+                "[2001:db8::10]" => "[2001:db8::10]".to_string(),
+            }
+
+            "bracketed IPv6 host" {
+                "2001:db8::10" => "[2001:db8::10]".to_string(),
+            }
+        );
     }
 }

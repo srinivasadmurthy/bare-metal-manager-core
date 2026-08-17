@@ -20,14 +20,23 @@ use clap::Parser;
 use rpc::forge::InstanceNvLinkConfig;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Update an instance's NVLink configuration:
+    $ nico-admin-cli instance update-nv-link-config \
+    --instance 12345678-1234-5678-90ab-cdef01234567 \
+    --config '{\"partition_id\":\"abcdef01-2345-6789-abcd-ef0123456789\"}'
+
+")]
+pub(crate) struct Args {
     #[clap(short, long, required(true))]
-    pub instance: InstanceId,
+    pub(super) instance: InstanceId,
     #[clap(
         long,
         required(true),
         help = "NVLink configuration in JSON format",
         value_name = "NVLINK_JSON"
     )]
-    pub config: InstanceNvLinkConfig,
+    pub(super) config: InstanceNvLinkConfig,
 }

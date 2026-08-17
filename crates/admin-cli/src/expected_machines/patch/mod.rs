@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
-pub mod args;
-pub mod cmd;
+mod args;
+mod cmd;
 
-use ::rpc::admin_cli::CarbideCliResult;
-pub use args::Args;
+pub(super) use args::Args;
 
 use crate::cfg::run::Run;
 use crate::cfg::runtime::RuntimeContext;
+use crate::errors::CarbideCliResult;
 
 /// `expected-machine patch`: forwards CLI flags to `ApiClient::patch_expected_machine` (partial
 /// update; unset flags keep existing values). `--bmc-ip-address` uses the same server-side
@@ -50,6 +50,13 @@ impl Run for Args {
                 self.dpf_enabled,
                 self.bmc_ip_address,
                 self.bmc_retain_credentials,
+                self.dpu_policy,
+                self.bmc_ip_allocation,
+                self.disable_lockdown
+                    .map(|dl| ::rpc::forge::HostLifecycleProfile {
+                        disable_lockdown: Some(dl),
+                    }),
+                self.interfaces,
             )
             .await?;
         Ok(())

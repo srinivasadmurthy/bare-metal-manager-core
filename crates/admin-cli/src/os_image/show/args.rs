@@ -16,24 +16,37 @@
  */
 
 use clap::Parser;
-use rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::os_image::common::str_to_rpc_uuid;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show a single OS image by UUID:
+    $ nico-admin-cli os-image show --id 12345678-1234-5678-90ab-cdef01234567
+
+List all OS images for a tenant:
+    $ nico-admin-cli os-image show --tenant-org-id fds34511233a
+
+List every OS image:
+    $ nico-admin-cli os-image show
+
+")]
+pub(crate) struct Args {
     #[clap(short = 'i', long, help = "uuid of the OS image to show.")]
-    pub id: Option<String>,
+    id: Option<String>,
     #[clap(
         short = 't',
         long,
         help = "Tenant organization identifier to filter OS images listing."
     )]
-    pub tenant_org_id: Option<String>,
+    tenant_org_id: Option<String>,
 }
 
 /// Represents the parsed query for the show command.
-pub enum ShowQuery {
+pub(super) enum ShowQuery {
     /// Show a single OS image by its UUID.
     Single(::rpc::common::Uuid),
     /// List OS images, optionally filtered by tenant organization ID.

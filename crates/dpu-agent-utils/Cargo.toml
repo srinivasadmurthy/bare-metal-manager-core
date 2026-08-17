@@ -20,6 +20,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 # TODO: rename to carbide_dpu_agent_utils in source
 [lib]
@@ -27,13 +28,9 @@ name = "forge_dpu_agent_utils"
 
 [dependencies]
 eyre = { workspace = true }
-rand = { workspace = true }
-serde = { features = ["derive"], workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-tonic = { workspace = true }
-tracing = { workspace = true }
 
 # [local-dependencies]
-carbide-tls = { path = "../tls" }
 carbide-rpc = { path = "../rpc" }
+
+[lints]
+workspace = true

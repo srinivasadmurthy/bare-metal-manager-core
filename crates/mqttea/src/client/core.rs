@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use carbide_instrument::emit;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
@@ -34,7 +35,9 @@ use crate::client::{ClientOptions, ClosureAdapter, ErasedHandler, ReceivedMessag
 use crate::errors::MqtteaClientError;
 use crate::registry::MqttRegistry;
 use crate::registry::types::PublishOptions;
-use crate::stats::{PublishStats, PublishStatsTracker, QueueStats, QueueStatsTracker};
+use crate::stats::{
+    ConnectionStateTracker, PublishStats, PublishStatsTracker, QueueStats, QueueStatsTracker,
+};
 use crate::traits::MessageHandler;
 
 const DEFAULT_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(300);
@@ -65,6 +68,10 @@ pub struct MqtteaClient {
     // When the connection drops and needs to reconnect, fresh credentials
     // will be fetched from this provider (e.g., to get a new OAuth2 token).
     credentials_provider: Option<Arc<dyn CredentialsProvider>>,
+    // subscriptions tracks the topic patterns and QoS values passed
+    // to `subscribe()` so they can be replayed when the broker reports
+    // that a reconnect created a fresh session.
+    subscriptions: Arc<RwLock<HashMap<String, QoS>>>,
     // handlers stores message-type-specific handlers for processing
     // received messages
     handlers: Arc<RwLock<HashMap<String, ErasedHandler>>>,
@@ -72,6 +79,9 @@ pub struct MqtteaClient {
     queue_stats: Arc<QueueStatsTracker>,
     // publish_stats tracks message publishing statistics and success rates.
     publish_stats: Arc<PublishStatsTracker>,
+    // connection_state tracks whether the client currently holds an
+    // acknowledged broker connection.
+    connection_state: Arc<ConnectionStateTracker>,
     // registry encapsulates all message type registration and routing logic.
     // Made pub(crate) so trait implementations in registry.rs can access it.
     pub(crate) registry: Arc<RwLock<MqttRegistry>>,
@@ -97,23 +107,9 @@ impl MqtteaClient {
         client_id: &str,
         client_options: Option<ClientOptions>,
     ) -> Result<Arc<Self>, MqtteaClientError> {
-        let mut mqtt_options = MqttOptions::new(client_id, broker_host, broker_port);
-        mqtt_options.set_keep_alive(
-            client_options
-                .as_ref()
-                .and_then(|opts| opts.keep_alive)
-                .unwrap_or(DEFAULT_KEEP_ALIVE),
-        );
-        mqtt_options.set_clean_session(false);
-
-        // Fetch credentials from provider if configured.
-        if let Some(provider) = client_options
-            .as_ref()
-            .and_then(|opts| opts.credentials_provider.as_ref())
-        {
-            let credentials = provider.get_credentials().await?;
-            mqtt_options.set_credentials(credentials.username, credentials.password);
-        }
+        let mqtt_options =
+            build_mqtt_options(client_id, broker_host, broker_port, client_options.as_ref())
+                .await?;
 
         let (client, event_loop) = AsyncClient::new(
             mqtt_options,
@@ -127,6 +123,7 @@ impl MqtteaClient {
 
         let queue_stats = Arc::new(QueueStatsTracker::new());
         let publish_stats = Arc::new(PublishStatsTracker::new());
+        let connection_state = Arc::new(ConnectionStateTracker::new());
 
         // Create client-scoped registry instead of using global static.
         let registry = Arc::new(RwLock::new(MqttRegistry::new()));
@@ -142,7 +139,7 @@ impl MqtteaClient {
             .as_ref()
             .and_then(|opts| opts.credentials_provider.clone());
 
-        info!("Created MQTT client for {}:{}", broker_host, broker_port);
+        info!(%broker_host, broker_port, "Created MQTT client");
 
         Ok(Arc::new(Self {
             client: Arc::new(client),
@@ -151,11 +148,42 @@ impl MqtteaClient {
             concurrency_semaphore: Arc::new(Semaphore::new(concurrency_limit)),
             client_options,
             credentials_provider,
+            subscriptions: Arc::new(RwLock::new(HashMap::new())),
             handlers,
             queue_stats,
             publish_stats,
+            connection_state,
             registry,
         }))
+    }
+
+    async fn replay_subscriptions(&self) {
+        let subs_snapshot: Vec<(String, QoS)> = self
+            .subscriptions
+            .read()
+            .await
+            .iter()
+            .map(|(topic, qos)| (topic.clone(), *qos))
+            .collect();
+
+        if subs_snapshot.is_empty() {
+            return;
+        }
+
+        info!(
+            subscription_count = subs_snapshot.len(),
+            "Replaying MQTT subscriptions after broker reported a fresh session"
+        );
+
+        for (topic, qos) in subs_snapshot {
+            if let Err(e) = self.client.subscribe(topic.as_str(), qos).await {
+                error!(
+                    %topic,
+                    error = %e,
+                    "Failed to re-subscribe after fresh session",
+                );
+            }
+        }
     }
 
     // connect actually connects and starts the event_loop for both
@@ -206,13 +234,31 @@ impl MqtteaClient {
         // freeing up the underlying message channel to continue receiving
         // messages.
         let queue_stats_producer = self.queue_stats.clone();
+        let connection_state = self.connection_state.clone();
         let registry_clone = self.registry.clone();
         let credentials_provider = self.credentials_provider.clone();
+        let client_for_reconnect = self.clone();
+        let mut has_connected = false;
         let mut backoff_strategy = SuperBasicBackoff::new();
         tokio::spawn(async move {
             loop {
                 match event_loop.poll().await {
                     Ok(event) => {
+                        if let Event::Incoming(Packet::ConnAck(connack)) = &event {
+                            let should_replay =
+                                should_replay_subscriptions(has_connected, connack.session_present);
+                            if has_connected {
+                                emit(MqttReconnected {});
+                            }
+                            has_connected = true;
+                            connection_state.set_connected(true);
+                            backoff_strategy.reset();
+
+                            if should_replay {
+                                client_for_reconnect.replay_subscriptions().await;
+                            }
+                        }
+
                         if let Event::Incoming(Packet::Publish(publish)) = event {
                             if let Some(msg) =
                                 ReceivedMessage::from_publish(&publish, registry_clone.clone())
@@ -228,8 +274,8 @@ impl MqtteaClient {
                                     }
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         warn!(
-                                            "Message queue full, dropping message from topic: {}",
-                                            publish.topic
+                                            topic = %publish.topic,
+                                            "Message queue full, dropping message from topic",
                                         );
                                         queue_stats_producer.increment_dropped(payload_size);
                                         tokio::time::sleep(backoff_strategy.next_delay()).await;
@@ -247,13 +293,17 @@ impl MqtteaClient {
                             } else {
                                 queue_stats_producer.increment_unmatched_topics();
                                 if warn_on_unmatched_topic {
-                                    warn!("No registered pattern matched topic: {}", publish.topic);
+                                    warn!(
+                                        topic = %publish.topic,
+                                        "No registered pattern matched topic",
+                                    );
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        error!("MQTT event loop connection error: {:?}", e);
+                        error!(error = %e, "MQTT event loop connection error");
+                        connection_state.set_connected(false);
                         queue_stats_producer.increment_event_loop_errors();
 
                         // Refresh credentials before reconnection attempt if a provider is configured.
@@ -273,8 +323,8 @@ impl MqtteaClient {
                                 }
                                 Err(cred_err) => {
                                     error!(
-                                        "Failed to refresh credentials for reconnection: {:?}",
-                                        cred_err
+                                        error = %cred_err,
+                                        "Failed to refresh credentials for reconnection",
                                     );
                                 }
                             }
@@ -306,14 +356,19 @@ impl MqtteaClient {
                                 .decrement_pending_increment_processed(payload_size);
                         }
                         Err(e) => {
-                            error!("Handler error for {}: {}", msg.type_name, e);
+                            error!(
+                                message_type = %msg.type_name,
+                                error = %e,
+                                "Handler error",
+                            );
                             queue_stats_processor.decrement_pending_increment_failed(payload_size);
                         }
                     }
                 } else {
                     warn!(
-                        "No handler registered for message type '{}' on topic '{}'",
-                        msg.type_name, msg.topic
+                        message_type = %msg.type_name,
+                        topic = %msg.topic,
+                        "No handler registered for message type on topic",
                     );
                     queue_stats_processor.decrement_pending_increment_failed(payload_size);
                 }
@@ -351,12 +406,10 @@ impl MqtteaClient {
                     let _permit = match semaphore_internal.acquire().await {
                         Ok(permit) => permit,
                         Err(e) => {
-                            // TODO(chet): Totally need to export a metric here,
-                            // since we're dropping messages at this point.
-                            error!(
-                                "failed to acquire semaphore permit for message_type={}: {e}",
-                                std::any::type_name::<T>().to_string()
-                            );
+                            emit(HandlerDispatchDropped {
+                                message_type: std::any::type_name::<T>(),
+                                error: e.to_string(),
+                            });
                             return;
                         }
                     };
@@ -406,19 +459,28 @@ impl MqtteaClient {
         let mut handlers_guard = self.handlers.write().await;
         handlers_guard.insert(std::any::type_name::<T>().to_string(), type_erased_handler);
         info!(
-            "Registered handler for message type: {}",
-            std::any::type_name::<T>()
+            message_type = std::any::type_name::<T>(),
+            "Registered handler for message type",
         );
     }
 
     // subscribe subscribes to a topic with the specified QoS.
+    //
+    // The subscription is also stored in the client so it can be
+    // replayed after a reconnect when the broker reports that the
+    // previous session was not resumed.
     pub async fn subscribe(&self, topic: &str, qos: QoS) -> Result<(), MqtteaClientError> {
+        self.subscriptions
+            .write()
+            .await
+            .insert(topic.to_string(), qos);
+
         self.client
             .subscribe(topic, qos)
             .await
             .map_err(MqtteaClientError::ConnectionError)?;
 
-        info!("Subscribed to topic: {} (QoS: {:?})", topic, qos);
+        info!(%topic, ?qos, "Subscribed to topic");
         Ok(())
     }
 
@@ -467,7 +529,7 @@ impl MqtteaClient {
         match self.client.publish(topic, qos, retain, payload).await {
             Ok(_) => {
                 self.publish_stats.increment_published(payload_size);
-                debug!("Published message to topic: {}", topic);
+                debug!(%topic, "Published message to topic");
                 Ok(())
             }
             Err(e) => {
@@ -503,6 +565,7 @@ impl MqtteaClient {
             .await
             .map_err(MqtteaClientError::ConnectionError)?;
 
+        self.connection_state.set_connected(false);
         info!("MQTT client disconnected");
         Ok(())
     }
@@ -520,6 +583,32 @@ impl MqtteaClient {
     // Tracks success/failure rates and throughput of outgoing messages.
     pub fn publish_stats(&self) -> PublishStats {
         self.publish_stats.to_stats()
+    }
+
+    // is_connected reports whether the client currently holds an
+    // acknowledged broker connection: true after a ConnAck, false after a
+    // connection error or disconnect() (and before connect()).
+    pub fn is_connected(&self) -> bool {
+        self.connection_state.is_connected()
+    }
+
+    // register_metrics registers observable instruments over the client's
+    // stats trackers on the given meter: gauges for point-in-time state
+    // (queue depth in messages and bytes, connection state) and observable
+    // counters for the monotonic totals (processed/failed/dropped and
+    // published/failed message and byte counts, event loop errors,
+    // unmatched topics). The callbacks read the existing atomics at
+    // collection time; nothing on the message path changes.
+    //
+    // Every series is labeled client=<client> so multiple clients in one
+    // process stay distinct. The value must be a compile-time literal
+    // naming the client's role (e.g. "dsx_event_bus") -- it is the
+    // cardinality bound, so never pass a configured or generated client id.
+    // Call once per client, any time after construction.
+    pub fn register_metrics(&self, meter: &opentelemetry::metrics::Meter, client: &'static str) {
+        self.queue_stats.register_metrics(meter, client);
+        self.publish_stats.register_metrics(meter, client);
+        self.connection_state.register_metrics(meter, client);
     }
 
     // is_queue_empty checks if the internal message queue is empty.
@@ -542,6 +631,70 @@ impl MqtteaClient {
         self.queue_stats.reset_counters();
         self.publish_stats.reset_counters();
     }
+}
+
+// build_mqtt_options assembles rumqttc `MqttOptions`, fetching fresh
+// credentials from the credentials provider if configured.
+async fn build_mqtt_options(
+    client_id: &str,
+    broker_host: &str,
+    broker_port: u16,
+    client_options: Option<&ClientOptions>,
+) -> Result<MqttOptions, MqtteaClientError> {
+    let mut mqtt_options = MqttOptions::new(client_id, broker_host, broker_port);
+    mqtt_options.set_keep_alive(
+        client_options
+            .and_then(|opts| opts.keep_alive)
+            .unwrap_or(DEFAULT_KEEP_ALIVE),
+    );
+    mqtt_options.set_clean_session(false);
+
+    if let Some(provider) = client_options.and_then(|opts| opts.credentials_provider.as_ref()) {
+        let credentials = provider.get_credentials().await?;
+        mqtt_options.set_credentials(credentials.username, credentials.password);
+    }
+
+    Ok(mqtt_options)
+}
+
+fn should_replay_subscriptions(has_connected_before: bool, session_present: bool) -> bool {
+    has_connected_before && !session_present
+}
+
+// The event loop received a ConnAck after having been connected before:
+// the broker connection was re-established. The rate is the signal (a
+// healthy client reconnects rarely); the surrounding reconnect machinery
+// already logs its own details, so this event is metric-only.
+#[derive(carbide_instrument::Event)]
+#[event(
+    event_name = "mqtt_reconnected",
+    metric_name = "carbide_mqtt_reconnects_total",
+    component = "mqttea",
+    log = off,
+    metric = counter,
+    describe = "Number of times an MQTT client re-established its broker connection after the initial connect"
+)]
+struct MqttReconnected {}
+
+// A received message was dropped at handler dispatch because the
+// concurrency semaphore could not be acquired (it only fails once the
+// semaphore is closed, so this also means the message's handler will
+// never run).
+#[derive(carbide_instrument::Event)]
+#[event(
+    event_name = "mqtt_handler_dispatch_dropped",
+    metric_name = "carbide_mqtt_dispatch_dropped_total",
+    component = "mqttea",
+    log = error,
+    metric = counter,
+    message = "failed to acquire semaphore permit, dropping message",
+    describe = "Number of received MQTT messages dropped because the handler concurrency semaphore could not be acquired"
+)]
+struct HandlerDispatchDropped {
+    #[context]
+    message_type: &'static str,
+    #[context]
+    error: String,
 }
 
 // SuperBasicBackoff is a basic backoff I'm implementing
@@ -567,13 +720,80 @@ impl SuperBasicBackoff {
         let delay = self.current;
         self.current = std::cmp::min(self.current * 2, self.max);
         warn!(
-            "Message event loop backoff updated: {}ms",
-            delay.as_millis()
+            delay_milliseconds = delay.as_millis(),
+            "Message event loop backoff updated"
         );
         delay
     }
 
     fn reset(&mut self) {
         self.current = std::time::Duration::from_millis(100);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_instrument::emit;
+    use carbide_instrument::testing::{MetricsCapture, capture_logs};
+
+    use super::{HandlerDispatchDropped, MqttReconnected, should_replay_subscriptions};
+
+    #[test]
+    fn dispatch_dropped_event_logs_error_and_ticks_counter() {
+        let metrics = MetricsCapture::start();
+        let logs = capture_logs(|| {
+            emit(HandlerDispatchDropped {
+                message_type: "mqttea::tests::Demo",
+                error: "semaphore closed".to_string(),
+            });
+        });
+
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].level, tracing::Level::ERROR);
+        assert_eq!(
+            logs[0].message,
+            "failed to acquire semaphore permit, dropping message"
+        );
+        assert!(logs[0].fields.contains(&(
+            "message_type".to_string(),
+            "mqttea::tests::Demo".to_string()
+        )));
+        assert!(
+            logs[0]
+                .fields
+                .contains(&("error".to_string(), "semaphore closed".to_string()))
+        );
+        assert_eq!(
+            metrics.counter_delta("carbide_mqtt_dispatch_dropped_total", &[]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn reconnect_event_is_metric_only() {
+        let metrics = MetricsCapture::start();
+        let logs = capture_logs(|| emit(MqttReconnected {}));
+
+        assert!(logs.is_empty());
+        assert_eq!(
+            metrics.counter_delta("carbide_mqtt_reconnects_total", &[]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn does_not_replay_on_initial_connect() {
+        assert!(!should_replay_subscriptions(false, false));
+        assert!(!should_replay_subscriptions(false, true));
+    }
+
+    #[test]
+    fn replays_on_reconnect_when_broker_has_fresh_session() {
+        assert!(should_replay_subscriptions(true, false));
+    }
+
+    #[test]
+    fn does_not_replay_on_reconnect_when_broker_resumed_session() {
+        assert!(!should_replay_subscriptions(true, true));
     }
 }

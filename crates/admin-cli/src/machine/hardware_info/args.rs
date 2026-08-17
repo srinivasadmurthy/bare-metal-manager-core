@@ -19,7 +19,18 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub enum Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show a machine's hardware info:
+    $ nico-admin-cli machine hardware-info show --machine 12345678-1234-5678-90ab-cdef01234567
+
+Update a machine's GPUs from a JSON file:
+    $ nico-admin-cli machine hardware-info update gpus --machine 12345678-1234-5678-90ab-cdef01234567 \
+    --gpu-json-file ./gpus.json
+
+")]
+pub(crate) enum Args {
     #[clap(about = "Show the hardware info of the machine")]
     Show(ShowMachineHardwareInfo),
     #[clap(subcommand, about = "Update the hardware info of the machine")]
@@ -27,13 +38,13 @@ pub enum Args {
 }
 
 #[derive(Parser, Debug)]
-pub struct ShowMachineHardwareInfo {
+pub(crate) struct ShowMachineHardwareInfo {
     #[clap(long, help = "Show the hardware info of this Machine ID")]
-    pub machine: MachineId,
+    pub(super) machine: MachineId,
 }
 
 #[derive(Parser, Debug)]
-pub enum MachineHardwareInfo {
+pub(crate) enum MachineHardwareInfo {
     //Cpu(MachineTopologyCommandCpu),
     #[clap(about = "Update the GPUs of this machine")]
     Gpus(MachineHardwareInfoGpus),
@@ -45,9 +56,9 @@ pub enum MachineHardwareInfo {
 }
 
 #[derive(Parser, Debug)]
-pub struct MachineHardwareInfoGpus {
+pub(crate) struct MachineHardwareInfoGpus {
     #[clap(long, help = "Machine ID of the server containing the GPUs")]
-    pub machine: MachineId,
+    pub(super) machine: MachineId,
     #[clap(
         long,
         help = "JSON file containing GPU info. It should contain an array of JSON objects like this:
@@ -63,5 +74,5 @@ pub struct MachineHardwareInfoGpus {
         }
         Pass an empty array if you want to remove GPUs."
     )]
-    pub gpu_json_file: std::path::PathBuf,
+    pub(super) gpu_json_file: std::path::PathBuf,
 }

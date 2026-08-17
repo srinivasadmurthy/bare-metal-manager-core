@@ -26,10 +26,12 @@ use carbide_utils::config::{
 };
 use chrono::Duration;
 use duration_str::{deserialize_duration, deserialize_duration_chrono};
+use model::expected_machine::HostDpuPolicy;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// SiteExplorer related configuration for hardware discovery and ingestion.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SiteExplorerConfig {
     /// Whether SiteExplorer is enabled. Dynamically toggleable at runtime via SetDynamicConfig.
     #[serde(
@@ -38,6 +40,13 @@ pub struct SiteExplorerConfig {
         serialize_with = "serialize_arc_atomic_bool"
     )]
     pub enabled: Arc<AtomicBool>,
+    /// How long a retained boot interface pair stays applicable (`None` =
+    /// forever). Deliberately not part of the `[site_explorer]` section
+    /// (serde skips it): setup copies the top-level
+    /// `retained_boot_interface_window` here so site-explorer's ingest paths
+    /// honor the same knob as DHCP.
+    #[serde(skip)]
+    pub retained_boot_interface_window: Option<chrono::Duration>,
     /// The interval at which site explorer runs.
     /// Defaults to 5 Minutes if not specified.
     #[serde(
@@ -50,10 +59,14 @@ pub struct SiteExplorerConfig {
     /// Default is 5.
     #[serde(default = "SiteExplorerConfig::default_concurrent_explorations")]
     pub concurrent_explorations: u64,
-    /// How many nodes should be explored in a single run.
-    /// Default is 10.
-    /// This number divided by `concurrent_explorations` will determine how many
-    /// exploration batches are needed inside a run.
+    /// How many routine (non-requested) endpoints should be explored in a single run.
+    /// Default is 90.
+    /// This bounds only the background refresh work: previously unseen endpoints
+    /// and stale endpoints whose reports we want to update. Endpoints with the
+    /// `exploration_requested` flag set are always attempted, regardless of this
+    /// value, because operators rely on that flag for guaranteed next-tick attempts.
+    /// Parallelism for both routine and requested explorations is still bounded by
+    /// `concurrent_explorations`.
     /// If the value is set too high the site exploration will take a lot of time
     /// and the exploration report will be updated less frequent. Therefore it
     /// is recommended to reduce `run_interval` instead of increasing
@@ -61,7 +74,7 @@ pub struct SiteExplorerConfig {
     #[serde(default = "SiteExplorerConfig::default_explorations_per_run")]
     pub explorations_per_run: u64,
 
-    /// Whether SiteExplorer should create Managed Host state machine
+    /// When false, SiteExplorer skips creating ManagedHost state machines; the DPU agent (scout) must self-register via DiscoverMachine gRPC endpoint with create_machine=true
     #[serde(
         default = "SiteExplorerConfig::default_create_machines",
         deserialize_with = "deserialize_arc_atomic_bool",
@@ -90,13 +103,6 @@ pub struct SiteExplorerConfig {
     /// The port to connect to for redfish requests.
     /// This is a debug override and should not be used in production.
     pub override_target_port: Option<u16>,
-
-    /// Whether to allow hosts with zero DPUs in site-explorer. This should typically be set to
-    /// false in production environments where we expect all hosts to have DPUs. When false, if we
-    /// encounter a host with no DPUs, site-explorer will throw an error for that host (because it
-    /// should be assumed that there's a bug in detecting the DPUs).
-    #[serde(default)]
-    pub allow_zero_dpu_hosts: bool,
 
     /// The host:port to use as a proxy when making BMC calls to all hosts in NICo. This is used
     /// for integration testing, and for local development with machine-a-tron/bmc-mock. Should not
@@ -131,16 +137,9 @@ pub struct SiteExplorerConfig {
     )]
     pub admin_segment_type_non_dpu: Arc<AtomicBool>,
 
-    /// Whether site-controller should allocate a secondary
-    /// VTEP IP or leave that to discovery.
-    /// Current secondary VTEP use-case is additional
-    /// VTEP IPs for GENEVE VTEPS (GTEPS) used by traffic-intercept users.
-    ///  Only sites expected to support
-    /// additional VTEPS would turn this on.
-    #[serde(default)]
-    pub allocate_secondary_vtep_ip: bool,
-
-    /// Whether SiteExplorer should create Power Shelf state machine
+    /// Whether SiteExplorer should create PowerShelf objects for explored power
+    /// shelves that match an `expected_power_shelves` record. Defaults to true;
+    /// set false to disable power shelf ingestion site-wide.
     #[serde(
         default = "SiteExplorerConfig::default_create_power_shelves",
         deserialize_with = "deserialize_arc_atomic_bool",
@@ -148,20 +147,14 @@ pub struct SiteExplorerConfig {
     )]
     pub create_power_shelves: Arc<AtomicBool>,
 
-    /// Whether SiteExplorer should create Power Shelf state machine from static IP
-    #[serde(
-        default = "SiteExplorerConfig::default_explore_power_shelves_from_static_ip",
-        deserialize_with = "deserialize_arc_atomic_bool",
-        serialize_with = "serialize_arc_atomic_bool"
-    )]
-    pub explore_power_shelves_from_static_ip: Arc<AtomicBool>,
-
     /// How many Power Shelves should be created in a single run.
     /// Default is 1.
     #[serde(default = "SiteExplorerConfig::default_power_shelves_created_per_run")]
     pub power_shelves_created_per_run: u64,
 
-    /// Whether SiteExplorer should create Switch state machine
+    /// Whether SiteExplorer should create Switch objects for explored switches
+    /// that match an `expected_switches` record. Defaults to true; set false to
+    /// disable switch ingestion site-wide.
     #[serde(
         default = "SiteExplorerConfig::default_create_switches",
         deserialize_with = "deserialize_arc_atomic_bool",
@@ -174,13 +167,20 @@ pub struct SiteExplorerConfig {
     #[serde(default = "SiteExplorerConfig::default_switches_created_per_run")]
     pub switches_created_per_run: u64,
 
-    /// Use onboard NIC for host networking instead of DPU NICs.
-    #[serde(
-        default = "SiteExplorerConfig::default_force_dpu_nic_mode",
-        deserialize_with = "deserialize_arc_atomic_bool",
-        serialize_with = "serialize_arc_atomic_bool"
-    )]
-    pub force_dpu_nic_mode: Arc<AtomicBool>,
+    /// Site-wide host DPU policy. Per-host `Nic` and `Ignore` policies
+    /// override it; per-host `Manage` inherits it for backward compatibility.
+    /// `None` falls back to [`HostDpuPolicy::Manage`].
+    ///
+    /// The legacy `dpu_mode` field and values remain accepted during
+    /// deserialization.
+    #[serde(default, alias = "dpu_mode")]
+    pub dpu_policy: Option<HostDpuPolicy>,
+
+    /// Deprecated compatibility key. This setting is ignored; use `dpu_policy`.
+    #[doc(hidden)]
+    #[serde(default, rename = "force_dpu_nic_mode", skip_serializing)]
+    pub deprecated_force_dpu_nic_mode: Option<bool>,
+
     /// Controls which Redfish client implementation is used
     /// for hardware discovery (LibRedfish, NvRedfish, or
     /// CompareResult for side-by-side validation).
@@ -191,27 +191,26 @@ pub struct SiteExplorerConfig {
 impl Default for SiteExplorerConfig {
     fn default() -> Self {
         SiteExplorerConfig {
-            enabled: Arc::new(true.into()),
+            enabled: Self::default_enabled(),
+            retained_boot_interface_window: None,
             run_interval: Self::default_run_interval(),
             concurrent_explorations: Self::default_concurrent_explorations(),
             explorations_per_run: Self::default_explorations_per_run(),
-            create_machines: Arc::new(true.into()),
+            create_machines: Self::default_create_machines(),
             machines_created_per_run: Self::default_machines_created_per_run(),
             override_target_ip: None,
             override_target_port: None,
-            allow_zero_dpu_hosts: false,
             bmc_proxy: bmc_proxy(None),
             allow_changing_bmc_proxy: None,
             reset_rate_limit: Self::default_reset_rate_limit(),
             admin_segment_type_non_dpu: Self::default_admin_segment_type_non_dpu(),
-            allocate_secondary_vtep_ip: false,
-            create_power_shelves: Arc::new(true.into()),
-            explore_power_shelves_from_static_ip: Arc::new(true.into()),
+            create_power_shelves: Self::default_create_power_shelves(),
             power_shelves_created_per_run: Self::default_power_shelves_created_per_run(),
-            create_switches: Arc::new(true.into()),
+            create_switches: Self::default_create_switches(),
             switches_created_per_run: Self::default_switches_created_per_run(),
             rotate_switch_nvos_credentials: Self::default_rotate_switch_nvos_credentials(),
-            force_dpu_nic_mode: Arc::new(false.into()),
+            dpu_policy: None,
+            deprecated_force_dpu_nic_mode: None,
             explore_mode: Self::default_explore_mode(),
         }
     }
@@ -219,14 +218,62 @@ impl Default for SiteExplorerConfig {
 
 impl PartialEq for SiteExplorerConfig {
     fn eq(&self, other: &SiteExplorerConfig) -> bool {
-        self.enabled.load(AtomicOrdering::Relaxed) == other.enabled.load(AtomicOrdering::Relaxed)
-            && self.run_interval == other.run_interval
-            && self.concurrent_explorations == other.concurrent_explorations
-            && self.explorations_per_run == other.explorations_per_run
-            && self.create_machines.load(AtomicOrdering::Relaxed)
+        // Destructured without `..` so adding a field to the struct without
+        // deciding how it compares here is a compile error, not a silent gap.
+        let Self {
+            enabled,
+            retained_boot_interface_window,
+            run_interval,
+            concurrent_explorations,
+            explorations_per_run,
+            create_machines,
+            machines_created_per_run,
+            rotate_switch_nvos_credentials,
+            override_target_ip,
+            override_target_port,
+            bmc_proxy,
+            allow_changing_bmc_proxy,
+            reset_rate_limit,
+            admin_segment_type_non_dpu,
+            create_power_shelves,
+            power_shelves_created_per_run,
+            create_switches,
+            switches_created_per_run,
+            dpu_policy,
+            deprecated_force_dpu_nic_mode,
+            explore_mode,
+        } = self;
+
+        enabled.load(AtomicOrdering::Relaxed) == other.enabled.load(AtomicOrdering::Relaxed)
+            && *retained_boot_interface_window == other.retained_boot_interface_window
+            && *run_interval == other.run_interval
+            && *concurrent_explorations == other.concurrent_explorations
+            && *explorations_per_run == other.explorations_per_run
+            && create_machines.load(AtomicOrdering::Relaxed)
                 == other.create_machines.load(AtomicOrdering::Relaxed)
-            && self.override_target_ip == other.override_target_ip
-            && self.override_target_port == other.override_target_port
+            && *machines_created_per_run == other.machines_created_per_run
+            && rotate_switch_nvos_credentials.load(AtomicOrdering::Relaxed)
+                == other
+                    .rotate_switch_nvos_credentials
+                    .load(AtomicOrdering::Relaxed)
+            && *override_target_ip == other.override_target_ip
+            && *override_target_port == other.override_target_port
+            && bmc_proxy.load_full() == other.bmc_proxy.load_full()
+            && *allow_changing_bmc_proxy == other.allow_changing_bmc_proxy
+            && *reset_rate_limit == other.reset_rate_limit
+            && admin_segment_type_non_dpu.load(AtomicOrdering::Relaxed)
+                == other
+                    .admin_segment_type_non_dpu
+                    .load(AtomicOrdering::Relaxed)
+            && create_power_shelves.load(AtomicOrdering::Relaxed)
+                == other.create_power_shelves.load(AtomicOrdering::Relaxed)
+            && *power_shelves_created_per_run == other.power_shelves_created_per_run
+            && create_switches.load(AtomicOrdering::Relaxed)
+                == other.create_switches.load(AtomicOrdering::Relaxed)
+            && *switches_created_per_run == other.switches_created_per_run
+            && *dpu_policy == other.dpu_policy
+            && *deprecated_force_dpu_nic_mode == other.deprecated_force_dpu_nic_mode
+            && *explore_mode == other.explore_mode
     }
 }
 
@@ -268,11 +315,7 @@ impl SiteExplorerConfig {
     }
 
     pub fn default_create_power_shelves() -> Arc<AtomicBool> {
-        Arc::new(false.into())
-    }
-
-    pub fn default_explore_power_shelves_from_static_ip() -> Arc<AtomicBool> {
-        Arc::new(false.into())
+        Arc::new(true.into())
     }
 
     pub const fn default_power_shelves_created_per_run() -> u64 {
@@ -280,19 +323,15 @@ impl SiteExplorerConfig {
     }
 
     pub fn default_create_switches() -> Arc<AtomicBool> {
-        Arc::new(false.into())
+        Arc::new(true.into())
     }
 
     pub const fn default_switches_created_per_run() -> u64 {
         9
     }
 
-    pub fn default_force_dpu_nic_mode() -> Arc<AtomicBool> {
-        Arc::new(false.into())
-    }
-
     pub const fn default_explore_mode() -> SiteExplorerExploreMode {
-        SiteExplorerExploreMode::LibRedfish
+        SiteExplorerExploreMode::NvRedfish
     }
 }
 
@@ -302,7 +341,7 @@ pub fn bmc_proxy(s: Option<HostPortPair>) -> Arc<ArcSwap<Option<HostPortPair>>> 
 
 /// Selects the Redfish client backend used by SiteExplorer
 /// for BMC discovery.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum SiteExplorerExploreMode {
     /// Use the libredfish Rust client.
     #[serde(rename = "libredfish")]

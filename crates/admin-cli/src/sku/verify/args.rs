@@ -19,6 +19,13 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
-    pub machine_id: MachineId,
+#[command(after_long_help = "\
+EXAMPLES:
+
+Verify a machine against its assigned SKU:
+    $ nico-admin-cli sku verify 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
+    pub(super) machine_id: MachineId,
 }

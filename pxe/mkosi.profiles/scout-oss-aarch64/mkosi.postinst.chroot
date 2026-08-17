@@ -28,6 +28,11 @@ apt-cache search nvidia-driver | grep "^nvidia-driver" | head -20
 
 apt-get ${APT_SANDBOX_OPTS} -y install ${NV_PACKAGES}
 
+# lldpd must be running for forge-scout to collect LLDP neighbors via lldpcli.
+# Enable it explicitly rather than relying on the package postinst.
+echo 'DAEMON_ARGS="-M 1"' >/etc/default/lldpd
+systemctl enable lldpd
+
 # ============================================================================
 # FORGE-SCOUT
 # ============================================================================
@@ -54,6 +59,7 @@ ln -s /etc/systemd/system/check-scout-updates.timer /etc/systemd/system/timers.t
 # MODULE LOADER
 # ============================================================================
 cp /build-output/load_modules.sh /opt/forge/
+cp /build-output/forge-scout-network.sh /opt/forge/
 
 # Ensure key commands are present
 for bin in /opt/forge/forge-scout \
@@ -110,4 +116,3 @@ do
     exit 1
   fi
 done
-

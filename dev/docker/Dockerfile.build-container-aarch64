@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-FROM arm64v8/rust:1.90.0-slim-bookworm
+FROM arm64v8/rust:1.97.1-slim-bookworm
 
 # Set in gitlab-templates/scripts/build-push-container-image.sh
 ARG CI_COMMIT_SHORT_SHA
@@ -44,6 +44,7 @@ RUN CACHEKEY=${CI_COMMIT_SHORT_SHA} apt update &&  \
 		jq \
 		kea-dev \
 		kea-dhcp4-server \
+		kea-dhcp6-server \
 		libboost-dev \
 		libgrpc-dev \
 		libopenipmi-dev \
@@ -53,8 +54,10 @@ RUN CACHEKEY=${CI_COMMIT_SHORT_SHA} apt update &&  \
 		libssl-dev \
 		libtss2-dev \
 		libudev-dev \
+		pandoc \
 		pkg-config \
 		tpm2-tools \
+		lld \
 		postgresql-15 \
 		protobuf-compiler \
 		sudo \
@@ -63,8 +66,12 @@ RUN CACHEKEY=${CI_COMMIT_SHORT_SHA} apt update &&  \
 		git \
 	&& rm -rf /var/lib/apt/lists/*
 
+# make LLVM's linker lld the default, because ld crashes using too much memory
+RUN update-alternatives --install /usr/bin/ld ld /usr/bin/lld 50
+
 RUN rustup component add rustfmt
-RUN cargo install cargo-cache cargo-make sccache cargo-deny --locked && \
+RUN cargo install cargo-cache cargo-make sccache --locked && \
+	cargo install cargo-deny --version 0.20.2 --locked && \
 	cargo install mdbook@0.4.52 mdbook-plantuml@0.8.0 mdbook-mermaid@0.16.2 && \
 	cargo cache -r registry-index,registry-sources
 
@@ -74,7 +81,7 @@ RUN curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.14.0/kind-linux-arm64  && chm
 RUN cd /tmp && curl -Lo ./grpcurl.tar.gz https://github.com/fullstorydev/grpcurl/releases/download/v1.8.7/grpcurl_1.8.7_linux_arm64.tar.gz && tar xzf grpcurl.tar.gz && chmod +x ./grpcurl && mv grpcurl /usr/local/bin/ && rm LICENSE && rm grpcurl.tar.gz
 RUN cd /tmp && curl -Lo vault.zip https://releases.hashicorp.com/vault/1.14.1/vault_1.14.1_linux_arm64.zip && unzip vault.zip && chmod u+x vault && mv vault /usr/local/bin/ && rm vault.zip
 RUN cd /usr/local/bin && curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/arm64/kubectl" && chmod +x /usr/local/bin/kubectl
-RUN export GO_VERSION="1.22.0" && \
+RUN export GO_VERSION="1.26.4" && \
 	export PLATFORM=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/') && \
 	export TARFILE=go${GO_VERSION}.linux-${PLATFORM}.tar.gz && \
 	export URL=https://golang.org/dl/${TARFILE} && \

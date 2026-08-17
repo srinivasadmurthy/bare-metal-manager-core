@@ -20,7 +20,13 @@ shard = 0
 shards_count = 1
 
 cache_size = 100
+# Maximum concurrent Redfish operations per BMC, including collector fan-out.
+# Must be greater than zero. Default: 4.
+# Changes take effect after restarting carbide-health.
+bmc_request_concurrency = 4
 bmc_proxy_url = "http://proxy.example.com:8080"
+
+endpoint_discovery_interval = "5m"
 
 # ==============================================================================
 # Endpoint Sources: Where to discover BMC endpoints from
@@ -30,7 +36,7 @@ bmc_proxy_url = "http://proxy.example.com:8080"
 root_ca = "/var/run/secrets/spiffe.io/ca.crt"
 client_cert = "/var/run/secrets/spiffe.io/tls.crt"
 client_key = "/var/run/secrets/spiffe.io/tls.key"
-api_url = "https://carbide-api.forge-system.svc.cluster.local:1079"
+api_url = "https://nico-api.nico-system.svc.cluster.local:1079"
 
 [[endpoint_sources.static_bmc_endpoints]]
 ip = "10.0.0.1"
@@ -38,6 +44,8 @@ port = 443
 mac = "aa:bb:cc:dd:ee:ff"
 username = "admin"
 password = "secret"
+labels = { site = "dev", cluster = "cluster-01", environment = "development" }
+machine = { id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "MN-001", slot_number = 15, tray_index = 5, nvlink_domain_uuid = "00000000-0000-0000-0000-000000000000" }
 
 [[endpoint_sources.static_bmc_endpoints]]
 ip = "10.0.1.1"
@@ -45,7 +53,28 @@ port = 443
 mac = "11:22:33:44:55:66"
 username = "admin"
 password = "secret"
-switch_serial = "SN-SWITCH-001"
+# Configure the same domain UUID on every static endpoint for the switch.
+# Invalid or nil values are omitted from telemetry.
+switch = { id = "fsw100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "SN-SWITCH-BMC-001", endpoint_role = "bmc", slot_number = 7, tray_index = 3, nvlink_domain_uuid = "9f4b45ec-705a-4af4-89f7-a112bc9c8f4e" }
+
+[[endpoint_sources.static_bmc_endpoints]]
+ip = "10.0.1.2"
+port = 443
+mac = "11:22:33:44:55:77"
+username = "admin"
+password = "secret"
+# For static switch host endpoints, nmxc_enabled controls direct NMX-C
+# Subscribe eligibility after the endpoint_role="host" and is_primary=true
+# checks. If omitted, it defaults to is_primary.
+switch = { id = "fsw100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "SN-SWITCH-HOST-001", endpoint_role = "host", is_primary = true, nmxc_enabled = true, slot_number = 7, tray_index = 3, nvlink_domain_uuid = "9f4b45ec-705a-4af4-89f7-a112bc9c8f4e" }
+
+[[endpoint_sources.static_bmc_endpoints]]
+ip = "10.0.2.1"
+port = 443
+mac = "22:33:44:55:66:77"
+username = "admin"
+password = "secret"
+power_shelf = { id = "fps100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "SN-POWER-SHELF-001" }
 
 # ==============================================================================
 # Sinks: Where collector events are sent
@@ -54,27 +83,110 @@ switch_serial = "SN-SWITCH-001"
 [sinks.tracing]
 enabled = false
 
+# Include Redfish diagnostic payload fields in tracing output.
+# Payload bodies are forwarded opaquely and may be large. If every
+# diagnostic-capable sink leaves diagnostics off, collectors do not attach them.
+include_diagnostics = false
+
 [sinks.prometheus]
 enabled = true
 
 [sinks.log_file]
 enabled = false
+
+# Include Redfish diagnostic payload fields in JSONL output.
+# If every diagnostic-capable sink leaves diagnostics off, collectors do not
+# attach them.
+include_diagnostics = false
+
 output_dir = "/tmp/logs"
 max_file_size = 104857600 # 100MB
 max_backups = 5
 
 [sinks.otlp]
 enabled = false
+
+# Each target owns its endpoint, queues, batching policy, diagnostics policy,
+# and optional TLS policy. This active target uses plaintext HTTP.
+# Add more target tables for fan-out.
+[[sinks.otlp.targets]]
 endpoint = "http://localhost:4317"
 batch_size = 512
 flush_interval = "2s"
+
+# Include Redfish diagnostic payload fields in OTLP logs for this target.
+# If every diagnostic-capable sink leaves diagnostics off, collectors do not
+# attach them. OTLP exports parent logs normally and keeps diagnostics as
+# latest-wins per endpoint while the drain is backed up.
+include_diagnostics = false
+
+# Include per-alert detail on health report records for this target. Records
+# otherwise carry routing fields, counts, and structured successes without the
+# alert attributes. When enabled, each record with alerts carries the first 64
+# alerts in report order; only a report with more than 64 alerts also carries
+# `health_report.alerts.dropped` with the number omitted.
+include_alert_details = false
+#
+# TLS-only target with an explicit CA bundle.
+# The reload interval is optional and defaults to five minutes.
+# [[sinks.otlp.targets]]
+# endpoint = "https://telemetry.example.com:4317"
+# batch_size = 1024
+# flush_interval = "5s"
+# include_diagnostics = true
+# include_alert_details = true
+#
+# [sinks.otlp.targets.tls]
+# ca_cert_path = "/var/run/secrets/central-otlp/ca.crt"
+# tls_server_name = "telemetry.example.com"
+# reload_interval = "5m"
+#
+# mTLS target with an explicit CA bundle and client identity.
+# [[sinks.otlp.targets]]
+# endpoint = "https://telemetry.example.com:4317"
+# batch_size = 1024
+# flush_interval = "5s"
+# include_diagnostics = true
+# include_alert_details = true
+#
+# [sinks.otlp.targets.tls]
+# ca_cert_path = "/var/run/secrets/central-otlp/ca.crt"
+# client_cert_path = "/var/run/secrets/central-otlp/tls.crt"
+# client_key_path = "/var/run/secrets/central-otlp/tls.key"
+# tls_server_name = "telemetry.example.com"
+# reload_interval = "5m"
 
 [sinks.health_report]
 root_ca = "/var/run/secrets/spiffe.io/ca.crt"
 client_cert = "/var/run/secrets/spiffe.io/tls.crt"
 client_key = "/var/run/secrets/spiffe.io/tls.key"
-api_url = "https://carbide-api.forge-system.svc.cluster.local:1079"
+api_url = "https://nico-api.nico-system.svc.cluster.local:1079"
 workers = 8
+skip_empty_reports = true
+
+[sinks.rack_health_report]
+root_ca = "/var/run/secrets/spiffe.io/ca.crt"
+client_cert = "/var/run/secrets/spiffe.io/tls.crt"
+client_key = "/var/run/secrets/spiffe.io/tls.key"
+api_url = "https://nico-api.nico-system.svc.cluster.local:1079"
+workers = 2
+skip_empty_reports = true
+
+[sinks.switch_health_report]
+root_ca = "/var/run/secrets/spiffe.io/ca.crt"
+client_cert = "/var/run/secrets/spiffe.io/tls.crt"
+client_key = "/var/run/secrets/spiffe.io/tls.key"
+api_url = "https://nico-api.nico-system.svc.cluster.local:1079"
+workers = 2
+skip_empty_reports = true
+
+[sinks.power_shelf_health_report]
+root_ca = "/var/run/secrets/spiffe.io/ca.crt"
+client_cert = "/var/run/secrets/spiffe.io/tls.crt"
+client_key = "/var/run/secrets/spiffe.io/tls.key"
+api_url = "https://nico-api.nico-system.svc.cluster.local:1079"
+workers = 2
+skip_empty_reports = true
 
 # ==============================================================================
 # Rate Limiting
@@ -86,31 +198,225 @@ bucket_replenish = "35ms"
 max_jitter = "40ms"
 
 # ==============================================================================
-# Collectors: What data to collect from BMCs and Switches (NMX-T/NVUE REST)
+# BMC Collectors: What data to collect from BMCs
 # ==============================================================================
 
+[collectors.discovery]
+refresh_interval = "60m"
+discovery_concurrency = 1
+
+# Optional direct TCP checks for ports used by eligible enabled collectors.
+# Every check emits a metric; "unreachable" logs failures and "all" logs every result.
+# Checks bypass BMC proxies and do not verify TLS, authentication, or protocol readiness.
+# Results never create health reports or alerts.
+[collectors.reachability]
+enabled = true
+interval = "30s"
+timeout = "3s"
+log_mode = "unreachable"
+
 [collectors.sensors]
-rediscover_interval = "5m"
-state_refresh_interval = "30m"
 sensor_fetch_interval = "1m"
-sensor_fetch_concurrency = 10
 include_sensor_thresholds = true
+
+[collectors.metrics]
+fetch_interval = "2m"
+
+# Redfish telemetry service: pre-aggregated metric reports, one GET per report
+# instead of one per resource. Published under the `hw_telemetry` series name so
+# it stays distinct from `hw_sensor` and `hw_metric`, which can cover the same
+# readings. Only platforms that implement TelemetryService produce anything here;
+# on the rest the collector is a cheap no-op. Disabled by default. Uncomment to
+# enable:
+# [collectors.telemetry]
+# fetch_interval = "1m"
 
 [collectors.firmware]
 firmware_refresh_interval = "30m"
 
-[collectors.logs]
-mode = "sse" # "sse" (default, preferred) or "periodic" (fallback)
+[collectors.leak_detector]
+poll_interval = "1m"
+state_refresh_interval = "30m"
 
-# required when mode = "periodic", must not be set when mode = "sse"
-# [collectors.logs.periodic]
-# logs_collection_interval = "5m"
-# state_refresh_interval = "30m"
-# logs_state_file = "/tmp/logs_collector_{machine_id}.json"
+# GPU inventory: out-of-band GPU count vs the machine's assigned SKU (issue #301).
+# Disabled by default. Requires [endpoint_sources.carbide_api] (to resolve the
+# expected count from the SKU) and [sinks.health_report] (to deliver alerts) to be
+# enabled, or config validation fails. GPU population is near-static, so keep the
+# interval infrequent (default 1h). Uncomment to enable:
+# [collectors.gpu_inventory]
+# interval = "1h"
+
+[collectors.logs]
+#  "auto": (default)
+#       - spawn SSE per endpoint
+#       - if SSE not supported, downgrade to periodic collection
+#       - if reconnects exceeds budget, downgrade to periodic collection
+#       - reset downgrades after server restart
+#  "sse": always SSE; retry with exp. backoff on connect failure
+#  "periodic": always poll
+mode = "auto"
+
+# auto-mode downgrade thresholds and periodic fallback; read only when
+# mode = "auto". omit the whole section to use defaults.
+[collectors.logs.auto]
+# auto uses [collectors.logs.sse] while attempting SSE, then switches to
+# these periodic fallback parameters after downgrade.
+sse_not_available_threshold = 1
+connect_failure_window = "5m"
+connect_failure_threshold = 5
+logs_collection_interval = "5m"
+state_refresh_interval = "30m"
+logs_state_file = "/tmp/logs_collector_{machine_id}.json"
+# Skip any Redfish LogService whose odata id contains one of these substrings.
+# Applies when auto-mode downgrades to periodic collection. See [collectors.logs.periodic].
+exclude_services = ["Journal"]
+# When true, on first encounter of a LogService with no saved state, anchor at
+# the current highest entry ID without emitting historical entries. Matches
+# SSE real-time behaviour. Default: false (collect all existing entries on
+# first run). Also read by auto-mode after downgrade to periodic.
+# skip_initial_history = false
+
+# SSE reconnect backoff; read when mode = "sse" and during auto-mode SSE attempts.
+[collectors.logs.sse]
+initial_backoff = "1s"
+max_backoff = "30s"
+
+# required when
+# mode = "periodic"; must not be set when mode = "sse"
+[collectors.logs.periodic]
+logs_collection_interval = "5m"
+state_refresh_interval = "30m"
+logs_state_file = "/tmp/logs_collector_{machine_id}.json"
+# Skip any Redfish LogService whose odata id contains one of these substrings.
+# Defaults to ["Journal"] to suppress the bmcweb HTTP-access log (high-volume noise,
+# self-referential since polling generates Journal entries). Set to [] to collect
+# from every discovered LogService. Also read by auto-mode after downgrade.
+exclude_services = ["Journal"]
+# When true, on first encounter of a LogService with no saved state, anchor at
+# the current highest entry ID without emitting historical entries. Matches
+# SSE real-time behaviour. Default: false (collect all existing entries on
+# first run).
+# skip_initial_history = false
+
+# ==============================================================================
+# TLS: Shared certificate configuration for switch collectors
+# ==============================================================================
+
+# Optional mTLS profile for direct switch collector connections.
+# This section is shared by switch collectors, but it is not itself a collector.
+# This is intentionally separate from Carbide API / SPIFFE certificate paths.
+# When configured, NVUE REST, NVUE gNMI, NMX-T, and NMX-C use this CA bundle,
+# client certificate, and client key for switch host connections.
+#
+# Switch server certificates must be valid for the TLS server name used by
+# health. Collectors always open TCP connections to discovered switch IPs. If
+# switch certificates contain DNS SANs instead of IP SANs, set tls_server_name
+# here. The value is used only for TLS SNI and certificate verification, not
+# for DNS resolution or endpoint discovery.
+# For HTTP collectors, the request URL and HTTP Host header stay on the
+# discovered switch IP. Only the TLS server name changes.
+#
+# Rotation behavior:
+# - NMX-T and NVUE REST share one cached HTTP client for this mTLS profile.
+#   The cache is checked on the shortest enabled HTTP collector poll interval,
+#   so cert file changes are adopted by the next reload window without building
+#   a client per switch target.
+# - NMX-C and NVUE gNMI read refreshed material when a long-lived stream
+#   reconnects.
+# - Existing HTTP clients and long-lived streams are not proactively closed on
+#   file changes.
+#
+# [tls.switch]
+# ca_cert_path = "/var/run/secrets/switch-mtls/ca.crt"
+# client_cert_path = "/var/run/secrets/switch-mtls/tls.crt"
+# client_key_path = "/var/run/secrets/switch-mtls/tls.key"
+# tls_server_name = "switches.example.forge"
+
+# ==============================================================================
+# Switch Host Collectors: What data to collect from NVLink Switch Hosts
+# ==============================================================================
+
+# NMX-C collection connects directly to the primary switch-host gRPC endpoint
+# when switch discovery metadata says NMX-C is enabled for that switch.
+# FabricManager (NMX-C) must be running there. Without [tls.switch],
+# current switch endpoints use plaintext gRPC over HTTP/2 on 9370.
+# NMX-C notifications currently emit log events only; metrics and health reports
+# are separate scope.
+[collectors.nmxc]
+# Enable the NMX-C streaming collector for eligible primary switch-host endpoints.
+enabled = false
+
+# NMX-C gRPC service port on the switch host.
+grpc_port = 9370
+
+# Gateway identity sent in Hello and Subscribe requests.
+gateway_id = "hw-health"
+
+# When true, NMX-C also reports changes initiated by this gateway_id.
+notify_on_self_change = false
+
+# Heartbeat interval requested from NMX-C for DomainStateInfo notifications.
+heartbeat_rate = 30
+
+# Optional TCP connect timeout for the NMX-C gRPC endpoint; defaults to 10s.
+connect_timeout = "10s"
+
+# Optional timeout for Hello, Subscribe, and initial Subscribe acknowledgement
+# RPCs; defaults to 10s.
+rpc_timeout = "10s"
+
+# First reconnect delay after connect or stream failure.
+initial_backoff = "1s"
+
+# Maximum reconnect delay after repeated connect or stream failures.
+max_backoff = "30s"
+
+# Optional. Omit this table to use the generated NMX-C collector.
+#
+# The override replaces the generated NMX-C collector with descriptor-driven
+# request encoding and response decoding. Responses are emitted as generic logs
+# and are not mapped to generated NMX-C events. Every OTLP target includes
+# canonical protobuf JSON regardless of include_diagnostics. These payloads may
+# be large.
+#
+# Enabling the override requires at least one [[sinks.otlp.targets]] entry. The
+# descriptor and request are loaded at startup; changes require a carbide-health
+# restart.
+#
+# [collectors.nmxc.schema_override]
+#
+# Required when the schema_override table is enabled. No default.
+# Path to a complete binary FileDescriptorSet containing the configured methods
+# and all imported descriptors. Relative paths use the process working directory.
+# descriptor_set_path = "/etc/carbide-health/nmx_c.desc"
+#
+# Optional. Default: "/nmx_c.NMX_Controller/Hello".
+# Fully qualified gRPC path in /package.Service/Method form. The method must
+# exist in the descriptor and use a unary request and response.
+# hello_rpc_path = "/nmx_c.NMX_Controller/Hello"
+#
+# Optional. Default: "/nmx_c.NMX_Controller/Subscribe".
+# Fully qualified gRPC path in /package.Service/Method form. The method must
+# exist in the descriptor, accept one request, and stream responses.
+# subscribe_rpc_path = "/nmx_c.NMX_Controller/Subscribe"
+#
+# Optional. Default: 4194304 (4 MiB). Valid range: 1-67108864.
+# Maximum encoded size accepted for one Hello or Subscribe response, in bytes.
+# max_frame_size_bytes = 4194304
+#
+# Optional. Default: empty.
+# Additional SubscribeRequest fields, using names and values accepted by the
+# supplied descriptor's protobuf JSON mapping. gateway_id, notify_on_self_change,
+# and heart_beat_rate are set by [collectors.nmxc] and cannot be repeated here.
+# [collectors.nmxc.schema_override.subscribe_fields]
+# additionalBooleanField = true
 
 [collectors.nmxt]
 scrape_interval = "1m"
 request_timeout = "30s"
+# Keep strict TLS certificate verification by default. Set true only when an
+# NMX-T HTTPS endpoint uses a certificate that cannot be verified normally.
+dangerously_skip_tls_verification = false
 
 [collectors.nvue.rest]
 poll_interval = "1m"
@@ -118,9 +424,37 @@ request_timeout = "30s"
 
 [collectors.nvue.rest.paths]
 system_health_enabled = true
+system_reboot_reason_enabled = true
 cluster_apps_enabled = true
 sdn_partitions_enabled = true
 interfaces_enabled = true
+platform_environment_fan_enabled = true
+platform_environment_temperature_enabled = true
+platform_environment_leakage_enabled = true
+platform_environment_status_enabled = true
+
+# NVUE gNMI streaming collector which subscribes to
+# gNMI SAMPLE paths (components + interfaces, plus platform_general when
+# platform_general_enabled is true) and pushes metrics through the configured
+# sinks. gNMI ON_CHANGE targets system-events
+[collectors.nvue.gnmi]
+# periodic SAMPLE (components, interfaces, and platform_general when
+# platform_general_enabled is true)
+gnmi_port = 9339
+sample_interval = "5m"
+request_timeout = "30s"
+# Keep strict TLS certificate and hostname verification by default. Set true only
+# for lab/self-signed NVOS gNMI endpoints where that dangerous bypass is required.
+dangerously_skip_tls_verification = false
+# streaming ON_CHANGE
+system_events_enabled = true
+
+[collectors.nvue.gnmi.paths]
+components_enabled = true
+interfaces_enabled = true
+# Switch-level memory and disk utilization from `/platform-general/state`
+# (a singleton, not keyed by interface or component name).
+platform_general_enabled = true
 
 # ==============================================================================
 # Processors
@@ -138,5 +472,16 @@ leaking_tray_threshold = 2
 # ==============================================================================
 
 [metrics]
+# Listener exposes /metrics (service), /telemetry (Prometheus sink hardware samples), /livez (health).
 endpoint = "0.0.0.0:9009"
 prefix = "carbide_hardware_health"
+
+# Disabled by default. When enabled, emits {prefix}_bmc_latency_ms for outbound
+# Redfish HTTP requests to BMCs.
+enable_bmc_latency_metrics = false
+
+# Defaults to ["all"]. Set a subset to control emitted labels. Allowed values:
+# "all", "http_response_status_code", "http_request_method", "http_path",
+# "server_address", "url_scheme", "bmc_vendor", "bmc_model", "entity_type",
+# "machine_id", "rack_id".
+bmc_latency_attributes = ["all"]

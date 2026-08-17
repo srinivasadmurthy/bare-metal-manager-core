@@ -15,15 +15,13 @@
  * limitations under the License.
  */
 
-mod fixtures;
-mod mock_keystore;
-mod mock_server;
+mod common;
 
 use std::collections as stdcol;
 
-use fixtures::*;
+use common::fixtures::*;
+use common::{mock_keystore as mks, mock_server as ms};
 use nras::{DeviceAttestationInfo, NrasError, VerifierClient};
-use {mock_keystore as mks, mock_server as ms};
 
 // --> NrasVerifierClient <--
 #[tokio::test]

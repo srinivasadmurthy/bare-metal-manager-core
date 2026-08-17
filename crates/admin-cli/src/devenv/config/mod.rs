@@ -17,16 +17,14 @@
 
 mod apply;
 
-use ::rpc::admin_cli::CarbideCliResult;
-#[cfg(test)]
-pub use apply::args::NetworkChoice;
 use clap::Parser;
 
 use crate::cfg::run::Run;
 use crate::cfg::runtime::RuntimeContext;
+use crate::errors::CarbideCliResult;
 
 #[derive(Parser, Debug, Clone)]
-pub enum Cmd {
+pub(crate) enum Cmd {
     #[clap(about = "Apply devenv config", visible_alias = "a")]
     Apply(apply::Args),
 }

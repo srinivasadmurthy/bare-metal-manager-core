@@ -1,12 +1,31 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use carbide_instrument::red;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
 use reqwest::{Client, ClientBuilder, Method, Response, Url};
 pub use serde_json::Value as JsonValue;
 
-use crate::NvueConfig;
-use crate::config::NvueRevision;
+use crate::config::{NvueConfig, NvueConfigWithHeader, NvueRevision};
+use crate::types::revision::{RevisionApplyStatus, RevisionData, RevisionIssueSummary};
 
 #[derive(Debug)]
 pub struct NvueClient {
@@ -15,6 +34,13 @@ pub struct NvueClient {
 }
 
 impl NvueClient {
+    // In the past, we've seen calls to `nv config apply` take a long time, to
+    // the point where the timeout for that code path (outside this crate) was
+    // raised to 45s. We don't know for sure that we need the same budget here,
+    // but let's assume we do. -drew
+    const APPLY_CONFIG_REVISION_TIMEOUT: Duration = Duration::from_secs(45);
+    const APPLY_CONFIG_REVISION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
     pub fn new(server_address: NvueServerAddress) -> Result<Self, NvueClientError> {
         build_client(&server_address).map(|client| Self {
             server_address,
@@ -59,39 +85,46 @@ impl NvueClient {
         Ok(builder)
     }
 
-    async fn execute(&self, request: reqwest::Request) -> Result<Response, NvueClientError> {
+    async fn execute(
+        &self,
+        operation: &'static str,
+        request: reqwest::Request,
+    ) -> Result<Response, NvueClientError> {
         let method = request.method().clone();
         let url = request.url().clone();
         let body = request
             .body()
             .and_then(|b| b.as_bytes())
             .map(|b| String::from_utf8_lossy(b).into_owned());
-        self.client
-            .execute(request)
-            .await
-            .and_then(|response| response.error_for_status())
-            .map_err(|source| {
-                NvueClientError::RequestFailed(Box::new(RequestFailed {
-                    method,
-                    url,
-                    body,
-                    source,
-                }))
-            })
+        red::instrumented("nvue", operation, async move {
+            self.client
+                .execute(request)
+                .await
+                .and_then(|response| response.error_for_status())
+        })
+        .await
+        .map_err(|source| {
+            NvueClientError::RequestFailed(Box::new(RequestFailed {
+                method,
+                url,
+                body,
+                source,
+            }))
+        })
     }
 
     pub async fn get_api(&self) -> Result<Response, NvueClientError> {
         const PATH: &str = "/nvue_v1/system/api?rev=applied";
         let request = self.request(Method::GET, PATH)?.build()?;
-        self.execute(request).await
+        self.execute("get_api", request).await
     }
 
     /// Return the config that is tagged as "applied" (in other words, the one
     /// that is currently running on the system).
-    pub async fn get_applied_config(&self) -> Result<NvueConfig, NvueClientError> {
+    pub async fn get_applied_config(&self) -> Result<NvueConfigWithHeader, NvueClientError> {
         const PATH: &str = "/nvue_v1/?rev=applied&filled=false";
         let request = self.request(Method::GET, PATH)?.build()?;
-        let response = self.execute(request).await?;
+        let response = self.execute("get_applied_config", request).await?;
         let nvue_config = response.json().await?;
         Ok(nvue_config)
     }
@@ -100,12 +133,26 @@ impl NvueClient {
     pub async fn create_config_revision(&self) -> Result<String, NvueClientError> {
         const PATH: &str = "/nvue_v1/revision";
         let request = self.request(Method::POST, PATH)?.build()?;
-        let response = self.execute(request).await?;
+        let response = self.execute("create_config_revision", request).await?;
         let revision: NvueRevision = response.json().await?;
         let revision_id = revision
             .get_revision_id()
             .ok_or(NvueClientError::SchemaMismatch("Missing revision id"))?;
         Ok(revision_id)
+    }
+
+    /// Return data about the specified revision.
+    pub async fn get_revision(&self, revision_id: &str) -> Result<RevisionData, NvueClientError> {
+        let revision_path = format!("/nvue_v1/revision/{revision_id}");
+        let request = self.request(Method::GET, &revision_path)?.build()?;
+        let response = self.execute("get_revision", request).await?;
+
+        // For some reason, the NVUE schema allows the response to be nulled,
+        // but as far as we're concerned that's an error.
+        let revision_data: Option<_> = response.json().await?;
+        revision_data.ok_or(NvueClientError::SchemaMismatch(
+            "revision response was null",
+        ))
     }
 
     /// Replace the specified config revision. Under the hood, this is a
@@ -122,28 +169,12 @@ impl NvueClient {
         let empty_config: HashMap<String, String> = HashMap::new();
         let builder = builder.json(&empty_config);
         let request = builder.build()?;
-        let _response = self.execute(request).await?;
+        let _response = self.execute("replace_config.delete", request).await?;
 
         let builder = self.request(Method::PATCH, &revision_path)?;
-        let mut config = config.clone();
-        // Just in case the config we got was derived from an older one,
-        // let's clear the rev-id from the header.
-        config.remove_rev_id();
-        // The startup templates wrap the payload in a [{header:...},{set:...}] list.
-        // The REST API expects only the inner config object, so strip the wrapper.
-        // If the config is a top-level array but has no "set" entry that is a
-        // schema error — surface it now rather than letting the API reject it
-        // with a cryptic response.
-        let mut config = match config.extract_set_payload()? {
-            Some(inner) => inner,
-            None => config,
-        };
-        // pf0dpu* interfaces lack a `type` field and are rejected by the REST API;
-        // skip them for now.
-        config.remove_pf0dpu_interfaces();
         let builder = builder.json(&config);
         let request = builder.build()?;
-        let _response = self.execute(request).await?;
+        let _response = self.execute("replace_config.patch", request).await?;
         Ok(())
     }
 
@@ -153,11 +184,44 @@ impl NvueClient {
         let body = NvueApplyData::force_apply();
         let builder = builder.json(&body);
         let request = builder.build()?;
-        let _response = self.execute(request).await?;
+        let _response = self.execute("apply_config_revision", request).await?;
 
-        // FIXME: we should poll on the revision path until it reaches an
-        // "applied" state
-        Ok(())
+        let started = tokio::time::Instant::now();
+        let deadline = started + Self::APPLY_CONFIG_REVISION_TIMEOUT;
+
+        loop {
+            let revision = self.get_revision(revision_id).await?;
+
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.checked_duration_since(now);
+
+            match (revision.apply_status(), remaining) {
+                (RevisionApplyStatus::Applied, _) => break Ok(()),
+                (RevisionApplyStatus::Failed(error_issues), _) => {
+                    break Err(NvueClientError::RevisionApplyFailed {
+                        revision_id: revision_id.to_owned(),
+                        reason: RevisionApplyFailureReason::Error,
+                        last_state: revision.state.clone(),
+                        progress: revision.transition_progress().map(String::from),
+                        error_issues,
+                    });
+                }
+                (RevisionApplyStatus::Pending, Some(remaining)) => {
+                    tokio::time::sleep(remaining.min(Self::APPLY_CONFIG_REVISION_POLL_INTERVAL))
+                        .await;
+                }
+                (RevisionApplyStatus::Pending, None) => {
+                    let elapsed = now - started;
+                    break Err(NvueClientError::RevisionApplyFailed {
+                        revision_id: revision_id.to_owned(),
+                        reason: RevisionApplyFailureReason::Timeout { waited: elapsed },
+                        last_state: revision.state.clone(),
+                        progress: revision.transition_progress().map(String::from),
+                        error_issues: Vec::new(),
+                    });
+                }
+            }
+        }
     }
 
     /// Create a new configuration using the values from `config`, then  apply
@@ -178,7 +242,7 @@ impl NvueClient {
         let path = "/nvue_v1/system";
         let builder = self.request(Method::GET, path)?;
         let request = builder.build()?;
-        let response = self.execute(request).await?;
+        let response = self.execute("system_info", request).await?;
         let resonse_body = response.json().await?;
         Ok(resonse_body)
     }
@@ -216,7 +280,7 @@ impl NvueClient {
         let path = format!("/nvue_v1/bridge/domain/{bridge_domain}/mac-table");
         let builder = self.request(Method::GET, &path)?;
         let request = builder.build()?;
-        let response = self.execute(request).await?;
+        let response = self.execute("bridge_mac_table", request).await?;
         let resonse_body: BTreeMap<String, _> = response.json().await?;
         let response = resonse_body.into_values().collect();
         Ok(response)
@@ -243,7 +307,7 @@ struct NvueApplyData {
 }
 
 impl NvueApplyData {
-    pub fn force_apply() -> Self {
+    fn force_apply() -> Self {
         let state = "apply".into();
         let auto_prompt = NvueAutoPrompt::ays_yes();
         Self { state, auto_prompt }
@@ -258,7 +322,7 @@ struct NvueAutoPrompt {
 }
 
 impl NvueAutoPrompt {
-    pub fn ays_yes() -> Self {
+    fn ays_yes() -> Self {
         let ays = "ays_yes".into();
         Self { ays }
     }
@@ -322,17 +386,43 @@ impl std::fmt::Debug for NvueAuth {
 
 #[derive(thiserror::Error, Debug)]
 pub enum NvueClientError {
-    #[error("Reqwest client error: {0}")]
+    #[error("reqwest client error: {0}")]
     ReqwestError(#[from] reqwest::Error),
 
     #[error(transparent)]
     RequestFailed(Box<RequestFailed>),
 
-    #[error("Environment variable error ({0}): {1}")]
+    #[error("environment variable error ({0}): {1}")]
     EnvVarError(&'static str, std::env::VarError),
 
-    #[error("Schema mismatch between NVUE client and server: {0}")]
+    #[error("schema mismatch between NVUE client and server: {0}")]
     SchemaMismatch(&'static str),
+
+    #[error(
+        "NVUE revision apply failed: revision_id={revision_id}, reason={reason}, last_state={last_state:?}, progress={progress:?}, error_issues={error_issues:?}"
+    )]
+    RevisionApplyFailed {
+        revision_id: String,
+        reason: RevisionApplyFailureReason,
+        last_state: Option<String>,
+        progress: Option<String>,
+        error_issues: Vec<RevisionIssueSummary>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionApplyFailureReason {
+    Error,
+    Timeout { waited: Duration },
+}
+
+impl std::fmt::Display for RevisionApplyFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Error => f.write_str("error"),
+            Self::Timeout { waited } => write!(f, "timeout after {waited:?}"),
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

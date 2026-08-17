@@ -18,12 +18,25 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all logical partitions:
+    $ nico-admin-cli logical-partition show
+
+Show one logical partition by ID:
+    $ nico-admin-cli logical-partition show 12345678-1234-5678-90ab-cdef01234567
+
+Filter by name:
+    $ nico-admin-cli logical-partition show --name my-partition
+
+")]
+pub(crate) struct Args {
     #[clap(
         default_value(""),
         help = "Optional, Logical Partition ID to search for"
     )]
-    pub id: String,
+    pub(super) id: String,
     #[clap(short, long, help = "Optional, Logical Partition Name to search for")]
-    pub name: Option<String>,
+    pub(super) name: Option<String>,
 }

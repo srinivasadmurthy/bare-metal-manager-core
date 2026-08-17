@@ -15,12 +15,13 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge as forgerpc;
 use prettytable::{Cell, Row, Table};
 use serde::Serialize;
 
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
 #[derive(Serialize)]
@@ -30,7 +31,7 @@ struct AddressRow {
     allocation_type: String,
 }
 
-pub async fn handle_show_addresses(
+pub(super) async fn handle_show_addresses(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,

@@ -19,16 +19,32 @@ use carbide_uuid::infiniband::IBPartitionId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all InfiniBand partitions:
+    $ nico-admin-cli ib-partition show
+
+Show one InfiniBand partition by ID:
+    $ nico-admin-cli ib-partition show 12345678-1234-5678-90ab-cdef01234567
+
+List partitions for one tenant:
+    $ nico-admin-cli ib-partition show --tenant-org-id fds34511233a
+
+Find a partition by name:
+    $ nico-admin-cli ib-partition show --name my-partition
+
+")]
+pub(crate) struct Args {
     #[clap(
         default_value(None),
         help = "The InfiniBand Partition ID to query, leave empty for all (default)"
     )]
-    pub id: Option<IBPartitionId>,
+    pub(super) id: Option<IBPartitionId>,
 
     #[clap(short, long, help = "The Tenant Org ID to query")]
-    pub tenant_org_id: Option<String>,
+    pub(super) tenant_org_id: Option<String>,
 
     #[clap(short, long, help = "The InfiniBand Partition name to query")]
-    pub name: Option<String>,
+    pub(super) name: Option<String>,
 }

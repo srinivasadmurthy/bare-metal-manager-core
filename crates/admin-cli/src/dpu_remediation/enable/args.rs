@@ -20,9 +20,16 @@ use clap::Parser;
 use rpc::forge::EnableRemediationRequest;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Enable a remediation:
+    $ nico-admin-cli dpu-remediation enable --id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(help = "The id of the remediation to enable", long)]
-    pub id: RemediationId,
+    pub(super) id: RemediationId,
 }
 
 impl From<Args> for EnableRemediationRequest {

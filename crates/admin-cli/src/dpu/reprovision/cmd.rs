@@ -15,16 +15,16 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use ::rpc::forge::DpuReprovisioningRequest;
 use carbide_uuid::machine::MachineType;
 use prettytable::{Table, row};
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::machine::{HealthReportTemplates, get_health_report};
 use crate::rpc::ApiClient;
 
-pub async fn reprovision(api_client: &ApiClient, reprov: Args) -> CarbideCliResult<()> {
+pub(super) async fn reprovision(api_client: &ApiClient, reprov: Args) -> CarbideCliResult<()> {
     match reprov {
         Args::Set(data) => {
             if let Some(update_message) = &data.update_message {
@@ -48,6 +48,7 @@ pub async fn reprovision(api_client: &ApiClient, reprov: Args) -> CarbideCliResu
     }
 }
 
+#[allow(deprecated)]
 async fn apply_health_report(
     api_client: &ApiClient,
     id: carbide_uuid::machine::MachineId,
@@ -74,7 +75,7 @@ async fn apply_health_report(
         }
         _ => {
             return Err(CarbideCliError::GenericError(format!(
-                "Invalid machine ID for reprevisioning, only Hosts and DPUs are supported: {update_message}"
+                "Invalid machine ID for reprovisioning, only Hosts and DPUs are supported: {id}"
             )));
         }
     };
@@ -110,7 +111,7 @@ async fn apply_health_report(
     Ok(())
 }
 
-pub async fn list_dpus_pending(api_client: &ApiClient) -> CarbideCliResult<()> {
+async fn list_dpus_pending(api_client: &ApiClient) -> CarbideCliResult<()> {
     let response = api_client.0.list_dpu_waiting_for_reprovisioning().await?;
     print_pending_dpus(response);
     Ok(())

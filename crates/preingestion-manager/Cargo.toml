@@ -5,18 +5,23 @@ edition.workspace = true
 description = "Carbide Pre-ingestion Manager"
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [lib]
 name = "carbide_preingestion_manager"
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
 
 [dependencies]
 bmc-vendor = { path = "../bmc-vendor" }
 carbide-api-db = { path = "../api-db" }
 carbide-api-model = { path = "../api-model" }
 carbide-firmware = { path = "../firmware" }
+carbide-instrument = { path = "../instrument" }
 carbide-redfish = { path = "../redfish" }
 carbide-secrets = { path = "../secrets" }
-carbide-site-explorer = { path = "../site-explorer" }
 carbide-ssh = { path = "../ssh" }
 carbide-utils = { path = "../utils" }
 
@@ -34,7 +39,14 @@ tracing = { workspace = true }
 version-compare = { workspace = true }
 
 [dev-dependencies]
+carbide-firmware = { path = "../firmware", features = ["test-support"] }
+carbide-instrument = { path = "../instrument", features = ["test-support"] }
+carbide-test-harness = { path = "../test-harness" }
+carbide-test-support = { path = "../test-support" }
+carbide-uuid = { path = "../uuid" }
+libc = { workspace = true }
 prometheus-text-parser = { path = "../prometheus-text-parser" }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

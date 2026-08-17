@@ -16,20 +16,19 @@
  */
 
 use clap::Parser;
-use rpc::{CredentialType, forge as forgerpc};
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
-    #[clap(long, required(true), help = "NmxM url")]
-    pub username: String,
-}
+#[command(
+    long_about = "Deprecated compatibility command. NMX-M is no longer supported. This command always returns an error and does not modify credentials. Use NMX-C for NVLink partition management.",
+    after_long_help = "\
+EXAMPLES:
 
-impl From<Args> for forgerpc::CredentialDeletionRequest {
-    fn from(args: Args) -> Self {
-        Self {
-            credential_type: CredentialType::NmxM.into(),
-            username: Some(args.username),
-            mac_address: None,
-        }
-    }
+Invoke the retained compatibility command (returns an unsupported error):
+    $ nico-admin-cli credential delete-nmx-m --username admin
+
+"
+)]
+pub(crate) struct Args {
+    #[clap(long, help = "Legacy NMX-M credential username")]
+    username: Option<String>,
 }

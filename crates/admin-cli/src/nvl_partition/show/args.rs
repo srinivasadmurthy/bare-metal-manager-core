@@ -18,14 +18,30 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all NvLink partitions:
+    $ nico-admin-cli nvl-partition show
+
+Show one NvLink partition by ID:
+    $ nico-admin-cli nvl-partition show 12345678-1234-5678-90ab-cdef01234567
+
+Filter by tenant org:
+    $ nico-admin-cli nvl-partition show --tenant-org-id fds34511233a
+
+Filter by name:
+    $ nico-admin-cli nvl-partition show --name my-partition
+
+")]
+pub(crate) struct Args {
     #[clap(
         default_value(""),
         help = "Optional, NvLink Partition ID to search for"
     )]
-    pub id: String,
+    pub(super) id: String,
     #[clap(short, long, help = "Optional, Tenant Organization ID to search for")]
-    pub tenant_org_id: Option<String>,
+    pub(super) tenant_org_id: Option<String>,
     #[clap(short, long, help = "Optional, NvLink Partition Name to search for")]
-    pub name: Option<String>,
+    pub(super) name: Option<String>,
 }

@@ -17,27 +17,22 @@
 
 use std::collections::HashMap;
 
-use ::rpc::errors::RpcDataConversionError;
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::instance_type::InstanceTypeId;
 use carbide_uuid::machine::MachineId;
 use carbide_uuid::network_security_group::NetworkSecurityGroupId;
 use chrono::{DateTime, Utc};
-use config_version::{ConfigVersion, Versioned};
+use config_version::ConfigVersion;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgRow;
-use sqlx::{FromRow, Row};
 
 use super::config::network::{InstanceNetworkConfig, InstanceNetworkConfigUpdate};
 use crate::instance::config::InstanceConfig;
 use crate::instance::config::extension_services::InstanceExtensionServicesConfig;
 use crate::instance::config::infiniband::InstanceInfinibandConfig;
 use crate::instance::config::nvlink::InstanceNvLinkConfig;
+use crate::instance::config::spx::InstanceSpxConfig;
 use crate::instance::config::tenant_config::TenantConfig;
-use crate::instance::status::{InstanceStatus, InstanceStatusObservations};
-use crate::machine::infiniband::MachineInfinibandStatusObservation;
-use crate::machine::nvlink::MachineNvLinkStatusObservation;
-use crate::machine::{ManagedHostState, ReprovisionRequest};
+use crate::instance::status::InstanceStatusObservations;
 use crate::metadata::Metadata;
 use crate::os::{InlineIpxe, OperatingSystem, OperatingSystemVariant};
 use crate::tenant::TenantOrganizationId;
@@ -84,6 +79,8 @@ pub struct InstanceSnapshot {
 
     pub nvlink_config_version: ConfigVersion,
 
+    pub spx_config_version: ConfigVersion,
+
     /// Observed status of the instance
     pub observations: InstanceStatusObservations,
 
@@ -109,38 +106,6 @@ pub struct InstanceSnapshot {
     // pub(crate) finished: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-impl InstanceSnapshot {
-    /// Derives the tenant and site-admin facing [`InstanceStatus`] from the
-    /// snapshot information about the instance
-    pub fn derive_status(
-        &self,
-        dpu_id_to_device_map: HashMap<String, Vec<MachineId>>,
-        managed_host_state: ManagedHostState,
-        reprovision_request: Option<ReprovisionRequest>,
-        ib_status: Option<&MachineInfinibandStatusObservation>,
-        nvlink_status: Option<&MachineNvLinkStatusObservation>,
-    ) -> Result<InstanceStatus, RpcDataConversionError> {
-        InstanceStatus::from_config_and_observation(
-            dpu_id_to_device_map,
-            Versioned::new(&self.config, self.config_version),
-            Versioned::new(&self.config.network, self.network_config_version),
-            Versioned::new(&self.config.infiniband, self.ib_config_version),
-            Versioned::new(
-                &self.config.extension_services,
-                self.extension_services_config_version,
-            ),
-            Versioned::new(&self.config.nvlink, self.nvlink_config_version),
-            &self.observations,
-            managed_host_state,
-            self.deleted.is_some(),
-            reprovision_request,
-            ib_status,
-            nvlink_status,
-            self.update_network_config_request.is_some(),
-        )
-    }
-}
-
 /// This represents the structure of an instance we get from postgres via the row_to_json or
 /// JSONB_AGG functions. Its fields need to match the column names of the instances table exactly.
 /// It's expected that we read this directly from the JSON returned by the query, and then
@@ -160,6 +125,8 @@ pub struct InstanceSnapshotPgJson {
     storage_config_version: String,
     nvlink_config: InstanceNvLinkConfig,
     nvlink_config_version: String,
+    spx_config: InstanceSpxConfig,
+    spx_config_version: String,
     config_version: String,
     phone_home_last_contact: Option<DateTime<Utc>>,
     use_custom_pxe_on_boot: bool,
@@ -177,6 +144,8 @@ pub struct InstanceSnapshotPgJson {
     pub operating_system_id: Option<uuid::Uuid>,
     instance_type_id: Option<InstanceTypeId>,
     network_security_group_id: Option<NetworkSecurityGroupId>,
+    #[serde(default)]
+    power_profile: Option<String>,
     extension_services_config: InstanceExtensionServicesConfig,
     extension_services_config_version: String,
     requested: DateTime<Utc>,
@@ -184,15 +153,6 @@ pub struct InstanceSnapshotPgJson {
     finished: Option<DateTime<Utc>>,
     deleted: Option<DateTime<Utc>>,
     update_network_config_request: Option<InstanceNetworkConfigUpdate>,
-}
-
-impl<'r> FromRow<'r, PgRow> for InstanceSnapshot {
-    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        let json: serde_json::value::Value = row.try_get(0)?;
-        InstanceSnapshotPgJson::deserialize(json)
-            .map_err(|err| sqlx::Error::Decode(err.into()))?
-            .try_into()
-    }
 }
 
 /// Builds an [`InstanceSnapshot`] from DB JSON and a pre-merged [`OperatingSystem`].
@@ -220,9 +180,11 @@ pub fn from_pg_json_and_os(
         os,
         network: value.network_config,
         infiniband: value.ib_config,
+        spxconfig: value.spx_config,
         nvlink: value.nvlink_config,
         network_security_group_id: value.network_security_group_id,
         extension_services: value.extension_services_config,
+        power_profile: value.power_profile,
     };
 
     Ok(InstanceSnapshot {
@@ -252,6 +214,12 @@ pub fn from_pg_json_and_os(
         nvlink_config_version: value.nvlink_config_version.parse().map_err(|e| {
             sqlx::error::Error::ColumnDecode {
                 index: "nvl_config_version".to_string(),
+                source: Box::new(e),
+            }
+        })?,
+        spx_config_version: value.spx_config_version.parse().map_err(|e| {
+            sqlx::error::Error::ColumnDecode {
+                index: "spx_config_version".to_string(),
                 source: Box::new(e),
             }
         })?,
@@ -331,6 +299,8 @@ impl TryFrom<InstanceSnapshotPgJson> for InstanceSnapshot {
             nvlink: value.nvlink_config,
             network_security_group_id: value.network_security_group_id,
             extension_services: value.extension_services_config,
+            spxconfig: value.spx_config,
+            power_profile: value.power_profile,
         };
 
         Ok(InstanceSnapshot {
@@ -360,6 +330,12 @@ impl TryFrom<InstanceSnapshotPgJson> for InstanceSnapshot {
             nvlink_config_version: value.nvlink_config_version.parse().map_err(|e| {
                 sqlx::error::Error::ColumnDecode {
                     index: "nvl_config_version".to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+            spx_config_version: value.spx_config_version.parse().map_err(|e| {
+                sqlx::error::Error::ColumnDecode {
+                    index: "spx_config_version".to_string(),
                     source: Box::new(e),
                 }
             })?,
@@ -397,10 +373,13 @@ impl TryFrom<InstanceSnapshotPgJson> for InstanceSnapshot {
 mod tests {
     use std::str::FromStr;
 
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::scenarios;
     use chrono::Utc;
     use uuid::Uuid;
 
     use super::*;
+    use crate::os::{InlineIpxe, OperatingSystemVariant};
 
     fn minimal_pg_json() -> InstanceSnapshotPgJson {
         let version = ConfigVersion::initial().version_string();
@@ -420,6 +399,8 @@ mod tests {
             storage_config_version: version.clone(),
             nvlink_config: InstanceNvLinkConfig::default(),
             nvlink_config_version: version.clone(),
+            spx_config: InstanceSpxConfig::default(),
+            spx_config_version: version.clone(),
             config_version: version.clone(),
             phone_home_last_contact: None,
             use_custom_pxe_on_boot: false,
@@ -435,6 +416,7 @@ mod tests {
             operating_system_id: None,
             instance_type_id: None,
             network_security_group_id: None,
+            power_profile: None,
             extension_services_config: InstanceExtensionServicesConfig::default(),
             extension_services_config_version: version,
             requested: Utc::now(),
@@ -449,6 +431,7 @@ mod tests {
     fn test_from_pg_json_and_os_uses_provided_os() {
         let mut pg_json = minimal_pg_json();
         pg_json.operating_system_id = Some(Uuid::nil());
+        pg_json.power_profile = Some("balanced".to_string());
         let os = OperatingSystem {
             user_data: Some("user-data".to_string()),
             variant: OperatingSystemVariant::Ipxe(InlineIpxe {
@@ -461,6 +444,7 @@ mod tests {
         assert_eq!(snapshot.config.os.variant, os.variant);
         assert_eq!(snapshot.config.os.user_data, os.user_data);
         assert_eq!(snapshot.config.os.phone_home_enabled, os.phone_home_enabled);
+        assert_eq!(snapshot.config.power_profile.as_deref(), Some("balanced"));
         if let OperatingSystemVariant::Ipxe(ipxe) = &snapshot.config.os.variant {
             assert_eq!(ipxe.ipxe_script, "script-from-os");
         } else {
@@ -468,41 +452,73 @@ mod tests {
         }
     }
 
+    /// `InstanceSnapshot::try_from` derives the OS variant from the legacy
+    /// instance columns (priority: operating_system_id > os_image_id > inline
+    /// iPXE). Each row mutates a minimal pg-json row, then projects the converted
+    /// snapshot to the fields under test: (os variant, user_data, phone_home,
+    /// power_profile).
     #[test]
-    fn test_try_from_legacy_ipxe_derives_os_from_instance_columns() {
-        let mut pg_json = minimal_pg_json();
-        pg_json.operating_system_id = None;
-        pg_json.os_ipxe_script = "legacy-inline-script".to_string();
-        pg_json.os_image_id = None;
-        pg_json.os_user_data = Some("legacy-user-data".to_string());
-        pg_json.os_phone_home_enabled = true;
-        let snapshot = InstanceSnapshot::try_from(pg_json).unwrap();
-        assert!(matches!(
-            &snapshot.config.os.variant,
-            OperatingSystemVariant::Ipxe(_)
-        ));
-        if let OperatingSystemVariant::Ipxe(ipxe) = &snapshot.config.os.variant {
-            assert_eq!(ipxe.ipxe_script, "legacy-inline-script");
-        }
-        assert_eq!(
-            snapshot.config.os.user_data.as_deref(),
-            Some("legacy-user-data")
-        );
-        assert!(snapshot.config.os.phone_home_enabled);
-    }
-
-    #[test]
-    fn test_try_from_legacy_os_image_derives_os_from_instance_columns() {
+    fn test_try_from_derives_os_from_instance_columns() {
         let image_uuid = uuid::uuid!("a1b2c3d4-e5f6-4780-a123-456789abcdef");
-        let mut pg_json = minimal_pg_json();
-        pg_json.operating_system_id = None;
-        pg_json.os_image_id = Some(image_uuid);
-        pg_json.os_ipxe_script = "ignored".to_string();
-        let snapshot = InstanceSnapshot::try_from(pg_json).unwrap();
-        assert!(matches!(
-            &snapshot.config.os.variant,
-            OperatingSystemVariant::OsImage(id) if *id == image_uuid
-        ));
+        let os_uuid = uuid::uuid!("b2c3d4e5-f6a7-4890-b234-567890abcdef");
+
+        scenarios!(
+            // Apply the row's mutation to a minimal pg-json, convert, and project
+            // to the asserted OS fields. The error type (sqlx::Error) is not
+            // PartialEq, so on failure we discard it.
+            run = |mutate| {
+                let mut pg_json = minimal_pg_json();
+                mutate(&mut pg_json);
+                InstanceSnapshot::try_from(pg_json)
+                    .map(|snapshot| {
+                        (
+                            snapshot.config.os.variant,
+                            snapshot.config.os.user_data,
+                            snapshot.config.os.phone_home_enabled,
+                            snapshot.config.power_profile,
+                        )
+                    })
+                    .map_err(drop)
+            };
+            "legacy inline iPXE derives Ipxe variant with user_data and phone_home" {
+                Box::new(|pg: &mut InstanceSnapshotPgJson| {
+                    pg.operating_system_id = None;
+                    pg.os_image_id = None;
+                    pg.os_ipxe_script = "legacy-inline-script".to_string();
+                    pg.os_user_data = Some("legacy-user-data".to_string());
+                    pg.os_phone_home_enabled = true;
+                    pg.power_profile = Some("balanced".to_string());
+                }) as Box<dyn Fn(&mut InstanceSnapshotPgJson)> => Yields((
+                    OperatingSystemVariant::Ipxe(InlineIpxe {
+                        ipxe_script: "legacy-inline-script".to_string(),
+                    }),
+                    Some("legacy-user-data".to_string()),
+                    true,
+                    Some("balanced".to_string()),
+                )),
+            }
+
+            "legacy os_image_id derives OsImage variant (iPXE script ignored)" {
+                Box::new(move |pg: &mut InstanceSnapshotPgJson| {
+                    pg.operating_system_id = None;
+                    pg.os_image_id = Some(image_uuid);
+                    pg.os_ipxe_script = "ignored".to_string();
+                }) => Yields((OperatingSystemVariant::OsImage(image_uuid), None, false, None)),
+            }
+
+            "operating_system_id takes priority over image and iPXE" {
+                Box::new(move |pg: &mut InstanceSnapshotPgJson| {
+                    pg.operating_system_id = Some(os_uuid);
+                    pg.os_image_id = None;
+                    pg.os_ipxe_script = String::new();
+                }) => Yields((
+                    OperatingSystemVariant::OperatingSystemId(os_uuid),
+                    None,
+                    false,
+                    None,
+                )),
+            }
+        );
     }
 
     #[test]
@@ -515,19 +531,5 @@ mod tests {
         assert!(matches!(err, sqlx::Error::ColumnDecode { .. }));
         assert!(format!("{err}").contains("no operating_system_id"));
         assert!(format!("{err}").contains("no iPXE script"));
-    }
-
-    #[test]
-    fn test_try_from_with_operating_system_id() {
-        let os_uuid = uuid::uuid!("b2c3d4e5-f6a7-4890-b234-567890abcdef");
-        let mut pg_json = minimal_pg_json();
-        pg_json.operating_system_id = Some(os_uuid);
-        pg_json.os_ipxe_script = String::new();
-        pg_json.os_image_id = None;
-        let snapshot = InstanceSnapshot::try_from(pg_json).unwrap();
-        assert!(matches!(
-            &snapshot.config.os.variant,
-            OperatingSystemVariant::OperatingSystemId(id) if *id == os_uuid
-        ));
     }
 }

@@ -19,16 +19,27 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub enum Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show all validation runs:
+    $ nico-admin-cli machine-validation runs show
+
+Show runs for one machine, including history:
+    $ nico-admin-cli machine-validation runs show --machine 12345678-1234-5678-90ab-cdef01234567 \
+    --history
+
+")]
+pub(crate) enum Args {
     #[clap(about = "Show Runs")]
     Show(ShowRunsOptions),
 }
 
 #[derive(Parser, Debug)]
-pub struct ShowRunsOptions {
+pub(crate) struct ShowRunsOptions {
     #[clap(short = 'm', long, help = "Show machine validation runs of a machine")]
-    pub machine: Option<MachineId>,
+    pub(super) machine: Option<MachineId>,
 
     #[clap(long, default_value = "false", help = "run history")]
-    pub history: bool,
+    pub(super) history: bool,
 }

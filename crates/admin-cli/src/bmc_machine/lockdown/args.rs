@@ -19,23 +19,39 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Enable lockdown on a machine:
+    $ nico-admin-cli bmc-machine lockdown \
+    --machine 12345678-1234-5678-90ab-cdef01234567 --enable
+
+Disable lockdown on a machine:
+    $ nico-admin-cli bmc-machine lockdown \
+    --machine 12345678-1234-5678-90ab-cdef01234567 --disable
+
+Enable lockdown and reboot to apply the change:
+    $ nico-admin-cli bmc-machine lockdown \
+    --machine 12345678-1234-5678-90ab-cdef01234567 --enable --reboot
+
+")]
+pub(crate) struct Args {
     #[clap(long, help = "ID of the machine to enable/disable lockdown")]
-    pub machine: MachineId,
+    pub(super) machine: MachineId,
     #[clap(short, long, help = "Issue reboot to apply lockdown change")]
-    pub reboot: bool,
+    pub(super) reboot: bool,
     #[clap(
         long,
         conflicts_with = "disable",
         required_unless_present = "disable",
         help = "Enable lockdown"
     )]
-    pub enable: bool,
+    pub(super) enable: bool,
     #[clap(
         long,
         conflicts_with = "enable",
         required_unless_present = "enable",
         help = "Disable lockdown"
     )]
-    pub disable: bool,
+    pub(super) disable: bool,
 }

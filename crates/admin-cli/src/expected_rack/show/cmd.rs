@@ -16,13 +16,14 @@
  */
 
 use prettytable::{Table, row};
-use rpc::admin_cli::{CarbideCliResult, OutputFormat};
+use rpc::admin_cli::OutputFormat;
 use rpc::forge::ExpectedRackRequest;
 
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn show(
+pub(super) async fn show(
     query: &Args,
     api_client: &ApiClient,
     output_format: OutputFormat,

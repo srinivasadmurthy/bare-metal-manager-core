@@ -19,9 +19,19 @@ use clap::Parser;
 use rpc::forge::FindTenantRequest;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all tenants:
+    $ nico-admin-cli tenant show
+
+Show details for one tenant org:
+    $ nico-admin-cli tenant show fds34511233a
+
+")]
+pub(crate) struct Args {
     #[clap(help = "Optional, tenant org ID to restrict the search")]
-    pub tenant_org: Option<String>,
+    tenant_org: Option<String>,
 }
 
 impl From<&Args> for Option<FindTenantRequest> {

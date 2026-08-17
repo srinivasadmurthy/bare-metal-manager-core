@@ -40,6 +40,7 @@ pub fn setup_logging() {
     use tracing_subscriber::util::SubscriberInitExt;
 
     if let Err(e) = tracing_subscriber::registry()
+        .with(carbide_instrument::LogEventsMetric::new("nico-api").layer())
         .with(
             tracing_subscriber::fmt::Layer::default()
                 .compact()
@@ -55,8 +56,10 @@ pub fn setup_logging() {
                 .add_directive("rustls=warn".parse().unwrap())
                 .add_directive("hyper=warn".parse().unwrap())
                 .add_directive("h2=warn".parse().unwrap())
+                // Suppress expected, repetitive environment diagnostics in integration tests.
+                .add_directive("carbide_diagnostics=off".parse().unwrap())
                 // Silence permissive mode related messages
-                .add_directive("carbide::auth=error".parse().unwrap()),
+                .add_directive("carbide_api_core::auth=error".parse().unwrap()),
         )
         .try_init()
     {

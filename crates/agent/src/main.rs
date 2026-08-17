@@ -14,11 +14,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#![cfg_attr(not(test), deny(dead_code_pub_in_binary))]
 
 use std::time::Duration;
 
 fn main() -> eyre::Result<()> {
-    carbide_host_support::init_logging()?;
+    let options = agent::Options::load();
+
+    // Purely local interrogation for troubleshooting.
+    if matches!(options.cmd, Some(agent::AgentCommand::LldpNeighbors)) {
+        let neighbors = carbide_host_support::lldp_collector::collect_lldp_neighbors()?;
+        println!("{neighbors:#?}");
+        return Ok(());
+    }
+
+    carbide_host_support::init_logging("nico-dpu-agent")?;
+    carbide_instrument::log_events::register(&agent::instrumentation::config::get_dpu_agent_meter());
 
     // We need a multi-threaded runtime since background threads will queue work
     // on it, and the foreground thread might not be blocked onto the runtime
@@ -26,7 +37,7 @@ fn main() -> eyre::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(agent::start(agent::Options::load()))?;
+    rt.block_on(agent::start(options))?;
     rt.shutdown_timeout(Duration::from_secs(2));
     Ok(())
 }

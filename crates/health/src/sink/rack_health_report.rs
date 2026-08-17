@@ -17,10 +17,14 @@
 
 use std::sync::Arc;
 
+use carbide_instrument::{Outcome, emit};
 use carbide_uuid::rack::RackId;
 
 use super::dedup_queue::DedupQueue;
-use super::{CollectorEvent, DataSink, EventContext, HealthReport, ReportSource};
+use super::{
+    CollectorEvent, DataSink, EventContext, HealthReport, HealthReportSubmitted,
+    HealthReportTarget, ReportSource,
+};
 use crate::HealthError;
 use crate::api_client::ApiClientWrapper;
 use crate::config::RackHealthReportSinkConfig;
@@ -33,6 +37,7 @@ struct RackHealthReportKey {
 
 pub struct RackHealthReportSink {
     queue: Arc<DedupQueue<RackHealthReportKey, Arc<HealthReport>>>,
+    skip_empty_reports: bool,
 }
 
 impl RackHealthReportSink {
@@ -62,17 +67,16 @@ impl RackHealthReportSink {
 
                     match report.as_ref().try_into() {
                         Ok(converted) => {
-                            if let Err(error) = worker_client
+                            let result = worker_client
                                 .submit_rack_health_report(&key.id, converted)
-                                .await
-                            {
-                                tracing::warn!(
-                                    ?error,
-                                    worker_id,
-                                    rack_id = %key.id,
-                                    "Failed to submit rack health report"
-                                );
-                            }
+                                .await;
+                            emit(HealthReportSubmitted {
+                                target: HealthReportTarget::Rack,
+                                outcome: Outcome::from(&result),
+                                id: key.id.to_string(),
+                                worker_id,
+                                error: result.err().map(|e| e.to_string()).unwrap_or_default(),
+                            });
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -87,7 +91,10 @@ impl RackHealthReportSink {
             });
         }
 
-        Ok(Self { queue })
+        Ok(Self {
+            queue,
+            skip_empty_reports: config.skip_empty_reports,
+        })
     }
 }
 
@@ -96,21 +103,35 @@ impl DataSink for RackHealthReportSink {
         "rack_health_report_sink"
     }
 
-    fn handle_event(&self, context: &EventContext, event: &CollectorEvent) {
+    fn try_handle_event(
+        &self,
+        context: &EventContext,
+        event: &CollectorEvent,
+    ) -> Result<(), HealthError> {
         let CollectorEvent::HealthReport(report) = event else {
-            return;
+            return Ok(());
         };
 
-        if report.source != ReportSource::RackLeakDetection {
-            return;
+        if report.target != Some(HealthReportTarget::Rack) {
+            return Ok(());
+        }
+
+        if self.skip_empty_reports && report.is_empty() {
+            tracing::debug!(
+                source = ?report.source,
+                "Skipping empty rack health report"
+            );
+            return Ok(());
         }
 
         let Some(rack_id) = context.rack_id() else {
             tracing::warn!(
                 endpoint_key = context.endpoint_key(),
-                "Received RackLeakDetection report without rack_id context"
+                "Received rack-target HealthReport event without rack_id context"
             );
-            return;
+            return Err(HealthError::GenericError(
+                "rack-target health report event without rack_id context".to_string(),
+            ));
         };
 
         let key = RackHealthReportKey {
@@ -118,5 +139,7 @@ impl DataSink for RackHealthReportSink {
             source: report.source,
         };
         self.queue.save_latest(key, Arc::clone(report));
+
+        Ok(())
     }
 }

@@ -20,6 +20,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [lib]
 name = "rpc"
@@ -27,19 +28,42 @@ name = "rpc"
 [features]
 sqlx = ["dep:sqlx"]
 cli = ["dep:clap", "dep:prettytable-rs", "dep:serde_yaml", "dep:csv"]
+model = [
+  "dep:carbide-api-model",
+  "dep:once_cell",
+  "dep:itertools",
+  "dep:itertools",
+  "dep:regex",
+  "dep:base64",
+]
+test-support = ["dep:carbide-prost-builder"]
 
 [dependencies]
+carbide-instrument = { path = "../instrument" }
 
 # [local-dependencies]
+carbide-api-model = { path = "../api-model", optional = true }
 carbide-http-connector = { path = "../http-connector" }
+carbide-ipxe-renderer = { path = "../ipxe-renderer" }
 carbide-tls = { path = "../tls" }
+trace-propagation = { path = "../trace-propagation" }
 carbide-health-report = { path = "../health-report" }
+carbide-libmlx-model = { path = "../libmlx-model" }
+carbide-measured-boot = { path = "../measured-boot", default-features = false }
+carbide-prost-builder = { path = "../prost-builder", optional = true }
+carbide-secrets = { path = "../secrets" }
+carbide-network = { path = "../network" }
+carbide-utils = { path = "../utils" }
+config-version = { path = "../config-version" }
 tonic-client-wrapper = { path = "../tonic-client-wrapper", default-features = false }
 dns-record = { path = "../dns-record" }
 carbide-uuid = { path = "../uuid" }
 
 chrono = { features = ["serde"], workspace = true }
+const_format = { workspace = true }
 eyre = { workspace = true }
+jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
+p256 = { workspace = true }
 hyper = { workspace = true, features = ["full"] }
 hyper-rustls = { workspace = true, features = ["http2"] }
 hyper-util = { features = [
@@ -75,7 +99,8 @@ async-trait = { workspace = true }
 nonempty = { workspace = true }
 clap = { features = ["derive"], optional = true, workspace = true }
 sqlx = { workspace = true, features = [
-  "runtime-tokio-rustls",
+  "runtime-tokio",
+  "tls-rustls",
   "mac_address",
   "ipnetwork",
   "uuid",
@@ -94,7 +119,26 @@ sha2 = { workspace = true }
 ipnetwork = { workspace = true, features = ["serde"] }
 csv = { optional = true, workspace = true }
 
+once_cell = { workspace = true, optional = true }
+itertools = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+
+[dev-dependencies]
+carbide-api-model = { path = "../api-model", features = ["test-support"] }
+carbide-libmlx-model = { path = "../libmlx-model", features = ["test-support"] }
+carbide-test-support = { path = "../test-support" }
+criterion = { workspace = true }
+rcgen = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "machine_convert"
+harness = false
+required-features = ["model"]
+
 [build-dependencies]
+carbide-proto-compiler = { path = "../proto-compiler" }
 tonic-prost-build = "0.14"
 tonic-client-wrapper = { path = "../tonic-client-wrapper" }
 

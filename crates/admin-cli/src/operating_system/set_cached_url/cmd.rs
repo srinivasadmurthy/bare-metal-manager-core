@@ -15,15 +15,16 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge::IpxeTemplateArtifactCacheStrategy;
 use prettytable::{Cell, Row, Table};
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::operating_system::common::{SerializableArtifact, str_to_os_id};
 use crate::rpc::ApiClient;
 
-pub async fn set_cached_url(
+pub(super) async fn set_cached_url(
     opts: Args,
     format: OutputFormat,
     api_client: &ApiClient,

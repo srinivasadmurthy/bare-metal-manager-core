@@ -20,11 +20,9 @@ use std::sync::Arc;
 
 use super::{EventContext, EventProcessor};
 use crate::sink::{
-    Classification, CollectorEvent, HealthReport, HealthReportAlert, HealthReportSuccess, Probe,
-    ReportSource,
+    Classification, CollectorEvent, HealthReport, HealthReportAlert, HealthReportSuccess,
+    HealthReportTarget, Probe, ReportSource,
 };
-
-const LEAK_DETECTOR_MARKER: &str = Classification::LeakDetector.as_str();
 
 pub struct LeakEventProcessor {
     minimum_alerts_per_report: usize,
@@ -40,13 +38,6 @@ impl LeakEventProcessor {
     fn is_leaking(&self, alerts: usize) -> bool {
         alerts >= self.minimum_alerts_per_report
     }
-}
-
-fn is_leak_detector_alert(alert: &HealthReportAlert) -> bool {
-    alert
-        .target
-        .as_deref()
-        .is_some_and(|input| input.contains(LEAK_DETECTOR_MARKER))
 }
 
 fn leak_details(alerts: &[&HealthReportAlert]) -> String {
@@ -76,11 +67,37 @@ impl EventProcessor for LeakEventProcessor {
             return Vec::new();
         };
 
+        // Normalize each source's leak signal into the derived tray leak report
+        // consumed by rack leak aggregation.
+        let (target, leak_classification, alert_kind, detail_kind) = match report.source {
+            ReportSource::BmcLeakDetectors => (
+                HealthReportTarget::Machine,
+                Classification::LeakDetector,
+                "leak-detector",
+                "detectors",
+            ),
+            ReportSource::NvueLeakage => (
+                HealthReportTarget::Switch,
+                Classification::Leak,
+                "nvue-leakage",
+                "leakage sensors",
+            ),
+            _ => return Vec::new(),
+        };
+
         let leak_alerts: Vec<&HealthReportAlert> = report
             .alerts
             .iter()
-            .filter(|alert| is_leak_detector_alert(alert))
+            .filter(|alert| alert.classifications.contains(&leak_classification))
             .collect();
+
+        if report.source == ReportSource::NvueLeakage
+            && leak_alerts.is_empty()
+            && !report.alerts.is_empty()
+        {
+            // Non-leak NVUE alerts are sensor or availability failures, not an all-clear.
+            return Vec::new();
+        }
 
         let alerts = if self.is_leaking(leak_alerts.len()) {
             let details = leak_details(&leak_alerts);
@@ -89,9 +106,11 @@ impl EventProcessor for LeakEventProcessor {
                 probe_id: Probe::LeakDetection,
                 target: None,
                 message: format!(
-                    "Leak detected: {} leak-detector alerts reached threshold {} (detectors: {})",
+                    "Leak detected: {} {} alerts reached threshold {} ({}: {})",
                     leak_alerts.len(),
+                    alert_kind,
                     self.minimum_alerts_per_report,
+                    detail_kind,
                     details
                 ),
                 classifications: vec![Classification::Leak],
@@ -111,6 +130,7 @@ impl EventProcessor for LeakEventProcessor {
 
         let leak_report = HealthReport {
             source: ReportSource::TrayLeakDetection,
+            target: Some(target),
             observed_at: Some(chrono::Utc::now()),
             successes,
             alerts,
@@ -138,15 +158,16 @@ mod tests {
                 port: Some(443),
                 mac: MacAddress::from_str("42:9e:b1:bd:9d:dd").expect("valid mac"),
             },
-            collector_type: "sensor_collector",
+            collector_type: "leak_detector_collector",
             metadata: None,
             rack_id: None,
+            labels: Default::default(),
         }
     }
 
     fn leak_alert(target: &str) -> HealthReportAlert {
         HealthReportAlert {
-            probe_id: Probe::Sensor,
+            probe_id: Probe::LeakDetection,
             target: Some(target.to_string()),
             message: "LeakDetector found leak".to_string(),
             classifications: vec![Classification::LeakDetector],
@@ -157,7 +178,8 @@ mod tests {
     fn does_not_emit_alert_when_threshold_not_met() {
         let processor = LeakEventProcessor::new(2);
         let report = HealthReport {
-            source: ReportSource::BmcSensors,
+            source: ReportSource::BmcLeakDetectors,
+            target: Some(HealthReportTarget::Machine),
             observed_at: Some(chrono::Utc::now()),
             successes: Vec::new(),
             alerts: vec![leak_alert("LeakDetector_Probe")],
@@ -171,6 +193,7 @@ mod tests {
             panic!("expected derived health report");
         };
 
+        assert_eq!(derived.target, Some(HealthReportTarget::Machine));
         assert_eq!(derived.alerts.len(), 0);
         assert_eq!(derived.successes.len(), 1);
         assert_eq!(derived.successes[0].probe_id, Probe::LeakDetection);
@@ -180,7 +203,8 @@ mod tests {
     fn emits_derived_leak_report_when_threshold_met() {
         let processor = LeakEventProcessor::new(1);
         let report = HealthReport {
-            source: ReportSource::BmcSensors,
+            source: ReportSource::BmcLeakDetectors,
+            target: Some(HealthReportTarget::Machine),
             observed_at: Some(chrono::Utc::now()),
             successes: Vec::new(),
             alerts: vec![leak_alert("LeakDetector_Probe")],
@@ -194,6 +218,7 @@ mod tests {
             panic!("expected derived health report");
         };
         assert_eq!(derived.source, ReportSource::TrayLeakDetection);
+        assert_eq!(derived.target, Some(HealthReportTarget::Machine));
         assert_eq!(derived.alerts.len(), 1);
         assert_eq!(derived.alerts[0].probe_id, Probe::LeakDetection);
         assert!(
@@ -205,10 +230,100 @@ mod tests {
     }
 
     #[test]
+    fn emits_switch_leak_report_for_nvue_leakage() {
+        let processor = LeakEventProcessor::new(1);
+
+        let report = HealthReport {
+            source: ReportSource::NvueLeakage,
+            target: Some(HealthReportTarget::Switch),
+            observed_at: Some(chrono::Utc::now()),
+            successes: Vec::new(),
+            alerts: vec![HealthReportAlert {
+                probe_id: Probe::NvueLeakage,
+                target: Some("LEAK1".to_string()),
+                message: "NVUE leakage sensor state".to_string(),
+                classifications: vec![Classification::Leak],
+            }],
+        };
+
+        let emitted =
+            processor.process_event(&context(), &CollectorEvent::HealthReport(Arc::new(report)));
+
+        assert_eq!(emitted.len(), 1);
+
+        let CollectorEvent::HealthReport(derived) = &emitted[0] else {
+            panic!("expected derived health report");
+        };
+
+        assert_eq!(derived.source, ReportSource::TrayLeakDetection);
+        assert_eq!(derived.target, Some(HealthReportTarget::Switch));
+        assert_eq!(derived.alerts.len(), 1);
+
+        assert!(
+            derived.alerts[0]
+                .classifications
+                .contains(&Classification::Leak)
+        );
+    }
+
+    #[test]
+    fn emits_switch_success_for_nvue_leakage_clear_report() {
+        let processor = LeakEventProcessor::new(1);
+
+        let report = HealthReport {
+            source: ReportSource::NvueLeakage,
+            target: Some(HealthReportTarget::Switch),
+            observed_at: Some(chrono::Utc::now()),
+            successes: vec![HealthReportSuccess {
+                probe_id: Probe::NvueLeakage,
+                target: Some("LEAK1".to_string()),
+            }],
+            alerts: Vec::new(),
+        };
+
+        let emitted =
+            processor.process_event(&context(), &CollectorEvent::HealthReport(Arc::new(report)));
+
+        assert_eq!(emitted.len(), 1);
+
+        let CollectorEvent::HealthReport(derived) = &emitted[0] else {
+            panic!("expected derived health report");
+        };
+
+        assert_eq!(derived.target, Some(HealthReportTarget::Switch));
+        assert!(derived.alerts.is_empty());
+        assert_eq!(derived.successes.len(), 1);
+        assert_eq!(derived.successes[0].probe_id, Probe::LeakDetection);
+    }
+
+    #[test]
+    fn ignores_nvue_leakage_failure_without_leak_alert() {
+        let processor = LeakEventProcessor::new(1);
+
+        let report = HealthReport {
+            source: ReportSource::NvueLeakage,
+            target: Some(HealthReportTarget::Switch),
+            observed_at: Some(chrono::Utc::now()),
+            successes: Vec::new(),
+            alerts: vec![HealthReportAlert {
+                probe_id: Probe::NvueLeakage,
+                target: Some("LEAK1".to_string()),
+                message: "NVUE leakage sensor state".to_string(),
+                classifications: vec![Classification::SensorFailure],
+            }],
+        };
+
+        let emitted =
+            processor.process_event(&context(), &CollectorEvent::HealthReport(Arc::new(report)));
+
+        assert!(emitted.is_empty());
+    }
+
+    #[test]
     fn ignores_non_health_report_events() {
         let processor = LeakEventProcessor::new(1);
         let metric_event = CollectorEvent::Metric(
-            crate::sink::SensorHealthData {
+            crate::sink::MetricSample {
                 key: "k".to_string(),
                 name: "n".to_string(),
                 metric_type: "gauge".to_string(),
@@ -220,6 +335,26 @@ mod tests {
             .into(),
         );
         let emitted = processor.process_event(&context(), &metric_event);
+        assert!(emitted.is_empty());
+    }
+
+    #[test]
+    fn ignores_sensor_health_reports() {
+        let processor = LeakEventProcessor::new(1);
+        let report = HealthReport {
+            source: ReportSource::BmcSensors,
+            observed_at: Some(chrono::Utc::now()),
+            successes: vec![HealthReportSuccess {
+                probe_id: Probe::Sensor,
+                target: Some("Voltage_1".to_string()),
+            }],
+            alerts: vec![],
+            target: Some(HealthReportTarget::Machine),
+        };
+
+        let emitted =
+            processor.process_event(&context(), &CollectorEvent::HealthReport(Arc::new(report)));
+
         assert!(emitted.is_empty());
     }
 }

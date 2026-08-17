@@ -17,18 +17,24 @@
 
 use std::sync::Arc;
 
+use carbide_host_support::agent_config::MachineIdentityConfig;
+use eyre::eyre;
+use forge_dpu_fmds_shared::machine_identity::MachineIdentityParams;
 use rpc::fmds::fmds_config_service_client::FmdsConfigServiceClient;
-use rpc::fmds::{FmdsConfigUpdate, IbDevice, IbInstance, UpdateConfigRequest};
+use rpc::fmds::{
+    FmdsConfigUpdate, FmdsMachineIdentityConfig, IbDevice, IbInstance, UpdateConfigRequest,
+};
 use rpc::forge::ManagedHostNetworkConfigResponse;
 use tonic::transport::Channel;
 
 use crate::instance_metadata_endpoint::InstanceMetadataRouterStateImpl;
+use crate::instrumentation::FmdsPush;
 use crate::periodic_config_fetcher::InstanceMetadata;
 
 /// FmdsUpdater abstracts over embedded vs external FMDS
 /// updates so the main loop doesn't need to care which
 /// mode it's in. It's all handled in here.
-pub enum FmdsUpdater {
+pub(super) enum FmdsUpdater {
     /// Embedded will update FMDS state directly within the
     /// carbide-dpu-agent (because the FMDS listener is in
     /// the agent).
@@ -36,11 +42,11 @@ pub enum FmdsUpdater {
     /// External will send FMDS updates to an FMDS server,
     /// which is colocated on the same DPU, possibly in its
     /// own container.
-    External(FmdsGrpcClient),
+    External(Box<FmdsGrpcClient>),
 }
 
 impl FmdsUpdater {
-    pub async fn update(
+    pub(super) async fn update(
         &mut self,
         instance_data: Option<Arc<InstanceMetadata>>,
         network_config: Option<Arc<ManagedHostNetworkConfigResponse>>,
@@ -51,30 +57,50 @@ impl FmdsUpdater {
                 state.update_network_configuration(network_config);
             }
             FmdsUpdater::External(client) => {
-                if let Err(err) = client.update_config(&instance_data, &network_config).await {
-                    tracing::error!(
-                        error = format!("{err:#}"),
-                        fmds_address = client.address,
-                        "Failed to send config update to external FMDS"
-                    );
+                let result = client.update_config(&instance_data, &network_config).await;
+                match &result {
+                    Ok(()) => FmdsPush::Succeeded.emit(),
+                    Err(err) => FmdsPush::Failed {
+                        error: format!("{err:#}"),
+                        fmds_address: client.address.clone(),
+                    }
+                    .emit(),
                 }
             }
         }
     }
 }
 
-pub struct FmdsGrpcClient {
+pub(super) struct FmdsGrpcClient {
     client: FmdsConfigServiceClient<Channel>,
     address: String,
+    machine_identity: MachineIdentityConfig,
 }
 
 impl FmdsGrpcClient {
-    pub async fn connect(address: &str) -> eyre::Result<Self> {
+    pub(super) async fn connect(
+        address: &str,
+        machine_identity: MachineIdentityConfig,
+    ) -> eyre::Result<Self> {
         let client = FmdsConfigServiceClient::connect(address.to_string()).await?;
         Ok(Self {
             client,
             address: address.to_string(),
+            machine_identity,
         })
+    }
+
+    fn machine_identity_proto(&self) -> eyre::Result<FmdsMachineIdentityConfig> {
+        MachineIdentityParams::try_from_limits(
+            self.machine_identity.requests_per_second,
+            self.machine_identity.burst,
+            self.machine_identity.wait_timeout_secs,
+            self.machine_identity.sign_timeout_secs,
+            self.machine_identity.sign_proxy_url.as_deref(),
+            self.machine_identity.sign_proxy_tls_root_ca.as_deref(),
+        )
+        .map(Into::into)
+        .map_err(|msg| eyre!("machine-identity (FMDS config push): {msg}"))
     }
 
     async fn update_config(
@@ -114,14 +140,17 @@ impl FmdsGrpcClient {
             .unwrap_or_default();
 
         let update = FmdsConfigUpdate {
-            address: metadata.address.clone(),
+            address: metadata.public_addresses.ipv4_string(),
+            address_ipv6: metadata.public_addresses.ipv6_string(),
             hostname: metadata.hostname.clone(),
+            instance_name: metadata.instance_name.clone(),
             sitename: metadata.sitename.clone(),
             instance_id: metadata.instance_id,
             machine_id: metadata.machine_id,
             user_data: metadata.user_data.clone(),
             ib_devices,
             asn,
+            machine_identity: Some(self.machine_identity_proto()?),
         };
 
         self.client

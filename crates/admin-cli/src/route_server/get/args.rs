@@ -18,4 +18,11 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {}
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all configured route servers:
+    $ nico-admin-cli route-server get
+
+")]
+pub(crate) struct Args {}

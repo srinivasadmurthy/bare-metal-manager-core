@@ -18,7 +18,14 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Replace all expected racks with the contents of a JSON file:
+    $ nico-admin-cli expected-rack replace-all --filename ./racks.json
+
+")]
+pub(crate) struct Args {
     #[clap(short, long)]
-    pub filename: String,
+    pub(super) filename: String,
 }

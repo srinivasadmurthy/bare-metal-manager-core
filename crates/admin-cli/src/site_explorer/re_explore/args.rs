@@ -18,7 +18,14 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Queue a host for re-exploration in the next cycle (result is stored):
+    $ nico-admin-cli site-explorer re-explore 192.0.2.10
+
+")]
+pub(crate) struct Args {
     #[clap(help = "BMC IP address")]
-    pub address: String,
+    pub(super) address: String,
 }

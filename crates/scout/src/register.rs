@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+use ::rpc::MachineDiscoveryReporter;
 use carbide_host_support::hardware_enumeration::enumerate_hardware;
 use carbide_host_support::registration;
 use carbide_host_support::registration::RegistrationError;
@@ -23,9 +24,9 @@ use tracing::info;
 use tss_esapi::Context;
 use tss_esapi::handles::KeyHandle;
 
-use crate::{CarbideClientError, attestation as attest};
+use crate::{CarbideClientError, attestation as attest, platform, tpm};
 
-pub async fn run(
+pub(super) async fn run(
     forge_api: &str,
     root_ca: String,
     machine_interface_id: Option<uuid::Uuid>,
@@ -35,7 +36,9 @@ pub async fn run(
     let mut hardware_info = enumerate_hardware()?;
     info!("Successfully enumerated hardware");
 
-    let is_dpu = hardware_info.tpm_ek_certificate.is_none();
+    // Missing TPM EK material must not be treated as DPU detection. DPUs are
+    // identified from platform SMBIOS data, not from TPM availability.
+    let is_dpu = !platform::is_host();
 
     if machine_interface_id.is_none() && !is_dpu {
         return Err(CarbideClientError::GenericError(
@@ -48,7 +51,17 @@ pub async fn run(
     let mut att_key_handle_opt: Option<KeyHandle> = None;
     let mut tss_ctx_opt: Option<Context> = None;
 
-    if !is_dpu {
+    // A host with no TPM cannot attest, so gate on actual TPM presence (not just is_dpu) and skip
+    // the flow rather than hard failing in create_context_from_path.
+    let do_attestation = !is_dpu && tpm::tpm_present(tpm_path);
+    if !is_dpu && !do_attestation {
+        tracing::warn!(
+            tpm_path = ?tpm_path,
+            "Host has no TPM device; skipping attestation key setup"
+        );
+    }
+
+    if do_attestation {
         // set the max auth fail to 256 as a stop gap measure to prevent machines from failing during
         // repeated reingestion cycle
         crate::tpm::set_tpm_max_auth_fail()?;
@@ -60,9 +73,17 @@ pub async fn run(
         // CHANGETO - supply context externally
         hardware_info.tpm_description = attest::get_tpm_description(&mut tss_ctx);
 
-        let result = attest::create_attest_key_info(&mut tss_ctx).map_err(|e| {
-            CarbideClientError::TpmError(format!("Could not create AttestKeyInfo: {e}"))
-        })?;
+        let result = match attest::create_attest_key_info(&mut tss_ctx) {
+            Ok(result) => result,
+            Err(e) => {
+                if tpm::should_attempt_tpm_recovery_for_attest_key_failure(&*e) {
+                    tpm::recover_tpm_and_reboot(tpm_path)?;
+                }
+                return Err(CarbideClientError::TpmError(format!(
+                    "Could not create AttestKeyInfo: {e}"
+                )));
+            }
+        };
 
         hardware_info.attest_key_info = Some(result.0);
         endorsement_key_handle_opt = Some(result.1);
@@ -80,14 +101,20 @@ pub async fn run(
             retry.clone(),
             true,
             is_dpu,
+            MachineDiscoveryReporter::Scout,
+            Some(carbide_version::v!(build_version).to_string()),
         )
         .await?;
     let machine_id = registration_data.machine_id;
-    info!("successfully discovered machine {machine_id} for interface {machine_interface_id:?}");
+    info!(
+        %machine_id,
+        ?machine_interface_id,
+        "successfully discovered machine",
+    );
 
     // If we are not on a DPU and have some post-registration things to do,
     // we do them here.
-    if !is_dpu {
+    if do_attestation {
         // If we have received back an attestation key challenge, this means
         // that Carbide has requested an attestation, so do it!
         //
@@ -101,9 +128,9 @@ pub async fn run(
                 "Sent AttestKeyInfo and received AttestKeyBindChallenge, starting measurements ..."
             );
             tracing::info!(
-                "cred_blob - {} bytes long, secret - {} bytes long",
-                attest_key_challenge.cred_blob.len(),
-                attest_key_challenge.encrypted_secret.len()
+                credential_blob_bytes = attest_key_challenge.cred_blob.len(),
+                encrypted_secret_bytes = attest_key_challenge.encrypted_secret.len(),
+                "Received attestation key challenge credential sizes",
             );
 
             let Some(ek_handle) = endorsement_key_handle_opt else {

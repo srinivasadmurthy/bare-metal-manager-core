@@ -24,9 +24,17 @@ use crate::bmc_machine::common::InfiniteBootArgs;
 // specific newtype to allow sharing of InfiniteBootArgs, and still
 // providing a subcommand-specific Run trait implementation.
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Check whether infinite boot is enabled on a machine:
+    $ nico-admin-cli bmc-machine is-infinite-boot-enabled \
+    --machine 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(flatten)]
-    pub inner: InfiniteBootArgs,
+    inner: InfiniteBootArgs,
 }
 
 impl From<Args> for forgerpc::IsInfiniteBootEnabledRequest {

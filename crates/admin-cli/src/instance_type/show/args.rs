@@ -18,18 +18,31 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all instance types:
+    $ nico-admin-cli instance-type show
+
+Show a single instance type by id:
+    $ nico-admin-cli instance-type show --id 12345678-1234-5678-90ab-cdef01234567
+
+List instance types with allocation counts:
+    $ nico-admin-cli instance-type show --show-stats true
+
+")]
+pub(crate) struct Args {
     #[clap(
         short = 'i',
         long,
         help = "Optional, instance type ID to restrict the search"
     )]
-    pub id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[clap(
         short = 's',
         long,
         help = "Optional, show counts for allocations of instance types"
     )]
-    pub show_stats: Option<bool>,
+    pub(super) show_stats: Option<bool>,
 }

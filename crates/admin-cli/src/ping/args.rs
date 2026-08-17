@@ -18,12 +18,22 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Opts {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Ping the API server (default 1s interval):
+    $ nico-admin-cli ping
+
+Ping twice a second:
+    $ nico-admin-cli ping --interval 0.5
+
+")]
+pub(crate) struct Opts {
     #[clap(
         short,
         long,
         default_value("1.0"),
         help = "Wait interval seconds between sending each request. Real number allowed with dot as a decimal separator."
     )]
-    pub interval: f32,
+    pub(super) interval: f32,
 }

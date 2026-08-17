@@ -18,25 +18,37 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Rename a tenant org:
+    $ nico-admin-cli tenant update fds34511233a --name \"Acme Corp\"
+
+Apply a routing profile to a tenant:
+    $ nico-admin-cli tenant update fds34511233a --routing-profile-type default
+
+Update only if the record is still at a known version (optimistic concurrency):
+    $ nico-admin-cli tenant update fds34511233a --name \"Acme Corp\" --version 7
+
+")]
+pub(crate) struct Args {
     #[clap(help = "Tenant org ID to update", default_value(None))]
-    pub tenant_org: String,
+    pub(super) tenant_org: String,
 
     #[clap(
         short = 'p',
         long,
-        help = "Optional, routing profile name to apply to the tenant",
-        default_value(None)
+        help = "Optional, routing profile name to apply to the tenant"
     )]
-    pub routing_profile_type: Option<String>,
+    pub(super) routing_profile_type: Option<String>,
 
     #[clap(
         short = 'v',
         long,
         help = "Optional, version to use for comparison when performing the update, which will be rejected if the actual version of the record does not match the value of this parameter"
     )]
-    pub version: Option<String>,
+    pub(super) version: Option<String>,
 
     #[clap(short = 'n', long, help = "Organization name of the tenant")]
-    pub name: Option<String>,
+    pub(super) name: Option<String>,
 }

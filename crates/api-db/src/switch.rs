@@ -17,16 +17,20 @@
 
 use std::net::IpAddr;
 
-use carbide_uuid::rack::RackId;
+use carbide_uuid::nvlink::NvLinkDomainId;
+use carbide_uuid::rack::{RackId, RackProfileId};
 use carbide_uuid::switch::SwitchId;
 use chrono::prelude::*;
 use config_version::{ConfigVersion, Versioned};
 use health_report::{HealthReport, HealthReportApplyMode};
+use mac_address::MacAddress;
 use model::controller_outcome::PersistentStateHandlerOutcome;
 use model::metadata::Metadata;
 use model::rack::RackFirmwareUpgradeStatus;
 use model::switch::{
-    FabricManagerStatus, NewSwitch, Switch, SwitchControllerState, SwitchReprovisionRequest,
+    CONTROL_PLANE_STATE_CONFIGURED, FabricManagerState, FabricManagerStatus, NewSwitch,
+    SWITCH_CONTROLLER_STATE_READY, Switch, SwitchControllerState, SwitchMaintenanceOperation,
+    SwitchMaintenanceRequest, SwitchReprovisionRequest,
 };
 use sqlx::PgConnection;
 
@@ -34,6 +38,9 @@ use crate::db_read::DbReader;
 use crate::{
     ColumnInfo, DatabaseError, DatabaseResult, FilterableQueryBuilder, ObjectColumnFilter,
 };
+
+#[cfg(test)]
+mod test_metadata;
 
 #[derive(Copy, Clone)]
 pub struct IdColumn;
@@ -56,6 +63,18 @@ impl ColumnInfo<'_> for NameColumn {
         "name"
     }
 }
+
+#[derive(Copy, Clone)]
+pub struct BmcMacAddressColumn;
+impl ColumnInfo<'_> for BmcMacAddressColumn {
+    type TableType = Switch;
+    type ColumnType = mac_address::MacAddress;
+
+    fn column_name(&self) -> &'static str {
+        "bmc_mac_address"
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SwitchSearchConfig {
     // pub include_history: bool, // unused
@@ -106,15 +125,19 @@ pub async fn create(txn: &mut PgConnection, new_switch: &NewSwitch) -> DatabaseR
         status: None,
         deleted: None,
         bmc_mac_address: new_switch.bmc_mac_address,
+        bmc_info: None,
+        bmc_credential_rotation_requested: false,
         controller_state: Versioned {
             value: state,
             version: controller_state_version,
         },
         controller_state_outcome: None,
+        switch_maintenance_requested: None,
         switch_reprovisioning_requested: None,
         firmware_upgrade_status: None,
         nvos_update_status: None,
         fabric_manager_status: None,
+        nvlink_domain_uuid: None,
         metadata,
         version,
         is_primary: false,
@@ -136,7 +159,7 @@ pub async fn find_by_name(txn: &mut PgConnection, name: &str) -> DatabaseResult<
         Err(DatabaseError::new(
             "Switch::find_by_name",
             sqlx::Error::Decode(
-                eyre::eyre!("Searching for Switch {} returned multiple results", name).into(),
+                eyre::eyre!("searching for switch {} returned multiple results", name).into(),
             ),
         ))
     }
@@ -153,10 +176,25 @@ pub async fn find_by_id(txn: &mut PgConnection, id: &SwitchId) -> DatabaseResult
         Err(DatabaseError::new(
             "Switch::find_by_id",
             sqlx::Error::Decode(
-                eyre::eyre!("Searching for Switch {} returned multiple results", id).into(),
+                eyre::eyre!("searching for switch {} returned multiple results", id).into(),
             ),
         ))
     }
+}
+
+// TODO(chet): Per Issue #925, the goal is to link machines to BMCs via
+// the machine_interfaces table, but for now this is going to be like
+// this until I take care of the issue.
+pub async fn find_by_bmc_mac_address(
+    txn: &mut PgConnection,
+    bmc_mac_address: mac_address::MacAddress,
+) -> DatabaseResult<Option<Switch>> {
+    let switches = find_by(
+        txn,
+        ObjectColumnFilter::One(BmcMacAddressColumn, &bmc_mac_address),
+    )
+    .await?;
+    Ok(switches.into_iter().next())
 }
 
 pub async fn find_ids(
@@ -175,9 +213,9 @@ pub async fn find_ids(
 
     qb.push(" WHERE TRUE");
 
-    if filter.rack_id.is_some() {
+    if let Some(rack_id) = filter.rack_id {
         qb.push(" AND s.rack_id = ");
-        qb.push_bind(filter.rack_id.unwrap());
+        qb.push_bind(rack_id);
     }
 
     match filter.deleted {
@@ -202,17 +240,90 @@ pub async fn find_ids(
         qb.push(" = ANY(es_nvos.nvos_mac_addresses)");
     }
 
+    if let Some(ovrrd_str) = &filter.only_with_health_alert {
+        qb.push(" AND health_reports->'merges' ? ");
+        qb.push_bind(ovrrd_str.clone());
+        qb.push(" AND jsonb_array_length(health_reports->'merges'->");
+        qb.push_bind(ovrrd_str);
+        qb.push("->'alerts') > 0");
+    }
+
     qb.build_query_as()
         .fetch_all(txn)
         .await
         .map_err(|e| DatabaseError::new("switch::find_ids", e))
 }
 
+/// Returns non-deleted switches in `rack_id` whose controller state is Ready and whose
+/// Fabric Manager status reports `fabric_manager_state = ok` with
+/// `addition_info = CONTROL_PLANE_STATE_CONFIGURED`.
+pub async fn find_ready_control_plane_configured_switch_ids_in_rack<DB>(
+    txn: &mut DB,
+    rack_id: &RackId,
+) -> DatabaseResult<Vec<SwitchId>>
+where
+    for<'db> &'db mut DB: DbReader<'db>,
+{
+    let query = r#"
+        SELECT s.id
+        FROM switches s
+        WHERE s.rack_id = $1
+          AND s.deleted IS NULL
+          AND s.controller_state->>'state' = $2
+          AND s.fabric_manager_status->>'fabric_manager_state' = $3
+          AND s.fabric_manager_status->>'addition_info' = $4
+    "#;
+
+    sqlx::query_as::<_, SwitchId>(query)
+        .bind(rack_id)
+        .bind(SWITCH_CONTROLLER_STATE_READY)
+        .bind(FabricManagerState::Ok.as_str())
+        .bind(CONTROL_PLANE_STATE_CONFIGURED)
+        .fetch_all(&mut *txn)
+        .await
+        .map_err(|e| {
+            DatabaseError::new(
+                "switch::find_ready_control_plane_configured_switch_ids_in_rack",
+                e,
+            )
+        })
+}
+
+/// Base relation for loading switches. Wraps the `switches` table in a derived
+/// table (aliased `switches`) that adds a `bmc_info` JSON column resolved from
+/// the `Bmc` machine_interface linked back to the switch -- mirroring how the
+/// machine snapshot query materializes `bmc_info` (see
+/// `sql/machine_snapshots.sql.template`). Keeping the alias `switches` lets the
+/// generic `FilterableQueryBuilder` filters reference unqualified columns.
+const SWITCHES_WITH_BMC_INFO: &str = r#"SELECT * FROM (
+    SELECT s.*, bmc.json AS bmc_info
+    FROM switches s
+    LEFT JOIN LATERAL (
+        SELECT jsonb_strip_nulls(jsonb_build_object(
+            'machine_interface_id', bmc_i.id,
+            'ip', host(bmc_addr.address),
+            'mac', bmc_i.mac_address::text
+        )) AS json
+        FROM machine_interfaces bmc_i
+        LEFT JOIN LATERAL (
+            SELECT a.address
+            FROM machine_interface_addresses a
+            WHERE a.interface_id = bmc_i.id
+            ORDER BY family(a.address), a.address
+            LIMIT 1
+        ) AS bmc_addr ON true
+        WHERE bmc_i.switch_id = s.id
+          AND bmc_i.interface_type = 'Bmc'
+        ORDER BY bmc_i.created ASC
+        LIMIT 1
+    ) AS bmc ON true
+) AS switches"#;
+
 pub async fn find_by<'a, C: ColumnInfo<'a, TableType = Switch>>(
     txn: &mut PgConnection,
     filter: ObjectColumnFilter<'a, C>,
 ) -> DatabaseResult<Vec<Switch>> {
-    let mut query = FilterableQueryBuilder::new("SELECT * FROM switches").filter(&filter);
+    let mut query = FilterableQueryBuilder::new(SWITCHES_WITH_BMC_INFO).filter(&filter);
 
     query
         .build_query_as()
@@ -260,14 +371,19 @@ pub async fn update_controller_state_outcome(
 /// Sets switch_reprovisioning_requested on the switch. Can be called from any state machine or
 /// service. When the switch is in Ready state, the switch state controller will observe the flag
 /// and transition to ReProvisioning::Start.
+///
+/// `activities` selects which rack maintenance phases the switch should wait for.
+/// Empty means all activities.
 pub async fn set_switch_reprovisioning_requested(
     txn: &mut PgConnection,
     switch_id: SwitchId,
     initiator: &str,
+    activities: Vec<model::rack::MaintenanceActivity>,
 ) -> DatabaseResult<()> {
     let req = SwitchReprovisionRequest {
         requested_at: Utc::now(),
         initiator: initiator.to_string(),
+        activities,
     };
     let query =
         "UPDATE switches SET switch_reprovisioning_requested = $1 WHERE id = $2 RETURNING id";
@@ -293,6 +409,41 @@ pub async fn clear_switch_reprovisioning_requested(
         .fetch_optional(txn)
         .await
         .map_err(|e| DatabaseError::new("clear_switch_reprovisioning_requested", e))?;
+    Ok(())
+}
+
+pub async fn set_switch_maintenance_requested(
+    txn: &mut PgConnection,
+    switch_id: SwitchId,
+    initiator: &str,
+    operation: SwitchMaintenanceOperation,
+) -> DatabaseResult<()> {
+    let req = SwitchMaintenanceRequest {
+        requested_at: Utc::now(),
+        initiator: initiator.to_string(),
+        operation,
+    };
+    let query = "UPDATE switches SET switch_maintenance_requested = $1 WHERE id = $2 RETURNING id";
+    sqlx::query_as::<_, SwitchId>(query)
+        .bind(sqlx::types::Json(req))
+        .bind(switch_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| DatabaseError::new("set_switch_maintenance_requested", e))?;
+    Ok(())
+}
+
+pub async fn clear_switch_maintenance_requested(
+    txn: &mut PgConnection,
+    switch_id: SwitchId,
+) -> DatabaseResult<()> {
+    let query =
+        "UPDATE switches SET switch_maintenance_requested = NULL WHERE id = $1 RETURNING id";
+    sqlx::query_as::<_, SwitchId>(query)
+        .bind(switch_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| DatabaseError::new("clear_switch_maintenance_requested", e))?;
     Ok(())
 }
 
@@ -341,6 +492,32 @@ pub async fn update_fabric_manager_status(
         .await
         .map_err(|e| DatabaseError::new("update_fabric_manager_status", e))?;
     Ok(())
+}
+
+/// Records one rack-scoped NVLink domain observation on every active switch.
+///
+/// Repeated observations are idempotent. Soft-deleted switches retain their
+/// previous value. Returns the active switches whose stored value changed.
+pub async fn update_nvlink_domain_uuid_for_rack(
+    txn: &mut PgConnection,
+    rack_id: &RackId,
+    nvlink_domain_uuid: NvLinkDomainId,
+) -> DatabaseResult<Vec<SwitchId>> {
+    sqlx::query_scalar(
+        r#"
+        UPDATE switches
+        SET nvlink_domain_uuid = $1
+        WHERE rack_id = $2
+          AND deleted IS NULL
+          AND nvlink_domain_uuid IS DISTINCT FROM $1
+        RETURNING id
+        "#,
+    )
+    .bind(nvlink_domain_uuid)
+    .bind(rack_id)
+    .fetch_all(txn)
+    .await
+    .map_err(|error| DatabaseError::new("update_nvlink_domain_uuid_for_rack", error))
 }
 
 pub async fn update_slot_and_tray(
@@ -413,34 +590,6 @@ pub async fn update(switch: &Switch, txn: &mut PgConnection) -> Result<Switch, D
     Ok(switch.clone())
 }
 
-use mac_address::MacAddress;
-
-#[derive(Debug, sqlx::FromRow)]
-pub struct SwitchBmcInfoRow {
-    pub serial_number: String,
-    pub bmc_mac_address: MacAddress,
-    pub ip_address: IpAddr,
-}
-
-pub async fn list_switch_bmc_info(txn: &mut PgConnection) -> DatabaseResult<Vec<SwitchBmcInfoRow>> {
-    let sql = r#"
-        SELECT 
-            es.serial_number,
-            es.bmc_mac_address,
-            mia.address as ip_address
-        FROM expected_switches es
-        JOIN machine_interfaces mi ON mi.mac_address = es.bmc_mac_address
-        JOIN machine_interface_addresses mia ON mia.interface_id = mi.id
-        JOIN network_segments ns ON ns.id = mi.segment_id
-        WHERE ns.network_segment_type = 'underlay'
-    "#;
-
-    sqlx::query_as(sql)
-        .fetch_all(txn)
-        .await
-        .map_err(|err| DatabaseError::new("list_switch_bmc_info", err))
-}
-
 /// Resolve SwitchIds to BMC IPs via the FK path:
 ///   switches.bmc_mac_address -> expected_switches.bmc_mac_address
 ///   -> machine_interfaces -> machine_interface_addresses (underlay) -> IP
@@ -468,6 +617,77 @@ pub async fn find_bmc_ips_by_switch_ids(
         .map_err(|err| DatabaseError::new("switch::find_bmc_ips_by_switch_ids", err))
 }
 
+/// Resolve the switch that owns a BMC MAC, for the operator force-converge
+/// escape hatch (the switch analogue of
+/// [`crate::machine_topology::find_machine_id_by_bmc_mac`]). A switch records
+/// its BMC MAC directly on its row and a MAC uniquely names one BMC device, so
+/// this is an exact lookup. Returns `None` when no live switch carries that MAC
+/// (e.g. it belongs to a machine or power-shelf BMC, or to no known device).
+pub async fn find_switch_id_by_bmc_mac(
+    txn: &mut PgConnection,
+    mac_address: MacAddress,
+) -> DatabaseResult<Option<SwitchId>> {
+    let query = r#"
+        SELECT id
+        FROM switches
+        WHERE bmc_mac_address = $1::macaddr
+            AND deleted IS NULL
+    "#;
+    sqlx::query_scalar(query)
+        .bind(mac_address)
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::new("switch::find_switch_id_by_bmc_mac", e))
+}
+
+/// Record an operator force-converge request against a switch's BMC. The
+/// switch state controller consumes it on its next sweep. Mirrors
+/// [`crate::machine::set_bmc_credential_rotation_requested`].
+pub async fn set_bmc_credential_rotation_requested(
+    txn: &mut PgConnection,
+    switch_id: SwitchId,
+) -> DatabaseResult<()> {
+    let query =
+        "UPDATE switches SET bmc_credential_rotation_requested = true WHERE id = $1 RETURNING id";
+    sqlx::query_scalar::<_, SwitchId>(query)
+        .bind(switch_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| match e {
+            // `RETURNING id` yields no row for an unknown switch; surface a clean
+            // not-found rather than a generic wrapped error.
+            sqlx::Error::RowNotFound => DatabaseError::NotFoundError {
+                kind: "switch",
+                id: switch_id.to_string(),
+            },
+            e => DatabaseError::new("switch::set_bmc_credential_rotation_requested", e),
+        })?;
+    Ok(())
+}
+
+/// Clear a switch's force-converge request, committed with the return to
+/// `Ready` once a forced tick settles. Mirrors
+/// [`crate::machine::clear_bmc_credential_rotation_requested`].
+pub async fn clear_bmc_credential_rotation_requested(
+    txn: &mut PgConnection,
+    switch_id: SwitchId,
+) -> DatabaseResult<()> {
+    let query =
+        "UPDATE switches SET bmc_credential_rotation_requested = false WHERE id = $1 RETURNING id";
+    sqlx::query_scalar::<_, SwitchId>(query)
+        .bind(switch_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => DatabaseError::NotFoundError {
+                kind: "switch",
+                id: switch_id.to_string(),
+            },
+            e => DatabaseError::new("switch::clear_bmc_credential_rotation_requested", e),
+        })?;
+    Ok(())
+}
+
 /// Full endpoint info for a switch: BMC MAC/IP and optionally NVOS MAC/IP.
 ///
 /// NVOS fields are nullable because `nvos_mac_addresses` may not be set on the
@@ -480,6 +700,17 @@ pub struct SwitchEndpointRow {
     pub bmc_ip: IpAddr,
     pub nvos_mac: Option<MacAddress>,
     pub nvos_ip: Option<IpAddr>,
+    /// `machine_interfaces.hostname` plus domain for the NVOS interface (TLS SNI).
+    pub nvos_hostname: Option<String>,
+}
+
+/// Ready switch endpoint selected for NMX-C rack-level operations.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ReadyControlPlaneSwitchEndpointRow {
+    pub switch_id: SwitchId,
+    pub rack_id: RackId,
+    pub rack_profile_id: Option<RackProfileId>,
+    pub nvos_ip: IpAddr,
 }
 
 /// Resolve SwitchIds to full endpoint info (BMC + NVOS MAC/IP).
@@ -503,7 +734,12 @@ pub async fn find_switch_endpoints_by_ids(
             es.bmc_mac_address   AS bmc_mac,
             bmc_mia.address      AS bmc_ip,
             nvos_mi.mac_address  AS nvos_mac,
-            nvos_mia.address     AS nvos_ip
+            nvos_mia.address     AS nvos_ip,
+            CASE
+                WHEN nvos_d.name IS NOT NULL AND nvos_d.name <> '' THEN
+                    nvos_mi.hostname || '.' || nvos_d.name
+                ELSE nvos_mi.hostname
+            END                  AS nvos_hostname
         FROM switches s
         JOIN expected_switches es
             ON es.bmc_mac_address = s.bmc_mac_address
@@ -518,6 +754,8 @@ pub async fn find_switch_endpoints_by_ids(
            AND nvos_mi.mac_address = ANY(es.nvos_mac_addresses)
         LEFT JOIN machine_interface_addresses nvos_mia
             ON nvos_mia.interface_id = nvos_mi.id
+        LEFT JOIN domains nvos_d
+            ON nvos_d.id = nvos_mi.domain_id
         WHERE s.id = ANY($1)
           AND bmc_ns.network_segment_type = 'underlay'
         ORDER BY s.id
@@ -528,6 +766,53 @@ pub async fn find_switch_endpoints_by_ids(
         .fetch_all(db)
         .await
         .map_err(|err| DatabaseError::new("switch::find_switch_endpoints_by_ids", err))
+}
+
+/// Resolve one ready Fabric Manager control-plane switch endpoint per rack.
+///
+/// When several switches in a rack match, the primary switch is preferred.
+pub async fn find_ready_control_plane_configured_switch_endpoints<DB>(
+    db: &mut DB,
+) -> DatabaseResult<Vec<ReadyControlPlaneSwitchEndpointRow>>
+where
+    for<'db> &'db mut DB: DbReader<'db>,
+{
+    let sql = r#"
+        SELECT DISTINCT ON (s.rack_id)
+            s.id               AS switch_id,
+            s.rack_id          AS rack_id,
+            r.rack_profile_id  AS rack_profile_id,
+            nvos_mia.address   AS nvos_ip
+        FROM switches s
+        LEFT JOIN racks r
+            ON r.id = s.rack_id
+        JOIN expected_switches es
+            ON es.bmc_mac_address = s.bmc_mac_address
+        JOIN machine_interfaces nvos_mi
+            ON es.nvos_mac_addresses IS NOT NULL
+           AND nvos_mi.mac_address = ANY(es.nvos_mac_addresses)
+        JOIN machine_interface_addresses nvos_mia
+            ON nvos_mia.interface_id = nvos_mi.id
+        WHERE s.rack_id IS NOT NULL
+          AND s.deleted IS NULL
+          AND s.controller_state->>'state' = $1
+          AND s.fabric_manager_status->>'fabric_manager_state' = $2
+          AND s.fabric_manager_status->>'addition_info' = $3
+        ORDER BY s.rack_id, s.is_primary DESC, s.id
+    "#;
+
+    sqlx::query_as(sql)
+        .bind(SWITCH_CONTROLLER_STATE_READY)
+        .bind(FabricManagerState::Ok.as_str())
+        .bind(CONTROL_PLANE_STATE_CONFIGURED)
+        .fetch_all(&mut *db)
+        .await
+        .map_err(|err| {
+            DatabaseError::new(
+                "switch::find_ready_control_plane_configured_switch_endpoints",
+                err,
+            )
+        })
 }
 
 pub async fn update_metadata(
@@ -565,38 +850,6 @@ pub async fn update_metadata(
     }
 }
 
-#[derive(Debug, sqlx::FromRow)]
-pub struct SwitchBmcRow {
-    pub switch_id: SwitchId,
-    pub bmc_mac: MacAddress,
-    pub bmc_ip: IpAddr,
-}
-
-/// Resolve SwitchIds to BMC MAC + IP via machine_interfaces.
-pub async fn find_bmc_info_by_switch_ids(
-    db: impl crate::db_read::DbReader<'_>,
-    switch_ids: &[SwitchId],
-) -> DatabaseResult<Vec<SwitchBmcRow>> {
-    let sql = r#"
-        SELECT DISTINCT ON (mi.switch_id)
-            mi.switch_id,
-            mi.mac_address   AS bmc_mac,
-            mia.address      AS bmc_ip
-        FROM machine_interfaces mi
-        JOIN machine_interface_addresses mia ON mia.interface_id = mi.id
-        JOIN network_segments ns ON ns.id = mi.segment_id
-        WHERE mi.switch_id = ANY($1)
-          AND ns.network_segment_type = 'underlay'
-        ORDER BY mi.switch_id
-    "#;
-
-    sqlx::query_as(sql)
-        .bind(switch_ids)
-        .fetch_all(db)
-        .await
-        .map_err(|err| DatabaseError::new("switch::find_bmc_info_by_switch_ids", err))
-}
-
 /// A switch resolved by its BMC MAC address, along with the rack it belongs
 /// to. Used by the Component Manager state controller wrapper to build a
 /// rack-level `MaintenanceScope` for the switches it's been asked to act on.
@@ -625,24 +878,30 @@ pub async fn find_ids_by_bmc_macs(
         .map_err(|err| DatabaseError::new("switch::find_ids_by_bmc_macs", err))
 }
 
-/// RMS identity for a switch: the switch ID (used as the RMS node_id),
-/// the BMC MAC address, and the rack_id.
+/// RMS identity for a switch, including rack profile context for node descriptor
+/// construction.
 #[derive(Debug, sqlx::FromRow)]
 pub struct SwitchRmsIdentity {
     pub id: String,
     pub bmc_mac_address: MacAddress,
     pub rack_id: Option<RackId>,
+    pub rack_profile_id: Option<RackProfileId>,
 }
 
-/// Look up RMS identities (node_id, rack_id) for switches by their
-/// BMC MAC addresses.
+/// Look up RMS identities and rack profile context for switches by their BMC
+/// MAC addresses.
 pub async fn find_rms_identities_by_macs(
     db: impl crate::db_read::DbReader<'_>,
     macs: &[MacAddress],
 ) -> DatabaseResult<Vec<SwitchRmsIdentity>> {
     let sql = r#"
-        SELECT s.id::text, s.bmc_mac_address, s.rack_id
+        SELECT
+            s.id::text,
+            s.bmc_mac_address,
+            s.rack_id,
+            r.rack_profile_id
         FROM switches s
+        LEFT JOIN racks r ON r.id = s.rack_id
         WHERE s.bmc_mac_address = ANY($1)
     "#;
 
@@ -670,4 +929,450 @@ pub async fn remove_health_report(
     source: &str,
 ) -> Result<(), DatabaseError> {
     crate::health_report::remove_health_report(txn, "switches", switch_id, mode, source).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use carbide_uuid::machine::MachineInterfaceId;
+    use carbide_uuid::network::NetworkSegmentId;
+    use carbide_uuid::rack::{RackId, RackProfileId};
+    use model::allocation_type::AllocationType;
+    use model::rack::RackConfig;
+    use model::switch::{
+        CONTROL_PLANE_STATE_CONFIGURED, FabricManagerState, FabricManagerStatus, NewSwitch,
+        SwitchConfig, SwitchControllerState,
+    };
+
+    use super::*;
+    use crate::test_support::switch::create_seeded_discovered;
+
+    /// The switch load query must surface `bmc_info` (MAC + IP +
+    /// machine-interface id) resolved from the BMC machine_interface linked
+    /// back to the switch (`switch_id` + `interface_type = 'Bmc'`), regardless
+    /// of network segment. A non-BMC interface on the same switch must be
+    /// ignored.
+    #[crate::sqlx_test]
+    async fn test_find_by_populates_bmc_info(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut txn = pool.begin().await?;
+
+        let switch_id =
+            SwitchId::from_str("sw100nsner0op5osl6n85t7772j010jmhafm934n7oej4mlome3okrn9b60")?;
+        // `switches.bmc_mac_address` is an FK into `expected_switches`, so seed
+        // the expected switch before creating the switch.
+        sqlx::query(
+            "INSERT INTO expected_switches (serial_number, bmc_mac_address, bmc_username, bmc_password)
+             VALUES ('SW-SN-BMC', '02:00:00:00:0b:01'::macaddr, 'admin', 'pw')",
+        )
+        .execute(txn.as_mut())
+        .await?;
+        create(
+            &mut txn,
+            &NewSwitch {
+                id: switch_id,
+                config: SwitchConfig {
+                    name: "BMC info switch".to_string(),
+                    enable_nmxc: false,
+                    fabric_manager_config: None,
+                },
+                bmc_mac_address: Some("02:00:00:00:0b:01".parse()?),
+                metadata: None,
+                rack_id: None,
+                slot_number: None,
+                tray_index: None,
+            },
+        )
+        .await?;
+
+        // A non-underlay segment on purpose: resolution must not depend on the
+        // segment type, only on the BMC link back to the switch.
+        let segment_id: NetworkSegmentId = sqlx::query_scalar(
+            "INSERT INTO network_segments (name, version, network_segment_type)
+             VALUES ($1, 'V1-T0', 'tenant') RETURNING id",
+        )
+        .bind("switch-bmc-info")
+        .fetch_one(txn.as_mut())
+        .await?;
+
+        let bmc_mac = "02:00:00:00:0b:01";
+        let bmc_ip: IpAddr = "10.30.40.50".parse()?;
+        let bmc_interface_id: MachineInterfaceId = sqlx::query_scalar(
+            "INSERT INTO machine_interfaces
+                 (switch_id, association_type, segment_id, mac_address,
+                  primary_interface, hostname, interface_type)
+             VALUES ($1, 'Switch', $2, $3::macaddr, false, 'bmc', 'Bmc')
+             RETURNING id",
+        )
+        .bind(switch_id)
+        .bind(segment_id)
+        .bind(bmc_mac)
+        .fetch_one(txn.as_mut())
+        .await?;
+        crate::machine_interface_address::insert(
+            txn.as_mut(),
+            bmc_interface_id,
+            bmc_ip,
+            AllocationType::Dhcp,
+        )
+        .await?;
+
+        // An NVOS 'Data' interface on the same switch must be ignored.
+        let data_interface_id: MachineInterfaceId = sqlx::query_scalar(
+            "INSERT INTO machine_interfaces
+                 (switch_id, association_type, segment_id, mac_address,
+                  primary_interface, hostname, interface_type)
+             VALUES ($1, 'Switch', $2, $3::macaddr, false, 'nvos', 'Data')
+             RETURNING id",
+        )
+        .bind(switch_id)
+        .bind(segment_id)
+        .bind("02:00:00:00:0b:02")
+        .fetch_one(txn.as_mut())
+        .await?;
+        crate::machine_interface_address::insert(
+            txn.as_mut(),
+            data_interface_id,
+            "10.30.40.51".parse::<IpAddr>()?,
+            AllocationType::Dhcp,
+        )
+        .await?;
+
+        let switch = find_by_id(&mut txn, &switch_id)
+            .await?
+            .expect("switch should exist");
+        let bmc_info = switch
+            .bmc_info
+            .expect("switch load should populate bmc_info from the BMC interface");
+        assert_eq!(bmc_info.machine_interface_id, Some(bmc_interface_id));
+        assert_eq!(bmc_info.mac, Some(bmc_mac.parse()?));
+        assert_eq!(bmc_info.ip, Some(bmc_ip));
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn rack_domain_update_is_idempotent_and_excludes_deleted_switches(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let rack_id = RackId::new("rack-nvlink-domain");
+        let rack_profile_id = RackProfileId::new("NVL72");
+        let mut txn = pool.begin().await?;
+
+        crate::rack::create(
+            txn.as_mut(),
+            &rack_id,
+            Some(&rack_profile_id),
+            &RackConfig::default(),
+            None,
+        )
+        .await?;
+
+        txn.commit().await?;
+
+        for (seed, name) in [
+            (21, "rack switch 1"),
+            (22, "rack switch 2"),
+            (23, "deleted rack switch"),
+        ] {
+            let mut txn = pool.begin().await?;
+            let mut switch = create_seeded_discovered(txn.as_mut(), seed, name).await?;
+            sqlx::query("UPDATE switches SET rack_id = $1 WHERE id = $2")
+                .bind(&rack_id)
+                .bind(switch.id)
+                .execute(txn.as_mut())
+                .await?;
+
+            if seed == 23 {
+                mark_as_deleted(&mut switch, txn.as_mut()).await?;
+            }
+
+            txn.commit().await?;
+        }
+
+        let first_domain: NvLinkDomainId = "11111111-1111-1111-1111-111111111111".parse()?;
+        let replacement_domain: NvLinkDomainId = "33333333-3333-3333-3333-333333333333".parse()?;
+        let mut txn = pool.begin().await?;
+
+        for (scenario, domain_uuid, expected_changes) in [
+            ("initial observation", first_domain, 2),
+            ("repeated observation", first_domain, 0),
+            ("replacement observation", replacement_domain, 2),
+        ] {
+            let changed =
+                update_nvlink_domain_uuid_for_rack(txn.as_mut(), &rack_id, domain_uuid).await?;
+
+            assert_eq!(changed.len(), expected_changes, "{scenario}");
+        }
+
+        txn.commit().await?;
+
+        let mut txn = pool.begin().await?;
+
+        let counts: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE deleted IS NULL AND nvlink_domain_uuid = $1
+                ),
+                COUNT(*) FILTER (
+                    WHERE deleted IS NOT NULL AND nvlink_domain_uuid IS NULL
+                )
+            FROM switches
+            WHERE rack_id = $2
+            "#,
+        )
+        .bind(replacement_domain)
+        .bind(&rack_id)
+        .fetch_one(txn.as_mut())
+        .await?;
+
+        assert_eq!(counts, (2, 1));
+
+        txn.rollback().await?;
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn test_find_ready_control_plane_configured_switch_ids_in_rack(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let rack_id: RackId = "rack-sw-find".parse().unwrap();
+        let other_rack_id: RackId = "rack-other".parse().unwrap();
+        let rack_profile_id = RackProfileId::new("NVL72");
+        let mut txn = pool.begin().await?;
+        crate::rack::create(
+            txn.as_mut(),
+            &rack_id,
+            Some(&rack_profile_id),
+            &RackConfig::default(),
+            None,
+        )
+        .await?;
+        crate::rack::create(
+            txn.as_mut(),
+            &other_rack_id,
+            Some(&rack_profile_id),
+            &RackConfig::default(),
+            None,
+        )
+        .await?;
+        txn.commit().await?;
+
+        let mut txn = pool.begin().await?;
+        let matching_switch = create_seeded_discovered(txn.as_mut(), 1, "Switch1").await?;
+        txn.commit().await?;
+        let mut txn = pool.begin().await?;
+        let wrong_fm_switch = create_seeded_discovered(txn.as_mut(), 2, "Switch2").await?;
+        txn.commit().await?;
+        let mut txn = pool.begin().await?;
+        let other_rack_switch = create_seeded_discovered(txn.as_mut(), 4, "Switch4").await?;
+        txn.commit().await?;
+
+        let configured_status = FabricManagerStatus {
+            fabric_manager_state: FabricManagerState::Ok,
+            addition_info: Some(CONTROL_PLANE_STATE_CONFIGURED.to_string()),
+            reason: None,
+            error_message: None,
+        };
+
+        let mut txn = pool.begin().await?;
+        for (switch_id, rack, fm_status) in [
+            (matching_switch.id, &rack_id, Some(&configured_status)),
+            (wrong_fm_switch.id, &rack_id, None),
+            (
+                other_rack_switch.id,
+                &other_rack_id,
+                Some(&configured_status),
+            ),
+        ] {
+            sqlx::query("UPDATE switches SET rack_id = $1 WHERE id = $2")
+                .bind(rack)
+                .bind(switch_id)
+                .execute(txn.as_mut())
+                .await?;
+
+            let switch = find_by_id(txn.as_mut(), &switch_id)
+                .await?
+                .expect("switch should exist");
+            let updated = try_update_controller_state(
+                txn.as_mut(),
+                switch_id,
+                switch.controller_state.version,
+                switch.controller_state.version.increment(),
+                &SwitchControllerState::Ready,
+            )
+            .await?;
+            assert!(
+                updated,
+                "setup should update switch controller state with the current version"
+            );
+
+            if let Some(status) = fm_status {
+                update_fabric_manager_status(txn.as_mut(), switch_id, Some(status)).await?;
+            }
+        }
+        txn.commit().await?;
+
+        let mut txn = pool.begin().await?;
+        let found =
+            find_ready_control_plane_configured_switch_ids_in_rack(txn.as_mut(), &rack_id).await?;
+        assert_eq!(found, vec![matching_switch.id]);
+
+        let found_other =
+            find_ready_control_plane_configured_switch_ids_in_rack(txn.as_mut(), &other_rack_id)
+                .await?;
+        assert_eq!(found_other, vec![other_rack_switch.id]);
+        txn.rollback().await?;
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn test_find_ready_control_plane_configured_switch_endpoints_prefers_primary(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let rack_id: RackId = "rack-sw-endpoint".parse().unwrap();
+        let rack_profile_id = RackProfileId::new("NVL72");
+        let mut txn = pool.begin().await?;
+        crate::rack::create(
+            txn.as_mut(),
+            &rack_id,
+            Some(&rack_profile_id),
+            &RackConfig::default(),
+            None,
+        )
+        .await?;
+        txn.commit().await?;
+
+        let mut txn = pool.begin().await?;
+        let secondary_switch = create_seeded_discovered(txn.as_mut(), 1, "Switch1").await?;
+        txn.commit().await?;
+        let mut txn = pool.begin().await?;
+        let primary_switch = create_seeded_discovered(txn.as_mut(), 2, "Switch2").await?;
+        txn.commit().await?;
+
+        let configured_status = FabricManagerStatus {
+            fabric_manager_state: FabricManagerState::Ok,
+            addition_info: Some(CONTROL_PLANE_STATE_CONFIGURED.to_string()),
+            reason: None,
+            error_message: None,
+        };
+
+        let mut txn = pool.begin().await?;
+        for switch_id in [secondary_switch.id, primary_switch.id] {
+            sqlx::query("UPDATE switches SET rack_id = $1 WHERE id = $2")
+                .bind(&rack_id)
+                .bind(switch_id)
+                .execute(txn.as_mut())
+                .await?;
+
+            let switch = find_by_id(txn.as_mut(), &switch_id)
+                .await?
+                .expect("switch should exist");
+            let updated = try_update_controller_state(
+                txn.as_mut(),
+                switch_id,
+                switch.controller_state.version,
+                switch.controller_state.version.increment(),
+                &SwitchControllerState::Ready,
+            )
+            .await?;
+            assert!(
+                updated,
+                "setup should update switch controller state with the current version"
+            );
+
+            update_fabric_manager_status(txn.as_mut(), switch_id, Some(&configured_status)).await?;
+        }
+        set_primary_switch_for_rack(txn.as_mut(), &rack_id, &primary_switch.id).await?;
+
+        let expected_nvos_ip = find_switch_endpoints_by_ids(txn.as_mut(), &[primary_switch.id])
+            .await?
+            .pop()
+            .expect("primary switch endpoint")
+            .nvos_ip
+            .expect("primary switch nvos ip");
+
+        let endpoints = find_ready_control_plane_configured_switch_endpoints(txn.as_mut()).await?;
+        let rack_endpoints = endpoints
+            .into_iter()
+            .filter(|endpoint| endpoint.rack_id == rack_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rack_endpoints.len(), 1);
+        assert_eq!(rack_endpoints[0].switch_id, primary_switch.id);
+        assert_eq!(rack_endpoints[0].rack_id, rack_id);
+        assert_eq!(rack_endpoints[0].nvos_ip, expected_nvos_ip);
+        txn.rollback().await?;
+
+        Ok(())
+    }
+
+    /// The force-converge escape hatch: a switch's BMC MAC resolves back
+    /// to its id, the boolean flag round-trips through the load path, and both
+    /// mutating DAOs surface a clean not-found for an unknown switch.
+    #[crate::sqlx_test]
+    async fn test_force_bmc_rotation_flag_and_mac_resolution(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut txn = pool.begin().await?;
+        let switch = create_seeded_discovered(txn.as_mut(), 7, "Switch7").await?;
+        txn.commit().await?;
+        let bmc_mac = switch.bmc_mac_address.expect("seeded switch has a BMC MAC");
+
+        let mut txn = pool.begin().await?;
+
+        // The switch's own BMC MAC resolves to its id; an unrelated MAC does not.
+        assert_eq!(
+            find_switch_id_by_bmc_mac(txn.as_mut(), bmc_mac).await?,
+            Some(switch.id)
+        );
+        let unrelated_mac: MacAddress = "02:00:00:00:ff:ff".parse()?;
+        assert_eq!(
+            find_switch_id_by_bmc_mac(txn.as_mut(), unrelated_mac).await?,
+            None
+        );
+
+        // The flag defaults false, set flips it, and clear resets it -- observed
+        // through the standard load path (`s.*` surfaces the column).
+        let is_requested = |switch: Option<Switch>| {
+            switch
+                .expect("switch exists")
+                .bmc_credential_rotation_requested
+        };
+        assert!(
+            !is_requested(find_by_id(txn.as_mut(), &switch.id).await?),
+            "flag defaults to false"
+        );
+        set_bmc_credential_rotation_requested(txn.as_mut(), switch.id).await?;
+        assert!(
+            is_requested(find_by_id(txn.as_mut(), &switch.id).await?),
+            "set records the request"
+        );
+        clear_bmc_credential_rotation_requested(txn.as_mut(), switch.id).await?;
+        assert!(
+            !is_requested(find_by_id(txn.as_mut(), &switch.id).await?),
+            "clear resets the request"
+        );
+
+        // An unknown switch id yields NotFound (via `RETURNING id`), not a
+        // generic wrapped error.
+        let ghost =
+            SwitchId::from_str("sw100nsner0op5osl6n85t7772j010jmhafm934n7oej4mlome3okrn9b60")?;
+        assert!(matches!(
+            set_bmc_credential_rotation_requested(txn.as_mut(), ghost).await,
+            Err(DatabaseError::NotFoundError { kind: "switch", .. })
+        ));
+        assert!(matches!(
+            clear_bmc_credential_rotation_requested(txn.as_mut(), ghost).await,
+            Err(DatabaseError::NotFoundError { kind: "switch", .. })
+        ));
+
+        txn.rollback().await?;
+        Ok(())
+    }
 }

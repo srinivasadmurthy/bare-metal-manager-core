@@ -1,0 +1,90 @@
+# machine-a-tron site values — MULTI-POD Controller Mode
+#
+# Multiple machine-a-tron pods with controller-managed ClusterIP Services.
+# Each pod simulates hosts + DPUs, and the mat-k8s-controller automatically
+# creates Services with BMC IP as ClusterIP.
+#
+# Deploy with:
+#   helm upgrade -i nico-machine-a-tron helm/charts/nico-machine-a-tron \
+#       -n nico-system -f <your-copy>.yaml
+#
+# Requirements:
+#  * oobDhcpRelayAddress must be within Kubernetes ServiceCIDR
+#    - vanilla k8s: 10.96.0.0/12
+#    - kind: 10.96.0.0/16
+#    - k3d: 10.43.0.0/16
+#  * NICo siteConfig needs:
+#    - allow_insecure_discovery = true
+#    - Network covering the BMC IP range
+#  * MAC address pools are AUTO-GENERATED per pod by the Helm chart
+
+certificate:
+  uris:
+    - spiffe://nico.local/nico-system/sa/machine-a-tron
+
+extraEnv:
+  - name: RUST_LOG
+    value: info
+
+global:
+  imagePullSecrets:
+    - name: machine-a-tron-pull
+
+image:
+  pullPolicy: IfNotPresent
+  repository: ""
+  tag: ""
+
+machineATron:
+  configureBmcProxyHost: ""
+  hostBmcPassword: NicoSiteRoot1
+  dpuBmcPassword: NicoSiteRoot1
+  nicoApiUrl: https://nico-api.nico-system.svc.cluster.local:1079
+  registerExpectedMachines: true
+  useSingleBmcMock: true
+
+# Enable auto-generated MAC pools (prevents collisions in multi-pod)
+macAddressPool:
+  enabled: true
+  basePrefix: "02:00"
+
+hwMacAddressRanges:
+  enabled: true
+  basePrefix: "02:01"
+
+# Controller mode - dynamically creates Services with BMC IP as ClusterIP
+mat-k8s-controller:
+  enabled: true
+  config:
+    insecureSkipVerify: true  # For self-signed certs
+
+pods:
+  default: null  # Disable default pod
+  mat-0:
+    machines:
+      compute:
+        hwType: wiwynn_gb200_nvl
+        hostCount: 100
+        dpuPerHostCount: 2
+        oobDhcpRelayAddress: "10.96.64.1"  # All pods share same relay
+        adminDhcpRelayAddress: "192.168.176.1"
+  mat-1:
+    machines:
+      compute:
+        hwType: wiwynn_gb200_nvl
+        hostCount: 100
+        dpuPerHostCount: 2
+        oobDhcpRelayAddress: "10.96.64.1"  # NICo assigns unique IPs
+        adminDhcpRelayAddress: "192.168.176.1"
+
+resources:
+  limits:
+    cpu: "2"
+    memory: 2Gi
+  requests:
+    cpu: 500m
+    memory: 512Mi
+
+# NOTE: Only use configFiles.matConfigs for advanced TOML overrides not exposed in values.
+configFiles:
+  matConfigs: {}

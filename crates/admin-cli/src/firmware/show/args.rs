@@ -18,4 +18,11 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {}
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show all available firmware:
+    $ nico-admin-cli firmware show
+
+")]
+pub(crate) struct Args {}

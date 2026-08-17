@@ -20,16 +20,30 @@ use mac_address::MacAddress;
 use rpc::forge as forgerpc;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Delete a BMC user, targeting the BMC by machine id:
+    $ nico-admin-cli bmc-machine delete-bmc-user \
+    --machine 12345678-1234-5678-90ab-cdef01234567 --username admin
+
+Target the BMC by IP address:
+    $ nico-admin-cli bmc-machine delete-bmc-user --ip-address 192.0.2.20 --username admin
+
+Target the BMC by MAC address:
+    $ nico-admin-cli bmc-machine delete-bmc-user --mac-address 00:11:22:33:44:55 --username admin
+
+")]
+pub(crate) struct Args {
     #[clap(long, short, help = "IP of the BMC where we want to delete a user")]
-    pub ip_address: Option<String>,
+    ip_address: Option<String>,
     #[clap(long, help = "MAC of the BMC where we want to delete a user")]
-    pub mac_address: Option<MacAddress>,
+    mac_address: Option<MacAddress>,
     #[clap(long, short, help = "ID of the machine where we want to delete a user")]
-    pub machine: Option<String>,
+    machine: Option<String>,
 
     #[clap(long, short, help = "Username of BMC account to delete")]
-    pub username: String,
+    username: String,
 }
 
 impl From<Args> for forgerpc::DeleteBmcUserRequest {

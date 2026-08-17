@@ -54,6 +54,60 @@ pub async fn find_by<'a, C: ColumnInfo<'a, TableType = PredictedMachineInterface
         .map_err(|e| DatabaseError::query(query.sql(), e))
 }
 
+/// Records the vendor-named Redfish `EthernetInterface.Id` on the predicted
+/// row(s) with the given MAC, keeping pending predictions as current as the
+/// live report -- the same per-exploration refresh `machine_interfaces`
+/// rows get.
+pub async fn set_boot_interface_id(
+    txn: &mut PgConnection,
+    mac_address: MacAddress,
+    boot_interface_id: &str,
+) -> Result<(), DatabaseError> {
+    let query =
+        "UPDATE predicted_machine_interfaces SET boot_interface_id = $1 WHERE mac_address = $2";
+    sqlx::query(query)
+        .bind(boot_interface_id)
+        .bind(mac_address)
+        .execute(txn)
+        .await
+        .map(|_| ())
+        .map_err(|e| DatabaseError::query(query, e))
+}
+
+/// Reconciles the selected primary state on a pending prediction.
+pub async fn set_primary_interface(
+    id: uuid::Uuid,
+    primary_interface: bool,
+    txn: &mut PgConnection,
+) -> Result<(), DatabaseError> {
+    let query = "UPDATE predicted_machine_interfaces SET primary_interface = $1 WHERE id = $2";
+    sqlx::query(query)
+        .bind(primary_interface)
+        .bind(id)
+        .execute(txn)
+        .await
+        .map(|_| ())
+        .map_err(|e| DatabaseError::query(query, e))
+}
+
+/// Clears the primary flag from every pending prediction except the selected
+/// MAC, keeping boot selection unambiguous when a refreshed report adds or
+/// changes the primary candidate.
+pub async fn demote_other_primary_interfaces_for_machine(
+    machine_id: &carbide_uuid::machine::MachineId,
+    primary_mac_address: MacAddress,
+    txn: &mut PgConnection,
+) -> Result<(), DatabaseError> {
+    let query = "UPDATE predicted_machine_interfaces SET primary_interface=false WHERE machine_id=$1 AND mac_address!=$2 AND primary_interface=true";
+    sqlx::query(query)
+        .bind(machine_id)
+        .bind(primary_mac_address)
+        .execute(txn)
+        .await
+        .map(|_| ())
+        .map_err(|e| DatabaseError::query(query, e))
+}
+
 pub async fn delete(
     value: &PredictedMachineInterface,
     txn: &mut PgConnection,
@@ -65,6 +119,15 @@ pub async fn delete(
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
     Ok(())
+}
+
+/// All predicted interfaces for a machine -- the boot-interface candidates a
+/// host offers while it awaits its first DHCP lease.
+pub async fn find_by_machine_id(
+    txn: &mut PgConnection,
+    machine_id: &carbide_uuid::machine::MachineId,
+) -> Result<Vec<PredictedMachineInterface>, DatabaseError> {
+    find_by(txn, ObjectColumnFilter::One(MachineIdColumn, machine_id)).await
 }
 
 pub async fn find_by_mac_address(
@@ -83,11 +146,13 @@ pub async fn create(
     value: NewPredictedMachineInterface<'_>,
     txn: &mut PgConnection,
 ) -> Result<PredictedMachineInterface, DatabaseError> {
-    let query = "INSERT INTO predicted_machine_interfaces (machine_id, mac_address, expected_network_segment_type) VALUES ($1, $2, $3) RETURNING *";
+    let query = "INSERT INTO predicted_machine_interfaces (machine_id, mac_address, expected_network_segment_type, boot_interface_id, primary_interface) VALUES ($1, $2, $3, $4, $5) RETURNING *";
     sqlx::query_as(query)
         .bind(value.machine_id)
         .bind(value.mac_address)
         .bind(value.expected_network_segment_type)
+        .bind(&value.boot_interface_id)
+        .bind(value.primary_interface)
         .fetch_one(txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))

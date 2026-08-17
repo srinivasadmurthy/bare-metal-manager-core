@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use ::rpc::forge::{IpxeTemplateParameters, UpdateOperatingSystemRequest};
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::operating_system::common::{str_to_ipxe_template_id, str_to_os_id};
 use crate::rpc::ApiClient;
 
-pub async fn update(opts: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
+pub(super) async fn update(opts: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
     let id = str_to_os_id(&opts.id)?;
     let ipxe_template_id = opts
         .ipxe_template_id

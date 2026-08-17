@@ -62,7 +62,7 @@ The NICo deployment includes a number of core services:
   it can be queried using tools such as Grafana and `logcli`.
 - **DNS**: Provides domain name service (DNS) functionality
   using two services:
-  - `carbide-dns`: Handles DNS queries from the site controller and managed nodes.
+  - `nico-dns`: Handles DNS queries from the site controller and managed nodes.
   - `unbound`: Provides recursive DNS services to managed machines and instances.
 
 This set of services is also referred to as the **Site Controller**
@@ -80,14 +80,16 @@ NICo requires persistent, durable storage to maintain state for the following co
   uses three each (one per K8s control node) of the `data-vault` and `audit-vault` 10GB PVs to protect and distribute
   the data in the absence of a shared storage solution.
 - [Postgres](https://www.postgresql.org/): This database is used to store state for any NICo or site controller
-  components that require it, including the main "forgedb". There are three 10GB `pgdata` PVs deployed to protect
-  and distribute the data in the absence of a shared storage solution. The `forgedb` database is stored here.
+  components that require it, including the main "nicodb". There are three 10GB `pgdata` PVs deployed to protect
+  and distribute the data in the absence of a shared storage solution. The `nicodb` database is stored here.
 - Certificate Management Infrastructure: This is a set of components that manage the certificates for the site controller and managed hosts.
 
 #### Site Management
 
-- Site Agent: Maintains a northbound Temporal connection to NICo REST (Cloud or centrally deployed or on-Site) to sync data with REST layer DB cache and delegate gRPC requests to NICo Core.
-- Admin CLI: Provides an admin level command line interface into NICo Core using the gRPC API
+- **Site Agent**: Maintains a northbound Temporal connection to NICo REST (Cloud, centrally deployed, or on-site) to sync data with the REST layer DB cache and delegate gRPC requests to NICo Core.
+- **Admin CLI**: Provides an admin-level command-line interface into NICo Core using the gRPC API.
+
+<Note> The REST API is the primary way to interact with NICo and should be used for all state-modifying operations (creating/modifying tenants, VPCs, instances, etc). The admin CLI is a convenience tool for administrative tasks and should not be relied upon for production workflows. </Note>
 
 #### NICo REST
 
@@ -98,15 +100,15 @@ The REST layer can be deployed in the datacenter with Infra Controller Core, or 
 in Cloud with Site Agent connecting from the datacenter. Multiple Infra Controller Cores running
 in different datacenters can also connect to Infra Controller REST through respective Site Agents.
 
-For details on NICo REST, please refer to [NICo REST Github Repository](https://github.com/NVIDIA/infra-controller-rest) and [NICo REST API Schema](https://nvidia.github.io/infra-controller-rest/).
+For details on NICo REST, please refer to the [infra-controller GitHub repository](https://github.com/NVIDIA/infra-controller) and the [REST API Reference](https://docs.nvidia.com/infra-controller/rest-api-reference/api-reference).
 
 ### Managed Hosts
 
-The point of having a Site Controller is to administer a Site that has been populated with managed hosts.
-Each managed host is a pairing of a single BlueField (BF) 2/3 DPU and a host server.
+The point of having a site controller is to administer a site that has been populated with managed hosts.
+Each managed host is a pairing of a host server and one or more BlueField 2/3 DPUs.
 During initial deployment, the `scout` service runs, informing the NICo Core gRPC API of any discovered DPUs. NICo completes the installation of services on the DPU and boots into regular operation mode. Thereafter, the `dpu-agent` starts as a daemon.
 
-Each DPU runs the `dpu-agent` which connects to NICo Core gRPC API to retrieve configuration instructions.
+Each DPU runs the `dpu-agent` which periodically connects to NICo Core gRPC API to retrieve configuration instructions.
 
 ### Metrics and Logs
 

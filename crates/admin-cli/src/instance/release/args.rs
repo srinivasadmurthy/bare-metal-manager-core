@@ -23,16 +23,29 @@ use clap::{ArgGroup, Parser};
         ArgGroup::new("release_instance")
         .required(true)
         .args(&["instance", "machine", "label_key"])))]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Release an instance by id:
+    $ nico-admin-cli instance release --instance 12345678-1234-5678-90ab-cdef01234567
+
+Release the instance on a machine:
+    $ nico-admin-cli instance release --machine 12345678-1234-5678-90ab-cdef01234567
+
+Release every instance matching a label:
+    $ nico-admin-cli instance release --label-key role --label-value training
+
+")]
+pub(crate) struct Args {
     #[clap(short, long)]
-    pub instance: Option<String>,
+    pub(super) instance: Option<String>,
 
     #[clap(short, long)]
-    pub machine: Option<MachineId>,
+    pub(super) machine: Option<MachineId>,
 
     #[clap(long, help = "The key of label instance to query")]
-    pub label_key: Option<String>,
+    pub(super) label_key: Option<String>,
 
     #[clap(long, help = "The value of label instance to query")]
-    pub label_value: Option<String>,
+    pub(super) label_value: Option<String>,
 }

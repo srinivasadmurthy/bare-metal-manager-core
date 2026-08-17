@@ -17,12 +17,14 @@
 
 use std::net::SocketAddr;
 
+use carbide_redfish::boot_interface::BootInterfaceTarget;
 use libredfish::RoleId;
-use libredfish::model::oem::nvidia_dpu::NicMode;
-use mac_address::MacAddress;
+use libredfish::model::service_root::RedfishVendor;
 use model::expected_entity::ExpectedEntity;
 use model::machine::MachineInterfaceSnapshot;
-use model::site_explorer::{EndpointExplorationError, EndpointExplorationReport, LockdownStatus};
+use model::site_explorer::{
+    BlueFieldOperatingMode, EndpointExplorationError, EndpointExplorationReport, LockdownStatus,
+};
 
 use super::metrics::SiteExplorationMetrics;
 
@@ -39,18 +41,13 @@ pub trait EndpointExplorer: Send + Sync + 'static {
         address: SocketAddr,
         interface: &MachineInterfaceSnapshot,
         expected: Option<&ExpectedEntity>,
-        last_report: Option<&EndpointExplorationReport>,
-        boot_interface_mac: Option<MacAddress>,
+        last_exploration_error: Option<&EndpointExplorationError>,
+        boot_interface: Option<&BootInterfaceTarget>,
     ) -> Result<EndpointExplorationReport, EndpointExplorationError>;
 
     async fn check_preconditions(
         &self,
         metrics: &mut SiteExplorationMetrics,
-    ) -> Result<(), EndpointExplorationError>;
-
-    async fn probe_redfish_endpoint(
-        &self,
-        bmc_ip_address: SocketAddr,
     ) -> Result<(), EndpointExplorationError>;
 
     // redfish_reset_bmc issues a BMC reset through redfish.
@@ -117,21 +114,21 @@ pub trait EndpointExplorer: Send + Sync + 'static {
         &self,
         address: SocketAddr,
         interface: &MachineInterfaceSnapshot,
-        boot_interface_mac: Option<&str>,
+        boot_interface: Option<&BootInterfaceTarget>,
     ) -> Result<(), EndpointExplorationError>;
 
     async fn set_boot_order_dpu_first(
         &self,
         address: SocketAddr,
         interface: &MachineInterfaceSnapshot,
-        boot_interface_mac: &str,
+        boot_interface: &BootInterfaceTarget,
     ) -> Result<(), EndpointExplorationError>;
 
     async fn set_nic_mode(
         &self,
         address: SocketAddr,
         interface: &MachineInterfaceSnapshot,
-        mode: NicMode,
+        mode: BlueFieldOperatingMode,
     ) -> Result<(), EndpointExplorationError>;
 
     async fn is_viking(
@@ -144,13 +141,6 @@ pub trait EndpointExplorer: Send + Sync + 'static {
         &self,
         bmc_ip_address: SocketAddr,
         interface: &MachineInterfaceSnapshot,
-    ) -> Result<(), EndpointExplorationError>;
-
-    async fn copy_bfb_to_dpu_rshim(
-        &self,
-        bmc_ip_address: SocketAddr,
-        interface: &MachineInterfaceSnapshot,
-        is_bf2: bool,
     ) -> Result<(), EndpointExplorationError>;
 
     async fn create_bmc_user(
@@ -168,4 +158,24 @@ pub trait EndpointExplorer: Send + Sync + 'static {
         interface: &MachineInterfaceSnapshot,
         username: &str,
     ) -> Result<(), EndpointExplorationError>;
+
+    // set_bmc_root_password authenticates with the endpoint's currently stored
+    // BMC root credentials, probes the vendor, sets `new_password` on the
+    // device, and records it as the device's per-BMC credential. This is an
+    // out-of-band set that does not update rotation convergence; the rotation
+    // engine will reassert the site-wide password on its next pass.
+    async fn set_bmc_root_password(
+        &self,
+        address: SocketAddr,
+        interface: &MachineInterfaceSnapshot,
+        new_password: &str,
+    ) -> Result<(), EndpointExplorationError>;
+
+    // probe_bmc_vendor resolves the endpoint's Redfish vendor using its stored
+    // BMC root credentials.
+    async fn probe_bmc_vendor(
+        &self,
+        address: SocketAddr,
+        interface: &MachineInterfaceSnapshot,
+    ) -> Result<RedfishVendor, EndpointExplorationError>;
 }

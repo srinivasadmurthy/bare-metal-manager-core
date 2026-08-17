@@ -20,6 +20,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine_validation::MachineValidationId;
 use errors::MachineValidationError;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,17 @@ pub struct MachineValidationFilter {
     pub contexts: Option<Vec<String>>,
 }
 
+impl From<rpc::forge_agent_control_response::MachineValidationFilter> for MachineValidationFilter {
+    fn from(filter: rpc::forge_agent_control_response::MachineValidationFilter) -> Self {
+        Self {
+            tags: filter.tags,
+            allowed_tests: filter.allowed_tests,
+            run_unverfied_tests: filter.run_unverfied_tests,
+            contexts: filter.contexts.map(|contexts| contexts.items),
+        }
+    }
+}
+
 pub struct MachineValidationManager {}
 
 impl MachineValidationManager {
@@ -71,13 +83,13 @@ impl MachineValidationManager {
             .await
             .or(Err(MachineValidationError::Generic(format!(
                 "Failed to GET from '{}'",
-                &url
+                url
             ))))?;
         let total_size = res
             .content_length()
             .ok_or(MachineValidationError::Generic(format!(
                 "Failed to get content length from '{}'",
-                &url
+                url
             )))?;
         let _ = std::fs::remove_file(output_file).or(Err(MachineValidationError::Generic(
             format!("Failed to delete file '{output_file}'"),
@@ -108,7 +120,7 @@ impl MachineValidationManager {
         platform_name: String,
         options: MachineValidationOptions,
         context: String,
-        uuid: String,
+        validation_id: MachineValidationId,
         machine_validation_filter: MachineValidationFilter,
     ) -> Result<(), MachineValidationError> {
         let mc = MachineValidation { options };
@@ -144,13 +156,12 @@ impl MachineValidationManager {
             })
             .await?;
         let mut run_request = rpc::forge::MachineValidationRunRequest {
-            validation_id: Some(rpc::Uuid {
-                value: uuid.to_owned(),
-            }),
+            validation_id: Some(validation_id),
             ..rpc::forge::MachineValidationRunRequest::default()
         };
         let mut expected_time_duration = 0;
-        for test in tests.clone() {
+        let mut selected_tests = Vec::new();
+        for test in &tests {
             if !machine_validation_filter.allowed_tests.is_empty()
                 && !machine_validation_filter
                     .allowed_tests
@@ -161,7 +172,9 @@ impl MachineValidationManager {
             }
             run_request.total += 1;
             expected_time_duration += test.timeout.unwrap_or(7200);
+            selected_tests.push(test.clone());
         }
+        run_request.selected_tests = selected_tests;
         run_request.duration_to_complete = Some(rpc::Duration::from(
             std::time::Duration::from_secs(expected_time_duration as u64),
         ));
@@ -173,7 +186,7 @@ impl MachineValidationManager {
             machine_id,
             tests,
             context,
-            uuid,
+            validation_id,
             true,
             machine_validation_filter,
         )

@@ -51,8 +51,8 @@ struct State {
 }
 
 #[tokio::test]
-pub async fn test_network_monitor() -> eyre::Result<()> {
-    carbide_host_support::init_logging()?;
+async fn test_network_monitor() -> eyre::Result<()> {
+    carbide_host_support::init_logging("nico-dpu-agent")?;
 
     let state: Arc<Mutex<State>> = Arc::new(Mutex::new(Default::default()));
 
@@ -60,11 +60,11 @@ pub async fn test_network_monitor() -> eyre::Result<()> {
     let app = Router::new()
         .route("/up", get(handle_up))
         .route(
-            "/forge.Forge/GetDpuInfoList",
+            ::rpc::service_path!("GetDpuInfoList"),
             post(handle_get_dpu_info_list),
         )
         // ForgeApiClient needs a working Version route for connection retrying
-        .route("/forge.Forge/Version", post(handle_version))
+        .route(::rpc::service_path!("Version"), post(handle_version))
         .fallback(handler)
         .with_state(state.clone());
     let (addr, join_handle) = common::run_grpc_server(app).await?;
@@ -87,7 +87,7 @@ pub async fn test_network_monitor() -> eyre::Result<()> {
         // development overrides
         Some(config_path) => (
             AgentConfig::load_from(&config_path).wrap_err(format!(
-                "Error loading agent configuration from {}",
+                "error loading agent configuration from {}",
                 config_path.display()
             ))?,
             config_path.display().to_string(),
@@ -166,10 +166,12 @@ async fn handle_get_dpu_info_list(
             rpc::DpuInfo {
                 id: DPU_ID.to_string(),
                 loopback_ip: "172.20.0.119".to_string(),
+                observed_status: None,
             },
             rpc::DpuInfo {
                 id: DEST_DPU_ID.to_string(),
                 loopback_ip: "172.20.0.200".to_string(),
+                observed_status: None,
             },
         ],
     })
@@ -180,7 +182,7 @@ async fn handle_version() -> impl IntoResponse {
 }
 
 async fn handler(uri: Uri) -> impl IntoResponse {
-    tracing::debug!("general handler: {:?}", uri);
+    tracing::debug!(?uri, "General request handler received request");
     StatusCode::NOT_FOUND
 }
 
@@ -213,7 +215,7 @@ fn verify_metrics(test_meter: &TestMeter) {
     }
 }
 
-pub struct TestMeter {
+struct TestMeter {
     meter: Meter,
     _meter_provider: metrics::SdkMeterProvider,
     registry: prometheus::Registry,
@@ -221,7 +223,7 @@ pub struct TestMeter {
 
 impl TestMeter {
     /// Returns the latest accumulated metrics in prometheus format
-    pub fn export_metrics(&self) -> String {
+    fn export_metrics(&self) -> String {
         let mut buffer = vec![];
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
@@ -229,12 +231,12 @@ impl TestMeter {
         String::from_utf8(buffer).unwrap()
     }
 
-    pub fn meter(&self) -> Meter {
+    fn meter(&self) -> Meter {
         self.meter.clone()
     }
 
     /// Returns the value of a single metric with a given name
-    pub fn formatted_metric(&self, metric_name: &str) -> Option<String> {
+    fn formatted_metric(&self, metric_name: &str) -> Option<String> {
         let mut metrics = self.formatted_metrics(metric_name);
         match metrics.len() {
             0 => None,
@@ -247,7 +249,7 @@ impl TestMeter {
 
     /// Returns the value of multiple metrics with the given name
     /// This can be used if the metric is duplicated due to attributes
-    pub fn formatted_metrics(&self, metric_name: &str) -> Vec<String> {
+    fn formatted_metrics(&self, metric_name: &str) -> Vec<String> {
         let formatted = self.export_metrics();
         let mut result = Vec::new();
         for line in formatted.lines() {
@@ -281,12 +283,13 @@ impl Default for TestMeter {
             .without_target_info()
             .build()
             .unwrap();
-        let view = metrics::new_view(
-            metrics::Instrument::new().name("*_network_*"), // Match all instruments with "network" in their name
-            metrics::Stream::new().aggregation(metrics::Aggregation::ExplicitBucketHistogram {
+        let view = carbide_metrics_utils::new_view(
+            "*_network_*", // Match all instruments with "network" in their name
+            None,
+            metrics::Aggregation::ExplicitBucketHistogram {
                 boundaries: vec![0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0],
                 record_min_max: true,
-            }),
+            },
         )
         .ok();
         let meter_provider = match view {
@@ -312,7 +315,7 @@ impl Default for TestMeter {
     }
 }
 
-pub struct MockPinger;
+struct MockPinger;
 #[async_trait]
 impl Ping for MockPinger {
     async fn ping_dpu(
@@ -320,7 +323,7 @@ impl Ping for MockPinger {
         dpu_info: DpuInfo,
         _interface: IpAddr,
     ) -> Result<DpuPingResult, (NetworkMonitorError, eyre::Report)> {
-        info!("Received ping request for {}", dpu_info);
+        info!(%dpu_info, "Received ping request");
         let ping_result = DpuPingResult {
             dpu_info,
             success_count: 1,

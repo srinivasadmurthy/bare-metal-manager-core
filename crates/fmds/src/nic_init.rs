@@ -15,13 +15,15 @@
  * limitations under the License.
  */
 
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use eyre::eyre;
 use futures_util::TryStreamExt;
 use ipnetwork::IpNetwork;
-use netlink_packet_route::address::AddressAttribute;
-use rtnetlink::Handle;
+use rtnetlink::packet_route::address::AddressAttribute;
+use rtnetlink::{Handle, LinkUnspec};
+use tokio::process::Command as TokioCommand;
 
 const LINK_LOOKUP_RETRIES: u32 = 15;
 const LINK_LOOKUP_BACKOFF: Duration = Duration::from_secs(2);
@@ -37,17 +39,73 @@ pub async fn assign_address(name: &str, cidr: IpNetwork) -> eyre::Result<()> {
     let index = wait_for_link(&handle, name).await?;
 
     if address_already_present(&handle, index, cidr).await? {
-        tracing::info!(interface = name, %cidr, "address already assigned; skipping add");
+        tracing::info!(interface_name = name, %cidr, "address already assigned; skipping add");
     } else {
         handle
             .address()
             .add(index, cidr.ip(), cidr.prefix())
             .execute()
             .await?;
-        tracing::info!(interface = name, %cidr, "assigned address");
+        tracing::info!(interface_name = name, %cidr, "assigned address");
     }
 
-    handle.link().set(index).up().execute().await?;
+    handle
+        .link()
+        .set(LinkUnspec::new_with_index(index).up().build())
+        .execute()
+        .await?;
+    Ok(())
+}
+
+/// Set up policy routing so replies from 169.254.169.254 egress via the metadata interface.
+/// Computes the gateway as the first host in the /30 (e.g. 169.254.169.253 for 169.254.169.254/30).
+pub async fn setup_metadata_routing(interface_name: &str, cidr: IpNetwork) -> eyre::Result<()> {
+    let IpNetwork::V4(net) = cidr else {
+        return Ok(());
+    };
+
+    let src_ip = net.ip();
+    let gateway = Ipv4Addr::from(u32::from(net.network()) + 1);
+
+    let rule = TokioCommand::new("ip")
+        .args(["rule", "add", "from", &src_ip.to_string(), "lookup", "100"])
+        .output()
+        .await?;
+    if !rule.status.success() {
+        let stderr = String::from_utf8_lossy(&rule.stderr);
+        if !stderr.contains("File exists") {
+            eyre::bail!("ip rule add failed: {stderr}");
+        }
+    }
+    tracing::info!(source_ip_address = %src_ip, table = 100, "policy rule configured");
+
+    let route = TokioCommand::new("ip")
+        .args([
+            "route",
+            "add",
+            "default",
+            "via",
+            &gateway.to_string(),
+            "dev",
+            interface_name,
+            "table",
+            "100",
+        ])
+        .output()
+        .await?;
+    if !route.status.success() {
+        let stderr = String::from_utf8_lossy(&route.stderr);
+        if !stderr.contains("File exists") {
+            eyre::bail!("ip route add failed: {stderr}");
+        }
+    }
+    tracing::info!(
+        gateway = %gateway,
+        interface_name,
+        table = 100,
+        "default policy route configured",
+    );
+
     Ok(())
 }
 
@@ -58,7 +116,7 @@ async fn wait_for_link(handle: &Handle, name: &str) -> eyre::Result<u32> {
             Ok(Some(link)) => return Ok(link.header.index),
             Ok(None) | Err(rtnetlink::Error::NetlinkError(_)) => {
                 tracing::debug!(
-                    interface = name,
+                    interface_name = name,
                     attempt,
                     "interface not yet present, retrying"
                 );

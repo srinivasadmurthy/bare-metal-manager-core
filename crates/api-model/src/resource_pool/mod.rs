@@ -23,9 +23,10 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 pub use define::{Range, ResourcePoolDef, ResourcePoolType};
-use rpc::errors::RpcDataConversionError;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+
+use crate::errors::ModelError;
 
 /// State of an entry inside the resource pool
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,18 +109,6 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ResourcePoolSnapshot {
     }
 }
 
-impl From<ResourcePoolSnapshot> for rpc::forge::ResourcePool {
-    fn from(rp: ResourcePoolSnapshot) -> Self {
-        rpc::forge::ResourcePool {
-            name: rp.name,
-            min: rp.min,
-            max: rp.max,
-            total: (rp.stats.free + rp.stats.used) as u64,
-            allocated: rp.stats.used as u64,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct ResourcePoolEntry {
     pub pool_name: String,
@@ -177,18 +166,19 @@ pub enum OwnerType {
     Vpc,
 
     /// owner_type for East West Networks
-    Dpa,
+    SpxPartition,
 }
 
 impl FromStr for OwnerType {
-    type Err = RpcDataConversionError;
+    type Err = ModelError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "machine" => Ok(Self::Machine),
             "network_segment" => Ok(Self::NetworkSegment),
             "ib_partition" => Ok(Self::IBPartition),
             "vpc" => Ok(Self::Vpc),
-            x => Err(RpcDataConversionError::InvalidArgument(format!(
+            "spx_partition" => Ok(Self::SpxPartition),
+            x => Err(ModelError::InvalidArgument(format!(
                 "Unknown owner_type '{x}'"
             ))),
         }
@@ -202,7 +192,7 @@ impl fmt::Display for OwnerType {
             Self::NetworkSegment => write!(f, "network_segment"),
             Self::IBPartition => write!(f, "ib_partition"),
             Self::Vpc => write!(f, "vpc"),
-            Self::Dpa => write!(f, "dpa"),
+            Self::SpxPartition => write!(f, "spx_partition"),
         }
     }
 }
@@ -230,9 +220,9 @@ pub struct ResourcePoolStats {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResourcePoolError {
-    #[error("Resource pool is empty, cannot allocate")]
+    #[error("resource pool is empty, cannot allocate")]
     Empty,
-    #[error("Cannot convert '{v}' to {pool_name}'s pool type for {owner_type} {owner_id}: {e}")]
+    #[error("cannot convert '{v}' to {pool_name}'s pool type for {owner_type} {owner_id}: {e}")]
     Parse {
         e: String,
         v: String,
@@ -244,30 +234,191 @@ pub enum ResourcePoolError {
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{scenarios, value_scenarios};
+
     use super::*;
 
     #[test]
-    fn test_serialize_resource_pool_entry_state() {
-        let state = ResourcePoolEntryState::Free;
-        let serialized = serde_json::to_string(&state).unwrap();
-        assert_eq!(serialized, r#"{"state":"free"}"#);
-        assert_eq!(
-            serde_json::from_str::<ResourcePoolEntryState>(&serialized).unwrap(),
-            state
-        );
+    fn serialize_resource_pool_entry_state() {
+        // Each row carries the state and its canonical JSON; the operation
+        // serializes the state and confirms it round-trips back unchanged.
+        scenarios!(
+            run = |state| {
+                let serialized = serde_json::to_string(&state).map_err(drop)?;
+                let parsed: ResourcePoolEntryState =
+                    serde_json::from_str(&serialized).map_err(drop)?;
+                if parsed != state {
+                    return Err(());
+                }
+                Ok::<_, ()>(serialized)
+            };
+            "free" {
+                ResourcePoolEntryState::Free => Yields(r#"{"state":"free"}"#.to_string()),
+            }
 
-        let state = ResourcePoolEntryState::Allocated {
-            owner: "me".to_string(),
-            owner_type: "my_stuff".to_string(),
-        };
-        let serialized = serde_json::to_string(&state).unwrap();
-        assert_eq!(
-            serialized,
-            r#"{"state":"allocated","owner":"me","owner_type":"my_stuff"}"#
+            "allocated" {
+                ResourcePoolEntryState::Allocated {
+                    owner: "me".to_string(),
+                    owner_type: "my_stuff".to_string(),
+                } => Yields(
+                    r#"{"state":"allocated","owner":"me","owner_type":"my_stuff"}"#.to_string(),
+                ),
+            }
+
+            "allocated with empty owner fields" {
+                ResourcePoolEntryState::Allocated {
+                    owner: String::new(),
+                    owner_type: String::new(),
+                } => Yields(
+                    r#"{"state":"allocated","owner":"","owner_type":""}"#.to_string(),
+                ),
+            }
         );
-        assert_eq!(
-            serde_json::from_str::<ResourcePoolEntryState>(&serialized).unwrap(),
-            state
+    }
+
+    #[test]
+    fn deserialize_resource_pool_entry_state() {
+        scenarios!(
+            run = |json| serde_json::from_str::<ResourcePoolEntryState>(json).map_err(drop);
+            "free" {
+                r#"{"state":"free"}"# => Yields(ResourcePoolEntryState::Free),
+            }
+
+            "allocated" {
+                r#"{"state":"allocated","owner":"me","owner_type":"vpc"}"# => Yields(ResourcePoolEntryState::Allocated {
+                    owner: "me".to_string(),
+                    owner_type: "vpc".to_string(),
+                }),
+            }
+
+            "unknown tag is rejected" {
+                r#"{"state":"borrowed"}"# => Fails,
+            }
+
+            "allocated missing owner_type is rejected" {
+                r#"{"state":"allocated","owner":"me"}"# => Fails,
+            }
+
+            "not an object is rejected" {
+                r#"42"# => Fails,
+            }
+        );
+    }
+
+    #[test]
+    fn owner_type_from_str() {
+        // `ModelError` has no `PartialEq`, so error rows use `Fails` and the run
+        // closure drops the error to settle on `()`.
+        scenarios!(
+            run = |s| OwnerType::from_str(s).map_err(drop);
+            "machine" {
+                "machine" => Yields(OwnerType::Machine),
+            }
+
+            "network_segment" {
+                "network_segment" => Yields(OwnerType::NetworkSegment),
+            }
+
+            "ib_partition" {
+                "ib_partition" => Yields(OwnerType::IBPartition),
+            }
+
+            "vpc" {
+                "vpc" => Yields(OwnerType::Vpc),
+            }
+
+            "spx_partition round-trips through Display/FromStr" {
+                "spx_partition" => Yields(OwnerType::SpxPartition),
+            }
+
+            "unknown string" {
+                "nonsense" => Fails,
+            }
+
+            "empty string" {
+                "" => Fails,
+            }
+
+            "wrong case is rejected" {
+                "Machine" => Fails,
+            }
+
+            "leading whitespace is rejected" {
+                " machine" => Fails,
+            }
+        );
+    }
+
+    #[test]
+    fn owner_type_display_round_trips_via_from_str() {
+        // Every variant that `from_str` accepts must display to a string that
+        // `from_str` accepts back as the same variant.
+        scenarios!(
+            run = |owner| OwnerType::from_str(&owner.to_string()).map_err(drop);
+            "machine" {
+                OwnerType::Machine => Yields(OwnerType::Machine),
+            }
+
+            "network_segment" {
+                OwnerType::NetworkSegment => Yields(OwnerType::NetworkSegment),
+            }
+
+            "ib_partition" {
+                OwnerType::IBPartition => Yields(OwnerType::IBPartition),
+            }
+
+            "vpc" {
+                OwnerType::Vpc => Yields(OwnerType::Vpc),
+            }
+        );
+    }
+
+    #[test]
+    fn owner_type_display() {
+        value_scenarios!(
+            run = |owner| owner.to_string();
+            "machine" {
+                OwnerType::Machine => "machine".to_string(),
+            }
+
+            "network_segment" {
+                OwnerType::NetworkSegment => "network_segment".to_string(),
+            }
+
+            "ib_partition" {
+                OwnerType::IBPartition => "ib_partition".to_string(),
+            }
+
+            "vpc" {
+                OwnerType::Vpc => "vpc".to_string(),
+            }
+
+            "spx_partition" {
+                OwnerType::SpxPartition => "spx_partition".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn value_type_display() {
+        value_scenarios!(
+            run = |value_type| value_type.to_string();
+            "integer" {
+                ValueType::Integer => "Integer".to_string(),
+            }
+
+            "ipv4" {
+                ValueType::Ipv4 => "Ipv4".to_string(),
+            }
+
+            "ipv6" {
+                ValueType::Ipv6 => "Ipv6".to_string(),
+            }
+
+            "ipv6_prefix" {
+                ValueType::Ipv6Prefix => "Ipv6Prefix".to_string(),
+            }
         );
     }
 }

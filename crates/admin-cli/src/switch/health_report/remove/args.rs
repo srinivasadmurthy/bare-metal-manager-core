@@ -19,7 +19,15 @@ use carbide_uuid::switch::SwitchId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
-    pub switch_id: SwitchId,
-    pub report_source: String,
+#[command(after_long_help = "\
+EXAMPLES:
+
+Remove a health report source from a switch (source name from `health-report show`):
+    $ nico-admin-cli switch health-report remove 12345678-1234-5678-90ab-cdef01234567 \
+    internal-maintenance
+
+")]
+pub(crate) struct Args {
+    pub(super) switch_id: SwitchId,
+    pub(super) report_source: String,
 }

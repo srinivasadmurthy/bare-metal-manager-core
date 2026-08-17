@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#![cfg_attr(not(test), deny(dead_code_pub_in_binary))]
 
 // src/main.rs
 // mockdpa used to test Carbide <-> DPA interactions
@@ -33,7 +34,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use ::rpc::protos::dpa_rpc::SetVni;
+use carbide_dpa::rpc::SetVni;
 use chrono::Local;
 use clap::Parser;
 use mqttea::client::{ClientOptions, MqtteaClient};

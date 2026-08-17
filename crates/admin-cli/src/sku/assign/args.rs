@@ -19,9 +19,19 @@ use carbide_uuid::machine::MachineId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
-    pub sku_id: String,
-    pub machine_id: MachineId,
+#[command(after_long_help = "\
+EXAMPLES:
+
+Assign a SKU to a machine:
+    $ nico-admin-cli sku assign DGX-H100-640GB 12345678-1234-5678-90ab-cdef01234567
+
+Force the assignment even if the machine does not verify against the SKU:
+    $ nico-admin-cli sku assign DGX-H100-640GB 12345678-1234-5678-90ab-cdef01234567 --force
+
+")]
+pub(crate) struct Args {
+    pub(super) sku_id: String,
+    pub(super) machine_id: MachineId,
     #[clap(long)]
-    pub force: bool,
+    pub(super) force: bool,
 }

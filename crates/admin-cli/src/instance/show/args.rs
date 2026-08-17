@@ -24,28 +24,50 @@ use clap::Parser;
 // TODO: Possibly add the ability to filter by a list of tenant
 // org IDs and/or VPC IDs.
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all instances:
+    $ nico-admin-cli instance show
+
+Show a single instance by id:
+    $ nico-admin-cli instance show 12345678-1234-5678-90ab-cdef01234567
+
+List instances for one tenant org:
+    $ nico-admin-cli instance show --tenant-org-id fds34511233a
+
+List instances in a VPC:
+    $ nico-admin-cli instance show --vpc-id abcdef01-2345-6789-abcd-ef0123456789
+
+List instances matching a label:
+    $ nico-admin-cli instance show --label-key role --label-value training
+
+List instances of an instance type:
+    $ nico-admin-cli instance show --instance-type-id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(
         default_value(""),
         help = "The instance ID to query, leave empty for all (default)"
     )]
-    pub id: String,
+    pub(crate) id: String,
 
     #[clap(short, long, action)]
-    pub extrainfo: bool,
+    pub(crate) extrainfo: bool,
 
     #[clap(short, long, help = "The Tenant Org ID to query")]
-    pub tenant_org_id: Option<String>,
+    pub(crate) tenant_org_id: Option<String>,
 
     #[clap(short, long, help = "The VPC ID to query.")]
-    pub vpc_id: Option<String>,
+    pub(crate) vpc_id: Option<String>,
 
     #[clap(long, help = "The key of label instance to query")]
-    pub label_key: Option<String>,
+    pub(crate) label_key: Option<String>,
 
     #[clap(long, help = "The value of label instance to query")]
-    pub label_value: Option<String>,
+    pub(crate) label_value: Option<String>,
 
     #[clap(long, help = "The instance type ID to query.")]
-    pub instance_type_id: Option<String>,
+    pub(crate) instance_type_id: Option<String>,
 }

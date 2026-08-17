@@ -23,8 +23,9 @@ use std::path::Path;
 use std::process::Command;
 use std::str::Utf8Error;
 
+use ::carbide_rpc_utils::machine_discovery::aggregate_cpus;
+use ::carbide_utils::arch::{CpuArchitecture, UnsupportedCpuArchitecture};
 use ::carbide_utils::cmd::CmdError;
-use ::carbide_utils::models::arch::{CpuArchitecture, UnsupportedCpuArchitecture};
 use ::rpc::machine_discovery as rpc_discovery;
 use base64::prelude::*;
 use carbide_utils::{BF2_PRODUCT_NAME, BF3_PRODUCT_NAME};
@@ -34,8 +35,6 @@ use rpc::machine_discovery::MemoryDevice;
 use tracing::warn;
 use uname::uname;
 
-use crate::cpu::aggregate_cpus;
-
 pub mod dpu;
 mod gpu;
 mod tpm;
@@ -43,7 +42,7 @@ mod tpm;
 /// Path where the init container writes the hardware snapshot, and the containerized agent reads it from.
 pub const HW_CACHE_PATH: &str = "/data/hw_output.json";
 
-const PCI_SUBCLASS: &str = "ID_PCI_SUBCLASS_FROM_DATABASE";
+pub(crate) const PCI_SUBCLASS: &str = "ID_PCI_SUBCLASS_FROM_DATABASE";
 const PCI_DEV_PATH: &str = "DEVPATH";
 const PCI_MODEL: &str = "ID_MODEL_FROM_DATABASE";
 const PCI_SLOT_NAME: &str = "PCI_SLOT_NAME";
@@ -57,15 +56,15 @@ const NVIDIA_VENDOR_DRIVER: &str = "nvidia";
 
 #[derive(thiserror::Error, Debug)]
 pub enum HardwareEnumerationError {
-    #[error("Hardware enumeration error: {0}")]
+    #[error("hardware enumeration error: {0}")]
     GenericError(String),
-    #[error("Udev failed with error: {0}")]
+    #[error("udev failed with error: {0}")]
     UdevError(#[from] libudev::Error),
-    #[error("Udev string {0} is not a valid MAC address")]
+    #[error("udev string {0} is not a valid MAC address")]
     InvalidMacAddress(String),
     #[error("{0}")]
     UnsupportedCpuArchitecture(String),
-    #[error("Command error {0}")]
+    #[error("command error {0}")]
     CmdError(#[from] CmdError),
 }
 
@@ -155,7 +154,7 @@ fn convert_udev_to_mac(udev: String) -> Result<String, HardwareEnumerationError>
     Ok(mac)
 }
 
-fn convert_property_to_string<'a>(
+pub fn convert_property_to_string<'a>(
     name: &'a str,
     default_value: &'a str,
     device: &'a Device,
@@ -226,15 +225,55 @@ fn get_numa_node_from_syspath(syspath: Option<&Path>) -> Result<i32, HardwareEnu
     })
 }
 
+// Total capacity of an NVMe controller in MB, summed across its block
+// namespaces. The `size` sysattr on a block device is a count of 512-byte
+// sectors (1 MB == 2048 sectors). Returns None when no namespace size can be
+// read, so callers can treat size as "unknown" rather than zero.
+fn get_nvme_size_mb(context: &libudev::Context, controller: &Device) -> Option<u32> {
+    let mut enumerator = libudev::Enumerator::new(context).ok()?;
+    enumerator.match_subsystem("block").ok()?;
+    enumerator.match_parent(controller).ok()?;
+
+    let mut total_sectors = 0_u64;
+    let mut found_namespace = false;
+    for ns in enumerator.scan_devices().ok()? {
+        // Only whole-namespace disks. `match_parent` walks the full block
+        // subtree, so without this a partitioned drive would have its
+        // partition sizes summed on top of the namespace size, inflating
+        // the reported capacity.
+        if ns.property_value("DEVTYPE").and_then(|v| v.to_str()) != Some("disk") {
+            continue;
+        }
+        found_namespace = true;
+        let sectors = ns
+            .attribute_value("size")
+            .and_then(|v| v.to_str())
+            .and_then(|v| v.trim().parse::<u64>().ok())?;
+        total_sectors = total_sectors.checked_add(sectors)?;
+    }
+    if !found_namespace {
+        return None;
+    }
+    u32::try_from(total_sectors / 2048).ok()
+}
+
 // discovery all the non-DPU IB devices
 pub fn discovery_ibs() -> HardwareEnumerationResult<Vec<rpc_discovery::InfinibandInterface>> {
     let device_debug_log = |device: &Device| {
-        tracing::debug!("SysPath - {:?}", device.syspath());
+        tracing::debug!(syspath = ?device.syspath(), "SysPath");
         for p in device.properties() {
-            tracing::trace!("Property - {:?} - {:?}", p.name(), p.value());
+            tracing::trace!(
+                property_name = ?p.name(),
+                property_value = ?p.value(),
+                "Property"
+            );
         }
         for a in device.attributes() {
-            tracing::trace! {"attribute - {:?} - {:?}", a.name(), a.value()}
+            tracing::trace! {
+                attribute_name = ?a.name(),
+                attribute_value = ?a.value(),
+                "attribute"
+            }
         }
     };
 
@@ -250,9 +289,9 @@ pub fn discovery_ibs() -> HardwareEnumerationResult<Vec<rpc_discovery::Infiniban
             Ok(properties_ext) => properties_ext,
             Err(e) => {
                 tracing::error!(
-                    "Failed to enumerate properties of device {:?}: {}",
-                    device.devpath(),
-                    e
+                    device_path = ?device.devpath(),
+                    error = %e,
+                    "Failed to enumerate properties of device"
                 );
                 continue;
             }
@@ -409,9 +448,13 @@ fn enumerate_hardware_inner(
 
     for device in devices {
         let sys_path = device.syspath();
-        tracing::debug!("SysPath - {:?}", sys_path);
+        tracing::debug!(syspath = ?sys_path, "SysPath");
         for p in device.properties() {
-            tracing::trace!("net device property - {:?} - {:?}", p.name(), p.value());
+            tracing::trace!(
+                property_name = ?p.name(),
+                property_value = ?p.value(),
+                "net device property"
+            );
         }
         //for a in device.attributes() {
         //    tracing::trace!("attribute - {:?} - {:?}", a.name(), a.value());
@@ -424,15 +467,15 @@ fn enumerate_hardware_inner(
                 Ok(properties_ext) => properties_ext,
                 Err(e) => {
                     tracing::error!(
-                        "Failed to enumerate properties of device {:?}: {}",
-                        device.devpath(),
-                        e
+                        device_path = ?device.devpath(),
+                        error = %e,
+                        "Failed to enumerate properties of device"
                     );
                     continue;
                 }
             };
 
-            tracing::trace!("properties: {:?}", properties_ext);
+            tracing::trace!(?properties_ext, "properties");
 
             // discovery DPU and non ib capable device
             // Note:
@@ -563,7 +606,7 @@ fn enumerate_hardware_inner(
             }
             CpuArchitecture::Unknown => {
                 tracing::error!(
-                    cpu_num,
+                    cpu_number = cpu_num,
                     arch = info.machine,
                     "CPU has unsupported architecture. Ignoring."
                 );
@@ -599,11 +642,11 @@ fn enumerate_hardware_inner(
         // skip the device if its hidden
         if convert_sysattr_to_string("hidden", &device).is_ok_and(|v| v == "1") {
             tracing::info!(
-                "Ignoring hidden device {}",
-                device
+                syspath = device
                     .syspath()
                     .and_then(|v| v.to_str())
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                "Ignoring hidden device"
             );
             continue;
         }
@@ -611,11 +654,11 @@ fn enumerate_hardware_inner(
         // skip the device if its removable
         if convert_sysattr_to_string("removable", &device).is_ok_and(|v| v != "0") {
             tracing::info!(
-                "Ignoring removable device {}",
-                device
+                syspath = device
                     .syspath()
                     .and_then(|v| v.to_str())
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                "Ignoring removable device"
             );
             continue;
         }
@@ -624,11 +667,11 @@ fn enumerate_hardware_inner(
             .is_ok_and(|v| v.contains("virtual"))
         {
             tracing::info!(
-                "Ignoring virtual device {}",
-                device
+                syspath = device
                     .syspath()
                     .and_then(|v| v.to_str())
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                "Ignoring virtual device"
             );
             continue;
         }
@@ -668,12 +711,17 @@ fn enumerate_hardware_inner(
             .filter(|v| !v.contains("virtual"))
             .is_some()
         {
+            let pci_path = convert_property_to_string(PCI_DEV_PATH, "", &device)
+                .ok()
+                .map(|v| v.to_string());
             nvmes.push(rpc_discovery::NvmeDevice {
                 model: convert_sysattr_to_string("model", &device)?.to_string(),
                 firmware_rev: convert_sysattr_to_string("firmware_rev", &device)?.to_string(),
                 serial: convert_sysattr_to_string("serial", &device)?
                     .trim()
                     .to_string(),
+                size_mb: get_nvme_size_mb(&context, &device),
+                pci_path,
             });
         }
     }
@@ -688,7 +736,7 @@ fn enumerate_hardware_inner(
     // There is only expected to be a single set, and we don't want to
     // accidentally overwrite it with other data
     if let Some(device) = devices.next() {
-        tracing::debug!("DMI device syspath: {:?}", device.syspath());
+        tracing::debug!(syspath = ?device.syspath(), "DMI device syspath");
 
         // e.g. 'DRAM'. We will use this later if smbios fails.
         backup_ram_type = device
@@ -715,9 +763,9 @@ fn enumerate_hardware_inner(
             dmi.product_name = convert_sysattr_to_string("product_name", &device)?.to_string();
             if cpu_part == BF3_CPU_PART && dmi.product_name == BF2_PRODUCT_NAME {
                 tracing::info!(
-                    "Overriding product name {} with {}",
-                    dmi.product_name,
-                    BF3_PRODUCT_NAME
+                    product_name = dmi.product_name.as_str(),
+                    new_product_name = BF3_PRODUCT_NAME,
+                    "Overriding product name"
                 );
                 dmi.product_name = BF3_PRODUCT_NAME.to_owned();
             }
@@ -739,10 +787,16 @@ fn enumerate_hardware_inner(
         }
     }
 
+    let is_dpu_dmi = dmi.product_name.contains(BF_PRODUCT_NAME_REGEX);
     let tpm_ek_certificate = match tpm::get_ek_certificate() {
         Ok(cert) => Some(BASE64_STANDARD.encode(cert)),
+        Err(e) if !is_dpu_dmi && tpm::is_tpm_present() => {
+            return Err(HardwareEnumerationError::GenericError(format!(
+                "TPM is present but EK certificate collection failed; refusing serial fallback: {e}"
+            )));
+        }
         Err(e) => {
-            tracing::error!("Could not read TPM EK certificate: {:?}", e);
+            tracing::error!(error = ?e, "Could not read TPM EK certificate");
             None
         }
     };
@@ -751,7 +805,7 @@ fn enumerate_hardware_inner(
         "https://www.mellanox.com" | "Nvidia" => match dpu::get_dpu_info() {
             Ok(dpu_data) => Some(dpu_data),
             Err(e) => {
-                tracing::error!("Could not get DPU data: {:?}", e);
+                tracing::error!(error = ?e, "Could not get DPU data");
                 None
             }
         },
@@ -813,7 +867,9 @@ fn enumerate_hardware_inner(
         }
         Err(err) => {
             warn!(
-                "Could not discover host memory using smbios device, using {mem_info_path}: {err}"
+                memory_info_path = mem_info_path,
+                error = %err,
+                "Could not discover host memory using smbios device"
             );
             let meminfo = std::fs::read_to_string(mem_info_path).map_err(|e| {
                 HardwareEnumerationError::GenericError(format!("Err reading {mem_info_path}: {e}"))
@@ -827,19 +883,22 @@ fn enumerate_hardware_inner(
         }
     }
 
-    tracing::debug!("Discovered Disks: {:?}", disks);
+    tracing::debug!(?disks, "Discovered Disks");
     if !cpus.is_empty() {
-        tracing::debug!("Discovered CPUs[0]: {:?}", cpus[0]);
+        tracing::debug!(cpu = ?cpus[0], "Discovered CPUs[0]");
     }
-    tracing::debug!("Discovered NICS: {:?}", nics);
-    tracing::debug!("Discovered IBS: {:?}", ibs);
-    tracing::debug!("Discovered NVMES: {:?}", nvmes);
-    tracing::debug!("Discovered DMI: {:?}", dmi);
-    tracing::debug!("Discovered GPUs: {:?}", gpus);
-    tracing::debug!("Discovered Machine Architecture: {}", info.machine.as_str());
-    tracing::debug!("Discovered DPU: {:?}", dpu_vpd);
+    tracing::debug!(?nics, "Discovered NICS");
+    tracing::debug!(?ibs, "Discovered IBS");
+    tracing::debug!(?nvmes, "Discovered NVMES");
+    tracing::debug!(?dmi, "Discovered DMI");
+    tracing::debug!(?gpus, "Discovered GPUs");
+    tracing::debug!(
+        architecture = info.machine.as_str(),
+        "Discovered Machine Architecture"
+    );
+    tracing::debug!(dpu_vpd = ?dpu_vpd, "Discovered DPU");
     if let Some(cert) = tpm_ek_certificate.as_ref() {
-        tracing::debug!("TPM EK certificate (base64): {}", cert);
+        tracing::debug!(certificate = cert.as_str(), "TPM EK certificate (base64)");
     }
 
     Ok(rpc_discovery::DiscoveryInfo {
@@ -850,15 +909,13 @@ fn enumerate_hardware_inner(
         nvme_devices: nvmes,
         dmi_data: Some(dmi),
         machine_type: arch.to_string(),
-        machine_arch: Some(arch.into()),
+        machine_arch: Some(rpc::utils::cpu_architecture_to_rpc(arch)),
         tpm_ek_certificate,
         dpu_info: dpu_vpd,
         gpus,
         memory_devices,
         tpm_description: None,
         attest_key_info: None,
-        // TODO: Remove when there's no longer a need to handle the old topology format
-        ..Default::default()
     })
 }
 
@@ -868,6 +925,23 @@ const INIT_CPU_INFO_PATH: &str = "/host-cpu-info";
 /// Path where the host's `/proc/meminfo` is bind-mounted inside the init container.
 const INIT_MEM_INFO_PATH: &str = "/host-mem-info";
 
+/// Validate that an enumerated [`rpc_discovery::DiscoveryInfo`] is complete
+/// enough for downstream use. Returns `Err` describing the missing piece so
+/// the caller can retry the probe.
+///
+/// Today the only required field is `dpu_info` — DPU VPD probing can race
+/// with device init and produce a `None` if read too early.
+fn validate_enumerated(
+    info: &rpc_discovery::DiscoveryInfo,
+) -> Result<(), HardwareEnumerationError> {
+    if info.dpu_info.is_none() {
+        return Err(HardwareEnumerationError::GenericError(
+            "Hardware enumeration is missing dpu_info".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Enumerate hardware and save the result as JSON to [`HW_CACHE_PATH`].
 ///
 /// Used by the init container to snapshot host hardware info so the containerized agent can
@@ -875,11 +949,49 @@ const INIT_MEM_INFO_PATH: &str = "/host-mem-info";
 ///
 /// Reads CPU info from [`INIT_CPU_INFO_PATH`] (`/host-cpu-info`) where the init container
 /// bind-mounts the host's `/proc/cpuinfo`.
-pub fn enumerate_and_save_hardware()
+pub async fn enumerate_and_save_hardware()
 -> Result<rpc_discovery::DiscoveryInfo, HardwareEnumerationError> {
-    let info = enumerate_hardware_inner(INIT_CPU_INFO_PATH, INIT_MEM_INFO_PATH)?;
-    save_hardware_to(&info, HW_CACHE_PATH)?;
-    Ok(info)
+    let mut last_err = String::new();
+
+    macro_rules! try_or_retry {
+        ($expr:expr, $msg:literal, $attempt:expr) => {
+            match $expr {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(attempt = $attempt, error = %e, $msg);
+                    last_err = e.to_string();
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    continue;
+                }
+            }
+        };
+    }
+
+    for attempt in 1..10 {
+        let info = try_or_retry!(
+            enumerate_hardware_inner(INIT_CPU_INFO_PATH, INIT_MEM_INFO_PATH),
+            "Hardware enumeration failed; retrying in 10s",
+            attempt
+        );
+        try_or_retry!(
+            validate_enumerated(&info),
+            "Hardware enumeration incomplete; retrying in 10s",
+            attempt
+        );
+        try_or_retry!(
+            save_hardware_to(&info, HW_CACHE_PATH),
+            "Failed to save hardware cache; retrying in 10s",
+            attempt
+        );
+        return Ok(info);
+    }
+
+    tracing::error!(
+        error = %last_err,
+        "Init container failed to generate hardware info. Try to delete the pod to recover."
+    );
+
+    Err(HardwareEnumerationError::GenericError(last_err))
 }
 
 /// Load the hardware snapshot from [`HW_CACHE_PATH`] written by the init container.
@@ -937,6 +1049,10 @@ fn parse_memtotal_kb(meminfo: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{
+        Case, Check, check_cases, check_values, scenarios, value_scenarios,
+    };
     use tempfile::NamedTempFile;
 
     use super::*;
@@ -948,122 +1064,451 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_save_and_load_roundtrip() {
-        let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap();
-
-        let info = minimal_discovery_info();
-        save_hardware_to(&info, path).expect("save should succeed");
-
-        let loaded = load_hardware_from(path).expect("load should succeed");
-        assert_eq!(loaded.machine_type, "aarch64");
-    }
-
-    #[test]
-    fn test_load_file_not_found() {
-        let err = load_hardware_from("/nonexistent/path/hw.json").unwrap_err();
-        assert!(
-            err.to_string().contains("/nonexistent/path/hw.json"),
-            "error should mention the path: {err}"
-        );
-    }
-
-    #[test]
-    fn test_load_invalid_json() {
-        let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap();
-        fs::write(path, b"not valid json { {").unwrap();
-
-        let err = load_hardware_from(path).unwrap_err();
-        assert!(
-            err.to_string().contains("Failed to parse hardware cache"),
-            "error should indicate parse failure: {err}"
-        );
-    }
-
-    #[test]
-    fn test_save_roundtrip_preserves_fields() {
-        let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap();
-
-        let info = rpc_discovery::DiscoveryInfo {
-            machine_type: "x86_64".to_string(),
-            block_devices: vec![rpc_discovery::BlockDevice {
-                model: "test-disk".to_string(),
-                serial: "SN123".to_string(),
+    /// Build a `PciDevicePropertiesExt` from the few fields the pure predicates
+    /// (`is_dpu`, `mlnx_ib_capable`) actually read.
+    fn props_ext(
+        device_id: &str,
+        vendor: &str,
+        slot: Option<&str>,
+        sub_class: &str,
+    ) -> PciDevicePropertiesExt {
+        PciDevicePropertiesExt {
+            sub_class: sub_class.to_string(),
+            pci_properties: rpc_discovery::PciDeviceProperties {
+                vendor: vendor.to_string(),
+                slot: slot.map(|s| s.to_string()),
                 ..Default::default()
-            }],
-            ..Default::default()
-        };
+            },
+            device_id: device_id.to_string(),
+        }
+    }
 
-        save_hardware_to(&info, path).unwrap();
-        let loaded = load_hardware_from(path).unwrap();
+    fn proc_cpu(
+        vendor: &str,
+        model: &str,
+        sockets: u32,
+        cores: u32,
+        threads: u32,
+    ) -> rpc_discovery::CpuInfo {
+        rpc_discovery::CpuInfo {
+            vendor: vendor.to_string(),
+            model: model.to_string(),
+            sockets,
+            cores,
+            threads,
+        }
+    }
 
-        assert_eq!(loaded.machine_type, "x86_64");
-        assert_eq!(loaded.block_devices.len(), 1);
-        assert_eq!(loaded.block_devices[0].model, "test-disk");
-        assert_eq!(loaded.block_devices[0].serial, "SN123");
+    // save_hardware_to + load_hardware_from round-trip and the load failure
+    // paths. Each row exercises the fallible save/load cluster against a temp
+    // path; `Yields(true)` means the round-tripped marker field survived, a
+    // `FailsWith` row pins the path/parse error text in the returned message.
+    #[test]
+    fn save_load_cluster() {
+        // round-trip: minimal info survives save -> load
+        Case {
+            scenario: "minimal info round-trips machine_type",
+            input: minimal_discovery_info(),
+            expect: Yields(true),
+        }
+        .check(|info| {
+            let tmp = NamedTempFile::new().map_err(drop)?;
+            let path = tmp.path().to_str().ok_or(())?;
+            save_hardware_to(&info, path).map_err(drop)?;
+            let loaded = load_hardware_from(path).map_err(drop)?;
+            Ok::<_, ()>(loaded.machine_type == "aarch64")
+        });
+
+        // round-trip: nested block_devices fields survive
+        Case {
+            scenario: "block device fields round-trip",
+            input: rpc_discovery::DiscoveryInfo {
+                machine_type: "x86_64".to_string(),
+                block_devices: vec![rpc_discovery::BlockDevice {
+                    model: "test-disk".to_string(),
+                    serial: "SN123".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            expect: Yields(true),
+        }
+        .check(|info| {
+            let tmp = NamedTempFile::new().map_err(drop)?;
+            let path = tmp.path().to_str().ok_or(())?;
+            save_hardware_to(&info, path).map_err(drop)?;
+            let loaded = load_hardware_from(path).map_err(drop)?;
+            Ok::<_, ()>(
+                loaded.machine_type == "x86_64"
+                    && loaded.block_devices.len() == 1
+                    && loaded.block_devices[0].model == "test-disk"
+                    && loaded.block_devices[0].serial == "SN123",
+            )
+        });
+
+        // load failure: missing file -> error mentions the path
+        Case {
+            scenario: "missing file error mentions path",
+            input: "/nonexistent/path/hw.json",
+            expect: Yields(true),
+        }
+        .check(|path| {
+            let err = load_hardware_from(path).unwrap_err();
+            Ok::<_, ()>(err.to_string().contains("/nonexistent/path/hw.json"))
+        });
+
+        // load failure: invalid JSON -> "Failed to parse" error
+        Case {
+            scenario: "invalid json reports parse failure",
+            input: &b"not valid json { {"[..],
+            expect: Yields(true),
+        }
+        .check(|bytes| {
+            let tmp = NamedTempFile::new().map_err(drop)?;
+            let path = tmp.path().to_str().ok_or(())?;
+            fs::write(path, bytes).map_err(drop)?;
+            let err = load_hardware_from(path).unwrap_err();
+            Ok::<_, ()>(err.to_string().contains("Failed to parse hardware cache"))
+        });
+    }
+
+    // Init-container bind-mount paths and the cache path are part of the
+    // daemonset contract; pin each constant exactly.
+    #[test]
+    fn init_container_path_constants() {
+        value_scenarios!(
+            // identity: the constant under test is handed in as the input
+            run = |c| c;
+            "init cpu info path" {
+                INIT_CPU_INFO_PATH => "/host-cpu-info",
+            }
+
+            "init mem info path" {
+                INIT_MEM_INFO_PATH => "/host-mem-info",
+            }
+
+            "hw cache path" {
+                HW_CACHE_PATH => "/data/hw_output.json",
+            }
+        );
+    }
+
+    // parse_memtotal_kb: total fn returning the kB value, 0 when the line is
+    // absent or the value is unparseable. Covers each lines() / split branch.
+    #[test]
+    fn parse_memtotal_kb_cases() {
+        check_values(
+            [
+                Check {
+                    scenario: "typical first line",
+                    input: "MemTotal:       32572708 kB\nMemFree:        16000000 kB\n",
+                    expect: 32_572_708,
+                },
+                Check {
+                    scenario: "MemTotal absent -> 0",
+                    input: "MemFree:        16000000 kB\nSwapTotal:      0 kB\n",
+                    expect: 0,
+                },
+                Check {
+                    scenario: "empty input -> 0",
+                    input: "",
+                    expect: 0,
+                },
+                Check {
+                    scenario: "non-numeric value -> 0",
+                    input: "MemTotal:       not_a_number kB\n",
+                    expect: 0,
+                },
+                Check {
+                    scenario: "MemTotal not first line",
+                    input: "HugePages_Total: 0\nMemTotal:        8192000 kB\nMemFree:         4096000 kB\nBuffers:          512000 kB\n",
+                    expect: 8_192_000,
+                },
+                // boundary: only the key with no value field -> nth(1) None -> "0" -> 0
+                Check {
+                    scenario: "MemTotal key with no value -> 0",
+                    input: "MemTotal:\n",
+                    expect: 0,
+                },
+                // a line that merely starts with "MemTotal" but is not the
+                // "MemTotal:" key is NOT matched (starts_with check is "MemTotal:")
+                Check {
+                    scenario: "MemTotalSwap not matched -> 0",
+                    input: "MemTotalSwap:   123 kB\n",
+                    expect: 0,
+                },
+            ],
+            parse_memtotal_kb,
+        );
+    }
+
+    // can_parse_int: hex (0x-prefixed, base 16) or decimal i32. True only when
+    // the remaining text parses; false on bad hex digits, bad decimal, empty,
+    // or overflow.
+    #[test]
+    fn can_parse_int_cases() {
+        value_scenarios!(
+            run = can_parse_int;
+            "plain decimal" {
+                "42" => true,
+            }
+
+            "negative decimal" {
+                "-7" => true,
+            }
+
+            "hex value" {
+                "0x10de" => true,
+            }
+
+            "hex with no digits after prefix" {
+                "0x" => false,
+            }
+
+            "non-numeric text" {
+                "GenuineIntel" => false,
+            }
+
+            "empty string" {
+                "" => false,
+            }
+
+            "decimal overflows i32" {
+                "9999999999" => false,
+            }
+
+            "bad hex digit" {
+                "0xZZ" => false,
+            }
+        );
+    }
+
+    // PciDevicePropertiesExt::is_dpu: device_id prefix decides. BlueField DPUs
+    // start 0xa2xx or 0xc2xx; everything else is not a DPU.
+    #[test]
+    fn is_dpu_cases() {
+        value_scenarios!(
+            run = |id| {
+                props_ext(
+                    id,
+                    "Mellanox Technologies",
+                    Some("0000:08:00.0"),
+                    "Ethernet controller",
+                )
+                .is_dpu()
+            };
+            "0xa2 prefix is dpu" {
+                "0xa2d6" => true,
+            }
+
+            "0xc2 prefix is dpu" {
+                "0xc2d2" => true,
+            }
+
+            "other mellanox id not dpu" {
+                "0x1021" => false,
+            }
+
+            "empty id not dpu" {
+                "" => false,
+            }
+
+            "0xa not enough to match" {
+                "0xa1ff" => false,
+            }
+        );
+    }
+
+    // PciDevicePropertiesExt::mlnx_ib_capable: true only when slot is present
+    // and non-empty, vendor is Mellanox (case-insensitive), and the subclass is
+    // "Infiniband controller" (case-insensitive). Any other combination false.
+    #[test]
+    fn mlnx_ib_capable_cases() {
+        value_scenarios!(
+            run = |p| p.mlnx_ib_capable();
+            "mellanox + slot + infiniband subclass" {
+                props_ext(
+                    "0xa2d6",
+                    "Mellanox Technologies",
+                    Some("0000:08:00.0"),
+                    "Infiniband controller",
+                ) => true,
+            }
+
+            "vendor case-insensitive match" {
+                props_ext(
+                    "0xa2d6",
+                    "mellanox technologies",
+                    Some("0000:08:00.0"),
+                    "Infiniband controller",
+                ) => true,
+            }
+
+            "subclass case-insensitive match" {
+                props_ext(
+                    "0xa2d6",
+                    "Mellanox Technologies",
+                    Some("0000:08:00.0"),
+                    "infiniband controller",
+                ) => true,
+            }
+
+            "ethernet subclass -> false" {
+                props_ext(
+                    "0xa2d6",
+                    "Mellanox Technologies",
+                    Some("0000:08:00.0"),
+                    "Ethernet controller",
+                ) => false,
+            }
+
+            "non-mellanox vendor -> false" {
+                props_ext(
+                    "0xa2d6",
+                    "Intel Corporation",
+                    Some("0000:08:00.0"),
+                    "Infiniband controller",
+                ) => false,
+            }
+
+            "slot None -> false" {
+                props_ext(
+                    "0xa2d6",
+                    "Mellanox Technologies",
+                    None,
+                    "Infiniband controller",
+                ) => false,
+            }
+
+            "empty slot -> false" {
+                props_ext(
+                    "0xa2d6",
+                    "Mellanox Technologies",
+                    Some(""),
+                    "Infiniband controller",
+                ) => false,
+            }
+        );
+    }
+
+    // convert_udev_to_mac: strips the leading "enx", chunks the rest into byte
+    // pairs, and colon-joins. Fails only on non-UTF-8 (unreachable for valid
+    // String input), so exercise the formatting branches here.
+    #[test]
+    fn convert_udev_to_mac_cases() {
+        check_cases(
+            [
+                Case {
+                    scenario: "standard 6-octet udev name",
+                    input: "enx112233445566".to_string(),
+                    expect: Yields("11:22:33:44:55:66".to_string()),
+                },
+                Case {
+                    scenario: "single octet after prefix",
+                    input: "enxab".to_string(),
+                    expect: Yields("ab".to_string()),
+                },
+                Case {
+                    scenario: "exactly the prefix, no octets",
+                    input: "enx".to_string(),
+                    expect: Yields(String::new()),
+                },
+                // trailing odd nibble becomes its own one-char chunk
+                Case {
+                    scenario: "odd-length remainder",
+                    input: "enx112233445".to_string(),
+                    expect: Yields("11:22:33:44:5".to_string()),
+                },
+            ],
+            |s| convert_udev_to_mac(s).map_err(drop),
+        );
+    }
+
+    // get_cpu_info: lscpu values override procfs only under specific conditions.
+    // vendor/model override iff the procfs value is an unmapped integer AND
+    // lscpu has the key. Topology is all-or-nothing and threads becomes
+    // cores*threads-per-core.
+    #[test]
+    fn get_cpu_info_vendor_model_cases() {
+        // procfs vendor/model are integers -> lscpu values win
+        let mut lscpu = HashMap::new();
+        lscpu.insert(LSCPU_VENDOR, "ARM".to_string());
+        lscpu.insert(LSCPU_MODEL, "Neoverse-N1".to_string());
+        let got = get_cpu_info(&lscpu, proc_cpu("0x41", "0x1", 1, 1, 1));
+        assert_eq!(got.vendor, "ARM", "integer procfs vendor replaced by lscpu");
+        assert_eq!(
+            got.model, "Neoverse-N1",
+            "integer procfs model replaced by lscpu"
+        );
+
+        // procfs vendor/model already human-readable -> lscpu ignored
+        let got = get_cpu_info(&lscpu, proc_cpu("GenuineIntel", "Xeon", 1, 1, 1));
+        assert_eq!(got.vendor, "GenuineIntel", "named procfs vendor kept");
+        assert_eq!(got.model, "Xeon", "named procfs model kept");
+
+        // procfs integer but lscpu has no key -> procfs value kept
+        let empty = HashMap::new();
+        let got = get_cpu_info(&empty, proc_cpu("0x41", "0x1", 2, 4, 8));
+        assert_eq!(got.vendor, "0x41", "no lscpu vendor -> keep procfs");
+        assert_eq!(got.model, "0x1", "no lscpu model -> keep procfs");
     }
 
     #[test]
-    fn test_init_container_paths_match_daemonset_mounts() {
-        assert_eq!(INIT_CPU_INFO_PATH, "/host-cpu-info");
-        assert_eq!(INIT_MEM_INFO_PATH, "/host-mem-info");
-        assert_eq!(HW_CACHE_PATH, "/data/hw_output.json");
+    fn get_cpu_info_topology_cases() {
+        // complete lscpu topology -> threads = cores_per_socket * threads_per_core
+        let mut full = HashMap::new();
+        full.insert(LSCPU_SOCKETS, "2".to_string());
+        full.insert(LSCPU_CORES_PER_SOCKET, "16".to_string());
+        full.insert(LSCPU_THREADS_PER_CORE, "2".to_string());
+        let got = get_cpu_info(&full, proc_cpu("0x41", "0x1", 9, 9, 9));
+        assert_eq!(got.sockets, 2, "lscpu sockets win");
+        assert_eq!(got.cores, 16, "lscpu cores win");
+        assert_eq!(got.threads, 32, "threads = cores * threads_per_core");
+
+        // partial topology (missing threads-per-core) -> all procfs values kept
+        let mut partial = HashMap::new();
+        partial.insert(LSCPU_SOCKETS, "2".to_string());
+        partial.insert(LSCPU_CORES_PER_SOCKET, "16".to_string());
+        let got = get_cpu_info(&partial, proc_cpu("0x41", "0x1", 9, 9, 9));
+        assert_eq!(got.sockets, 9, "incomplete topology -> keep procfs sockets");
+        assert_eq!(got.cores, 9, "incomplete topology -> keep procfs cores");
+        assert_eq!(got.threads, 9, "incomplete topology -> keep procfs threads");
+
+        // unparseable topology value -> all procfs values kept
+        let mut bad = HashMap::new();
+        bad.insert(LSCPU_SOCKETS, "two".to_string());
+        bad.insert(LSCPU_CORES_PER_SOCKET, "16".to_string());
+        bad.insert(LSCPU_THREADS_PER_CORE, "2".to_string());
+        let got = get_cpu_info(&bad, proc_cpu("0x41", "0x1", 9, 9, 9));
+        assert_eq!(
+            got.sockets, 9,
+            "unparseable topology -> keep procfs sockets"
+        );
+        assert_eq!(
+            got.threads, 9,
+            "unparseable topology -> keep procfs threads"
+        );
     }
 
+    // validate_enumerated: the sole required field today is dpu_info. None ->
+    // Err, Some -> Ok(()). Error is not PartialEq so use Fails + Yields(()).
     #[test]
-    fn test_parse_memtotal_kb_typical() {
-        let meminfo = "MemTotal:       32572708 kB\nMemFree:        16000000 kB\n";
-        assert_eq!(parse_memtotal_kb(meminfo), 32572708);
-    }
+    fn validate_enumerated_cases() {
+        scenarios!(
+            run = |info| validate_enumerated(&info).map_err(drop);
+            "missing dpu_info fails" {
+                rpc_discovery::DiscoveryInfo {
+                    dpu_info: None,
+                    ..Default::default()
+                } => Fails,
+            }
 
-    #[test]
-    fn test_parse_memtotal_kb_missing_returns_zero() {
-        let meminfo = "MemFree:        16000000 kB\nSwapTotal:      0 kB\n";
-        assert_eq!(parse_memtotal_kb(meminfo), 0);
-    }
-
-    #[test]
-    fn test_parse_memtotal_kb_empty_returns_zero() {
-        assert_eq!(parse_memtotal_kb(""), 0);
-    }
-
-    #[test]
-    fn test_parse_memtotal_kb_malformed_value_returns_zero() {
-        let meminfo = "MemTotal:       not_a_number kB\n";
-        assert_eq!(parse_memtotal_kb(meminfo), 0);
-    }
-
-    #[test]
-    fn test_parse_memtotal_kb_realistic_meminfo() {
-        let meminfo = "\
-HugePages_Total: 0
-MemTotal:        8192000 kB
-MemFree:         4096000 kB
-Buffers:          512000 kB
-";
-        assert_eq!(parse_memtotal_kb(meminfo), 8192000);
-    }
-
-    #[test]
-    fn test_enumerate_and_save_writes_readable_cache() {
-        use std::fs;
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let cache_path = tmp_dir.path().join("hw_output.json");
-        let cache_path_str = cache_path.to_str().unwrap();
-
-        let info = minimal_discovery_info();
-        save_hardware_to(&info, cache_path_str).unwrap();
-
-        let loaded = load_hardware_from(cache_path_str).unwrap();
-        assert_eq!(loaded.machine_type, info.machine_type);
-
-        let raw = fs::read_to_string(cache_path_str).unwrap();
-        assert!(
-            raw.contains("machine_type"),
-            "cache should be JSON with known field"
+            "present dpu_info passes" {
+                rpc_discovery::DiscoveryInfo {
+                    dpu_info: Some(Default::default()),
+                    ..Default::default()
+                } => Yields(()),
+            }
         );
     }
 }

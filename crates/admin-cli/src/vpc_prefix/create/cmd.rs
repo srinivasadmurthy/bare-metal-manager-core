@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::output::{FormattedOutput, OutputFormat};
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
+use ::rpc::admin_cli::output::OutputFormat;
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 use crate::vpc_prefix::show::cmd::ShowOutput;
 
-pub async fn create(
+pub(super) async fn create(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,
@@ -31,9 +31,12 @@ pub async fn create(
         .0
         .create_vpc_prefix(args)
         .await
-        .map(ShowOutput::One)?;
+        .map(|vpc_prefix| ShowOutput::One {
+            vpc_prefix,
+            history: Vec::new(),
+        })?;
 
     output
-        .write_output(output_format, ::rpc::admin_cli::Destination::Stdout())
+        .write_output(output_format, crate::Destination::Stdout())
         .map_err(CarbideCliError::from)
 }

@@ -18,8 +18,18 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Keep the 1000 most recent measured-boot reports, deleting the rest:
+    $ nico-admin-cli trim-table measured-boot --keep-entries 1000
+
+Trim down to the latest report only:
+    $ nico-admin-cli trim-table measured-boot --keep-entries 1
+
+")]
+pub(crate) struct Args {
     #[clap(help = "Number of entries to keep")]
     #[arg(long)]
-    pub keep_entries: u32,
+    pub(super) keep_entries: u32,
 }

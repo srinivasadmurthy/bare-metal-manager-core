@@ -19,11 +19,11 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use ::rpc::forge as rpc_forge;
 use serde::{Deserialize, Serialize};
 
 use super::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::expected_rack::common::ExpectedRackJson;
 use crate::rpc::ApiClient;
 
@@ -34,7 +34,7 @@ struct ExpectedRackList {
 }
 
 /// replace_all clears all expected racks and replaces them with the contents of a JSON file.
-pub async fn replace_all(args: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
+pub(super) async fn replace_all(args: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
     let json_file_path = Path::new(&args.filename);
     let reader = BufReader::new(File::open(json_file_path)?);
 

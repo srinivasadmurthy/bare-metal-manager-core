@@ -23,7 +23,14 @@ use super::super::common::ExploreOptions;
 // specific newtype to allow sharing of ExploreOptions, and still
 // providing a subcommand-specific Run trait implementation.
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Check whether a BMC belongs to a discovered managed host:
+    $ nico-admin-cli site-explorer is-bmc-in-managed-host 192.0.2.10
+
+")]
+pub(crate) struct Args {
     #[clap(flatten)]
-    pub inner: ExploreOptions,
+    pub(super) inner: ExploreOptions,
 }

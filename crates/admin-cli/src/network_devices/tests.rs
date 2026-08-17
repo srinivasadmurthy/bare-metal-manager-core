@@ -23,9 +23,12 @@
 // Command Structure - Baseline debug_assert() of the entire command.
 // Argument Parsing  - Ensure required/optional arg combinations parse correctly.
 
-use clap::{CommandFactory, Parser};
+use carbide_test_support::Outcome::*;
+use carbide_test_support::scenarios;
+use clap::CommandFactory;
 
 use super::*;
+use crate::test_support::{parse_leaf, raw_value};
 
 // verify_cmd_structure runs a baseline clap debug_assert()
 // to do basic command configuration checking and validation,
@@ -44,43 +47,31 @@ fn verify_cmd_structure() {
 // including testing required arguments, as well as optional
 // flag-specific checking.
 
-// parse_show_no_args ensures show parses with no
-// arguments (all devices).
+// show parses with no arguments (all devices), with a device ID, and with the
+// deprecated --all flag; each row asserts the resulting (id, all) pair.
 #[test]
-fn parse_show_no_args() {
-    let cmd = Cmd::try_parse_from(["network-device", "show"]).expect("should parse show");
-
-    match cmd {
-        Cmd::Show(args) => {
-            assert!(args.id.is_empty());
-            assert!(!args.all);
+fn parse_show_variants() {
+    scenarios!(
+        run = |argv| {
+            parse_leaf::<Cmd>(argv, &["show"])
+                .map(|matches| {
+                    (
+                        raw_value(&matches, "id").unwrap_or_default(),
+                        matches.get_flag("all"),
+                    )
+                })
+                .map_err(drop)
+        };
+        "no arguments parses (all devices)" {
+            &["network-device", "show"][..] => Yields((String::new(), false)),
         }
-    }
-}
 
-// parse_show_with_id ensures show parses with device ID.
-#[test]
-fn parse_show_with_id() {
-    let cmd = Cmd::try_parse_from(["network-device", "show", "mac=00:11:22:33:44:55"])
-        .expect("should parse show with id");
-
-    match cmd {
-        Cmd::Show(args) => {
-            assert_eq!(args.id, "mac=00:11:22:33:44:55");
+        "with a device ID" {
+            &["network-device", "show", "mac=00:11:22:33:44:55"][..] => Yields(("mac=00:11:22:33:44:55".to_string(), false)),
         }
-    }
-}
 
-// parse_show_with_all ensures show parses with
-// --all flag (deprecated).
-#[test]
-fn parse_show_with_all() {
-    let cmd =
-        Cmd::try_parse_from(["network-device", "show", "--all"]).expect("should parse show --all");
-
-    match cmd {
-        Cmd::Show(args) => {
-            assert!(args.all);
+        "with the deprecated --all flag" {
+            &["network-device", "show", "--all"][..] => Yields((String::new(), true)),
         }
-    }
+    );
 }

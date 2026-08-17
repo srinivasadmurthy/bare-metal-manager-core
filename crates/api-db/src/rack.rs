@@ -28,6 +28,9 @@ use crate::{
     ColumnInfo, DatabaseError, DatabaseResult, FilterableQueryBuilder, ObjectColumnFilter,
 };
 
+#[cfg(test)]
+mod test_metadata;
+
 #[derive(Copy, Clone)]
 pub struct IdColumn;
 impl ColumnInfo<'_> for IdColumn {
@@ -55,17 +58,63 @@ where
         .map_err(|e| DatabaseError::new(query.sql(), e))
 }
 
+/// Lock one active rack until the caller's transaction completes.
+pub async fn lock_for_update(txn: &mut PgConnection, rack_id: &RackId) -> DatabaseResult<bool> {
+    let query = "SELECT id FROM racks WHERE id = $1 AND deleted IS NULL FOR UPDATE";
+    sqlx::query_as::<_, (RackId,)>(query)
+        .bind(rack_id)
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::new(query, e))
+        .map(|row| row.is_some())
+}
+
 pub async fn find_ids(
     txn: impl DbReader<'_>,
-    _filter: model::rack::RackSearchFilter,
+    filter: model::rack::RackSearchFilter,
 ) -> Result<Vec<RackId>, DatabaseError> {
     let mut builder = sqlx::QueryBuilder::new("SELECT id FROM racks WHERE TRUE "); // The TRUE will be optimized away.
+
+    if let Some(label) = filter.label {
+        match (label.key.is_empty(), label.value) {
+            // Label key is empty, label value is set.
+            (true, Some(value)) => {
+                builder.push(
+                    " AND EXISTS (
+                        SELECT 1
+                        FROM jsonb_each_text(labels) AS kv
+                        WHERE kv.value = ",
+                );
+                builder.push_bind(value);
+                builder.push(")");
+            }
+            // Label key is empty, label value is not set.
+            (true, None) => {
+                return Err(DatabaseError::InvalidArgument(
+                    "finding racks based on label needs either key or a value.".to_string(),
+                ));
+            }
+            // Label key is not empty, label value is not set.
+            (false, None) => {
+                builder.push(" AND labels ->> ");
+                builder.push_bind(label.key);
+                builder.push(" IS NOT NULL");
+            }
+            // Label key is not empty, label value is set.
+            (false, Some(value)) => {
+                builder.push(" AND labels ->> ");
+                builder.push_bind(label.key);
+                builder.push(" = ");
+                builder.push_bind(value);
+            }
+        }
+    }
 
     let query = builder.build_query_as();
     query
         .fetch_all(txn)
         .await
-        .map_err(|e| DatabaseError::new("instance::find_ids", e))
+        .map_err(|e| DatabaseError::new("rack::find_ids", e))
 }
 
 pub async fn create(

@@ -19,7 +19,14 @@ use carbide_uuid::switch::SwitchId;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List the health report sources for a switch:
+    $ nico-admin-cli switch health-report show 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(help = "Switch ID to show health reports for")]
-    pub switch_id: SwitchId,
+    pub(super) switch_id: SwitchId,
 }

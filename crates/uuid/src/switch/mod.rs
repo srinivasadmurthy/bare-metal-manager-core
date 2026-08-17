@@ -35,6 +35,8 @@ use sqlx::{
 
 use crate::DbPrimaryUuid;
 
+static SWITCH_ID_PREFIX: &str = "sw100";
+
 /// This is a fixed-size hash of the switch hardware.
 pub type HardwareHash = [u8; 32];
 /// This is the base32-encoded representation of the hardware hash. It is a fixed size instead of a
@@ -98,7 +100,7 @@ impl Debug for SwitchId {
 impl sqlx::Encode<'_, sqlx::Postgres> for SwitchId {
     fn encode_by_ref(
         &self,
-        buf: &mut <Postgres as Database>::ArgumentBuffer<'_>,
+        buf: &mut <Postgres as Database>::ArgumentBuffer,
     ) -> Result<IsNull, BoxDynError> {
         buf.extend(self.to_string().as_bytes());
         Ok(sqlx::encode::IsNull::No)
@@ -202,6 +204,10 @@ impl SwitchId {
             SwitchType::NvLink,
         )
     }
+
+    pub(crate) fn is_matching_prefix(s: &str) -> bool {
+        s.starts_with(SWITCH_ID_PREFIX)
+    }
 }
 
 impl DbPrimaryUuid for SwitchId {
@@ -286,13 +292,14 @@ impl std::fmt::Display for SwitchId {
         // `sw` is for switch
         // `1` is a version identifier
         // The next 2 bytes `00` are reserved
-        f.write_str("sw100")?;
+        f.write_str(SWITCH_ID_PREFIX)?;
         // Write the switch type
         f.write_char(self.ty.id_char())?;
         // The next character determines how the SwitchId is derived (`SwitchIdSource`)
         f.write_char(self.source.id_char())?;
-        // Then follows the actual source data. self.hardware_id is guaranteed to have been written
-        // from a valid string, so we can use from_utf8_unchecked.
+        // Then follows the source data.
+        // SAFETY: `hardware_id` is private and populated only from `BASE32_DNSSEC::encode`, whose
+        // output is ASCII and therefore valid UTF-8.
         unsafe { f.write_str(std::str::from_utf8_unchecked(self.hardware_id.as_slice())) }
     }
 }
@@ -328,11 +335,11 @@ pub const SWITCH_ID_LENGTH: usize = SWITCH_ID_PREFIX_LENGTH + SWITCH_ID_HARDWARE
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum SwitchIdParseError {
-    #[error("The Switch ID has an invalid length of {0}")]
+    #[error("the switch ID has an invalid length of {0}")]
     Length(usize),
-    #[error("The Switch ID {0} has an invalid prefix")]
+    #[error("the switch ID {0} has an invalid prefix")]
     Prefix(String),
-    #[error("The Switch ID {0} has an invalid encoding")]
+    #[error("the switch ID {0} has an invalid encoding")]
     Encoding(String),
 }
 
@@ -344,7 +351,7 @@ impl FromStr for SwitchId {
             return Err(SwitchIdParseError::Length(s.len()));
         }
         // Check for version 1 and 2 reserved bytes
-        if !s.starts_with("sw100") {
+        if !s.starts_with(SWITCH_ID_PREFIX) {
             return Err(SwitchIdParseError::Prefix(s.to_string()));
         }
 
@@ -413,6 +420,9 @@ impl prost::Message for SwitchId {
         let mut legacy_message = legacy_rpc::SwitchId::from(*self);
         legacy_message.merge_field(tag, wire_type, buf, ctx)?;
         *self = SwitchId::from_str(&legacy_message.id).map_err(|_| {
+            // Deprecation: if they remove DecodeError::new, they hopefully will provide some other way
+            // to impl prost::Message.
+            #[allow(deprecated)]
             DecodeError::new(format!("Invalid power shelf id: {}", legacy_message.id))
         })?;
         Ok(())
@@ -442,9 +452,9 @@ mod legacy_rpc {
     /// manually every time, while still interacting with peers that expect a `.common.SwitchId`
     /// to be serialized.
     #[derive(prost::Message)]
-    pub struct SwitchId {
+    pub(super) struct SwitchId {
         #[prost(string, tag = "1")]
-        pub id: String,
+        pub(super) id: String,
     }
 
     impl From<super::SwitchId> for SwitchId {
@@ -458,60 +468,103 @@ mod legacy_rpc {
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{scenarios, value_scenarios};
+
     use super::*;
 
-    #[test]
-    fn test_switch_id_round_trip() {
-        let switch_id_str = "sw100nt038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg";
-        let switch_id = SwitchId::from_str(switch_id_str)
-            .expect("Should have successfully converted from a valid string");
-        let round_tripped = switch_id.to_string();
-        assert_eq!(switch_id_str, round_tripped);
+    #[derive(Debug, PartialEq, Eq)]
+    enum ParseFailure {
+        Length,
+        Prefix,
+        Encoding,
+    }
+
+    fn parse_switch_id(input: &str) -> Result<String, ParseFailure> {
+        SwitchId::from_str(input)
+            .map(|id| id.to_string())
+            .map_err(|err| match err {
+                SwitchIdParseError::Length(_) => ParseFailure::Length,
+                SwitchIdParseError::Prefix(_) => ParseFailure::Prefix,
+                SwitchIdParseError::Encoding(_) => ParseFailure::Encoding,
+            })
     }
 
     #[test]
-    fn test_invalid_switch_ids() {
-        match SwitchId::from_str("sw100nt038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hc") {
-            // one character short
-            Err(SwitchIdParseError::Length(_)) => {} // Expect an error
-            Ok(_) => panic!("Converting from a too-short switch ID should have failed"),
-            Err(e) => panic!(
-                "Converting from a too-short string should have failed with a length error, got {e}"
-            ),
-        }
+    fn test_switch_id_parse_cases() {
+        const VALID_SWITCH_ID: &str = "sw100nt038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg";
 
-        match SwitchId::from_str("SW100nt038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg") {
-            Err(SwitchIdParseError::Prefix(_)) => {} // Expect an error
-            Ok(_) => {
-                panic!("Converting from a switch ID with an invalid prefix should have failed")
+        scenarios!(
+            run = parse_switch_id;
+            "valid NVLink TPM switch ID" {
+                VALID_SWITCH_ID => Yields(VALID_SWITCH_ID.to_string()),
             }
-            Err(e) => panic!(
-                "Converting from a switch ID with an invalid prefix should have failed with a Prefix error, got {e}"
-            ),
-        }
 
-        match SwitchId::from_str("sw100xt038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg") {
-            Err(SwitchIdParseError::Prefix(_)) => {} // Expect an error
-            Ok(_) => panic!("Converting from a switch ID with type `x` should have failed"),
-            Err(e) => panic!(
-                "Converting from a switch ID with type `x` should have failed with a Prefix error, got {e}"
-            ),
-        }
+            "one character short" {
+                "sw100nt038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hc" => FailsWith(ParseFailure::Length),
+            }
 
-        match SwitchId::from_str("sw100nx038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg") {
-            Err(SwitchIdParseError::Prefix(_)) => {} // Expect an error
-            Ok(_) => panic!("Converting from a switch ID with source `x` should have failed"),
-            Err(e) => panic!(
-                "Converting from a switch ID with source `x` should have failed with a Prefix error, got {e}"
-            ),
-        }
+            "empty string" {
+                "" => FailsWith(ParseFailure::Length),
+            }
 
-        match SwitchId::from_str("sw100nt038bg3qsho433vkg684heguv28!qaggmrsh2ugn1qk096n2c6hcg") {
-            Err(SwitchIdParseError::Encoding(_)) => {} // Expect an error
-            Ok(_) => panic!("Converting from a switch ID with a `!` should have failed"),
-            Err(e) => panic!(
-                "Converting from a switch ID with a `!` should have failed with an Encoding error, got {e}"
-            ),
-        }
+            "invalid prefix casing" {
+                "SW100nt038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg" => FailsWith(ParseFailure::Prefix),
+            }
+
+            "invalid switch type" {
+                "sw100xt038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg" => FailsWith(ParseFailure::Prefix),
+            }
+
+            "invalid source" {
+                "sw100nx038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg" => FailsWith(ParseFailure::Prefix),
+            }
+
+            "invalid base32 payload" {
+                "sw100nt038bg3qsho433vkg684heguv28!qaggmrsh2ugn1qk096n2c6hcg" => FailsWith(ParseFailure::Encoding),
+            }
+        );
+    }
+
+    #[test]
+    fn test_switch_type_mappings() {
+        value_scenarios!(
+            run = |ty| (ty.id_char(), ty.to_string());
+            "NVLink" {
+                SwitchType::NvLink => ('n', "NvLink".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_switch_type_from_id_char() {
+        value_scenarios!(
+            run = SwitchType::from_id_char;
+            "NVLink" {
+                'n' => Some(SwitchType::NvLink),
+            }
+
+            "unknown" {
+                'x' => None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_switch_id_source_from_id_char() {
+        value_scenarios!(
+            run = SwitchIdSource::from_id_char;
+            "TPM" {
+                't' => Some(SwitchIdSource::Tpm),
+            }
+
+            "product board chassis serial" {
+                's' => Some(SwitchIdSource::ProductBoardChassisSerial),
+            }
+
+            "unknown" {
+                'x' => None,
+            }
+        );
     }
 }

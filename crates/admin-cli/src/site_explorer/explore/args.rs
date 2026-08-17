@@ -23,7 +23,17 @@ use super::super::common::ExploreOptions;
 // specific newtype to allow sharing of ExploreOptions, and still
 // providing a subcommand-specific Run trait implementation.
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Explore a single host now and print the report (not stored):
+    $ nico-admin-cli site-explorer explore 192.0.2.10
+
+Explore a host, supplying the MAC it sent DHCP from:
+    $ nico-admin-cli site-explorer explore 192.0.2.10 --mac 00:11:22:33:44:55
+
+")]
+pub(crate) struct Args {
     #[clap(flatten)]
-    pub inner: ExploreOptions,
+    pub(super) inner: ExploreOptions,
 }

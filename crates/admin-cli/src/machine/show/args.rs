@@ -20,9 +20,23 @@ use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[clap(disable_help_flag = true)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all machines:
+    $ nico-admin-cli machine show
+
+Show one machine by ID:
+    $ nico-admin-cli machine show 12345678-1234-5678-90ab-cdef01234567
+
+Show only DPUs (or only hosts):
+    $ nico-admin-cli machine show --dpus
+    $ nico-admin-cli machine show --hosts
+
+")]
+pub(crate) struct Args {
     #[clap(long, action = clap::ArgAction::HelpLong)]
-    pub help: Option<bool>,
+    pub(crate) help: Option<bool>,
 
     #[clap(
         short,
@@ -31,7 +45,7 @@ pub struct Args {
         conflicts_with = "machine",
         help = "Show all machines (DEPRECATED)"
     )]
-    pub all: bool,
+    pub(crate) all: bool,
 
     #[clap(
         short,
@@ -40,7 +54,7 @@ pub struct Args {
         conflicts_with = "machine",
         help = "Show only DPUs"
     )]
-    pub dpus: bool,
+    pub(crate) dpus: bool,
 
     #[clap(
         short,
@@ -49,7 +63,7 @@ pub struct Args {
         conflicts_with = "machine",
         help = "Show only hosts"
     )]
-    pub hosts: bool,
+    pub(crate) hosts: bool,
 
     #[clap(
         short = 't',
@@ -61,13 +75,13 @@ pub struct Args {
         conflicts_with = "dpus",
         help = "Show only machines for this instance type"
     )]
-    pub instance_type_id: Option<String>,
+    pub(crate) instance_type_id: Option<String>,
 
     #[clap(
         default_value(None),
-        help = "The machine to query, leave empty for all (default)"
+        help = "The machine ID to query. Omit to show all machines."
     )]
-    pub machine: Option<MachineId>,
+    pub(crate) machine: Option<MachineId>,
 
     #[clap(
         short = 'c',
@@ -75,5 +89,5 @@ pub struct Args {
         default_value("5"),
         help = "History count. Valid if `machine` argument is passed."
     )]
-    pub history_count: u32,
+    pub(crate) history_count: u32,
 }

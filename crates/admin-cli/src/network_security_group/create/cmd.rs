@@ -15,16 +15,17 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 
 use super::args::Args;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::network_security_group::common::convert_nsgs_to_table;
 use crate::rpc::ApiClient;
 
 /// Create a network security group.
 /// On successful creation, the details of the
 /// new group will be displayed.
-pub async fn create(
+pub(super) async fn create(
     args: Args,
     output_format: OutputFormat,
     api_client: &ApiClient,

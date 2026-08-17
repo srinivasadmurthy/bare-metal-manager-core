@@ -16,13 +16,15 @@
  */
 use std::net::IpAddr;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use config_version::ConfigVersion;
+use const_format::concatcp;
 use mac_address::MacAddress;
 use model::firmware::FirmwareComponentType;
+use model::machine_boot_interface::MachineBootInterface;
 use model::site_explorer::{
-    EndpointExplorationReport, ExploredEndpoint, InitialResetPhase, PowerDrainState,
-    PreingestionState, TimeSyncResetPhase,
+    EndpointExplorationReport, ExploredEndpoint, InitialBmcResetPhase, InitialResetPhase,
+    PowerDrainState, PreingestionState, TimeSyncResetPhase,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{FromRow, PgConnection, Row};
@@ -59,6 +61,8 @@ struct DbExploredEndpoint {
     pause_remediation: bool,
     /// The MAC address of the boot interface (primary interface) for this host endpoint
     boot_interface_mac: Option<MacAddress>,
+    /// The vendor-native Redfish interface id of the boot interface
+    boot_interface_id: Option<String>,
 }
 
 impl<'r> FromRow<'r, PgRow> for DbExploredEndpoint {
@@ -76,6 +80,7 @@ impl<'r> FromRow<'r, PgRow> for DbExploredEndpoint {
         let pause_ingestion_and_poweron = row.try_get("pause_ingestion_and_poweron")?;
         let pause_remediation = row.try_get("pause_remediation")?;
         let boot_interface_mac = row.try_get("boot_interface_mac")?;
+        let boot_interface_id = row.try_get("boot_interface_id")?;
         Ok(DbExploredEndpoint {
             address: row.try_get("address")?,
             report: report.0,
@@ -90,6 +95,7 @@ impl<'r> FromRow<'r, PgRow> for DbExploredEndpoint {
             pause_ingestion_and_poweron,
             pause_remediation,
             boot_interface_mac,
+            boot_interface_id,
         })
     }
 }
@@ -110,6 +116,7 @@ impl From<DbExploredEndpoint> for ExploredEndpoint {
             pause_ingestion_and_poweron: endpoint.pause_ingestion_and_poweron,
             pause_remediation: endpoint.pause_remediation,
             boot_interface_mac: endpoint.boot_interface_mac,
+            boot_interface_id: endpoint.boot_interface_id,
         }
     }
 }
@@ -120,7 +127,7 @@ pub async fn find_ips(
     _filter: model::site_explorer::ExploredEndpointSearchFilter,
 ) -> Result<Vec<IpAddr>, DatabaseError> {
     #[derive(Debug, Clone, Copy, FromRow)]
-    pub struct ExploredEndpointIp(IpAddr);
+    struct ExploredEndpointIp(IpAddr);
     // grab list of IPs
     let mut builder = sqlx::QueryBuilder::new("SELECT address FROM explored_endpoints");
     let query = builder.build_query_as();
@@ -146,6 +153,32 @@ pub async fn find_by_ips(
         .map_err(|e| DatabaseError::new("explored_endpoints::find_by_ips", e))
 }
 
+/// Fetches explored DPU endpoints whose reported system serial number is in
+/// `serials`. Resolves the host-to-DPU serial join for a page of hosts without
+/// loading every explored endpoint. Constrained to DPU reports
+/// (`Systems[0].Id == "Bluefield"`) so a host endpoint with a coincidentally
+/// matching serial is not pulled in.
+///
+/// `exploration_report` is the constantly-rewritten site-exploration blob, so we
+/// deliberately do not index this JSON path: DPU-endpoint cardinality per site is
+/// low and this serves an occasional admin query, so a scoped scan beats taxing
+/// the exploration write path with an expression index.
+pub async fn find_by_dpu_serial_numbers(
+    db: impl DbReader<'_>,
+    serials: Vec<String>,
+) -> Result<Vec<ExploredEndpoint>, DatabaseError> {
+    let query = "SELECT * FROM explored_endpoints \
+                 WHERE exploration_report->'Systems'->0->>'SerialNumber' = ANY($1) \
+                 AND exploration_report->'Systems'->0->>'Id' = 'Bluefield'";
+
+    sqlx::query_as::<_, DbExploredEndpoint>(query)
+        .bind(serials)
+        .fetch_all(db)
+        .await
+        .map(|endpoints| endpoints.into_iter().map(Into::into).collect())
+        .map_err(|e| DatabaseError::new("explored_endpoints::find_by_dpu_serial_numbers", e))
+}
+
 /// find_all returns all explored endpoints that site explorer has been able to probe
 pub async fn find_all(txn: impl DbReader<'_>) -> Result<Vec<ExploredEndpoint>, DatabaseError> {
     let query = "SELECT * FROM explored_endpoints";
@@ -157,33 +190,107 @@ pub async fn find_all(txn: impl DbReader<'_>) -> Result<Vec<ExploredEndpoint>, D
         .map_err(|e| DatabaseError::new("explored_endpoints find_all", e))
 }
 
+/// The WHERE clause matching endpoints still in preingestion that are neither
+/// waiting for a site-explorer refresh nor in an error state. If
+/// LastExplorationError is completely nonexistent it is NULL; if it is there
+/// and indicates a null value it is 'null'.
+///
+/// [`find_preingest_not_waiting_not_error`] and
+/// [`count_preingest_not_waiting_not_error`] both build their queries from
+/// this, so the row-returning and counting variants cannot drift apart.
+const PREINGEST_NOT_WAITING_NOT_ERROR_WHERE: &str = "(preingestion_state IS NULL OR preingestion_state->'state' != '\"complete\"')
+                            AND waiting_for_explorer_refresh = false
+                            AND (exploration_report->'LastExplorationError' IS NULL OR exploration_report->'LastExplorationError' = 'null')";
+
 /// find_preingest_not_waiting gets everything that is still in preingestion that isn't waiting for site explorer to refresh it again and isn't in an error state.
 pub async fn find_preingest_not_waiting_not_error(
     txn: impl DbReader<'_>,
 ) -> Result<Vec<ExploredEndpoint>, DatabaseError> {
-    let query = "SELECT * FROM explored_endpoints
-                        WHERE (preingestion_state IS NULL OR preingestion_state->'state' != '\"complete\"')
-                            AND waiting_for_explorer_refresh = false
-                            AND (exploration_report->'LastExplorationError' IS NULL OR exploration_report->'LastExplorationError' = 'null')"; // If LastExplorationError is completely notexistant it is NULL, if it is there and indicates a null value it is 'null'.
+    const QUERY: &str = concatcp!(
+        "SELECT * FROM explored_endpoints
+                        WHERE ",
+        PREINGEST_NOT_WAITING_NOT_ERROR_WHERE
+    );
 
-    sqlx::query_as::<_, DbExploredEndpoint>(query)
+    sqlx::query_as::<_, DbExploredEndpoint>(QUERY)
         .fetch_all(txn)
         .await
         .map(|endpoints| endpoints.into_iter().map(Into::into).collect())
         .map_err(|e| DatabaseError::new("explored_endpoints find_preingest_not_waiting", e))
 }
 
-/// find_preingest_installing returns the endpoints where wew are waiting for firmware installs
+/// Counts the endpoints still in preingestion that are neither waiting for a
+/// site-explorer refresh nor in an error state.
+///
+/// Callers that only need the number of such endpoints (e.g. a metric gauge)
+/// use this instead of `find_preingest_not_waiting_not_error(..).len()`: it runs
+/// the same predicate but selects a scalar `count(*)`, so the database neither
+/// returns nor decodes the per-row `exploration_report` jsonb blob. Unlike that
+/// row-returning twin, the count also includes rows whose `exploration_report`
+/// or `preingestion_state` would fail to deserialize (COUNT never decodes them)
+/// — intentional for a metrics counter.
+pub async fn count_preingest_not_waiting_not_error(
+    txn: impl DbReader<'_>,
+) -> Result<i64, DatabaseError> {
+    const QUERY: &str = concatcp!(
+        "SELECT count(*) FROM explored_endpoints
+                        WHERE ",
+        PREINGEST_NOT_WAITING_NOT_ERROR_WHERE
+    );
+
+    sqlx::query_scalar(QUERY).fetch_one(txn).await.map_err(|e| {
+        DatabaseError::new(
+            "explored_endpoints count_preingest_not_waiting_not_error",
+            e,
+        )
+    })
+}
+
+/// The WHERE clause matching endpoints waiting on a firmware install.
+///
+/// [`find_preingest_installing`] and [`count_preingest_installing`] both build
+/// their queries from this, so the row-returning and counting variants cannot
+/// drift apart.
+const PREINGEST_INSTALLING_WHERE: &str = "preingestion_state->'state' = '\"upgradefirmwarewait\"'";
+
+/// find_preingest_installing returns the endpoints where we are waiting for firmware installs.
+///
+/// The metrics caller now uses [`count_preingest_installing`]; this
+/// row-returning form remains for callers that need the endpoints themselves
+/// and anchors the count's parity test.
 pub async fn find_preingest_installing(
     txn: impl DbReader<'_>,
 ) -> Result<Vec<ExploredEndpoint>, DatabaseError> {
-    let query = "SELECT * FROM explored_endpoints WHERE preingestion_state->'state' = '\"upgradefirmwarewait\"'";
+    const QUERY: &str = concatcp!(
+        "SELECT * FROM explored_endpoints WHERE ",
+        PREINGEST_INSTALLING_WHERE
+    );
 
-    sqlx::query_as::<_, DbExploredEndpoint>(query)
+    sqlx::query_as::<_, DbExploredEndpoint>(QUERY)
         .fetch_all(txn)
         .await
         .map(|endpoints| endpoints.into_iter().map(Into::into).collect())
-        .map_err(|e| DatabaseError::new("explored_endpoints find_preingest_not_waiting", e))
+        .map_err(|e| DatabaseError::new("explored_endpoints find_preingest_installing", e))
+}
+
+/// Counts the endpoints waiting for a firmware install to finish.
+///
+/// The counting counterpart to [`find_preingest_installing`]: callers that only
+/// need the number (e.g. a metric gauge) use this so the database returns a
+/// single scalar rather than every matching row's `exploration_report` jsonb.
+/// Unlike that row-returning twin, the count also includes rows whose
+/// `exploration_report` or `preingestion_state` would fail to deserialize
+/// (COUNT never decodes them) — intentional for a metrics counter.
+pub async fn count_preingest_installing(txn: impl DbReader<'_>) -> Result<i64, DatabaseError> {
+    const QUERY: &str = concatcp!(
+        "SELECT count(*) FROM explored_endpoints WHERE ",
+        PREINGEST_INSTALLING_WHERE
+    );
+
+    sqlx::query_scalar(QUERY)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| DatabaseError::new("explored_endpoints count_preingest_installing", e))
 }
 
 /// find_all_no_upgrades returns all explored endpoints that site explorer has been able to probe, but ignores anything currently undergoing an upgrade
@@ -215,20 +322,34 @@ pub async fn find_all_by_ip(
         .map_err(|e| DatabaseError::new("explored_endpoints find_all_by_ip", e))
 }
 
-pub async fn lookup_vendor_by_ip(
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ExploredBmcMetadata {
+    pub vendor: Option<String>,
+    pub ipmi_port: Option<u16>,
+}
+
+pub async fn lookup_bmc_metadata_by_ip(
     address: IpAddr,
     db_reader: impl DbReader<'_>,
-) -> Result<Option<String>, DatabaseError> {
-    let query = "SELECT exploration_report ->> 'Vendor' AS vendor FROM explored_endpoints WHERE address = $1";
+) -> Result<ExploredBmcMetadata, DatabaseError> {
+    let query = "SELECT exploration_report ->> 'Vendor' AS vendor, \
+                 exploration_report #>> '{Managers,0,IpmiPort}' AS ipmi_port \
+                 FROM explored_endpoints WHERE address = $1";
 
-    // exploration_report is JSONB and technically the Vendor field can be set to NULL, so we need 2 levels of Option<T>
-    let vendor: Option<Option<String>> = sqlx::query_scalar(query)
+    let metadata: Option<(Option<String>, Option<String>)> = sqlx::query_as(query)
         .bind(address)
         .fetch_optional(db_reader)
         .await
-        .map_err(|e| DatabaseError::new("explored_endpoints lookup_vendor_by_ip", e))?;
+        .map_err(|e| DatabaseError::new("explored_endpoints lookup_bmc_metadata_by_ip", e))?;
 
-    Ok(vendor.flatten())
+    Ok(
+        metadata.map_or_else(ExploredBmcMetadata::default, |(vendor, ipmi_port)| {
+            ExploredBmcMetadata {
+                vendor,
+                ipmi_port: ipmi_port.and_then(|port| port.parse().ok()),
+            }
+        }),
+    )
 }
 
 /// Updates the explored information about a node
@@ -259,15 +380,67 @@ WHERE address=$4 AND version=$5";
     Ok(query_result.rows_affected() > 0)
 }
 
-/// clear_last_known_error clears the last known error in explored_endpoints for the BMC identified by IP
+/// Updates only the last exploration error and latency in an endpoint's report.
+///
+/// This preserves the rest of the last successful exploration report while recording
+/// an exploration failure. Returns `Ok(false)` if the entry had been deleted in the
+/// meantime or otherwise modified. It will not fail for version mismatches.
+pub async fn try_update_last_exploration_error(
+    address: IpAddr,
+    old_version: ConfigVersion,
+    error: &model::site_explorer::EndpointExplorationError,
+    latency: std::time::Duration,
+    txn: &mut PgConnection,
+) -> Result<bool, DatabaseError> {
+    let new_version = old_version.increment();
+    let query = "UPDATE explored_endpoints
+SET version=$1,
+    exploration_report=jsonb_set(
+        jsonb_set(exploration_report, '{LastExplorationError}', $2::jsonb, true),
+        '{LastExplorationLatency}', $3::jsonb, true
+    ),
+    waiting_for_explorer_refresh=true,
+    exploration_requested=false
+WHERE address=$4 AND version=$5";
+    let query_result = sqlx::query(query)
+        .bind(new_version)
+        .bind(sqlx::types::Json(error))
+        .bind(sqlx::types::Json(&latency))
+        .bind(address)
+        .bind(old_version)
+        .execute(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(query_result.rows_affected() > 0)
+}
+
+/// Clears the last known error in `explored_endpoints` for the BMC identified by IP.
+///
+/// Lock the endpoint while reading its report so a concurrent exploration
+/// update either commits first and is preserved, or loses its optimistic update
+/// after this clear commits.
 pub async fn clear_last_known_error(
     address: IpAddr,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
-    for row in find_all_by_ip(address, txn).await? {
-        let mut report = row.report;
-        report.last_exploration_error = None;
-        try_update(address, row.report_version, &report, true, txn).await?;
+    let query = "SELECT * FROM explored_endpoints WHERE address = $1 FOR UPDATE";
+    let Some(row) = sqlx::query_as::<_, DbExploredEndpoint>(query)
+        .bind(address)
+        .fetch_optional(&mut *txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?
+    else {
+        return Ok(());
+    };
+
+    let mut report = row.report;
+    report.last_exploration_error = None;
+    if !try_update(address, row.report_version, &report, true, txn).await? {
+        return Err(DatabaseError::ConcurrentModificationError(
+            "ExploredEndpoint",
+            row.report_version.version_string(),
+        ));
     }
 
     Ok(())
@@ -368,14 +541,35 @@ pub async fn set_preingestion_initial_reset(
     set_preingestion(address, state, txn).await
 }
 
+pub async fn set_preingestion_initial_bmc_reset(
+    address: IpAddr,
+    phase: InitialBmcResetPhase,
+    txn: &mut PgConnection,
+) -> Result<(), DatabaseError> {
+    let state = PreingestionState::InitialBMCReset { phase };
+    set_preingestion(address, state, txn).await
+}
+
+pub async fn set_preingestion_set_ntp_servers(
+    address: IpAddr,
+    set_at: Option<DateTime<Utc>>,
+    attempts: u32,
+    txn: &mut PgConnection,
+) -> Result<(), DatabaseError> {
+    let state = PreingestionState::SetNtpServers { set_at, attempts };
+    set_preingestion(address, state, txn).await
+}
+
 pub async fn set_preingestion_time_sync_reset(
     address: IpAddr,
     phase: TimeSyncResetPhase,
+    attempt: u32,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     let state = PreingestionState::TimeSyncReset {
         phase,
         last_time: Utc::now(),
+        attempt,
     };
     set_preingestion(address, state, txn).await
 }
@@ -533,6 +727,26 @@ pub async fn set_preingestion_failed(
     set_preingestion(address, state, txn).await
 }
 
+/// If the endpoint's preingestion is in the terminal `Failed` state, reset it
+/// back to `Initial` so preingestion runs again from the top. States other than
+/// `Failed` are left untouched, so this is safe to call unconditionally when an
+/// operator clears an error. Returns true if a `Failed` state was actually reset.
+pub async fn reset_failed_preingestion(
+    address: IpAddr,
+    txn: &mut PgConnection,
+) -> Result<bool, DatabaseError> {
+    let query = "
+UPDATE explored_endpoints
+SET preingestion_state = '{\"state\":\"initial\"}'
+WHERE address = $1 AND preingestion_state->>'state' = 'failed'";
+    let result = sqlx::query(query)
+        .bind(address)
+        .execute(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn insert(
     address: IpAddr,
     exploration_report: &EndpointExplorationReport,
@@ -581,8 +795,8 @@ pub async fn delete_many(
     Ok(())
 }
 
-/// Search the exploration report for any explored endpoint with a manager or system interface
-/// matching the given MAC address.
+/// `find_by_mac_address` searches the System, Manager, and adapter Port MAC
+/// inventory persisted in an exploration report.
 ///
 /// NOTE: This function's query is designed to exactly match with the GIN index
 /// explored_endpoints_mac_addresses_idx, to avoid a full scan of all endpoint reports. Do NOT
@@ -597,6 +811,8 @@ pub async fn find_by_mac_address(
                 jsonb_path_query_array(exploration_report, '$.Systems[*].EthernetInterfaces[*].MACAddress')
                 ||
                 jsonb_path_query_array(exploration_report, '$.Managers[*].EthernetInterfaces[*].MACAddress')
+                ||
+                jsonb_path_query_array(exploration_report, '$.Chassis[*].NetworkAdapters[*].PortMacAddresses[*]')
             ) @> to_jsonb(ARRAY[$1]);
         "#;
     sqlx::query_as::<_, DbExploredEndpoint>(query)
@@ -677,14 +893,15 @@ pub async fn set_pause_remediation(
     Ok(())
 }
 
-pub async fn set_boot_interface_mac(
+pub async fn set_boot_interface(
     address: IpAddr,
-    mac: MacAddress,
+    boot_interface: &MachineBootInterface,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
-    let query = "UPDATE explored_endpoints SET boot_interface_mac = $1 WHERE address = $2";
+    let query = "UPDATE explored_endpoints SET boot_interface_mac = $1, boot_interface_id = $2 WHERE address = $3";
     sqlx::query(query)
-        .bind(mac)
+        .bind(boot_interface.mac_address)
+        .bind(&boot_interface.interface_id)
         .bind(address)
         .execute(txn)
         .await
@@ -706,4 +923,118 @@ pub async fn set_pause_ingestion_and_poweron(
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use model::site_explorer::{Chassis, NetworkAdapter};
+
+    use super::*;
+
+    /// An `UpgradeFirmwareWait` state — the one the "installing" predicate keys
+    /// on. Built from the real enum so the row-returning path can deserialize it.
+    fn installing_state() -> PreingestionState {
+        PreingestionState::UpgradeFirmwareWait {
+            task_id: "task-1".to_string(),
+            final_version: "1.2.3".to_string(),
+            upgrade_type: FirmwareComponentType::default(),
+            power_drains_needed: None,
+            firmware_number: None,
+        }
+    }
+
+    /// Inserts an explored endpoint with a fat, *decodable* `exploration_report`
+    /// blob and the given preingestion `state`. Both are built from the real
+    /// model types so the row-returning path can deserialize them — which is
+    /// exactly the per-row cost the count path avoids.
+    async fn seed_endpoint(txn: &mut PgConnection, addr: &str, state: PreingestionState) {
+        // A real report with a deliberately large field, so the row-returning
+        // path has genuine multi-KB jsonb to decode; the count path never
+        // touches it.
+        let report = EndpointExplorationReport {
+            model: Some("x".repeat(4096)),
+            ..Default::default()
+        };
+        sqlx::query(
+            "INSERT INTO explored_endpoints (address, exploration_report, version, preingestion_state, waiting_for_explorer_refresh) \
+             VALUES ($1::inet, $2, 'V1-T1733777281821769', $3, false)",
+        )
+        .bind(addr)
+        .bind(sqlx::types::Json(report))
+        .bind(sqlx::types::Json(state))
+        .execute(&mut *txn)
+        .await
+        .expect("seed explored_endpoint");
+    }
+
+    /// `count_preingest_not_waiting_not_error` returns the same tally as
+    /// `find_preingest_not_waiting_not_error(..).len()`. The win: the count
+    /// query returns one scalar, whereas the find query returns every matching
+    /// row and decodes each row's multi-KB `exploration_report` jsonb — so the
+    /// win is rows + per-row jsonb decode, N -> 0.
+    #[crate::sqlx_test]
+    async fn count_matches_find_not_waiting_not_error(pool: sqlx::PgPool) {
+        let mut txn = pool.begin().await.unwrap();
+        // Three endpoints still in preingestion (not complete), not waiting, no error.
+        seed_endpoint(&mut txn, "10.0.0.1", PreingestionState::Initial).await;
+        seed_endpoint(&mut txn, "10.0.0.2", PreingestionState::RecheckVersions).await;
+        seed_endpoint(&mut txn, "10.0.0.3", installing_state()).await;
+        // One that is complete -> excluded by the predicate.
+        seed_endpoint(&mut txn, "10.0.0.4", PreingestionState::Complete).await;
+
+        let rows = find_preingest_not_waiting_not_error(&mut *txn)
+            .await
+            .unwrap();
+        let count = count_preingest_not_waiting_not_error(&mut *txn)
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 3, "three endpoints match the predicate");
+        assert_eq!(count, 3, "count agrees with the row count");
+        assert_eq!(count, rows.len() as i64);
+    }
+
+    /// `count_preingest_installing` returns the same tally as
+    /// `find_preingest_installing(..).len()` without returning/decoding the
+    /// per-row jsonb reports.
+    #[crate::sqlx_test]
+    async fn count_matches_find_installing(pool: sqlx::PgPool) {
+        let mut txn = pool.begin().await.unwrap();
+        seed_endpoint(&mut txn, "10.0.1.1", installing_state()).await;
+        seed_endpoint(&mut txn, "10.0.1.2", installing_state()).await;
+        // Not installing -> excluded.
+        seed_endpoint(&mut txn, "10.0.1.3", PreingestionState::Initial).await;
+
+        let rows = find_preingest_installing(&mut *txn).await.unwrap();
+        let count = count_preingest_installing(&mut *txn).await.unwrap();
+
+        assert_eq!(rows.len(), 2, "two endpoints are installing firmware");
+        assert_eq!(count, 2, "count agrees with the row count");
+        assert_eq!(count, rows.len() as i64);
+    }
+
+    #[crate::sqlx_test]
+    async fn find_by_mac_address_includes_adapter_ports(pool: sqlx::PgPool) {
+        let mut txn = pool.begin().await.unwrap();
+        let mac_address = "94:6d:ae:53:cb:9b".parse().unwrap();
+        let address = "10.0.2.1".parse().unwrap();
+        let report = EndpointExplorationReport {
+            chassis: vec![Chassis {
+                id: "Self".to_string(),
+                network_adapters: vec![NetworkAdapter {
+                    id: "1".to_string(),
+                    port_mac_addresses: vec![mac_address],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        insert(address, &report, false, &mut txn).await.unwrap();
+
+        let endpoints = find_by_mac_address(&mut *txn, mac_address).await.unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].address, address);
+    }
 }

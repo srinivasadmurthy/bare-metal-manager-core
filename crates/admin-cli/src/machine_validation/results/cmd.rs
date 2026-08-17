@@ -18,14 +18,15 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 
-use ::rpc::admin_cli::{CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge as forgerpc;
 use prettytable::{Table, row};
 
 use super::args::ShowResultsOptions;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn handle_results_show(
+pub(super) async fn handle_results_show(
     args: ShowResultsOptions,
     output_format: OutputFormat,
     api_client: &ApiClient,
@@ -124,10 +125,9 @@ fn convert_to_nice_format(
 ) -> CarbideCliResult<String> {
     let width = 14;
     let mut lines = String::new();
-    if results.results.is_empty() {
+    let Some(first) = results.results.first() else {
         return Ok(lines);
-    }
-    let first = results.results.first().unwrap();
+    };
     let data = vec![
         (
             "ID",

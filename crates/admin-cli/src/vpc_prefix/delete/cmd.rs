@@ -15,12 +15,16 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::CarbideCliResult;
-
 use super::args::Args;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn delete(args: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
+pub(super) async fn delete(args: Args, api_client: &ApiClient) -> CarbideCliResult<()> {
+    let vpc_prefix_id = args.vpc_prefix_id.to_string();
+
+    // Request asynchronous deletion through the API.
     api_client.0.delete_vpc_prefix(args).await?;
+    eprintln!("Delete requested for VPC prefix {vpc_prefix_id}; final removal is asynchronous.");
+
     Ok(())
 }

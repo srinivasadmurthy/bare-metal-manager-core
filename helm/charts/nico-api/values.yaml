@@ -1,0 +1,384 @@
+## =============================================================================
+## nico-api — Core API server (gRPC + REST)
+## =============================================================================
+## Manages machines, provisioning, networking, firmware updates, and the web UI.
+## Requires PostgreSQL and Vault. See PREREQUISITES.md for required Secrets
+## and ConfigMaps.
+## =============================================================================
+
+## Global settings (overridden by umbrella chart)
+global:
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  certificate:
+    duration: 720h0m0s
+    renewBefore: 360h0m0s
+    privateKey:
+      algorithm: ECDSA
+      size: 384
+    issuerRef:
+      kind: ClusterIssuer
+      name: vault-nico-issuer
+      group: cert-manager.io
+  spiffe:
+    trustDomain: nico.local
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: site-controller
+
+## Override the release namespace (defaults to helm install -n <namespace>)
+namespaceOverride: ""
+
+## Legacy name aliases — opt-in ExternalName Services so binaries that
+## hardcode the pre-rename hostnames (e.g. `carbide-api.forge-system.svc.
+## cluster.local:1079`) continue to resolve to this chart's nico-api
+## Service. Both the modern and legacy names resolve simultaneously; they
+## share the same pods. Disable when running an all-modern fleet.
+##
+## Each entry creates:
+##   - the alias namespace, only if `createNamespace: true`. Opt in only
+##     when nothing else owns the target namespace: a second renderer makes
+##     GitOps controllers fight over ownership, and disabling it later can
+##     prune the whole namespace.
+##   - an ExternalName Service `<name>.<namespace>` that CNAMEs to
+##     `nico-api.<this-namespace>.svc.cluster.local`.
+##
+## Clients running in-cluster against the legacy hostname should set
+## `dnsConfig.options: [{name: ndots, value: "2"}]` on their pod so the
+## resolver tries the literal FQDN first rather than ndots search
+## expansion (which would otherwise try `carbide-api.forge-system.svc.
+## cluster.local.<pod-search-domain>` first and get NXDOMAIN).
+legacyAlias:
+  # On by default so DNS resolution of the legacy hostname keeps working
+  # for existing pre-rename clients. Note this only covers name
+  # resolution -- the `nico-api` Certificate's SAN list does not include
+  # `carbide-api.forge-system.svc.cluster.local`, so any client actually
+  # dialing that hostname over TLS still fails certificate verification.
+  # Flip to false on all-modern fleets where no client uses the legacy
+  # hostname.
+  enabled: true
+  aliases:
+    - name: carbide-api
+      namespace: forge-system
+      # Off by default: helm-prereqs already owns this namespace (see note above).
+      createNamespace: false
+
+replicas: 1
+automountServiceAccountToken: true
+annotations:
+  configmap.reloader.stakater.com/reload: '{{ include "nico-api.name" . }}-config-files,{{ include "nico-api.name" . }}-site-config-files'
+
+resources:
+  limits:
+    cpu: 3
+    memory: 32Gi
+  requests:
+    cpu: 1500m
+    memory: 8Gi
+
+## Optional init containers (general-purpose pass-through)
+initContainers: []
+
+## Boot-artifact init containers
+## Each entry is rendered as a Kubernetes init container with the boot-artifacts
+## volume automatically mounted at /forge-boot-artifacts/blobs/internal.
+## Prefer separate `repository` + `tag` fields (they win when set). The combined
+## `image: <ref>:<tag>` form is still honored for backward compatibility.
+bootArtifactContainers: []
+# bootArtifactContainers:
+#   - name: boot-artifacts-x86-64
+#     repository: <your-registry>/boot-artifacts-x86_64
+#     tag: latest
+#     command: ["sh", "-c", "cp -r /x86_64 /forge-boot-artifacts/blobs/internal"]
+#   - name: boot-artifacts-aarch64
+#     repository: <your-registry>/boot-artifacts-aarch64
+#     tag: latest
+#     # NOTE: the aarch64 image ships /aarch64 + /apt (NOT /firmware) — copying a missing dir crash-loops the init.
+#     command: ["sh", "-c", "cp -r /aarch64 /apt /forge-boot-artifacts/blobs/internal"]
+#   - name: machine-validation-config
+#     repository: <your-registry>/machine-validation-config
+#     tag: latest
+#     command: ["sh", "-c", "cp -r /machine-validation /forge-boot-artifacts/blobs/internal"]
+
+service:
+  grpc:
+    port: 1079
+  metrics:
+    port: 1080
+  ## Enables the application listener, container port, and Kubernetes Service
+  ## for high-cardinality per-object state metrics. An empty objectTypes list
+  ## skips the listener and omits the Service/port even when enabled is true.
+  ## The chart always renders object_types explicitly, so this list (not the
+  ## application default) decides what is emitted; all valid types are listed
+  ## below — remove entries to exclude them.
+  perObjectStateMetrics:
+    enabled: false
+    port: 9091
+    objectTypes:
+      - machine
+      - switch
+      - power_shelf
+      - rack
+      - network_segment
+      - vpc_prefix
+      - spdm_attestation
+      - ib_partition
+  profiler:
+    port: 1081
+
+certificate:
+  ## serviceName is used to auto-generate dnsNames and SPIFFE URIs based on global.namespace
+  serviceName: ""
+  spiffeServiceName: ""
+  identityNamespace: ""
+  ## Fully override the auto-generated dnsNames/uris. When empty, dnsNames and
+  ## uris are generated from serviceName + namespace (extraDnsNames/extraUris
+  ## are appended to the generated list).
+  dnsNames: []
+  uris: []
+  # carbide-api.forge: the forge-dpu-agent (v0.10.3) still dials the API by this
+  # legacy name during the carbide->nico rename; without this SAN the DPU agent
+  # rejects the serving cert (TLS BadCertificate) and never heartbeats (DPUs stuck
+  # at WaitingForNetworkConfig). See issue #2823.
+  extraDnsNames:
+    - carbide-api.forge
+  extraUris: []
+  # Dev/sim only: IP SANs for direct-IP TLS (e.g. API VIP). Leave empty in production.
+  ipAddresses: []
+
+migrationJob:
+  sslMode: require
+
+## Grace period for nico-api to stop claiming state-controller work and drain
+## handlers already in flight. Keep this greater than the largest configured
+## controller.max_object_handling_time; 240 seconds covers the default 3 minutes
+## with additional time for queue finalization.
+terminationGracePeriodSeconds: 240
+
+## Container command (override to customise startup).
+## Picks /opt/nico/nico-api if present (renamed image), else /opt/carbide/carbide-api
+## (current image). Configmaps are mounted at both /etc/nico and /etc/forge paths
+## so the binary finds its expected config regardless of which it picks.
+command:
+  - /bin/sh
+  - -c
+  - |
+    if [ -x /opt/nico/nico-api ]; then
+      exec /opt/nico/nico-api run \
+        --config-path /etc/nico/nico-api/nico-api-config.toml \
+        --site-config-path /etc/nico/nico-api/site/nico-api-site-config.toml
+    else
+      exec /opt/carbide/carbide-api run \
+        --config-path /etc/forge/carbide-api/carbide-api-config.toml \
+        --site-config-path /etc/forge/carbide-api/site/carbide-api-site-config.toml
+    fi
+
+## Environment variables for nico-api
+env:
+  VAULT_PKI_ROLE_NAME: "nico-cluster"
+  RUST_BACKTRACE: "full"
+  RUST_LIB_BACKTRACE: "0"
+
+## Optional Figment dictionary for CARBIDE_API_DSX_EXCHANGE_EVENT_BUS.
+dsxExchangeEventBusConfig: ""
+
+## =============================================================================
+## Component manager
+## =============================================================================
+## Renders the [component_manager] section into the global application config.
+## Presence of that section is what enables the component manager; site-config
+## can override fields but cannot remove the section once rendered — hence the
+## Helm gate. Independent of rms.enabled below. On by default for the standard
+## rack-management path; set enabled: false on deployments that do not run it.
+##
+## The chart defaults use rms backends + state controllers (recommended path).
+## With rms backends, keep rms.enabled=true (the chart default) or supply an
+## equivalent [rms] block in site-config; otherwise Core leaves the component
+## manager uninitialized and logs a build error.
+componentManager:
+  enabled: true
+  ## Backend per role. computeTray: rms | core | mock. nvSwitch: rms | nsm |
+  ## mock. powerShelf: rms | psm | mock. The binary defaults all three to rms;
+  ## nsm/psm select the standalone managers instead of RMS.
+  computeTrayBackend: "rms"
+  nvSwitchBackend: "rms"
+  powerShelfBackend: "rms"
+  ## Route power control and firmware updates through the state controllers
+  ## rather than dispatching straight to the device. The binary's field default
+  ## is false (legacy direct dispatch); state-controlled dispatch is the
+  ## recommended mode, so the chart turns it on.
+  computeTrayUseStateController: true
+  nvSwitchUseStateController: true
+  powerShelfUseStateController: true
+
+## =============================================================================
+## RMS (Rack Management Service) connectivity
+## =============================================================================
+## RMS deploys as its own Helm chart (rack-manager); Core only needs the
+## connection details for rack-level firmware upgrades, power sequencing, and
+## rms-backed component-manager operations. When disabled, no [rms] section is
+## rendered. Independent of componentManager.enabled. On by default for the
+## standard rack-management path; set enabled: false on deployments that do
+## not run RMS.
+##
+## Qualified NVL72 / NVL72_GB300 rack_profiles always ship in the global toml;
+## override OEM vendors (or add test profiles) via site-config merge.
+##
+## Enabling BEFORE rack-manager is deployed is safe: the client is constructed
+## lazily and every RMS-backed operation guards on it, so Core runs healthy
+## and rack operations report a clean error until RMS comes up at apiUrl.
+rms:
+  enabled: true
+  ## RMS API server URL. The default matches the rack-manager chart's
+  ## api-server Service in its default namespace (port 8801), TLS enabled.
+  apiUrl: "https://rms-api-server.rack-manager.svc.cluster.local:8801"
+  ## Enforce TLS when connecting to RMS. The standard RMS deployment serves
+  ## mTLS (apiServer.tls.enabled + caEnabled) with a certificate minted from
+  ## the same vault-nico-issuer that signs nico-api's SPIFFE cert.
+  enforceTls: true
+  ## Optional mTLS material overrides — paths inside the nico-api container.
+  ## Leave empty: the RMS client (nv-rms-client) auto-discovers nico-api's
+  ## own SPIFFE certificate mount (/var/run/secrets/spiffe.io/{tls.crt,
+  ## tls.key,ca.crt}), which shares a CA with the RMS api-server certificate
+  ## — mTLS both ways with no extra mounts and no configuration. Set these
+  ## only to use different cert material.
+  rootCaPath: ""
+  clientCert: ""
+  clientKey: ""
+
+extraEnv: []
+
+## Authentication for the /admin WebUI. CARBIDE_WEB_AUTH_TYPE in extraEnv
+## takes precedence for compatibility with existing installations.
+webAuth:
+  ## Allowed values: basic, oauth2, none.
+  mode: basic
+  basic:
+    ## Use an operator-managed password Secret instead of generating one.
+    ## Leave name empty to create nico-api-web-basic-auth with a generated password.
+    existingSecret:
+      name: ""
+      key: password
+
+## External secret/configmap references mounted into the pod
+envFrom:
+  vaultApproleTokens:
+    secretName: nico-vault-approle-tokens
+  vaultToken:
+    secretName: nico-vault-token
+  vaultClusterInfo:
+    configMapName: vault-cluster-info
+  databaseCredentials:
+    secretName: nico-system.nico.nico-pg-cluster.credentials
+  databaseConfig:
+    configMapName: nico-system-nico-database-config
+  nicoWebHostname:
+    configMapName: nico-web-api-hostname
+
+livenessProbe:
+  httpGet:
+    port: 1080
+    scheme: HTTP
+  initialDelaySeconds: 20
+  periodSeconds: 20
+  failureThreshold: 3
+  successThreshold: 1
+  timeoutSeconds: 20
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 25s
+
+## A separate monitor lets operators use a slower scrape interval and distinct
+## retention/routing for the high-cardinality per-object series.
+perObjectStateMetricsServiceMonitor:
+  enabled: false
+  interval: 60s
+  scrapeTimeout: 25s
+
+auth:
+  ## Namespace component accepted in service (/<ns>/sa/) and machine
+  ## (/<ns>/machine/) SPIFFE IDs. Empty = deploy namespace; forge-system for legacy.
+  namespace: ""
+  ## SPIFFE service-id principals granted the dhcp / dns roles in the casbin policy.
+  principals:
+    dhcp: nico-dhcp
+    dns: nico-dns
+  ## [auth] permissive_mode — bypass the casbin policy layer. DEV ONLY. Note: this does
+  ## NOT bypass the internal RBAC handler, so it does not grant admin-CLI access by itself.
+  permissiveMode: false
+  ## [auth.trust] additional_issuer_cns — client leaf Issuer DN CNs mapped to ExternalUser
+  ## principals (group = cert SubjectOU), as required by the default internal RBAC admin path.
+  ## This CN-only mapping spans the combined TLS trust store and is not bound to
+  ## adminRootCertPem. Use a globally unique, PrintableString-encoded Subject CN
+  ## from the dedicated issuing intermediate; never use a shared or root CA CN.
+  additionalIssuerCns: []
+  ## [tls] admin_root_cafile_path — CA bundle added to the client TLS trust store.
+  ## Every presented cert successfully validated against it becomes a TrustedCertificate
+  ## and passes the default Casbin forge/* rule; internal RBAC still requires ExternalUser
+  ## for the ForgeAdminCLI path unless bypass_rbac is enabled.
+  adminRootCafilePath: "/etc/forge/carbide-api/site/admin_root_cert_pem"
+
+## Config files -- can be overridden with custom content
+configFiles:
+  nicoApiConfig: ""  # If empty, uses the default from files/
+  casbinPolicy: ""      # If empty, uses the default from files/
+
+## Site-specific config (nico-api-site-config-files ConfigMap)
+## nicoApiSiteConfig is REQUIRED: nico-api exits at startup if the four
+## resource pool definitions (lo-ip, vlan-id, vni, vpc-vni) are absent.
+## See PREREQUISITES.md § "Site Configuration" and
+## deploy/files/nico-api/nico-api-site-config.toml for a full example.
+siteConfig:
+  enabled: true
+  nicoApiSiteConfig: ""  # Must include [pools.lo-ip], [pools.vlan-id], [pools.vni], [pools.vpc-vni]
+  ## Public CA trust bundle used to verify admin client certificates. Use a dedicated
+  ## admin-client intermediate whose entire issuance population may cross this trust boundary.
+  ## Accepts only bare PEM CERTIFICATE blocks separated by whitespace; strip subject=/issuer=
+  ## lines and comments. Private keys are rejected. Helm validates the PEM envelope only,
+  ## not X.509 CA semantics. Pair with auth.additionalIssuerCns to map the client leaf's
+  ## Issuer DN CN to an ExternalUser principal required by the default internal RBAC admin path.
+  adminRootCertPem: ""
+
+## DPF (DOCA Platform Framework) integration.
+## rbacCreate: create a Role/RoleBinding in the DPF operator namespace so the
+## API can manage DPF CRs (templates/dpf-rbac.yaml). Enabled by setup.sh (DPF is
+## the default); pair with a [dpf] block in siteConfig.nicoApiSiteConfig
+## (docs/manuals/dpf.md §3.5).
+## HARD PRECONDITION: operatorNamespace must already exist when rbacCreate=true,
+## or `helm install` fails with "namespaces ... not found" and rolls back the
+## whole release. setup.sh sets rbacCreate=true only after phase 5b creates the
+## namespace. Leave it false unless the DPF operator stack is installed.
+## This value must MATCH the namespace the DPF operator + prereqs run in — the
+## prereq stack hardcodes dpf-operator-system, so changing it here alone would
+## put the Role/RoleBinding in a different namespace than the operator it grants
+## carbide-api access to, silently breaking DPF CR management.
+dpf:
+  rbacCreate: false
+  operatorNamespace: dpf-operator-system
+
+## NICo Web UI hostname (always created as ConfigMap)
+hostname: "nico.local"
+
+vaultClusterInfo: {}
+#  VAULT_SERVICE: "https://vault.example.com"
+#  NICO_VAULT_MOUNT: "secrets"
+#  NICO_VAULT_PKI_MOUNT: "nicoca"
+
+databaseConfig: {}
+#  DB_HOST: "postgresql.nico-system.svc.cluster.local"
+#  DB_PORT: "5432"
+#  DB_NAME: "nico"
+
+## External LoadBalancer Service (for bare-metal / MetalLB)
+externalService:
+  enabled: false
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  annotations: {}
+  # annotations:
+  #   metallb.universe.tf/loadBalancerIPs: "10.x.x.x"

@@ -166,7 +166,7 @@ impl K8sConfigRepository for DeviceRegistrationMock {
     ) -> Result<Option<BTreeMap<String, Vec<u8>>>, DpfError> {
         Ok(None)
     }
-    async fn create_secret(
+    async fn apply_secret(
         &self,
         _: &str,
         _: &str,
@@ -195,11 +195,11 @@ async fn test_register_devices_node_and_force_delete() {
     for i in 1..=2 {
         let info = DpuDeviceInfo {
             device_id: format!("dpu-{}", i),
-            dpu_bmc_ip: format!("192.168.1.{}", 100 + i),
-            host_bmc_ip: "192.168.1.1".to_string(),
+            dpu_bmc_ip: format!("192.168.1.{}", 100 + i).parse().unwrap(),
+            host_bmc_ip: "192.168.1.1".parse().unwrap(),
             serial_number: format!("SN-{}", i),
-            host_machine_id: "host-001-id".to_string(),
             dpu_machine_id: format!("dpu-{}-id", i),
+            is_primary: true,
         };
         sdk.register_dpu_device(info).await.unwrap();
     }
@@ -207,9 +207,9 @@ async fn test_register_devices_node_and_force_delete() {
     // Register node
     let node_info = DpuNodeInfo {
         node_id: "host-001".to_string(),
-        host_bmc_ip: "192.168.1.1".to_string(),
+        host_bmc_ip: "192.168.1.1".parse().unwrap(),
         device_ids: vec!["dpu-1".to_string(), "dpu-2".to_string()],
-        host_machine_id: "host-001-id".to_string(),
+        deployment_type: DpuDeploymentType::Bf3,
     };
     sdk.register_dpu_node(node_info).await.unwrap();
 
@@ -227,9 +227,7 @@ async fn test_register_devices_node_and_force_delete() {
 
     // Force delete
     let dpu_ids = vec!["dpu-1".to_string(), "dpu-2".to_string()];
-    sdk.force_delete_host("node-host-001", &dpu_ids)
-        .await
-        .unwrap();
+    sdk.force_delete_host("host-001", &dpu_ids).await.unwrap();
 
     assert_eq!(
         DpuDeviceRepository::list(&mock, TEST_NS)

@@ -41,6 +41,8 @@ pub type HardwareHash = [u8; 32];
 /// String so that we can implement the Copy trait.
 pub type HardwareIdBase32 = [u8; POWER_SHELF_ID_HARDWARE_ID_BASE32_LENGTH];
 
+static POWER_SHELF_ID_PREFIX: &str = "ps100";
+
 /// The `PowerShelfId` uniquely identifies a power shelf that is managed by the Forge system
 ///
 /// `PowerShelfId`s are derived from a hardware fingerprint, and are thereby
@@ -98,7 +100,7 @@ impl Debug for PowerShelfId {
 impl sqlx::Encode<'_, sqlx::Postgres> for PowerShelfId {
     fn encode_by_ref(
         &self,
-        buf: &mut <Postgres as Database>::ArgumentBuffer<'_>,
+        buf: &mut <Postgres as Database>::ArgumentBuffer,
     ) -> Result<IsNull, BoxDynError> {
         buf.extend(self.to_string().as_bytes());
         Ok(sqlx::encode::IsNull::No)
@@ -205,6 +207,10 @@ impl PowerShelfId {
             [0; 32],
             PowerShelfType::Host,
         )
+    }
+
+    pub(crate) fn is_matching_prefix(s: &str) -> bool {
+        s.starts_with(POWER_SHELF_ID_PREFIX)
     }
 }
 
@@ -318,13 +324,14 @@ impl std::fmt::Display for PowerShelfId {
         // `ps` is for power-shelf
         // `1` is a version identifier
         // The next 2 bytes `00` are reserved
-        f.write_str("ps100")?;
+        f.write_str(POWER_SHELF_ID_PREFIX)?;
         // Write the power shelf type
         f.write_char(self.ty.id_char())?;
         // The next character determines how the PowerShelfId is derived (`PowerShelfIdSource`)
         f.write_char(self.source.id_char())?;
-        // Then follows the actual source data. self.hardware_id is guaranteed to have been written
-        // from a valid string, so we can use from_utf8_unchecked.
+        // Then follows the source data.
+        // SAFETY: `hardware_id` is private and populated only from `BASE32_DNSSEC::encode`, whose
+        // output is ASCII and therefore valid UTF-8.
         unsafe { f.write_str(std::str::from_utf8_unchecked(self.hardware_id.as_slice())) }
     }
 }
@@ -345,11 +352,11 @@ pub const POWER_SHELF_ID_LENGTH: usize =
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum PowerShelfIdParseError {
-    #[error("The Power Shelf ID has an invalid length of {0}")]
+    #[error("the power shelf ID has an invalid length of {0}")]
     Length(usize),
-    #[error("The Power Shelf ID {0} has an invalid prefix")]
+    #[error("the power shelf ID {0} has an invalid prefix")]
     Prefix(String),
-    #[error("The Power Shelf ID {0} has an invalid encoding")]
+    #[error("the power shelf ID {0} has an invalid encoding")]
     Encoding(String),
 }
 
@@ -361,7 +368,7 @@ impl FromStr for PowerShelfId {
             return Err(PowerShelfIdParseError::Length(s.len()));
         }
         // Check for version 1 and 2 reserved bytes
-        if !s.starts_with("ps100") {
+        if !s.starts_with(POWER_SHELF_ID_PREFIX) {
             return Err(PowerShelfIdParseError::Prefix(s.to_string()));
         }
 
@@ -431,6 +438,9 @@ impl prost::Message for PowerShelfId {
         let mut legacy_message = legacy_rpc::PowerShelfId::from(*self);
         legacy_message.merge_field(tag, wire_type, buf, ctx)?;
         *self = PowerShelfId::from_str(&legacy_message.id).map_err(|_| {
+            // Deprecation: if they remove DecodeError::new, they hopefully will provide some other way
+            // to impl prost::Message.
+            #[allow(deprecated)]
             DecodeError::new(format!("Invalid power shelf id: {}", legacy_message.id))
         })?;
         Ok(())
@@ -460,9 +470,9 @@ mod legacy_rpc {
     /// manually every time, while still interacting with peers that expect a `.common.PowerShelfId`
     /// to be serialized.
     #[derive(prost::Message)]
-    pub struct PowerShelfId {
+    pub(super) struct PowerShelfId {
         #[prost(string, tag = "1")]
-        pub id: String,
+        pub(super) id: String,
     }
 
     impl From<super::PowerShelfId> for PowerShelfId {
@@ -476,64 +486,112 @@ mod legacy_rpc {
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{scenarios, value_scenarios};
+
     use super::*;
 
-    #[test]
-    fn test_power_shelf_id_round_trip() {
-        let power_shelf_id_str = "ps100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg";
-        let power_shelf_id = PowerShelfId::from_str(power_shelf_id_str)
-            .expect("Should have successfully converted from a valid string");
-        let round_tripped = power_shelf_id.to_string();
-        assert_eq!(power_shelf_id_str, round_tripped);
+    #[derive(Debug, PartialEq, Eq)]
+    enum ParseFailure {
+        Length,
+        Prefix,
+        Encoding,
+    }
+
+    fn parse_power_shelf_id(input: &str) -> Result<String, ParseFailure> {
+        PowerShelfId::from_str(input)
+            .map(|id| id.to_string())
+            .map_err(|err| match err {
+                PowerShelfIdParseError::Length(_) => ParseFailure::Length,
+                PowerShelfIdParseError::Prefix(_) => ParseFailure::Prefix,
+                PowerShelfIdParseError::Encoding(_) => ParseFailure::Encoding,
+            })
     }
 
     #[test]
-    fn test_invalid_power_shelf_ids() {
-        match PowerShelfId::from_str("ps100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hc") {
-            // one character short
-            Err(PowerShelfIdParseError::Length(_)) => {} // Expect an error
-            Ok(_) => panic!("Converting from a too-short power shelf ID should have failed"),
-            Err(e) => panic!(
-                "Converting from a too-short string should have failed with a length error, got {e}"
-            ),
-        }
+    fn test_power_shelf_id_parse_cases() {
+        const VALID_POWER_SHELF_ID: &str =
+            "ps100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg";
 
-        match PowerShelfId::from_str("PS100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg")
-        {
-            Err(PowerShelfIdParseError::Prefix(_)) => {} // Expect an error
-            Ok(_) => {
-                panic!("Converting from a power shelf ID with an invalid prefix should have failed")
+        scenarios!(
+            run = parse_power_shelf_id;
+            "valid host TPM power shelf ID" {
+                VALID_POWER_SHELF_ID => Yields(VALID_POWER_SHELF_ID.to_string()),
             }
-            Err(e) => panic!(
-                "Converting from a power shelf ID with an invalid prefix should have failed with a Prefix error, got {e}"
-            ),
-        }
 
-        match PowerShelfId::from_str("ps100xt038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg")
-        {
-            Err(PowerShelfIdParseError::Prefix(_)) => {} // Expect an error
-            Ok(_) => panic!("Converting from a power shelf ID with type `x` should have failed"),
-            Err(e) => panic!(
-                "Converting from a power shelf ID with type `x` should have failed with a Prefix error, got {e}"
-            ),
-        }
+            "one character short" {
+                "ps100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hc" => FailsWith(ParseFailure::Length),
+            }
 
-        match PowerShelfId::from_str("ps100dx038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg")
-        {
-            Err(PowerShelfIdParseError::Prefix(_)) => {} // Expect an error
-            Ok(_) => panic!("Converting from a power shelf ID with source `x` should have failed"),
-            Err(e) => panic!(
-                "Converting from a power shelf ID with source `x` should have failed with a Prefix error, got {e}"
-            ),
-        }
+            "empty string" {
+                "" => FailsWith(ParseFailure::Length),
+            }
 
-        match PowerShelfId::from_str("ps100ht038bg3qsho433vkg684heguv28!qaggmrsh2ugn1qk096n2c6hcg")
-        {
-            Err(PowerShelfIdParseError::Encoding(_)) => {} // Expect an error
-            Ok(_) => panic!("Converting from a power shelf ID with a `!` should have failed"),
-            Err(e) => panic!(
-                "Converting from a power shelf ID with a `!` should have failed with an Encoding error, got {e}"
-            ),
-        }
+            "invalid prefix casing" {
+                "PS100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg" => FailsWith(ParseFailure::Prefix),
+            }
+
+            "invalid power shelf type" {
+                "ps100xt038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg" => FailsWith(ParseFailure::Prefix),
+            }
+
+            "invalid source" {
+                "ps100dx038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg" => FailsWith(ParseFailure::Prefix),
+            }
+
+            "invalid base32 payload" {
+                "ps100ht038bg3qsho433vkg684heguv28!qaggmrsh2ugn1qk096n2c6hcg" => FailsWith(ParseFailure::Encoding),
+            }
+        );
+    }
+
+    #[test]
+    fn test_power_shelf_type_mappings() {
+        value_scenarios!(
+            run = |ty| (ty.id_char(), ty.to_string(), ty.is_rack(), ty.is_host());
+            "rack" {
+                PowerShelfType::Rack => ('r', "Rack".to_string(), true, false),
+            }
+
+            "host" {
+                PowerShelfType::Host => ('h', "Host".to_string(), false, true),
+            }
+        );
+    }
+
+    #[test]
+    fn test_power_shelf_type_from_id_char() {
+        value_scenarios!(
+            run = PowerShelfType::from_id_char;
+            "rack" {
+                'r' => Some(PowerShelfType::Rack),
+            }
+
+            "host" {
+                'h' => Some(PowerShelfType::Host),
+            }
+
+            "unknown" {
+                'x' => None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_power_shelf_id_source_from_id_char() {
+        value_scenarios!(
+            run = PowerShelfIdSource::from_id_char;
+            "TPM" {
+                't' => Some(PowerShelfIdSource::Tpm),
+            }
+
+            "product board chassis serial" {
+                's' => Some(PowerShelfIdSource::ProductBoardChassisSerial),
+            }
+
+            "unknown" {
+                'x' => None,
+            }
+        );
     }
 }

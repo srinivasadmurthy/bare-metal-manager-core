@@ -16,16 +16,19 @@
  */
 use std::collections::HashMap;
 
-use ::rpc::admin_cli::{CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
+use clap::ValueEnum;
 use mac_address::MacAddress;
 use prettytable::{Table, row};
 use rpc::forge::ExpectedMachineRequest;
 
 use super::args::Args;
 use crate::async_write;
+use crate::errors::CarbideCliResult;
+use crate::expected_machines::common::HostDpuPolicy;
 use crate::rpc::ApiClient;
 
-pub async fn show_expected_machines(
+pub(super) async fn show_expected_machines(
     expected_machine_query: &Args,
     api_client: &ApiClient,
     output_format: OutputFormat,
@@ -77,8 +80,8 @@ pub async fn show_expected_machines(
         }));
 
     let bmc_ips = expected_mi
-        .iter()
-        .filter_map(|(_mac, interface)| {
+        .values()
+        .filter_map(|interface| {
             let ip = interface.address.first()?;
             Some(ip.clone())
         })
@@ -132,6 +135,8 @@ async fn convert_and_print_into_nice_table(
         "SKU ID",
         "Pause On Ingestion",
         "DPF Enabled",
+        "Disable Lockdown",
+        "DPU Policy",
     ]);
 
     for expected_machine in &expected_machines.expected_machines {
@@ -152,6 +157,8 @@ async fn convert_and_print_into_nice_table(
             .map(String::as_str);
 
         let labels = crate::metadata::fmt_labels_as_kv_pairs(expected_machine.metadata.as_ref());
+
+        let dpu_policy_display = dpu_policy_display(expected_machine.dpu_mode);
 
         table.add_row(row![
             expected_machine.chassis_serial_number,
@@ -180,10 +187,66 @@ async fn convert_and_print_into_nice_table(
                 .is_dpf_enabled
                 .unwrap_or(expected_machine.dpf_enabled)
                 .to_string(),
+            expected_machine
+                .host_lifecycle_profile
+                .and_then(|hlp| hlp.disable_lockdown)
+                .unwrap_or_default()
+                .to_string(),
+            dpu_policy_display,
         ]);
     }
 
     async_write!(output, "{}", table)?;
 
     Ok(())
+}
+
+/// Formats the stable Forge compatibility field with policy vocabulary.
+fn dpu_policy_display(dpu_mode: Option<i32>) -> String {
+    dpu_mode
+        .and_then(|value| ::rpc::forge::DpuMode::try_from(value).ok())
+        .map(HostDpuPolicy::from)
+        .filter(|policy| *policy != HostDpuPolicy::Unspecified)
+        .unwrap_or(HostDpuPolicy::Manage)
+        .to_possible_value()
+        .map(|value| value.get_name().to_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::value_scenarios;
+    use rpc::forge::DpuMode;
+
+    use super::dpu_policy_display;
+
+    #[test]
+    fn dpu_policy_display_uses_canonical_policy_vocabulary() {
+        value_scenarios!(
+            run = dpu_policy_display;
+            "missing value defaults to manage" {
+                None => "manage".to_string(),
+            }
+
+            "protobuf sentinel defaults to manage" {
+                Some(DpuMode::Unspecified as i32) => "manage".to_string(),
+            }
+
+            "DPU mode displays as manage" {
+                Some(DpuMode::DpuMode as i32) => "manage".to_string(),
+            }
+
+            "NIC mode displays as use as NIC" {
+                Some(DpuMode::NicMode as i32) => "nic".to_string(),
+            }
+
+            "no DPU displays as ignore" {
+                Some(DpuMode::NoDpu as i32) => "ignore".to_string(),
+            }
+
+            "unknown value preserves historical manage default" {
+                Some(i32::MAX) => "manage".to_string(),
+            }
+        );
+    }
 }

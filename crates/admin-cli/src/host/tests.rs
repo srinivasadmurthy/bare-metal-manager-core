@@ -23,9 +23,15 @@
 // Command Structure - Baseline debug_assert() of the entire command.
 // Argument Parsing  - Ensure required/optional arg combinations parse correctly.
 
+use carbide_test_support::Outcome::*;
+use carbide_test_support::scenarios;
+use carbide_uuid::machine::MachineId;
 use clap::{CommandFactory, Parser};
+use rpc::forge::HostReprovisioningRequest;
+use rpc::forge::host_reprovisioning_request::Mode;
 
 use super::*;
+use crate::test_support::{parse_with_leaf_matches, raw_value};
 
 // verify_cmd_structure runs a baseline clap debug_assert()
 // to do basic command configuration checking and validation,
@@ -37,6 +43,9 @@ fn verify_cmd_structure() {
     Cmd::command().debug_assert();
 }
 
+// Define a basic/working MachineId for testing.
+const TEST_MACHINE_ID: &str = "fm100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg";
+
 /////////////////////////////////////////////////////////////////////////////
 // Argument Parsing
 //
@@ -44,146 +53,184 @@ fn verify_cmd_structure() {
 // including testing required arguments, as well as optional
 // flag-specific checking.
 
-// parse_set_uefi_password ensures set-uefi-password
-// parses with machine query.
+// The UEFI-password subcommands each route to their own top-level variant:
+// set/clear take a machine query, generate takes no args.
 #[test]
-fn parse_set_uefi_password() {
-    let cmd = Cmd::try_parse_from(["host", "set-uefi-password", "--query", "machine-123"])
-        .expect("should parse set-uefi-password");
-
-    assert!(matches!(cmd, Cmd::SetUefiPassword(_)));
-}
-
-// parse_clear_uefi_password ensures clear-uefi-password
-// parses with machine query.
-#[test]
-fn parse_clear_uefi_password() {
-    let cmd = Cmd::try_parse_from(["host", "clear-uefi-password", "--query", "machine-123"])
-        .expect("should parse clear-uefi-password");
-
-    assert!(matches!(cmd, Cmd::ClearUefiPassword(_)));
-}
-
-// parse_generate_host_uefi_password ensures
-// generate-host-uefi-password parses with no args.
-#[test]
-fn parse_generate_host_uefi_password() {
-    let cmd = Cmd::try_parse_from(["host", "generate-host-uefi-password"])
-        .expect("should parse generate-host-uefi-password");
-
-    assert!(matches!(cmd, Cmd::GenerateHostUefiPassword(_)));
-}
-
-// Define a basic/working MachineId for testing.
-const TEST_MACHINE_ID: &str = "fm100ht038bg3qsho433vkg684heguv282qaggmrsh2ugn1qk096n2c6hcg";
-
-// parse_reprovision_set ensures reprovision set parses
-// with required args.
-#[test]
-fn parse_reprovision_set() {
-    let cmd = Cmd::try_parse_from(["host", "reprovision", "set", "--id", TEST_MACHINE_ID])
-        .expect("should parse reprovision set");
-
-    match cmd {
-        Cmd::Reprovision(reprovision::args::Args::Set(args)) => {
-            assert_eq!(args.id.to_string(), TEST_MACHINE_ID);
-            assert!(!args.update_firmware);
-            assert!(args.update_message.is_none());
+fn uefi_password_subcommands_route_to_their_variant() {
+    scenarios!(
+        run = |argv| {
+            let subcommand = argv[1];
+            parse_with_leaf_matches::<Cmd>(argv, &[subcommand])
+                .map(|(cmd, _)| match cmd {
+                    Cmd::SetUefiPassword(_) => "set-uefi-password",
+                    Cmd::ClearUefiPassword(_) => "clear-uefi-password",
+                    Cmd::GenerateHostUefiPassword(_) => "generate-host-uefi-password",
+                    _ => panic!("expected a UEFI-password command"),
+                })
+                .map_err(drop)
+        };
+        "set-uefi-password with machine query" {
+            &["host", "set-uefi-password", "--query", "machine-123"][..] => Yields("set-uefi-password"),
         }
-        _ => panic!("expected Reprovision Set variant"),
-    }
-}
 
-// parse_reprovision_set_with_options ensures
-// reprovision set parses with all options.
-#[test]
-fn parse_reprovision_set_with_options() {
-    let cmd = Cmd::try_parse_from([
-        "host",
-        "reprovision",
-        "set",
-        "--id",
-        TEST_MACHINE_ID,
-        "--update-firmware",
-        "--update-message",
-        "Maintenance in progress",
-    ])
-    .expect("should parse reprovision set with options");
-
-    match cmd {
-        Cmd::Reprovision(reprovision::args::Args::Set(args)) => {
-            assert!(args.update_firmware);
-            assert_eq!(
-                args.update_message,
-                Some("Maintenance in progress".to_string())
-            );
+        "clear-uefi-password with machine query" {
+            &["host", "clear-uefi-password", "--query", "machine-123"][..] => Yields("clear-uefi-password"),
         }
-        _ => panic!("expected Reprovision Set variant"),
-    }
-}
 
-// parse_reprovision_clear ensures reprovision clear
-// parses with required args.
-#[test]
-fn parse_reprovision_clear() {
-    let cmd = Cmd::try_parse_from(["host", "reprovision", "clear", "--id", TEST_MACHINE_ID])
-        .expect("should parse reprovision clear");
-
-    match cmd {
-        Cmd::Reprovision(reprovision::args::Args::Clear(args)) => {
-            assert_eq!(args.id.to_string(), TEST_MACHINE_ID);
-            assert!(!args.update_firmware);
+        "generate-host-uefi-password with no args" {
+            &["host", "generate-host-uefi-password"][..] => Yields("generate-host-uefi-password"),
         }
-        _ => panic!("expected Reprovision Clear variant"),
-    }
+    );
 }
 
-// parse_reprovision_list ensures reprovision list
-// parses with no args.
+// reprovision set parses to the Set variant. With only --id the optional
+// flags stay at their defaults; with --update-firmware and --update-message
+// supplied they carry through. The asserted tuple is
+// (id, update_firmware, update_message).
 #[test]
-fn parse_reprovision_list() {
-    let cmd = Cmd::try_parse_from(["host", "reprovision", "list"])
-        .expect("should parse reprovision list");
-
-    assert!(matches!(
-        cmd,
-        Cmd::Reprovision(reprovision::args::Args::List)
-    ));
-}
-
-// parse_reprovision_set_missing_id_fails ensures
-// reprovision set requires --id.
-#[test]
-fn parse_reprovision_set_missing_id_fails() {
-    let result = Cmd::try_parse_from(["host", "reprovision", "set"]);
-    assert!(result.is_err(), "should fail without --id");
-}
-
-// parse_reprovision_mark_manual_upgrade_complete ensures
-// mark-manual-upgrade-complete parses with required --id.
-#[test]
-fn parse_reprovision_mark_manual_upgrade_complete() {
-    let cmd = Cmd::try_parse_from([
-        "host",
-        "reprovision",
-        "mark-manual-upgrade-complete",
-        "--id",
-        TEST_MACHINE_ID,
-    ])
-    .expect("should parse mark-manual-upgrade-complete");
-
-    match cmd {
-        Cmd::Reprovision(reprovision::args::Args::MarkManualUpgradeComplete(args)) => {
-            assert_eq!(args.id.to_string(), TEST_MACHINE_ID);
+fn reprovision_set_parses_fields() {
+    scenarios!(
+        run = |argv| {
+            parse_with_leaf_matches::<Cmd>(argv, &["reprovision", "set"])
+                .map(|(cmd, matches)| {
+                    let request = match cmd {
+                        Cmd::Reprovision(reprovision::Args::Set(args)) => {
+                            HostReprovisioningRequest::from(&args)
+                        }
+                        _ => panic!("expected Reprovision Set variant"),
+                    };
+                    assert_eq!(request.mode, Mode::Set as i32);
+                    (
+                        request
+                            .machine_id
+                            .expect("machine ID is required")
+                            .to_string(),
+                        matches.get_flag("update_firmware"),
+                        raw_value(&matches, "update_message"),
+                    )
+                })
+                .map_err(drop)
+        };
+        "set with only required --id" {
+            &["host", "reprovision", "set", "--id", TEST_MACHINE_ID][..] => Yields((TEST_MACHINE_ID.to_string(), false, None)),
         }
-        _ => panic!("expected Reprovision MarkManualUpgradeComplete variant"),
-    }
+
+        "set with all options" {
+            &[
+                "host",
+                "reprovision",
+                "set",
+                "--id",
+                TEST_MACHINE_ID,
+                "--update-firmware",
+                "--update-message",
+                "Maintenance in progress",
+            ][..] => Yields((
+                TEST_MACHINE_ID.to_string(),
+                true,
+                Some("Maintenance in progress".to_string()),
+            )),
+        }
+    );
 }
 
-// parse_reprovision_mark_manual_upgrade_complete_missing_id_fails
-// ensures mark-manual-upgrade-complete requires --id.
+// reprovision clear parses to the Clear variant with required --id; the
+// update_firmware flag defaults off. The asserted tuple is
+// (id, update_firmware).
 #[test]
-fn parse_reprovision_mark_manual_upgrade_complete_missing_id_fails() {
-    let result = Cmd::try_parse_from(["host", "reprovision", "mark-manual-upgrade-complete"]);
-    assert!(result.is_err(), "should fail without --id");
+fn reprovision_clear_parses_fields() {
+    scenarios!(
+        run = |argv| {
+            parse_with_leaf_matches::<Cmd>(argv, &["reprovision", "clear"])
+                .map(|(cmd, matches)| {
+                    let request = match cmd {
+                        Cmd::Reprovision(reprovision::Args::Clear(args)) => {
+                            HostReprovisioningRequest::from(args)
+                        }
+                        _ => panic!("expected Reprovision Clear variant"),
+                    };
+                    assert_eq!(request.mode, Mode::Clear as i32);
+                    (
+                        request
+                            .machine_id
+                            .expect("machine ID is required")
+                            .to_string(),
+                        matches.get_flag("update_firmware"),
+                    )
+                })
+                .map_err(drop)
+        };
+        "clear with required --id" {
+            &["host", "reprovision", "clear", "--id", TEST_MACHINE_ID][..] => Yields((TEST_MACHINE_ID.to_string(), false)),
+        }
+    );
+}
+
+// reprovision mark-manual-upgrade-complete parses to its variant with the
+// required --id; the asserted value is the id.
+#[test]
+fn reprovision_mark_manual_upgrade_complete_parses_fields() {
+    scenarios!(
+        run = |argv| {
+            parse_with_leaf_matches::<Cmd>(argv, &["reprovision", "mark-manual-upgrade-complete"])
+                .map(|(cmd, matches)| {
+                    assert!(matches!(
+                        cmd,
+                        Cmd::Reprovision(reprovision::Args::MarkManualUpgradeComplete(_))
+                    ));
+                    matches
+                        .get_one::<MachineId>("id")
+                        .expect("machine ID is required")
+                        .to_string()
+                })
+                .map_err(drop)
+        };
+        "mark-manual-upgrade-complete with required --id" {
+            &[
+                "host",
+                "reprovision",
+                "mark-manual-upgrade-complete",
+                "--id",
+                TEST_MACHINE_ID,
+            ][..] => Yields(TEST_MACHINE_ID.to_string()),
+        }
+    );
+}
+
+// reprovision list parses to the List variant with no args.
+#[test]
+fn reprovision_list_parses() {
+    scenarios!(
+        run = |argv| {
+            parse_with_leaf_matches::<Cmd>(argv, &["reprovision", "list"])
+                .map(|(cmd, _)| match cmd {
+                    Cmd::Reprovision(reprovision::Args::List) => "list",
+                    _ => panic!("expected Reprovision List variant"),
+                })
+                .map_err(drop)
+        };
+        "list with no args" {
+            &["host", "reprovision", "list"][..] => Yields("list"),
+        }
+    );
+}
+
+// Each malformed reprovision invocation is rejected at parse time: the
+// subcommands that need --id refuse to parse without it.
+#[test]
+fn invalid_invocations_are_rejected() {
+    scenarios!(
+        run = |argv| {
+            Cmd::try_parse_from(argv.iter().copied())
+                .map(|_| ())
+                .map_err(drop)
+        };
+        "reprovision set without --id" {
+            &["host", "reprovision", "set"][..] => Fails,
+        }
+
+        "reprovision mark-manual-upgrade-complete without --id" {
+            &["host", "reprovision", "mark-manual-upgrade-complete"][..] => Fails,
+        }
+    );
 }

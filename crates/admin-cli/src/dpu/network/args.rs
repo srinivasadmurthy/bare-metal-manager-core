@@ -17,9 +17,26 @@
 
 #[derive(clap::Subcommand, Debug)]
 #[clap(rename_all = "kebab-case")]
-pub enum Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Print network status of all DPUs:
+    $ nico-admin-cli dpu network status
+
+Show the VPC network configuration for one DPU:
+    $ nico-admin-cli dpu network config --machine-id 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) enum Args {
     #[clap(about = "Print network status of all machines")]
     Status,
     #[clap(about = "Machine network configuration, used by VPC.")]
+    #[command(after_long_help = "\
+EXAMPLES:
+
+Show the VPC network configuration for one DPU:
+    $ nico-admin-cli dpu network config --machine-id 12345678-1234-5678-90ab-cdef01234567
+
+")]
     Config(crate::machine::NetworkConfigQuery),
 }

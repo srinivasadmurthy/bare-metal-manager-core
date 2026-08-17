@@ -19,7 +19,7 @@ use carbide_uuid::power_shelf::PowerShelfId;
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub enum Args {
+pub(crate) enum Args {
     #[clap(about = "Set the Name or Description of the Power Shelf")]
     Set(PowerShelfMetadataCommandSet),
     #[clap(about = "Show the Metadata of the Power Shelf")]
@@ -33,43 +33,88 @@ pub enum Args {
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct PowerShelfMetadataCommandShow {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Show a power shelf's metadata:
+    $ nico-admin-cli power-shelf metadata show 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct PowerShelfMetadataCommandShow {
     #[clap(help = "The power shelf which should get its metadata displayed")]
-    pub power_shelf: PowerShelfId,
+    pub(super) power_shelf: PowerShelfId,
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct PowerShelfMetadataCommandSet {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Set a power shelf's name and description:
+    $ nico-admin-cli power-shelf metadata set 12345678-1234-5678-90ab-cdef01234567 \
+    --name ps-01 --description \"Rack 4 power shelf\"
+
+")]
+pub(crate) struct PowerShelfMetadataCommandSet {
     #[clap(help = "The power shelf which should get updated metadata")]
-    pub power_shelf: PowerShelfId,
+    pub(super) power_shelf: PowerShelfId,
     #[clap(long, help = "The updated name of the Power Shelf")]
-    pub name: Option<String>,
+    pub(super) name: Option<String>,
     #[clap(long, help = "The updated description of the Power Shelf")]
-    pub description: Option<String>,
+    pub(super) description: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct PowerShelfMetadataCommandAddLabel {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Add a key-only label:
+    $ nico-admin-cli power-shelf metadata add-label 12345678-1234-5678-90ab-cdef01234567 --key edge
+
+Add a key/value label:
+    $ nico-admin-cli power-shelf metadata add-label 12345678-1234-5678-90ab-cdef01234567 \
+    --key row --value C
+
+")]
+pub(crate) struct PowerShelfMetadataCommandAddLabel {
     #[clap(help = "The power shelf which should get updated metadata")]
-    pub power_shelf: PowerShelfId,
+    pub(super) power_shelf: PowerShelfId,
     #[clap(long, help = "The key to add")]
-    pub key: String,
+    pub(super) key: String,
     #[clap(long, help = "The optional value to add")]
-    pub value: Option<String>,
+    pub(super) value: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct PowerShelfMetadataCommandRemoveLabels {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Remove one or more labels by key:
+    $ nico-admin-cli power-shelf metadata remove-labels 12345678-1234-5678-90ab-cdef01234567 \
+    --keys row --keys edge
+
+")]
+pub(crate) struct PowerShelfMetadataCommandRemoveLabels {
     #[clap(help = "The power shelf which should get updated metadata")]
-    pub power_shelf: PowerShelfId,
+    pub(super) power_shelf: PowerShelfId,
     #[clap(long, help = "The keys to remove")]
-    pub keys: Vec<String>,
+    pub(super) keys: Vec<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct PowerShelfMetadataCommandFromExpectedPowerShelf {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Fill in missing metadata from the expected-power-shelf (leaving existing values intact):
+    $ nico-admin-cli power-shelf metadata from-expected-power-shelf 12345678-1234-5678-90ab-cdef01234567
+
+Overwrite the power shelf's metadata with the expected-power-shelf's values:
+    $ nico-admin-cli power-shelf metadata from-expected-power-shelf 12345678-1234-5678-90ab-cdef01234567 \
+    --replace-all
+
+")]
+pub(crate) struct PowerShelfMetadataCommandFromExpectedPowerShelf {
     #[clap(help = "The power shelf which should get updated metadata")]
-    pub power_shelf: PowerShelfId,
+    pub(super) power_shelf: PowerShelfId,
     /// Whether to fully replace the Metadata that is currently stored on the Power Shelf.
     /// - If not set, existing Metadata on the Power Shelf will not be touched by executing
     ///   the command:
@@ -82,5 +127,5 @@ pub struct PowerShelfMetadataCommandFromExpectedPowerShelf {
     ///   they would if the Power Shelf would get freshly ingested.
     ///   Metadata that is currently set on the Power Shelf will be overridden.
     #[clap(long, verbatim_doc_comment)]
-    pub replace_all: bool,
+    pub(super) replace_all: bool,
 }

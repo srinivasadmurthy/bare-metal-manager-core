@@ -23,9 +23,13 @@
 // Command Structure - Baseline debug_assert() of the entire command.
 // Argument Parsing  - Ensure required/optional arg combinations parse correctly.
 
+use carbide_test_support::Outcome::*;
+use carbide_test_support::scenarios;
 use clap::{CommandFactory, Parser};
+use mac_address::MacAddress;
 
 use super::*;
+use crate::test_support::{parse_with_leaf_matches, raw_value};
 
 // verify_cmd_structure runs a baseline clap debug_assert()
 // to do basic command configuration checking and validation,
@@ -44,153 +48,165 @@ fn verify_cmd_structure() {
 // including testing required arguments, as well as optional
 // flag-specific checking.
 
-// parse_show_no_args ensures show parses with no
-// arguments (all switches).
+// show parses with or without an optional MAC address; the yielded bool is
+// whether a MAC was supplied.
 #[test]
-fn parse_show_no_args() {
-    let cmd = Cmd::try_parse_from(["expected-switch", "show"]).expect("should parse show");
-
-    match cmd {
-        Cmd::Show(args) => {
-            assert!(args.bmc_mac_address.is_none());
+fn parse_show() {
+    scenarios!(
+        run = |argv| parse_with_leaf_matches::<Cmd>(argv, &["show"])
+            .map(|(cmd, matches)| {
+                assert!(matches!(cmd, Cmd::Show(_)));
+                matches.get_one::<MacAddress>("bmc_mac_address").is_some()
+            })
+            .map_err(drop);
+        "show with no arguments (all switches)" {
+            &["expected-switch", "show"][..] => Yields(false),
         }
-        _ => panic!("expected Show variant"),
-    }
+
+        "show with a MAC address" {
+            &["expected-switch", "show", "1a:2b:3c:4d:5e:6f"][..] => Yields(true),
+        }
+    );
 }
 
-// parse_show_with_mac ensures show parses with MAC address.
-#[test]
-fn parse_show_with_mac() {
-    let cmd = Cmd::try_parse_from(["expected-switch", "show", "1a:2b:3c:4d:5e:6f"])
-        .expect("should parse show with MAC");
-
-    match cmd {
-        Cmd::Show(args) => {
-            assert!(args.bmc_mac_address.is_some());
-        }
-        _ => panic!("expected Show variant"),
-    }
-}
-
-// parse_add ensures add parses with required arguments.
+// add parses with the required credential/serial set, and with the optional
+// meta-name supplied; the yielded tuple is (bmc_username, switch_serial_number,
+// meta_name).
 #[test]
 fn parse_add() {
-    let cmd = Cmd::try_parse_from([
-        "expected-switch",
-        "add",
-        "--bmc-mac-address",
-        "1a:2b:3c:4d:5e:6f",
-        "--bmc-username",
-        "admin",
-        "--bmc-password",
-        "secret",
-        "--switch-serial-number",
-        "SW12345",
-    ])
-    .expect("should parse add");
-
-    match cmd {
-        Cmd::Add(args) => {
-            assert_eq!(args.bmc_username, "admin");
-            assert_eq!(args.switch_serial_number, "SW12345");
+    scenarios!(
+        run = |argv| parse_with_leaf_matches::<Cmd>(argv, &["add"])
+            .map(|(cmd, matches)| {
+                assert!(matches!(cmd, Cmd::Add(_)));
+                (
+                    raw_value(&matches, "bmc_username").expect("BMC username is required"),
+                    raw_value(&matches, "switch_serial_number")
+                        .expect("switch serial number is required"),
+                    raw_value(&matches, "meta_name"),
+                )
+            })
+            .map_err(drop);
+        "add with required arguments" {
+            &[
+                "expected-switch",
+                "add",
+                "--bmc-mac-address",
+                "1a:2b:3c:4d:5e:6f",
+                "--bmc-username",
+                "admin",
+                "--bmc-password",
+                "secret",
+                "--switch-serial-number",
+                "SW12345",
+            ][..] => Yields(("admin".to_string(), "SW12345".to_string(), None)),
         }
-        _ => panic!("expected Add variant"),
-    }
-}
 
-// parse_add_with_options ensures add parses with
-// all options.
-#[test]
-fn parse_add_with_options() {
-    let cmd = Cmd::try_parse_from([
-        "expected-switch",
-        "add",
-        "--bmc-mac-address",
-        "1a:2b:3c:4d:5e:6f",
-        "--bmc-username",
-        "admin",
-        "--bmc-password",
-        "secret",
-        "--switch-serial-number",
-        "SW12345",
-        "--meta-name",
-        "MySwitch",
-        "--label",
-        "env:prod",
-    ])
-    .expect("should parse add with options");
-
-    match cmd {
-        Cmd::Add(args) => {
-            assert_eq!(args.meta_name, Some("MySwitch".to_string()));
+        "add with all options" {
+            &[
+                "expected-switch",
+                "add",
+                "--bmc-mac-address",
+                "1a:2b:3c:4d:5e:6f",
+                "--bmc-username",
+                "admin",
+                "--bmc-password",
+                "secret",
+                "--switch-serial-number",
+                "SW12345",
+                "--meta-name",
+                "MySwitch",
+                "--label",
+                "env:prod",
+            ][..] => Yields((
+                "admin".to_string(),
+                "SW12345".to_string(),
+                Some("MySwitch".to_string()),
+            )),
         }
-        _ => panic!("expected Add variant"),
-    }
+    );
 }
 
-// parse_delete ensures delete parses with MAC address.
-#[test]
-fn parse_delete() {
-    let cmd = Cmd::try_parse_from(["expected-switch", "delete", "1a:2b:3c:4d:5e:6f"])
-        .expect("should parse delete");
-
-    assert!(matches!(cmd, Cmd::Delete(_)));
-}
-
-// parse_update ensures update parses with required
-// arguments.
+// update parses with the required MAC plus the optional serial-number override;
+// the yielded value is the parsed switch_serial_number.
 #[test]
 fn parse_update() {
-    let cmd = Cmd::try_parse_from([
-        "expected-switch",
-        "update",
-        "--bmc-mac-address",
-        "1a:2b:3c:4d:5e:6f",
-        "--switch-serial-number",
-        "NEW_SERIAL",
-    ])
-    .expect("should parse update");
-
-    match cmd {
-        Cmd::Update(args) => {
-            assert_eq!(args.switch_serial_number, Some("NEW_SERIAL".to_string()));
+    scenarios!(
+        run = |argv| parse_with_leaf_matches::<Cmd>(argv, &["update"])
+            .map(|(cmd, matches)| {
+                assert!(matches!(cmd, Cmd::Update(_)));
+                raw_value(&matches, "switch_serial_number")
+            })
+            .map_err(drop);
+        "update with required arguments" {
+            &[
+                "expected-switch",
+                "update",
+                "--bmc-mac-address",
+                "1a:2b:3c:4d:5e:6f",
+                "--switch-serial-number",
+                "NEW_SERIAL",
+            ][..] => Yields(Some("NEW_SERIAL".to_string())),
         }
-        _ => panic!("expected Update variant"),
-    }
+    );
 }
 
-// parse_replace_all ensures replace-all parses with
-// filename.
+// replace-all parses with a filename; the yielded value is the parsed filename.
 #[test]
 fn parse_replace_all() {
-    let cmd = Cmd::try_parse_from([
-        "expected-switch",
-        "replace-all",
-        "--filename",
-        "switches.json",
-    ])
-    .expect("should parse replace-all");
-
-    match cmd {
-        Cmd::ReplaceAll(args) => {
-            assert_eq!(args.filename, "switches.json");
+    scenarios!(
+        run = |argv| parse_with_leaf_matches::<Cmd>(argv, &["replace-all"])
+            .map(|(cmd, matches)| {
+                assert!(matches!(cmd, Cmd::ReplaceAll(_)));
+                raw_value(&matches, "filename").expect("filename is required")
+            })
+            .map_err(drop);
+        "replace-all with a filename" {
+            &[
+                "expected-switch",
+                "replace-all",
+                "--filename",
+                "switches.json",
+            ][..] => Yields("switches.json".to_string()),
         }
-        _ => panic!("expected ReplaceAll variant"),
-    }
+    );
 }
 
-// parse_erase ensures erase parses with no arguments.
+// delete and erase only need to route to their respective subcommand variants;
+// the yielded string names the variant the argv landed on.
 #[test]
-fn parse_erase() {
-    let cmd = Cmd::try_parse_from(["expected-switch", "erase"]).expect("should parse erase");
+fn parse_routes_to_variant() {
+    scenarios!(
+        run = |argv| {
+            let subcommand = argv[1];
+            parse_with_leaf_matches::<Cmd>(argv, &[subcommand])
+                .map(|(cmd, _)| match cmd {
+                    Cmd::Delete(_) => "delete",
+                    Cmd::Erase(_) => "erase",
+                    _ => panic!("expected Delete or Erase variant"),
+                })
+                .map_err(drop)
+        };
+        "delete with a MAC address" {
+            &["expected-switch", "delete", "1a:2b:3c:4d:5e:6f"][..] => Yields("delete"),
+        }
 
-    assert!(matches!(cmd, Cmd::Erase(_)));
+        "erase with no arguments" {
+            &["expected-switch", "erase"][..] => Yields("erase"),
+        }
+    );
 }
 
-// parse_add_missing_required_fails ensures add fails
-// without required arguments.
+// Every malformed invocation is rejected at parse time.
 #[test]
-fn parse_add_missing_required_fails() {
-    let result = Cmd::try_parse_from(["expected-switch", "add"]);
-    assert!(result.is_err(), "should fail without required arguments");
+fn invalid_invocations_are_rejected() {
+    scenarios!(
+        run = |argv| {
+            Cmd::try_parse_from(argv.iter().copied())
+                .map(|_| ())
+                .map_err(drop)
+        };
+        "add without its required arguments" {
+            &["expected-switch", "add"][..] => Fails,
+        }
+    );
 }

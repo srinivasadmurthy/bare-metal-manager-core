@@ -19,30 +19,28 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use mac_address::MacAddress;
-use rpc::DiscoveryInfo;
 use serde_json::json;
 
 use crate::{BootOptionKind, Callbacks, hw, redfish};
 
-#[allow(dead_code)]
-pub struct LenovoGB300Nvl<'a> {
-    pub system_0_serial_number: Cow<'a, str>,
-    pub chassis_0_serial_number: Cow<'a, str>,
-    pub dpu: hw::bluefield3::Bluefield3<'a>,
-    pub embedded_1g_nic: hw::nic_intel_i210::NicIntelI210,
-    pub bmc_mac_address_eth0: MacAddress,
-    pub bmc_mac_address_eth1: MacAddress,
-    pub bmc_mac_address_usb0: MacAddress,
-    pub hgx_bmc_mac_address_usb0: MacAddress,
-    pub hgx_serial_number: Cow<'a, str>,
-    pub topology: hw::nvidia_gbx00::Topology,
-    pub cpu: [hw::nvidia_gb300::NvidiaGB300Cpu<'a>; 2],
-    pub gpu: [hw::nvidia_gb300::NvidiaGB300Gpu<'a>; 4],
-    pub io_board: [hw::nvidia_gb300::NvidiaGB300IoBoard<'a>; 2],
+pub(crate) struct LenovoGB300Nvl<'a> {
+    pub(crate) system_0_serial_number: Cow<'a, str>,
+    pub(crate) chassis_0_serial_number: Cow<'a, str>,
+    pub(crate) dpu: hw::bluefield3::Bluefield3<'a>,
+    pub(crate) embedded_1g_nic: hw::nic_intel_i210::NicIntelI210,
+    pub(crate) bmc_mac_address_eth0: MacAddress,
+    pub(crate) bmc_mac_address_eth1: MacAddress,
+    pub(crate) bmc_mac_address_usb0: MacAddress,
+    pub(crate) hgx_bmc_mac_address_usb0: MacAddress,
+    pub(crate) hgx_serial_number: Cow<'a, str>,
+    pub(crate) topology: hw::nvidia_gbx00::Topology,
+    pub(crate) cpu: [hw::nvidia_gb300::NvidiaGB300Cpu<'a>; 2],
+    pub(crate) gpu: [hw::nvidia_gb300::NvidiaGB300Gpu<'a>; 4],
+    pub(crate) io_board: [hw::nvidia_gb300::NvidiaGB300IoBoard<'a>; 2],
 }
 
 impl LenovoGB300Nvl<'_> {
-    pub fn manager_config(&self) -> redfish::manager::Config {
+    pub(crate) fn manager_config(&self) -> redfish::manager::Config {
         let bmc_manager_id = "BMC_0";
         let bmc_eth_builder = |eth| {
             redfish::ethernet_interface::builder(&redfish::ethernet_interface::manager_resource(
@@ -75,6 +73,7 @@ impl LenovoGB300Nvl<'_> {
                         .interface_enabled(true)
                         .build(),
                     ]),
+                    serial_interfaces: None,
                     firmware_version: Some("3.00.0"),
                     oem: None,
                 },
@@ -92,6 +91,7 @@ impl LenovoGB300Nvl<'_> {
                     // GB200Nvl-25.08-B is how it is reported in
                     // example of Redfish dump. Probably it will be
                     // fixed in future.
+                    serial_interfaces: None,
                     firmware_version: Some("GB200Nvl-25.08-B"),
                     oem: None,
                 },
@@ -99,7 +99,10 @@ impl LenovoGB300Nvl<'_> {
         }
     }
 
-    pub fn system_config(&self, callbacks: Arc<dyn Callbacks>) -> redfish::computer_system::Config {
+    pub(crate) fn system_config(
+        &self,
+        callbacks: Arc<dyn Callbacks>,
+    ) -> redfish::computer_system::Config {
         let system_id = "System_0";
         // TODO: It is PXE but apparently if enable HTTP in bios HTTP
         // (Uefi) boot options will show up here...
@@ -127,7 +130,7 @@ impl LenovoGB300Nvl<'_> {
                     .boot_option_reference(&format!("Boot{id}"))
                     // Real "Description": "DisplayName": "[Slot16]UEFI: PXE IPv4 Nvidia Network Adapter - 90:E3:17:95:01:DE",
                     .display_name(&format!(
-                        "[SlotFFFF]: PXE IPv4 Some Network Adapter - {}",
+                        "[SlotFFFF]: HTTP IPv4 Some Network Adapter - {}",
                         nic.mac_address
                     ))
                     .uefi_device_path(&format!(
@@ -138,7 +141,7 @@ impl LenovoGB300Nvl<'_> {
                     .build()
                 }),
         )
-        .collect();
+        .collect::<Vec<_>>();
 
         // Not: No DPU in EthernetInterfaces.
         let eth_interfaces = [&self.embedded_1g_nic.ethernet_nic()]
@@ -173,15 +176,18 @@ impl LenovoGB300Nvl<'_> {
                     model: Some("GB300 1CPU:2GPU Board PC".into()),
                     oem: redfish::computer_system::Oem::Generic,
                     callbacks: None,
+                    serial_console: None,
                     secure_boot_available: false,
                     serial_number: Some(self.hgx_serial_number.to_string().into()),
                     storage: None,
+                    processors: None,
+                    memory: None,
                 },
                 redfish::computer_system::SingleSystemConfig {
                     base_bios: Some(base_bios(system_id)),
                     bios_mode: redfish::computer_system::BiosMode::Generic,
                     boot_options: Some(boot_options),
-                    boot_order_mode: redfish::computer_system::BootOrderMode::Generic,
+                    boot_order_mode: redfish::computer_system::BootOrderMode::ViaSettings,
                     chassis: vec!["Chassis_0".into()],
                     eth_interfaces: Some(eth_interfaces),
                     id: system_id.into(),
@@ -192,15 +198,18 @@ impl LenovoGB300Nvl<'_> {
                     model: Some("HG634N_V2".into()),
                     oem: redfish::computer_system::Oem::Generic,
                     callbacks: Some(callbacks),
+                    serial_console: None,
                     secure_boot_available: true,
                     serial_number: Some(self.system_0_serial_number.to_string().into()),
                     storage: None,
+                    processors: None,
+                    memory: None,
                 },
             ],
         }
     }
 
-    pub fn chassis_config(&self) -> redfish::chassis::ChassisConfig {
+    pub(crate) fn chassis_config(&self) -> redfish::chassis::ChassisConfig {
         let dpu_chassis = |chassis_id: &'static str, bf3: &hw::bluefield3::Bluefield3<'_>| {
             let nic = bf3.host_nic();
             redfish::chassis::SingleChassisConfig {
@@ -237,10 +246,13 @@ impl LenovoGB300Nvl<'_> {
                         redfish::sensor::Layout {
                             temperature: 47,
                             power: 2,
-                            leak: 12, // Leak + Voltage
+                            voltage: 12,
                             fan: 24,
                             current: 0,
                         },
+                    )),
+                    leak_detectors: Some(redfish::leak_detector::generate_chassis_leak_detectors(
+                        4,
                     )),
                     ..redfish::chassis::SingleChassisConfig::defaults()
                 }))
@@ -264,15 +276,22 @@ impl LenovoGB300Nvl<'_> {
         }
     }
 
-    pub fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
+    pub(crate) fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
         redfish::update_service::UpdateServiceConfig {
-            firmware_inventory: vec![],
+            firmware_inventory: [("BMC-Primary", "1.0.0"), ("UEFI", "1.0.0")]
+                .iter()
+                .map(|(id, version)| {
+                    redfish::software_inventory::builder(
+                        &redfish::software_inventory::firmware_inventory_resource(id),
+                    )
+                    .version(version)
+                    .build()
+                })
+                .collect(),
+            host_bmc_inventory_id: Some("BMC-Primary".to_string()),
+            host_uefi_inventory_id: Some("UEFI".to_string()),
+            ..Default::default()
         }
-    }
-
-    pub fn discovery_info(&self) -> DiscoveryInfo {
-        // TODO: Should be generated by scout...
-        DiscoveryInfo::default()
     }
 }
 
@@ -321,7 +340,10 @@ fn base_bios(system_id: &str) -> serde_json::Value {
             // NOTE: This is the closest replacement for synthetic
             // "EndlessBoot" from lenovo_ami.rs. Value 50 means endless boot.
             // Real dump currently reports 0.
-            "LEM0003": 0
+            "LEM0003": 0,
+
+            // "USB Support"
+            "USB000": "USB000Enabled",
         }))
         .build()
 }

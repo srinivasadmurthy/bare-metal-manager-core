@@ -18,6 +18,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use ::rpc::forge::DhcpDiscovery;
+use carbide_dhcp_common::VendorClass;
 use lru::LruCache;
 use rpc::forge::DhcpRecord;
 use tokio::sync::Mutex;
@@ -28,10 +29,9 @@ use crate::Config;
 use crate::cache::{self, CacheEntry};
 use crate::errors::DhcpError;
 use crate::rpc::client::discover_dhcp;
-use crate::vendor_class::VendorClass;
 
 #[derive(Debug)]
-pub struct Controller {}
+pub(crate) struct Controller {}
 
 #[async_trait]
 impl DhcpMode for Controller {
@@ -73,12 +73,12 @@ impl DhcpMode for Controller {
                 &mut machine_cache,
             ) {
                 tracing::info!(
-                    "returning cached response for (mac: {}, link(or relay)_address: {}, circuit_id: {:?}, remote: {:?}, vendor: {})",
-                    discovery_request.mac_address,
-                    link_address,
-                    &discovery_request.circuit_id,
-                    &discovery_request.remote_id,
-                    &vendor_id,
+                    mac_address = %discovery_request.mac_address,
+                    %link_address,
+                    circuit_id = ?discovery_request.circuit_id,
+                    remote_id = ?discovery_request.remote_id,
+                    %vendor_id,
+                    "returning cached response"
                 );
 
                 return Ok(cache_entry.dhcp_record);

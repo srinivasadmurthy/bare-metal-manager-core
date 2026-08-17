@@ -20,7 +20,20 @@ use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[clap(disable_help_flag = true)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all managed hosts:
+    $ nico-admin-cli managed-host show
+
+Show details for one host (by host or DPU machine ID):
+    $ nico-admin-cli managed-host show 12345678-1234-5678-90ab-cdef01234567
+
+Show the summary with IP details:
+    $ nico-admin-cli managed-host show --ips
+
+")]
+pub(crate) struct Args {
     #[clap(long, action = clap::ArgAction::HelpLong)]
     help: Option<bool>,
 
@@ -31,13 +44,13 @@ pub struct Args {
         help = "Show all managed hosts (DEPRECATED)",
         conflicts_with = "machine"
     )]
-    pub all: bool,
+    pub(super) all: bool,
 
     #[clap(
         default_value(None),
         help = "Show managed host specific details (using host or dpu machine id), leave empty for all"
     )]
-    pub machine: Option<MachineId>,
+    pub(super) machine: Option<MachineId>,
 
     #[clap(
         short,
@@ -46,7 +59,7 @@ pub struct Args {
         help = "Show IP details in summary",
         conflicts_with = "machine"
     )]
-    pub ips: bool,
+    pub(super) ips: bool,
 
     #[clap(
         short = 't',
@@ -54,7 +67,7 @@ pub struct Args {
         action,
         help = "Show only hosts for this instance type"
     )]
-    pub instance_type_id: Option<String>,
+    instance_type_id: Option<String>,
 
     #[clap(
         short,
@@ -63,11 +76,11 @@ pub struct Args {
         help = "Show GPU and memory details in summary",
         conflicts_with = "machine"
     )]
-    pub more: bool,
+    pub(super) more: bool,
 
     #[clap(long, action, help = "Show only hosts in maintenance mode")]
-    pub fix: bool,
+    pub(super) fix: bool,
 
     #[clap(long, action, help = "Show only hosts in quarantine")]
-    pub quarantine: bool,
+    pub(super) quarantine: bool,
 }

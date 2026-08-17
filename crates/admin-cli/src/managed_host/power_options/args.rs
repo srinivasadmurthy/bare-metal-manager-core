@@ -20,27 +20,61 @@ use clap::{Parser, ValueEnum};
 use rpc::forge::{self as forgerpc, PowerOptionUpdateRequest};
 
 #[derive(Parser, Debug)]
-pub enum Args {
+pub(crate) enum Args {
+    #[command(after_long_help = "\
+EXAMPLES:
+
+Show power options for all hosts:
+    $ nico-admin-cli managed-host power-options show
+
+Show power options for one host:
+    $ nico-admin-cli managed-host power-options show 12345678-1234-5678-90ab-cdef01234567
+
+")]
     Show(ShowPowerOptions),
+    #[command(after_long_help = "\
+EXAMPLES:
+
+Set a host's desired power state (on / off / power-manager-disabled):
+    $ nico-admin-cli managed-host power-options update 12345678-1234-5678-90ab-cdef01234567 \
+    --desired-power-state off
+
+")]
     Update(UpdatePowerOptions),
     #[clap(about = "Get machine ingestion state")]
+    #[command(after_long_help = "\
+EXAMPLES:
+
+Get the ingestion state for a machine by its BMC MAC:
+    $ nico-admin-cli managed-host power-options get-machine-ingestion-state \
+    --mac-address 00:11:22:33:44:55
+
+")]
     GetMachineIngestionState(BmcMacAddress),
     #[clap(about = "Allow a machine to power on")]
+    #[command(after_long_help = "\
+EXAMPLES:
+
+Allow a machine to be ingested and powered on:
+    $ nico-admin-cli managed-host power-options allow-ingestion-and-power-on \
+    --mac-address 00:11:22:33:44:55
+
+")]
     AllowIngestionAndPowerOn(BmcMacAddress),
 }
 
 #[derive(Parser, Debug)]
-pub struct ShowPowerOptions {
+pub(crate) struct ShowPowerOptions {
     #[clap(help = "ID of the host or nothing for all")]
-    pub machine: Option<MachineId>,
+    pub(super) machine: Option<MachineId>,
 }
 
 #[derive(Parser, Debug)]
-pub struct UpdatePowerOptions {
+pub(crate) struct UpdatePowerOptions {
     #[clap(help = "ID of the host")]
-    pub machine: MachineId,
+    machine: MachineId,
     #[clap(long, short, help = "Desired Power State")]
-    pub desired_power_state: DesiredPowerState,
+    desired_power_state: DesiredPowerState,
 }
 
 impl From<UpdatePowerOptions> for PowerOptionUpdateRequest {
@@ -58,14 +92,45 @@ impl From<UpdatePowerOptions> for PowerOptionUpdateRequest {
 }
 
 #[derive(ValueEnum, Parser, Debug, Clone, PartialEq)]
-pub enum DesiredPowerState {
+enum DesiredPowerState {
     On,
     Off,
     PowerManagerDisabled,
 }
 
 #[derive(Parser, Debug)]
-pub struct BmcMacAddress {
+pub(crate) struct BmcMacAddress {
     #[clap(short, long, help = "MAC Address of host BMC endpoint")]
-    pub mac_address: mac_address::MacAddress,
+    pub(super) mac_address: mac_address::MacAddress,
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::scenarios;
+    use clap::ValueEnum;
+
+    use super::DesiredPowerState;
+
+    #[test]
+    fn desired_power_state_value_enum() {
+        scenarios!(
+            run = |s| DesiredPowerState::from_str(s, false).map(|v| format!("{v:?}"));
+            "on" {
+                "on" => Yields(format!("{:?}", DesiredPowerState::On)),
+            }
+
+            "off" {
+                "off" => Yields(format!("{:?}", DesiredPowerState::Off)),
+            }
+
+            "power-manager-disabled" {
+                "power-manager-disabled" => Yields(format!("{:?}", DesiredPowerState::PowerManagerDisabled)),
+            }
+
+            "invalid value" {
+                "invalid" => Fails,
+            }
+        );
+    }
 }

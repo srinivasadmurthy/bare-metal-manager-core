@@ -18,7 +18,20 @@
 use clap::{ArgGroup, Parser};
 
 #[derive(Parser, Debug, PartialEq)]
-pub enum Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Dump the entire latest report as JSON:
+    $ nico-admin-cli site-explorer get-report all
+
+Show discovered managed-host details:
+    $ nico-admin-cli site-explorer get-report managed-host
+
+Show explored endpoint details:
+    $ nico-admin-cli site-explorer get-report endpoint
+
+")]
+pub(crate) enum Args {
     #[clap(about = "Get everything in Json")]
     All,
     #[clap(about = "Get discovered host details.")]
@@ -29,40 +42,69 @@ pub enum Args {
 
 #[derive(Parser, Debug, PartialEq)]
 #[clap(group(ArgGroup::new("selector").required(false).args(&["erroronly", "successonly"])))]
-pub struct EndpointInfo {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all explored endpoints:
+    $ nico-admin-cli site-explorer get-report endpoint
+
+Show one endpoint by BMC IP:
+    $ nico-admin-cli site-explorer get-report endpoint 192.0.2.10
+
+Show only endpoints that errored, filtered by vendor:
+    $ nico-admin-cli site-explorer get-report endpoint --erroronly --vendor nvidia
+
+Show only endpoints not yet paired to a managed host:
+    $ nico-admin-cli site-explorer get-report endpoint --unpairedonly
+
+")]
+pub(crate) struct EndpointInfo {
     #[clap(help = "BMC IP address of Endpoint.")]
-    pub address: Option<String>,
+    pub(crate) address: Option<String>,
 
     #[clap(
         short,
         long,
         help = "Filter based on vendor. Valid only for table view."
     )]
-    pub vendor: Option<String>,
+    pub(crate) vendor: Option<String>,
 
     #[clap(
         long,
         action,
         help = "By default shows all endpoints. If wants to see unpairedonly, choose this option."
     )]
-    pub unpairedonly: bool,
+    pub(crate) unpairedonly: bool,
 
     #[clap(long, action, help = "Show only endpoints which have error.")]
-    pub erroronly: bool,
+    pub(crate) erroronly: bool,
 
     #[clap(long, action, help = "Show only endpoints which have no error.")]
-    pub successonly: bool,
+    pub(crate) successonly: bool,
 }
 
 #[derive(Parser, Debug, PartialEq)]
-pub struct ManagedHostInfo {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all discovered managed hosts:
+    $ nico-admin-cli site-explorer get-report managed-host
+
+Show one managed host by its host/DPU BMC IP:
+    $ nico-admin-cli site-explorer get-report managed-host 192.0.2.10
+
+Filter managed hosts by vendor:
+    $ nico-admin-cli site-explorer get-report managed-host --vendor nvidia
+
+")]
+pub(crate) struct ManagedHostInfo {
     #[clap(help = "BMC IP address of host or DPU")]
-    pub address: Option<String>,
+    pub(super) address: Option<String>,
 
     #[clap(
         short,
         long,
         help = "Filter based on vendor. Valid only for table view."
     )]
-    pub vendor: Option<String>,
+    pub(super) vendor: Option<String>,
 }

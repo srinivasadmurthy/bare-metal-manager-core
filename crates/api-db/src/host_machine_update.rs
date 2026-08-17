@@ -27,43 +27,36 @@ pub async fn find_upgrade_needed(
     global_enabled: bool,
     ready_only: bool,
 ) -> Result<Vec<HostMachineUpdate>, DatabaseError> {
-    let from_global = if global_enabled {
-        " OR machines.firmware_autoupdate IS NULL"
-    } else {
-        ""
-    };
-    let ready_only = if ready_only {
-        "            AND machines.controller_state->>'state' = 'ready'"
-    } else {
-        ""
-    };
-
     let host_prefix = MachineType::Host.id_prefix();
 
     // Both desired_firmware.versions and explored_endpoints.exploration_report->>'Versions' are sorted, and will have their keys
     // defined based on the firmware config.  If a new key (component type) is added to the configuration, we would initally flag
     // everything, but nothing would happen to them and the next time site explorer runs on those hosts they will be made to match.
     // The ORDER BY causes us to choose unassigned machines before assigned machines.
-    let query = format!(
-        r#"select machines.id, explored_endpoints.exploration_report->>'Vendor', explored_endpoints.exploration_report->>'Model'
+    let query = r#"select machines.id, explored_endpoints.exploration_report->>'Vendor', explored_endpoints.exploration_report->>'Model'
         FROM explored_endpoints
-        INNER JOIN machine_topologies
-            ON SPLIT_PART(explored_endpoints.address::text, '/', 1) = machine_topologies.topology->'bmc_info'->>'ip'
+        INNER JOIN machine_interface_addresses
+            ON explored_endpoints.address = machine_interface_addresses.address
+        INNER JOIN machine_interfaces
+            ON machine_interface_addresses.interface_id = machine_interfaces.id
+            AND machine_interfaces.interface_type = 'Bmc'
         INNER JOIN machines
-            ON machine_topologies.machine_id = machines.id
+            ON machine_interfaces.machine_id = machines.id
         INNER JOIN desired_firmware
             ON explored_endpoints.exploration_report->>'Vendor' = desired_firmware.vendor AND explored_endpoints.exploration_report->>'Model' = desired_firmware.model
-        WHERE starts_with(machines.id, '{host_prefix}')
-            {ready_only}
+        WHERE starts_with(machines.id, $2)
+            AND ($3 OR machines.controller_state->>'state' = 'ready')
             AND machines.host_reprovisioning_requested IS NULL
             AND desired_firmware.versions->>'Versions' != explored_endpoints.exploration_report->>'Versions'
-            AND (machines.firmware_autoupdate = TRUE{from_global})
+            AND (machines.firmware_autoupdate = TRUE OR ($4 AND machines.firmware_autoupdate IS NULL))
             AND (desired_firmware.explicit_update_start_needed = false OR ($1 > machines.firmware_update_time_window_start AND $1 < machines.firmware_update_time_window_end))
         ORDER BY machines.controller_state->>'state' != 'ready'
-        ;"#,
-    );
-    sqlx::query_as(query.as_str())
+        ;"#;
+    sqlx::query_as(query)
         .bind(chrono::Utc::now())
+        .bind(host_prefix)
+        .bind(!ready_only)
+        .bind(global_enabled)
         .fetch_all(txn)
         .await
         .map_err(|e| DatabaseError::new("find_outdated_hosts", e))
@@ -128,6 +121,32 @@ pub async fn clear_host_reprovisioning_request(
         .map_err(|e| DatabaseError::query(query, e))?;
 
     Ok(())
+}
+
+/// Clears a rack-owned host reprovisioning request if the machine has not left `Ready`.
+///
+/// Returns whether the request was cleared. A concurrent transition out of `Ready`, or a
+/// request from another initiator, leaves the request untouched so its owning controller can
+/// unwind it.
+pub async fn clear_ready_host_reprovisioning_request(
+    txn: &mut PgConnection,
+    machine_id: &MachineId,
+    initiator: &str,
+) -> Result<bool, DatabaseError> {
+    let query = r#"UPDATE machines
+        SET host_reprovisioning_requested = NULL
+        WHERE id = $1
+          AND controller_state->>'state' = 'ready'
+          AND host_reprovisioning_requested->>'initiator' = $2
+        RETURNING id"#;
+    let cleared = sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .bind(initiator)
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(cleared.is_some())
 }
 
 pub async fn reset_host_reprovisioning_request(

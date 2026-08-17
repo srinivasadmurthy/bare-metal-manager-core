@@ -17,12 +17,11 @@
 
 use std::collections::HashMap;
 
-use ::rpc::errors::RpcDataConversionError;
+use carbide_utils::none_if_empty::NoneIfEmpty;
 use carbide_uuid::extension_service::ExtensionServiceId;
 use carbide_uuid::machine::MachineId;
 use chrono::{DateTime, Utc};
 use config_version::{ConfigVersion, Versioned};
-use rpc::forge as rpc;
 use serde::{Deserialize, Serialize};
 
 use crate::extension_service::ExtensionServiceType;
@@ -40,28 +39,13 @@ pub struct InstanceExtensionServicesStatus {
     pub configs_synced: SyncState,
 }
 
-impl TryFrom<InstanceExtensionServicesStatus> for rpc::InstanceDpuExtensionServicesStatus {
-    type Error = RpcDataConversionError;
-
-    fn try_from(status: InstanceExtensionServicesStatus) -> Result<Self, Self::Error> {
-        let mut extension_services = Vec::with_capacity(status.extension_services.len());
-        for service in status.extension_services {
-            extension_services.push(rpc::InstanceDpuExtensionServiceStatus::try_from(service)?);
-        }
-        Ok(rpc::InstanceDpuExtensionServicesStatus {
-            dpu_extension_services: extension_services,
-            configs_synced: rpc::SyncState::try_from(status.configs_synced)? as i32,
-        })
-    }
-}
-
 impl InstanceExtensionServicesStatus {
     /// Derives the extension services status from the user's desired config
     /// and the observations from DPUs.
     /// For each extension service, we aggregate the statuses from all DPUs.
     /// The config passed must be from database (not rpc InstanceConfig), and must contain any terminating services.
     pub fn from_config_and_observations(
-        dpu_id_to_device_map: &HashMap<String, Vec<MachineId>>,
+        dpu_ids: &[MachineId],
         config: Versioned<&InstanceExtensionServicesConfig>,
         observations: &HashMap<MachineId, InstanceExtensionServiceStatusObservation>,
     ) -> Self {
@@ -74,12 +58,11 @@ impl InstanceExtensionServicesStatus {
             };
         }
 
-        // Extract all unique DPU machine IDs from the dpu_id_to_device_map
-        let all_dpu_ids: Vec<MachineId> =
-            dpu_id_to_device_map.values().flatten().copied().collect();
-
-        // @TODO(Felicity): Zero DPU for this instance? Maybe deny extension service config if no DPUs?
-        if all_dpu_ids.is_empty() {
+        // Instance allocation rejects non-empty service_configs on zero-DPU
+        // hosts, so, in practice, we *shouldn't* reach here. BUT, if we do,
+        // assume it's from something like a stale pre-validation instance,
+        // and just report unsynced.
+        if dpu_ids.is_empty() {
             return Self::unsynced_for_config(&config);
         }
 
@@ -90,7 +73,7 @@ impl InstanceExtensionServicesStatus {
         for service in config.service_configs.iter() {
             let mut dpu_statuses = vec![];
 
-            for dpu_id in &all_dpu_ids {
+            for dpu_id in dpu_ids {
                 match observations.get(dpu_id) {
                     // DPU has observation with matching config version
                     Some(obs) if obs.config_version == config.version => {
@@ -103,11 +86,7 @@ impl InstanceExtensionServicesStatus {
                             dpu_statuses.push(MachineExtensionServiceStatus {
                                 machine_id: *dpu_id,
                                 status: service_status.overall_state.clone(),
-                                error_message: if service_status.message.is_empty() {
-                                    None
-                                } else {
-                                    Some(service_status.message.clone())
-                                },
+                                error_message: service_status.message.clone().none_if_empty(),
                                 components: service_status.components.clone(),
                             });
                         } else {
@@ -247,9 +226,11 @@ impl InstanceExtensionServicesStatus {
         }
     }
 
-    /// Returns the set of service IDs that are marked as removed and have been fully terminated
-    /// across all DPUs (i.e., all DPUs report the service as Terminated)
-    pub fn get_terminated_service_ids(&self) -> std::collections::HashSet<ExtensionServiceId> {
+    /// Returns `(service_id, extension service config version)` for extension services that are
+    /// marked removed and fully `Terminated` on every DPU. Cleanup must use this pair, not
+    /// `service_id` alone, because multiple config versions for the same service can exist during
+    /// rolldown/upgrade.
+    pub fn get_terminated_service_keys(&self) -> Vec<(ExtensionServiceId, ConfigVersion)> {
         self.extension_services
             .iter()
             .filter(|svc| {
@@ -264,7 +245,7 @@ impl InstanceExtensionServicesStatus {
                         )
                     })
             })
-            .map(|svc| svc.service_id)
+            .map(|svc| (svc.service_id, svc.version))
             .collect()
     }
 }
@@ -310,108 +291,12 @@ pub enum ExtensionServiceDeploymentStatus {
     Error,
 }
 
-impl From<rpc::DpuExtensionServiceDeploymentStatus> for ExtensionServiceDeploymentStatus {
-    fn from(status: rpc::DpuExtensionServiceDeploymentStatus) -> Self {
-        match status {
-            rpc::DpuExtensionServiceDeploymentStatus::DpuExtensionServiceUnknown => Self::Unknown,
-            rpc::DpuExtensionServiceDeploymentStatus::DpuExtensionServicePending => Self::Pending,
-            rpc::DpuExtensionServiceDeploymentStatus::DpuExtensionServiceRunning => Self::Running,
-            rpc::DpuExtensionServiceDeploymentStatus::DpuExtensionServiceTerminating => {
-                Self::Terminating
-            }
-            rpc::DpuExtensionServiceDeploymentStatus::DpuExtensionServiceTerminated => {
-                Self::Terminated
-            }
-            rpc::DpuExtensionServiceDeploymentStatus::DpuExtensionServiceFailed => Self::Failed,
-            rpc::DpuExtensionServiceDeploymentStatus::DpuExtensionServiceError => Self::Error,
-        }
-    }
-}
-
-impl From<ExtensionServiceDeploymentStatus> for rpc::DpuExtensionServiceDeploymentStatus {
-    fn from(status: ExtensionServiceDeploymentStatus) -> Self {
-        match status {
-            ExtensionServiceDeploymentStatus::Unknown => Self::DpuExtensionServiceUnknown,
-            ExtensionServiceDeploymentStatus::Pending => Self::DpuExtensionServicePending,
-            ExtensionServiceDeploymentStatus::Running => Self::DpuExtensionServiceRunning,
-            ExtensionServiceDeploymentStatus::Terminating => Self::DpuExtensionServiceTerminating,
-            ExtensionServiceDeploymentStatus::Terminated => Self::DpuExtensionServiceTerminated,
-            ExtensionServiceDeploymentStatus::Failed => Self::DpuExtensionServiceFailed,
-            ExtensionServiceDeploymentStatus::Error => Self::DpuExtensionServiceError,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionServiceComponent {
     pub name: String,
     pub version: String, // This is the version of the component, not the version of the extension service
     pub url: String,
     pub status: String,
-}
-
-impl TryFrom<rpc::DpuExtensionServiceComponent> for ExtensionServiceComponent {
-    type Error = RpcDataConversionError;
-
-    fn try_from(component: rpc::DpuExtensionServiceComponent) -> Result<Self, Self::Error> {
-        Ok(Self {
-            name: component.name,
-            version: component.version,
-            url: component.url,
-            status: component.status,
-        })
-    }
-}
-
-impl From<ExtensionServiceComponent> for rpc::DpuExtensionServiceComponent {
-    fn from(component: ExtensionServiceComponent) -> Self {
-        Self {
-            name: component.name,
-            version: component.version,
-            url: component.url,
-            status: component.status,
-        }
-    }
-}
-
-impl TryFrom<MachineExtensionServiceStatus> for rpc::DpuExtensionServiceStatus {
-    type Error = RpcDataConversionError;
-
-    fn try_from(status: MachineExtensionServiceStatus) -> Result<Self, Self::Error> {
-        Ok(Self {
-            dpu_machine_id: Some(status.machine_id),
-            status: rpc::DpuExtensionServiceDeploymentStatus::from(status.status).into(),
-            error_message: status.error_message,
-            components: status
-                .components
-                .into_iter()
-                .map(rpc::DpuExtensionServiceComponent::from)
-                .collect(),
-        })
-    }
-}
-
-impl TryFrom<InstanceExtensionServiceStatus> for rpc::InstanceDpuExtensionServiceStatus {
-    type Error = RpcDataConversionError;
-
-    fn try_from(status: InstanceExtensionServiceStatus) -> Result<Self, Self::Error> {
-        let dpu_statuses = status
-            .dpu_statuses
-            .into_iter()
-            .map(rpc::DpuExtensionServiceStatus::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(Self {
-            service_id: status.service_id.into(),
-            version: status.version.to_string(),
-            deployment_status: rpc::DpuExtensionServiceDeploymentStatus::from(
-                status.overall_status,
-            )
-            .into(),
-            dpu_statuses,
-            removed: status.removed,
-        })
-    }
 }
 
 /// A single extension service status reported by DPU agent
@@ -425,87 +310,6 @@ pub struct ExtensionServiceStatusObservation {
     pub overall_state: ExtensionServiceDeploymentStatus,
     pub components: Vec<ExtensionServiceComponent>,
     pub message: String,
-}
-
-impl TryFrom<rpc::DpuExtensionServiceStatusObservation> for ExtensionServiceStatusObservation {
-    type Error = RpcDataConversionError;
-
-    fn try_from(
-        observation: rpc::DpuExtensionServiceStatusObservation,
-    ) -> Result<Self, Self::Error> {
-        let service_id = observation
-            .service_id
-            .parse::<ExtensionServiceId>()
-            .map_err(|e| {
-                RpcDataConversionError::InvalidUuid("ExtensionServiceId", e.to_string())
-            })?;
-
-        let service_type = rpc::DpuExtensionServiceType::try_from(observation.service_type)
-            .map_err(|_| {
-                RpcDataConversionError::InvalidValue(
-                    observation.service_type.to_string(),
-                    "service_type".to_string(),
-                )
-            })?
-            .into();
-
-        let overall_state = rpc::DpuExtensionServiceDeploymentStatus::try_from(observation.state)
-            .map_err(|_| {
-                RpcDataConversionError::InvalidValue(
-                    observation.state.to_string(),
-                    "state".to_string(),
-                )
-            })?
-            .into();
-
-        let components = observation
-            .components
-            .into_iter()
-            .map(ExtensionServiceComponent::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let version = observation.version.parse::<ConfigVersion>().map_err(|e| {
-            RpcDataConversionError::InvalidConfigVersion(format!(
-                "Failed to parse version as ConfigVersion: {}",
-                e
-            ))
-        })?;
-
-        Ok(Self {
-            service_id,
-            service_type,
-            service_name: observation.service_name,
-            version,
-            removed: observation.removed,
-            overall_state,
-            components,
-            message: observation.message,
-        })
-    }
-}
-
-impl From<ExtensionServiceStatusObservation> for rpc::DpuExtensionServiceStatusObservation {
-    fn from(observation: ExtensionServiceStatusObservation) -> Self {
-        Self {
-            service_id: observation.service_id.into(),
-            service_type: rpc::DpuExtensionServiceType::from(observation.service_type).into(),
-            service_name: observation.service_name,
-            version: observation.version.to_string(),
-            removed: observation.removed,
-            state: rpc::DpuExtensionServiceDeploymentStatus::from(observation.overall_state).into(),
-            components: observation
-                .components
-                .into_iter()
-                .map(|c| rpc::DpuExtensionServiceComponent {
-                    name: c.name,
-                    version: c.version,
-                    url: c.url,
-                    status: c.status,
-                })
-                .collect(),
-            message: observation.message,
-        }
-    }
 }
 
 /// Observation of extension service statuses reported by a single DPU
@@ -620,24 +424,26 @@ pub fn is_extension_services_ready(
 mod tests {
     use std::str::FromStr;
 
+    use carbide_test_support::value_scenarios;
+    use chrono::{TimeZone, Utc};
+
     use super::*;
     use crate::extension_service::ExtensionServiceType;
     use crate::instance::config::extension_services::{
         InstanceExtensionServiceConfig, InstanceExtensionServicesConfig,
     };
 
-    fn get_test_machine_id() -> MachineId {
-        MachineId::from_str("fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80").unwrap()
+    fn get_dpu_ids() -> Vec<MachineId> {
+        vec![
+            MachineId::from_str("fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80")
+                .unwrap(),
+            MachineId::from_str("fm100ds27v4uuq7sgs4gsjummskt0b3tedugtpevjrbfh6su081n9jufcq0")
+                .unwrap(),
+        ]
     }
 
     fn get_test_service_id() -> ExtensionServiceId {
         ExtensionServiceId::from_str("00000000-0000-0000-0000-000000000000").unwrap()
-    }
-
-    fn create_dpu_map_with_one_dpu() -> HashMap<String, Vec<MachineId>> {
-        let mut map = HashMap::new();
-        map.insert("device0".to_string(), vec![get_test_machine_id()]);
-        map
     }
 
     fn create_service_config(version: ConfigVersion) -> InstanceExtensionServicesConfig {
@@ -654,346 +460,834 @@ mod tests {
         config_version: ConfigVersion,
         service_version: ConfigVersion,
         status: ExtensionServiceDeploymentStatus,
+    ) -> InstanceExtensionServiceStatusObservation {
+        InstanceExtensionServiceStatusObservation {
+            config_version,
+            instance_config_version: None,
+            extension_service_statuses: vec![ExtensionServiceStatusObservation {
+                service_id: get_test_service_id(),
+                service_type: ExtensionServiceType::KubernetesPod,
+                service_name: "test-service".to_string(),
+                version: service_version,
+                removed: None,
+                overall_state: status,
+                components: vec![],
+                message: String::new(),
+            }],
+            observed_at: Utc::now(),
+        }
+    }
+
+    fn create_observations(
+        statuses: impl IntoIterator<
+            Item = (
+                MachineId,
+                ConfigVersion,
+                ConfigVersion,
+                ExtensionServiceDeploymentStatus,
+            ),
+        >,
+    ) -> HashMap<MachineId, InstanceExtensionServiceStatusObservation> {
+        statuses
+            .into_iter()
+            .map(|(dpu_id, config_version, service_version, status)| {
+                (
+                    dpu_id,
+                    create_observation(config_version, service_version, status),
+                )
+            })
+            .collect()
+    }
+
+    struct StatusInput {
+        dpu_ids: Vec<MachineId>,
+        config: InstanceExtensionServicesConfig,
+        config_version: ConfigVersion,
+        observations: HashMap<MachineId, InstanceExtensionServiceStatusObservation>,
+    }
+
+    fn status_input(
+        dpu_ids: Vec<MachineId>,
+        service_version: ConfigVersion,
+        config_version: ConfigVersion,
+        observations: HashMap<MachineId, InstanceExtensionServiceStatusObservation>,
+    ) -> StatusInput {
+        StatusInput {
+            dpu_ids,
+            config: create_service_config(service_version),
+            config_version,
+            observations,
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DpuStatusProjection {
+        machine_id: MachineId,
+        status: ExtensionServiceDeploymentStatus,
+        error_message: Option<String>,
+        components: Vec<ExtensionServiceComponent>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ServiceStatusProjection {
+        service_id: ExtensionServiceId,
+        version: u64,
+        overall_status: ExtensionServiceDeploymentStatus,
+        dpu_statuses: Vec<DpuStatusProjection>,
+        removed: Option<String>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct StatusProjection {
+        configs_synced: SyncState,
+        extension_services: Vec<ServiceStatusProjection>,
+    }
+
+    fn project_status(status: InstanceExtensionServicesStatus) -> StatusProjection {
+        StatusProjection {
+            configs_synced: status.configs_synced,
+            extension_services: status
+                .extension_services
+                .into_iter()
+                .map(|service| ServiceStatusProjection {
+                    service_id: service.service_id,
+                    version: service.version.version_nr(),
+                    overall_status: service.overall_status,
+                    dpu_statuses: service
+                        .dpu_statuses
+                        .into_iter()
+                        .map(|dpu| DpuStatusProjection {
+                            machine_id: dpu.machine_id,
+                            status: dpu.status,
+                            error_message: dpu.error_message,
+                            components: dpu.components,
+                        })
+                        .collect(),
+                    removed: service.removed,
+                })
+                .collect(),
+        }
+    }
+
+    fn expected_dpu_status(
+        machine_id: MachineId,
+        status: ExtensionServiceDeploymentStatus,
+        error_message: Option<&str>,
+    ) -> DpuStatusProjection {
+        DpuStatusProjection {
+            machine_id,
+            status,
+            error_message: error_message.map(str::to_string),
+            components: vec![],
+        }
+    }
+
+    fn expected_status(
+        configs_synced: SyncState,
+        overall_status: ExtensionServiceDeploymentStatus,
+        dpu_statuses: Vec<DpuStatusProjection>,
+    ) -> StatusProjection {
+        StatusProjection {
+            extension_services: vec![ServiceStatusProjection {
+                service_id: get_test_service_id(),
+                version: 1,
+                overall_status,
+                dpu_statuses,
+                removed: None,
+            }],
+            configs_synced,
+        }
+    }
+
+    #[test]
+    fn extension_service_status_from_config_and_observations() {
+        let service_version = ConfigVersion::initial();
+        let config_version = ConfigVersion::initial();
+        let [dpu1_id, dpu2_id] = get_dpu_ids().try_into().unwrap();
+        let missing_observation =
+            "No status observation observed for this extension service config version yet.";
+        let component = ExtensionServiceComponent {
+            name: "test-component".to_string(),
+            version: "1.0.0".to_string(),
+            url: "registry.example.test/test-component:1.0.0".to_string(),
+            status: "Running".to_string(),
+        };
+        let service_message = "service is running";
+        let mut synced_observation = create_observations([(
+            dpu1_id,
+            config_version,
+            service_version,
+            ExtensionServiceDeploymentStatus::Running,
+        )]);
+        let synced_service = &mut synced_observation
+            .get_mut(&dpu1_id)
+            .unwrap()
+            .extension_service_statuses[0];
+        synced_service.message = service_message.to_string();
+        synced_service.components = vec![component.clone()];
+        let stale_service_observation = create_observations([(
+            dpu1_id,
+            config_version,
+            service_version.increment(),
+            ExtensionServiceDeploymentStatus::Running,
+        )]);
+        let mut other_service_observation = create_observations([(
+            dpu1_id,
+            config_version,
+            service_version,
+            ExtensionServiceDeploymentStatus::Running,
+        )]);
+        other_service_observation
+            .get_mut(&dpu1_id)
+            .unwrap()
+            .extension_service_statuses[0]
+            .service_id =
+            ExtensionServiceId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let missing_service =
+            format!("Status observation is found for DPU {dpu1_id} but service is not in it.");
+        let removed_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let removed_at_text = "2026-01-01 00:00:00 UTC".to_string();
+        let second_service_version = service_version.increment();
+
+        value_scenarios!(
+            run = |StatusInput {
+                dpu_ids,
+                config,
+                config_version,
+                observations,
+            }| {
+                project_status(InstanceExtensionServicesStatus::from_config_and_observations(
+                    &dpu_ids,
+                    Versioned::new(&config, config_version),
+                    &observations,
+                ))
+            };
+            "without configured services" {
+                StatusInput {
+                    dpu_ids: vec![dpu1_id],
+                    config: InstanceExtensionServicesConfig {
+                        service_configs: vec![],
+                    },
+                    config_version,
+                    observations: HashMap::new(),
+                } => StatusProjection {
+                    configs_synced: SyncState::Synced,
+                    extension_services: vec![],
+                },
+            }
+
+            "with configured services but no target DPUs" {
+                StatusInput {
+                    dpu_ids: vec![],
+                    config: InstanceExtensionServicesConfig {
+                        service_configs: vec![
+                            InstanceExtensionServiceConfig {
+                                service_id: get_test_service_id(),
+                                version: second_service_version,
+                                removed: None,
+                            },
+                            InstanceExtensionServiceConfig {
+                                service_id: get_test_service_id(),
+                                version: service_version,
+                                removed: Some(removed_at),
+                            },
+                        ],
+                    },
+                    config_version,
+                    observations: HashMap::new(),
+                } => StatusProjection {
+                    configs_synced: SyncState::Pending,
+                    extension_services: vec![
+                        ServiceStatusProjection {
+                            service_id: get_test_service_id(),
+                            version: 2,
+                            overall_status: ExtensionServiceDeploymentStatus::Unknown,
+                            dpu_statuses: vec![],
+                            removed: None,
+                        },
+                        ServiceStatusProjection {
+                            service_id: get_test_service_id(),
+                            version: 1,
+                            overall_status: ExtensionServiceDeploymentStatus::Unknown,
+                            dpu_statuses: vec![],
+                            removed: Some(removed_at_text),
+                        },
+                    ],
+                },
+            }
+
+            "without observations" {
+                status_input(
+                    vec![dpu1_id],
+                    service_version,
+                    config_version,
+                    HashMap::new(),
+                ) => expected_status(
+                    SyncState::Pending,
+                    ExtensionServiceDeploymentStatus::Unknown,
+                    vec![expected_dpu_status(
+                        dpu1_id,
+                        ExtensionServiceDeploymentStatus::Unknown,
+                        Some(missing_observation),
+                    )],
+                ),
+            }
+
+            "with a synced observation" {
+                status_input(
+                    vec![dpu1_id],
+                    service_version,
+                    config_version,
+                    synced_observation,
+                ) => expected_status(
+                    SyncState::Synced,
+                    ExtensionServiceDeploymentStatus::Running,
+                    vec![DpuStatusProjection {
+                        machine_id: dpu1_id,
+                        status: ExtensionServiceDeploymentStatus::Running,
+                        error_message: Some(service_message.to_string()),
+                        components: vec![component],
+                    }],
+                ),
+            }
+
+            "when a synced observation only has a stale service version" {
+                status_input(
+                    vec![dpu1_id],
+                    service_version,
+                    config_version,
+                    stale_service_observation,
+                ) => expected_status(
+                    SyncState::Synced,
+                    ExtensionServiceDeploymentStatus::Unknown,
+                    vec![expected_dpu_status(
+                        dpu1_id,
+                        ExtensionServiceDeploymentStatus::Unknown,
+                        Some(missing_service.as_str()),
+                    )],
+                ),
+            }
+
+            "when a synced observation only has another service" {
+                status_input(
+                    vec![dpu1_id],
+                    service_version,
+                    config_version,
+                    other_service_observation,
+                ) => expected_status(
+                    SyncState::Synced,
+                    ExtensionServiceDeploymentStatus::Unknown,
+                    vec![expected_dpu_status(
+                        dpu1_id,
+                        ExtensionServiceDeploymentStatus::Unknown,
+                        Some(missing_service.as_str()),
+                    )],
+                ),
+            }
+
+            "with an outdated observation" {
+                status_input(
+                    vec![dpu1_id],
+                    service_version,
+                    config_version.increment(),
+                    create_observations([(
+                        dpu1_id,
+                        config_version,
+                        service_version,
+                        ExtensionServiceDeploymentStatus::Running,
+                    )]),
+                ) => expected_status(
+                    SyncState::Pending,
+                    ExtensionServiceDeploymentStatus::Unknown,
+                    vec![expected_dpu_status(
+                        dpu1_id,
+                        ExtensionServiceDeploymentStatus::Unknown,
+                        Some(missing_observation),
+                    )],
+                ),
+            }
+
+            "with one of two DPU observations missing" {
+                status_input(
+                    vec![dpu1_id, dpu2_id],
+                    service_version,
+                    config_version,
+                    create_observations([(
+                        dpu1_id,
+                        config_version,
+                        service_version,
+                        ExtensionServiceDeploymentStatus::Running,
+                    )]),
+                ) => expected_status(
+                    SyncState::Pending,
+                    ExtensionServiceDeploymentStatus::Unknown,
+                    vec![
+                        expected_dpu_status(
+                            dpu1_id,
+                            ExtensionServiceDeploymentStatus::Running,
+                            None,
+                        ),
+                        expected_dpu_status(
+                            dpu2_id,
+                            ExtensionServiceDeploymentStatus::Unknown,
+                            Some(missing_observation),
+                        ),
+                    ],
+                ),
+            }
+
+            "with all DPU observations present" {
+                status_input(
+                    vec![dpu1_id, dpu2_id],
+                    service_version,
+                    config_version,
+                    create_observations([
+                        (
+                            dpu1_id,
+                            config_version,
+                            service_version,
+                            ExtensionServiceDeploymentStatus::Running,
+                        ),
+                        (
+                            dpu2_id,
+                            config_version,
+                            service_version,
+                            ExtensionServiceDeploymentStatus::Running,
+                        ),
+                    ]),
+                ) => expected_status(
+                    SyncState::Synced,
+                    ExtensionServiceDeploymentStatus::Running,
+                    vec![
+                        expected_dpu_status(
+                            dpu1_id,
+                            ExtensionServiceDeploymentStatus::Running,
+                            None,
+                        ),
+                        expected_dpu_status(
+                            dpu2_id,
+                            ExtensionServiceDeploymentStatus::Running,
+                            None,
+                        ),
+                    ],
+                ),
+            }
+
+            "scoped to target DPUs" {
+                status_input(
+                    vec![dpu1_id],
+                    service_version,
+                    config_version,
+                    create_observations([
+                        (
+                            dpu1_id,
+                            config_version,
+                            service_version,
+                            ExtensionServiceDeploymentStatus::Running,
+                        ),
+                        (
+                            dpu2_id,
+                            config_version,
+                            service_version,
+                            ExtensionServiceDeploymentStatus::Pending,
+                        ),
+                    ]),
+                ) => expected_status(
+                    SyncState::Synced,
+                    ExtensionServiceDeploymentStatus::Running,
+                    vec![expected_dpu_status(
+                        dpu1_id,
+                        ExtensionServiceDeploymentStatus::Running,
+                        None,
+                    )],
+                ),
+            }
+        );
+    }
+
+    fn readiness_status(
+        configs_synced: SyncState,
+        services: impl IntoIterator<Item = (bool, ExtensionServiceDeploymentStatus)>,
+    ) -> InstanceExtensionServicesStatus {
+        InstanceExtensionServicesStatus {
+            extension_services: services
+                .into_iter()
+                .map(|(removed, overall_status)| InstanceExtensionServiceStatus {
+                    service_id: get_test_service_id(),
+                    version: ConfigVersion::initial(),
+                    overall_status,
+                    dpu_statuses: vec![],
+                    removed: removed.then(|| Utc::now().to_string()),
+                })
+                .collect(),
+            configs_synced,
+        }
+    }
+
+    #[test]
+    fn extension_service_readiness() {
+        value_scenarios!(
+            run = |status| (
+                compute_extension_services_readiness(&status),
+                is_extension_services_ready(&status),
+            );
+            "configs pending" {
+                readiness_status(
+                    SyncState::Pending,
+                    [(false, ExtensionServiceDeploymentStatus::Unknown)],
+                ) => (ExtensionServicesReadiness::ConfigsPending, false),
+            }
+
+            "configs synced without services" {
+                readiness_status(SyncState::Synced, []) =>
+                    (ExtensionServicesReadiness::Ready, true),
+            }
+
+            "configs synced and service running" {
+                readiness_status(
+                    SyncState::Synced,
+                    [(false, ExtensionServiceDeploymentStatus::Running)],
+                ) => (ExtensionServicesReadiness::Ready, true),
+            }
+
+            "active service not running" {
+                readiness_status(
+                    SyncState::Synced,
+                    [(false, ExtensionServiceDeploymentStatus::Pending)],
+                ) => (ExtensionServicesReadiness::NotFullyRunning, false),
+            }
+
+            "removed service still terminating" {
+                readiness_status(
+                    SyncState::Synced,
+                    [(true, ExtensionServiceDeploymentStatus::Terminating)],
+                ) => (ExtensionServicesReadiness::SomeTerminating, false),
+            }
+
+            "removed service terminated" {
+                readiness_status(
+                    SyncState::Synced,
+                    [(true, ExtensionServiceDeploymentStatus::Terminated)],
+                ) => (ExtensionServicesReadiness::Ready, true),
+            }
+
+            "active failure takes precedence over removed termination" {
+                readiness_status(
+                    SyncState::Synced,
+                    [
+                        (false, ExtensionServiceDeploymentStatus::Failed),
+                        (true, ExtensionServiceDeploymentStatus::Terminating),
+                    ],
+                ) => (ExtensionServicesReadiness::NotFullyRunning, false),
+            }
+        );
+    }
+
+    #[test]
+    fn extension_service_calculate_overall_status() {
+        value_scenarios!(
+            run = |statuses: Vec<ExtensionServiceDeploymentStatus>| {
+                let machine_id = get_dpu_ids()[0];
+                let dpu_statuses = statuses
+                    .into_iter()
+                    .map(|status| MachineExtensionServiceStatus {
+                        machine_id,
+                        status,
+                        error_message: None,
+                        components: vec![],
+                    })
+                    .collect::<Vec<_>>();
+                InstanceExtensionServicesStatus::calculate_overall_status(&dpu_statuses)
+            };
+            "all running" {
+                vec![
+                    ExtensionServiceDeploymentStatus::Running,
+                    ExtensionServiceDeploymentStatus::Running,
+                ] => ExtensionServiceDeploymentStatus::Running,
+            }
+
+            "one failed" {
+                vec![
+                    ExtensionServiceDeploymentStatus::Running,
+                    ExtensionServiceDeploymentStatus::Failed,
+                ] => ExtensionServiceDeploymentStatus::Error,
+            }
+
+            "error takes precedence over unknown" {
+                vec![
+                    ExtensionServiceDeploymentStatus::Unknown,
+                    ExtensionServiceDeploymentStatus::Error,
+                ] => ExtensionServiceDeploymentStatus::Error,
+            }
+
+            "unknown takes precedence over pending" {
+                vec![
+                    ExtensionServiceDeploymentStatus::Pending,
+                    ExtensionServiceDeploymentStatus::Unknown,
+                ] => ExtensionServiceDeploymentStatus::Unknown,
+            }
+
+            "one pending" {
+                vec![
+                    ExtensionServiceDeploymentStatus::Running,
+                    ExtensionServiceDeploymentStatus::Pending,
+                ] => ExtensionServiceDeploymentStatus::Pending,
+            }
+
+            "pending takes precedence over terminating" {
+                vec![
+                    ExtensionServiceDeploymentStatus::Terminating,
+                    ExtensionServiceDeploymentStatus::Pending,
+                ] => ExtensionServiceDeploymentStatus::Pending,
+            }
+
+            "one terminating" {
+                vec![
+                    ExtensionServiceDeploymentStatus::Running,
+                    ExtensionServiceDeploymentStatus::Terminating,
+                ] => ExtensionServiceDeploymentStatus::Terminating,
+            }
+
+            "terminating takes precedence over terminated" {
+                vec![
+                    ExtensionServiceDeploymentStatus::Terminated,
+                    ExtensionServiceDeploymentStatus::Terminating,
+                ] => ExtensionServiceDeploymentStatus::Terminating,
+            }
+
+            "all terminated" {
+                vec![
+                    ExtensionServiceDeploymentStatus::Terminated,
+                    ExtensionServiceDeploymentStatus::Terminated,
+                ] => ExtensionServiceDeploymentStatus::Terminated,
+            }
+
+            "mixed running and terminated" {
+                vec![
+                    ExtensionServiceDeploymentStatus::Running,
+                    ExtensionServiceDeploymentStatus::Terminated,
+                ] => ExtensionServiceDeploymentStatus::Unknown,
+            }
+
+            "empty" {
+                vec![] => ExtensionServiceDeploymentStatus::Unknown,
+            }
+        );
+    }
+
+    #[test]
+    fn extension_service_observations_from_dpu_snapshots() {
+        let config_version = ConfigVersion::initial();
+        let observation = create_observation(
+            config_version,
+            ConfigVersion::initial(),
+            ExtensionServiceDeploymentStatus::Running,
+        );
+        let mut observed_dpu = crate::test_support::machine_snapshot::dpu_machine(0);
+        observed_dpu
+            .network_status_observation
+            .as_mut()
+            .unwrap()
+            .extension_service_observation = Some(observation.clone());
+        let observed_dpu_id = observed_dpu.id;
+
+        value_scenarios!(
+            run = |dpu_snapshots: Vec<Machine>| {
+                InstanceExtensionServiceStatusObservation::aggregate_instance_observation(
+                    &dpu_snapshots,
+                )
+            };
+            "without snapshots" {
+                vec![] => HashMap::new(),
+            }
+
+            "snapshot without an extension-service observation" {
+                vec![crate::test_support::machine_snapshot::dpu_machine(1)] => HashMap::new(),
+            }
+
+            "mixed snapshots" {
+                vec![
+                    observed_dpu,
+                    crate::test_support::machine_snapshot::dpu_machine(1),
+                ] => HashMap::from([(observed_dpu_id, observation)]),
+            }
+        );
+    }
+
+    fn create_observation_two_versions(
+        dpu_id: MachineId,
+        cfg_version: ConfigVersion,
+        v_new: ConfigVersion,
+        new_state: ExtensionServiceDeploymentStatus,
+        v_old: ConfigVersion,
+        old_state: ExtensionServiceDeploymentStatus,
     ) -> HashMap<MachineId, InstanceExtensionServiceStatusObservation> {
         let mut observations = HashMap::new();
         observations.insert(
-            MachineId::from_str("fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80")
-                .unwrap(),
+            dpu_id,
             InstanceExtensionServiceStatusObservation {
-                config_version,
+                config_version: cfg_version,
                 instance_config_version: None,
-                extension_service_statuses: vec![ExtensionServiceStatusObservation {
-                    service_id: get_test_service_id(),
-                    service_type: ExtensionServiceType::KubernetesPod,
-                    service_name: "test-service".to_string(),
-                    version: service_version,
-                    removed: None,
-                    overall_state: status,
-                    components: vec![],
-                    message: String::new(),
-                }],
+                extension_service_statuses: vec![
+                    ExtensionServiceStatusObservation {
+                        service_id: get_test_service_id(),
+                        service_type: ExtensionServiceType::KubernetesPod,
+                        service_name: "test-service".to_string(),
+                        version: v_new,
+                        removed: None,
+                        overall_state: new_state,
+                        components: vec![],
+                        message: String::new(),
+                    },
+                    ExtensionServiceStatusObservation {
+                        service_id: get_test_service_id(),
+                        service_type: ExtensionServiceType::KubernetesPod,
+                        service_name: "test-service".to_string(),
+                        version: v_old,
+                        removed: Some(Utc::now().to_rfc3339()),
+                        overall_state: old_state,
+                        components: vec![],
+                        message: String::new(),
+                    },
+                ],
                 observed_at: chrono::Utc::now(),
             },
         );
         observations
     }
 
-    #[test]
-    fn extension_service_status_without_observations() {
-        let service_version = ConfigVersion::initial();
-        let config = create_service_config(service_version);
+    fn machine_statuses(
+        statuses: impl IntoIterator<Item = (MachineId, ExtensionServiceDeploymentStatus)>,
+    ) -> Vec<MachineExtensionServiceStatus> {
+        statuses
+            .into_iter()
+            .map(|(machine_id, status)| MachineExtensionServiceStatus {
+                machine_id,
+                status,
+                error_message: None,
+                components: vec![],
+            })
+            .collect()
+    }
 
-        let config_version = ConfigVersion::initial();
-        let dpu_map = create_dpu_map_with_one_dpu();
-
-        let status = InstanceExtensionServicesStatus::from_config_and_observations(
-            &dpu_map,
-            Versioned::new(&config, config_version),
-            &HashMap::new(),
-        );
-
-        // Without observations, should be unsynced with DPU status showing Unknown
-        assert_eq!(status.configs_synced, SyncState::Pending);
-        assert_eq!(status.extension_services.len(), 1);
-        assert_eq!(status.extension_services[0].version.version_nr(), 1);
-        assert_eq!(
-            status.extension_services[0].overall_status,
-            ExtensionServiceDeploymentStatus::Unknown
-        );
-        assert_eq!(status.extension_services[0].dpu_statuses.len(), 1);
-        assert_eq!(
-            status.extension_services[0].dpu_statuses[0].status,
-            ExtensionServiceDeploymentStatus::Unknown
-        );
-
-        // Readiness check: configs are not synced, so should be ConfigsPending
-        let readiness = compute_extension_services_readiness(&status);
-        assert_eq!(readiness, ExtensionServicesReadiness::ConfigsPending);
+    fn service_status(
+        version: ConfigVersion,
+        removed: bool,
+        overall_status: ExtensionServiceDeploymentStatus,
+        dpu_statuses: Vec<MachineExtensionServiceStatus>,
+    ) -> InstanceExtensionServiceStatus {
+        InstanceExtensionServiceStatus {
+            service_id: get_test_service_id(),
+            version,
+            overall_status,
+            dpu_statuses,
+            removed: removed.then(|| "removed".to_string()),
+        }
     }
 
     #[test]
-    fn extension_service_status_with_synced_observations() {
-        let service_version = ConfigVersion::initial();
-        let config = create_service_config(service_version);
+    fn extension_service_get_terminated_service_keys() {
+        let [dpu1_id, dpu2_id] = get_dpu_ids().try_into().unwrap();
+
+        let init_version = ConfigVersion::initial();
+        let second_version = init_version.increment();
+        let config = InstanceExtensionServicesConfig {
+            service_configs: vec![
+                InstanceExtensionServiceConfig {
+                    service_id: get_test_service_id(),
+                    version: second_version,
+                    removed: None,
+                },
+                InstanceExtensionServiceConfig {
+                    service_id: get_test_service_id(),
+                    version: init_version,
+                    removed: Some(Utc::now()),
+                },
+            ],
+        };
         let config_version = ConfigVersion::initial();
-
-        let dpu_map = create_dpu_map_with_one_dpu();
-        let observations = create_observation(
-            config_version,
-            service_version,
-            ExtensionServiceDeploymentStatus::Running,
-        );
-
-        let status = InstanceExtensionServicesStatus::from_config_and_observations(
-            &dpu_map,
-            Versioned::new(&config, config_version),
-            &observations,
-        );
-
-        assert_eq!(status.configs_synced, SyncState::Synced);
-        assert_eq!(status.extension_services.len(), 1);
-        assert_eq!(
-            status.extension_services[0].overall_status,
-            ExtensionServiceDeploymentStatus::Running
-        );
-        assert_eq!(status.extension_services[0].dpu_statuses.len(), 1);
-        assert_eq!(
-            status.extension_services[0].dpu_statuses[0].machine_id,
-            get_test_machine_id(),
-        );
-        assert_eq!(
-            status.extension_services[0].dpu_statuses[0].status,
-            ExtensionServiceDeploymentStatus::Running
-        );
-
-        // Readiness check: configs synced and all services running, should be Ready
-        let readiness = compute_extension_services_readiness(&status);
-        assert_eq!(readiness, ExtensionServicesReadiness::Ready);
-    }
-
-    #[test]
-    fn extension_service_status_with_outdated_observation() {
-        let config = create_service_config(ConfigVersion::initial());
-        let version = ConfigVersion::initial();
-        let dpu_map = create_dpu_map_with_one_dpu();
-        let observations = create_observation(
-            ConfigVersion::initial(),
-            ConfigVersion::initial(),
-            ExtensionServiceDeploymentStatus::Running,
-        );
-
-        let status = InstanceExtensionServicesStatus::from_config_and_observations(
-            &dpu_map,
-            Versioned::new(&config, version.increment()), // Increment config version for extension service config
-            &observations,                                // Observation has initial config version
-        );
-
-        // Should be unsynced due to version mismatch, with DPU status showing Unknown
-        assert_eq!(status.configs_synced, SyncState::Pending);
-        assert_eq!(status.extension_services.len(), 1);
-        assert_eq!(
-            status.extension_services[0].overall_status,
-            ExtensionServiceDeploymentStatus::Unknown
-        );
-        assert_eq!(status.extension_services[0].dpu_statuses.len(), 1);
-        assert_eq!(
-            status.extension_services[0].dpu_statuses[0].status,
-            ExtensionServiceDeploymentStatus::Unknown
-        );
-        assert!(
-            status.extension_services[0].dpu_statuses[0]
-                .error_message
-                .as_ref()
-                .unwrap()
-                .contains(
-                    "No status observation observed for this extension service config version yet."
-                )
-        );
-
-        // Readiness check: configs not synced (version mismatch), should be ConfigsPending
-        let readiness = compute_extension_services_readiness(&status);
-        assert_eq!(readiness, ExtensionServicesReadiness::ConfigsPending);
-    }
-
-    #[test]
-    fn extension_service_status_with_multiple_dpus_one_missing_observation() {
-        let service_version = ConfigVersion::initial();
-        let config = create_service_config(service_version);
-
-        let config_version = ConfigVersion::initial();
-
-        // Create a map with two DPUs
-        let dpu1_id = get_test_machine_id();
-        let dpu2_id =
-            MachineId::from_str("fm100ds27v4uuq7sgs4gsjummskt0b3tedugtpevjrbfh6su081n9jufcq0")
-                .unwrap();
-        let mut dpu_map = HashMap::new();
-        dpu_map.insert("device0".to_string(), vec![dpu1_id, dpu2_id]);
-
-        // Create observation for only one DPU
-        let observations = create_observation(
-            config_version,
-            service_version,
-            ExtensionServiceDeploymentStatus::Running,
-        );
-
-        let status = InstanceExtensionServicesStatus::from_config_and_observations(
-            &dpu_map,
-            Versioned::new(&config, config_version),
-            &observations,
-        );
-
-        // Should be unsynced because one DPU is missing observation
-        assert_eq!(status.configs_synced, SyncState::Pending);
-        assert_eq!(status.extension_services.len(), 1);
-        assert_eq!(
-            status.extension_services[0].overall_status,
-            ExtensionServiceDeploymentStatus::Unknown
-        );
-        assert_eq!(status.extension_services[0].dpu_statuses.len(), 2);
-
-        // One DPU should have Running status, the other Unknown
-        let running_count = status.extension_services[0]
-            .dpu_statuses
-            .iter()
-            .filter(|s| s.status == ExtensionServiceDeploymentStatus::Running)
-            .count();
-        let unknown_count = status.extension_services[0]
-            .dpu_statuses
-            .iter()
-            .filter(|s| s.status == ExtensionServiceDeploymentStatus::Unknown)
-            .count();
-        assert_eq!(running_count, 1);
-        assert_eq!(unknown_count, 1);
-
-        // Readiness check: configs not synced (one DPU missing observation), should be ConfigsPending
-        let readiness = compute_extension_services_readiness(&status);
-        assert_eq!(readiness, ExtensionServicesReadiness::ConfigsPending);
-    }
-
-    #[test]
-    fn extension_service_status_with_all_dpus_reporting() {
-        let service_version = ConfigVersion::initial();
-        let config = create_service_config(service_version);
-        let config_version = ConfigVersion::initial();
-
-        // Create a map with two DPUs
-        let dpu1_id = get_test_machine_id();
-        let dpu2_id =
-            MachineId::from_str("fm100ds27v4uuq7sgs4gsjummskt0b3tedugtpevjrbfh6su081n9jufcq0")
-                .unwrap();
-        let mut dpu_map = HashMap::new();
-        dpu_map.insert("device0".to_string(), vec![dpu1_id, dpu2_id]);
-
-        // Create observations for both DPUs
-        let mut observations = HashMap::new();
-        observations.insert(
+        let observations = create_observation_two_versions(
             dpu1_id,
-            InstanceExtensionServiceStatusObservation {
-                config_version,
-                instance_config_version: None,
-                extension_service_statuses: vec![ExtensionServiceStatusObservation {
-                    service_id: get_test_service_id(),
-                    service_type: ExtensionServiceType::KubernetesPod,
-                    service_name: "test-service".to_string(),
-                    version: service_version,
-                    removed: None,
-                    overall_state: ExtensionServiceDeploymentStatus::Running,
-                    components: vec![],
-                    message: String::new(),
-                }],
-                observed_at: chrono::Utc::now(),
-            },
-        );
-        observations.insert(
-            dpu2_id,
-            InstanceExtensionServiceStatusObservation {
-                config_version,
-                instance_config_version: None,
-                extension_service_statuses: vec![ExtensionServiceStatusObservation {
-                    service_id: get_test_service_id(),
-                    service_type: ExtensionServiceType::KubernetesPod,
-                    service_name: "test-service".to_string(),
-                    version: service_version,
-                    removed: None,
-                    overall_state: ExtensionServiceDeploymentStatus::Running,
-                    components: vec![],
-                    message: String::new(),
-                }],
-                observed_at: chrono::Utc::now(),
-            },
+            config_version,
+            second_version,
+            ExtensionServiceDeploymentStatus::Running,
+            init_version,
+            ExtensionServiceDeploymentStatus::Terminated,
         );
 
-        let status = InstanceExtensionServicesStatus::from_config_and_observations(
-            &dpu_map,
+        let aggregated_status = InstanceExtensionServicesStatus::from_config_and_observations(
+            &[dpu1_id],
             Versioned::new(&config, config_version),
             &observations,
         );
 
-        // Should be synced because all DPUs have observations
-        assert_eq!(status.configs_synced, SyncState::Synced);
-        assert_eq!(status.extension_services.len(), 1);
-        assert_eq!(
-            status.extension_services[0].overall_status,
-            ExtensionServiceDeploymentStatus::Running
+        value_scenarios!(
+            run = |status: InstanceExtensionServicesStatus| {
+                status.get_terminated_service_keys()
+            };
+            "removed version terminated on every DPU" {
+                aggregated_status => vec![(get_test_service_id(), init_version)],
+            }
+
+            "active version" {
+                InstanceExtensionServicesStatus {
+                    extension_services: vec![service_status(
+                        init_version,
+                        false,
+                        ExtensionServiceDeploymentStatus::Terminated,
+                        machine_statuses([(
+                            dpu1_id,
+                            ExtensionServiceDeploymentStatus::Terminated,
+                        )]),
+                    )],
+                    configs_synced: SyncState::Synced,
+                } => vec![],
+            }
+
+            "removed version not terminated overall" {
+                InstanceExtensionServicesStatus {
+                    extension_services: vec![service_status(
+                        init_version,
+                        true,
+                        ExtensionServiceDeploymentStatus::Terminating,
+                        machine_statuses([(
+                            dpu1_id,
+                            ExtensionServiceDeploymentStatus::Terminated,
+                        )]),
+                    )],
+                    configs_synced: SyncState::Synced,
+                } => vec![],
+            }
+
+            "removed version without DPU statuses" {
+                InstanceExtensionServicesStatus {
+                    extension_services: vec![service_status(
+                        init_version,
+                        true,
+                        ExtensionServiceDeploymentStatus::Terminated,
+                        vec![],
+                    )],
+                    configs_synced: SyncState::Synced,
+                } => vec![],
+            }
+
+            "removed version with one DPU not terminated" {
+                InstanceExtensionServicesStatus {
+                    extension_services: vec![service_status(
+                        init_version,
+                        true,
+                        ExtensionServiceDeploymentStatus::Terminated,
+                        machine_statuses([
+                            (
+                                dpu1_id,
+                                ExtensionServiceDeploymentStatus::Terminated,
+                            ),
+                            (dpu2_id, ExtensionServiceDeploymentStatus::Running),
+                        ]),
+                    )],
+                    configs_synced: SyncState::Synced,
+                } => vec![],
+            }
         );
-        assert_eq!(status.extension_services[0].dpu_statuses.len(), 2);
-
-        // Both DPUs should have Running status
-        let running_count = status.extension_services[0]
-            .dpu_statuses
-            .iter()
-            .filter(|s| s.status == ExtensionServiceDeploymentStatus::Running)
-            .count();
-        assert_eq!(running_count, 2);
-
-        // Readiness check: configs synced and all services running, should be Ready
-        let readiness = compute_extension_services_readiness(&status);
-        assert_eq!(readiness, ExtensionServicesReadiness::Ready);
-    }
-
-    #[test]
-    fn extension_service_calculate_overall_status_all_running() {
-        let dpu_statuses = vec![
-            MachineExtensionServiceStatus {
-                machine_id: MachineId::from_str(
-                    "fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80",
-                )
-                .unwrap(),
-                status: ExtensionServiceDeploymentStatus::Running,
-                error_message: None,
-                components: vec![],
-            },
-            MachineExtensionServiceStatus {
-                machine_id: MachineId::from_str(
-                    "fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80",
-                )
-                .unwrap(),
-                status: ExtensionServiceDeploymentStatus::Running,
-                error_message: None,
-                components: vec![],
-            },
-        ];
-
-        let overall_status =
-            InstanceExtensionServicesStatus::calculate_overall_status(&dpu_statuses);
-        assert_eq!(overall_status, ExtensionServiceDeploymentStatus::Running);
-    }
-
-    #[test]
-    fn extension_service_calculate_overall_status_one_failed() {
-        let dpu_statuses = vec![
-            MachineExtensionServiceStatus {
-                machine_id: MachineId::from_str(
-                    "fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80",
-                )
-                .unwrap(),
-                status: ExtensionServiceDeploymentStatus::Running,
-                error_message: None,
-                components: vec![],
-            },
-            MachineExtensionServiceStatus {
-                machine_id: MachineId::from_str(
-                    "fm100ds27v4uuq7sgs4gsjummskt0b3tedugtpevjrbfh6su081n9jufcq0",
-                )
-                .unwrap(),
-                status: ExtensionServiceDeploymentStatus::Failed,
-                error_message: Some("Test error".to_string()),
-                components: vec![],
-            },
-        ];
-
-        let overall_status =
-            InstanceExtensionServicesStatus::calculate_overall_status(&dpu_statuses);
-        // If any DPU reports Failed, the overall status is Error
-        assert_eq!(overall_status, ExtensionServiceDeploymentStatus::Error);
-    }
-
-    #[test]
-    fn extension_service_calculate_overall_status_empty() {
-        let dpu_statuses = vec![];
-        let overall_status =
-            InstanceExtensionServicesStatus::calculate_overall_status(&dpu_statuses);
-        assert_eq!(overall_status, ExtensionServiceDeploymentStatus::Unknown);
     }
 }

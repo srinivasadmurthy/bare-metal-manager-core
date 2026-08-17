@@ -15,25 +15,20 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use ::rpc::forge::InstanceReleaseRequest;
 use carbide_uuid::instance::InstanceId;
 
 use super::args::Args;
-use crate::instance::common::GlobalOptions;
+use crate::cfg::runtime::RuntimeContext;
+use crate::errors::{CarbideCliError, CarbideCliResult};
 use crate::rpc::ApiClient;
 
-pub async fn release(
+pub(super) async fn release(
     api_client: &ApiClient,
     release_request: Args,
-    opts: GlobalOptions<'_>,
+    ctx: &RuntimeContext,
 ) -> CarbideCliResult<()> {
-    if opts.cloud_unsafe_op.is_none() {
-        return Err(CarbideCliError::GenericError(
-            "Operation not allowed due to potential inconsistencies with cloud database."
-                .to_owned(),
-        ));
-    }
+    ctx.assert_cloud_unsafe_op_message()?;
 
     let mut instance_ids: Vec<InstanceId> = Vec::new();
 
@@ -48,13 +43,17 @@ pub async fn release(
                 .into(),
         ),
         (_, Some(machine_id), _) => {
-            let instances = api_client.0.find_instance_by_machine_id(machine_id).await?;
-            if instances.instances.is_empty() {
+            let instances = api_client
+                .0
+                .find_instance_by_machine_id(machine_id)
+                .await?
+                .instances;
+            let Some(instance_id) = instances.into_iter().next().and_then(|i| i.id) else {
                 return Err(CarbideCliError::GenericError(
                     "No instances assigned to that machine".to_string(),
                 ));
-            }
-            instance_ids.push(instances.instances[0].id.unwrap());
+            };
+            instance_ids.push(instance_id);
         }
         (_, _, Some(key)) => {
             let instances = api_client
@@ -64,7 +63,7 @@ pub async fn release(
                     Some(key),
                     release_request.label_value,
                     None,
-                    opts.page_size,
+                    ctx.config.page_size,
                 )
                 .await?;
             if instances.instances.is_empty() {
@@ -87,6 +86,7 @@ pub async fn release(
                 id: Some(instance_id),
                 issue: None,
                 is_repair_tenant: None,
+                delete_attribution: None,
             })
             .await?;
     }

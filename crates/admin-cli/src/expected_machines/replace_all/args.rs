@@ -45,7 +45,14 @@ use clap::Parser;
 ///    }
 #[derive(Parser, Debug)]
 #[clap(verbatim_doc_comment)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+Replace the entire expected machines table from a JSON file:
+    $ nico-admin-cli expected-machine replace-all --filename ./expected-machines.json
+
+")]
+pub(crate) struct Args {
     #[clap(short, long)]
-    pub filename: String,
+    pub(super) filename: String,
 }

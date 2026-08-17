@@ -18,7 +18,17 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all network security groups:
+    $ nico-admin-cli network-security-group show
+
+Show one network security group by ID:
+    $ nico-admin-cli network-security-group show 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(help = "Optional, network security group ID to restrict the search")]
-    pub id: Option<String>,
+    pub(super) id: Option<String>,
 }

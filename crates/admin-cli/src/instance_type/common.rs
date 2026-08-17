@@ -15,16 +15,17 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliError, CarbideCliResult};
 use ::rpc::forge as forgerpc;
 use prettytable::{Table, row};
+
+use crate::errors::{CarbideCliError, CarbideCliResult};
 
 /// Produces a table for printing a non-JSON representation of a
 /// instance type to standard out.
 ///
 /// * `itypes`  - A reference to an active DB transaction
 /// * `verbose` - A bool to select more verbose output (e.g., include full rule details)
-pub fn convert_itypes_to_table(
+pub(super) fn convert_itypes_to_table(
     itypes: &[forgerpc::InstanceType],
     verbose: bool,
 ) -> CarbideCliResult<Box<Table>> {

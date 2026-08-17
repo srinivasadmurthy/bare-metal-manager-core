@@ -15,14 +15,15 @@
  * limitations under the License.
  */
 
-use ::rpc::admin_cli::{CarbideCliResult, OutputFormat};
+use ::rpc::admin_cli::OutputFormat;
 use ::rpc::forge as forgerpc;
 use prettytable::{Table, row};
 
 use super::args::ShowRunsOptions;
+use crate::errors::CarbideCliResult;
 use crate::rpc::ApiClient;
 
-pub async fn handle_runs_show(
+pub(super) async fn handle_runs_show(
     args: ShowRunsOptions,
     output_format: OutputFormat,
     api_client: &ApiClient,

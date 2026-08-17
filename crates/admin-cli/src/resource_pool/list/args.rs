@@ -18,7 +18,14 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Default)]
-pub struct Args;
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all resource pools with their stats:
+    $ nico-admin-cli resource-pool list
+
+")]
+pub(crate) struct Args;
 
 impl From<Args> for ::rpc::forge::ListResourcePoolsRequest {
     fn from(_args: Args) -> Self {

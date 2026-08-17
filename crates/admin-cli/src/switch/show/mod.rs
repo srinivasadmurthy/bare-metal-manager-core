@@ -15,18 +15,26 @@
  * limitations under the License.
  */
 
-pub mod args;
-pub mod cmd;
+mod args;
+mod cmd;
 
-use ::rpc::admin_cli::CarbideCliResult;
-pub use args::Args;
+pub(super) use args::Args;
 
 use crate::cfg::run::Run;
 use crate::cfg::runtime::RuntimeContext;
+use crate::errors::CarbideCliResult;
 
 impl Run for Args {
     async fn run(self, ctx: &mut RuntimeContext) -> CarbideCliResult<()> {
-        cmd::handle_show(self, &ctx.api_client, &ctx.config).await?;
+        cmd::handle_show(
+            self,
+            &ctx.config.format,
+            &mut ctx.output_file,
+            &ctx.api_client,
+            ctx.config.page_size,
+            &ctx.config.sort_by,
+        )
+        .await?;
         Ok(())
     }
 }

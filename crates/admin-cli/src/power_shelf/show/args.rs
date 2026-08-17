@@ -18,7 +18,17 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Args {
+#[command(after_long_help = "\
+EXAMPLES:
+
+List all power shelves:
+    $ nico-admin-cli power-shelf show
+
+Show one power shelf by ID or name:
+    $ nico-admin-cli power-shelf show 12345678-1234-5678-90ab-cdef01234567
+
+")]
+pub(crate) struct Args {
     #[clap(help = "Power shelf ID or name to show (leave empty for all)")]
-    pub identifier: Option<String>,
+    pub(super) identifier: Option<String>,
 }

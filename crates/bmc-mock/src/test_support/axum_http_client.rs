@@ -21,8 +21,11 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
-use nv_redfish::bmc_http::{BmcCredentials, CacheableError, HttpClient};
-use nv_redfish::core::{BoxTryStream, ModificationResponse, ODataETag};
+use nv_redfish::bmc_http::{
+    BmcCredentials, CacheableError, HttpClient, RejectedUriReferenceError, RequestError,
+};
+use nv_redfish::core::upload::{MultipartUpdateRequest, UploadReader};
+use nv_redfish::core::{BoxTryStream, ModificationResponse, ODataETag, SessionCreateResponse};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tower::ServiceExt;
@@ -38,6 +41,7 @@ pub enum Error {
     Json(serde_json::Error),
     Http(axum::http::Error),
     Cache(String),
+    RejectedUriReference(String),
     NotSupported(&'static str),
 }
 
@@ -50,12 +54,21 @@ impl fmt::Display for Error {
             Self::Json(err) => write!(f, "json error: {err}"),
             Self::Http(err) => write!(f, "http build error: {err}"),
             Self::Cache(reason) => write!(f, "cache error: {reason}"),
+            Self::RejectedUriReference(reason) => {
+                write!(f, "rejected URI reference: {reason}")
+            }
             Self::NotSupported(what) => write!(f, "not supported in test client: {what}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl RequestError for Error {
+    fn rejected_uri_reference(error: RejectedUriReferenceError) -> Self {
+        Self::RejectedUriReference(error.reason)
+    }
+}
 
 impl CacheableError for Error {
     fn is_cached(&self) -> bool {
@@ -200,5 +213,33 @@ impl HttpClient for AxumRouterHttpClient {
         _custom_headers: &HeaderMap,
     ) -> Result<BoxTryStream<T, Self::Error>, Self::Error> {
         Err(Error::NotSupported("SSE stream is not supported yet"))
+    }
+
+    async fn post_session<B, T>(
+        &self,
+        _: Url,
+        _: &B,
+        _: &HeaderMap,
+    ) -> Result<SessionCreateResponse<T>, Self::Error>
+    where
+        B: Serialize + Send + Sync,
+        T: DeserializeOwned + Send + Sync,
+    {
+        Err(Error::NotSupported("POST for Session is not supported yet"))
+    }
+
+    async fn post_multipart_update<U, V, T>(
+        &self,
+        _: Url,
+        _: MultipartUpdateRequest<'_, U, V>,
+        _: &BmcCredentials,
+        _: &HeaderMap,
+    ) -> Result<ModificationResponse<T>, Self::Error>
+    where
+        U: UploadReader,
+        T: DeserializeOwned + Send + Sync,
+        V: Serialize + Send + Sync,
+    {
+        Err(Error::NotSupported("Multipart update is not supported yet"))
     }
 }
