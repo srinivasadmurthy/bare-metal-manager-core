@@ -2415,24 +2415,11 @@ impl Redfish for RedfishSimClient {
 
     // The sim does not model Vera-Rubin CX NICs, so these mirror the
     // not-applicable behavior of every other vendor.
-    fn get_nic_east_west_control_enabled_all<'a>(
-        &'a self,
-    ) -> libredfish::RedfishFuture<'a, Result<Option<Vec<bool>>, RedfishError>> {
-        Box::pin(async move { Ok(None) })
-    }
-
     fn get_nic_east_west_control_enabled<'a>(
         &'a self,
         _nic_index: u8,
     ) -> libredfish::RedfishFuture<'a, Result<Option<bool>, RedfishError>> {
         Box::pin(async move { Ok(None) })
-    }
-
-    fn set_nic_east_west_control_enabled_all<'a>(
-        &'a self,
-        _enabled: bool,
-    ) -> libredfish::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { Ok(()) })
     }
 
     fn set_nic_east_west_control_enabled<'a>(
@@ -2443,13 +2430,7 @@ impl Redfish for RedfishSimClient {
         Box::pin(async move { Ok(()) })
     }
 
-    fn get_nic_mac_addresses_all<'a>(
-        &'a self,
-    ) -> libredfish::RedfishFuture<'a, Result<Option<Vec<String>>, RedfishError>> {
-        Box::pin(async move { Ok(None) })
-    }
-
-    fn get_nic_mac_addresses<'a>(
+    fn get_nic_mac_address<'a>(
         &'a self,
         _nic_index: u8,
     ) -> libredfish::RedfishFuture<'a, Result<Option<String>, RedfishError>> {
