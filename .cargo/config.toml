@@ -31,6 +31,11 @@ rustflags = [
   "dependency-on-unit-never-type-fallback",
   "-A",
   "unknown_lints",                          # Needed so that prior cargo checks tolerate custom lints like txn_held_across_await
+  # LOCAL ONLY -- revert before committing. Paired with the [patch] on libredfish
+  # in Cargo.toml: a path dependency is not lint-capped the way a git source is,
+  # so libredfish's own `pub` items would otherwise fail the build.
+  "-A",
+  "unreachable-pub",
 ]
 
 # This linker seems faster than default, but not everyone is using it yet

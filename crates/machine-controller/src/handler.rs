@@ -74,10 +74,10 @@ use model::machine::infiniband::{IbConfigNotSyncedReason, ib_config_synced};
 use model::machine::nvlink::nvlink_config_synced;
 use model::machine::{
     AttestationMode, BomValidating, BomValidatingContext, CleanupContext, CleanupState,
-    CreateBossVolumeContext, CreateBossVolumeState, DpuDiscoveringState, DpuInitNextStateResolver,
-    DpuInitState, FactoryResetBmcState, FailureCause, FailureDetails, FailureSource,
-    HostPlatformConfigurationState, HostReprovisionState, InitialResetPhase, InstallDpuOsState,
-    InstanceNextStateResolver, InstanceState, LockdownInfo, LockdownState,
+    ConfigureAstraState, CreateBossVolumeContext, CreateBossVolumeState, DpuDiscoveringState,
+    DpuInitNextStateResolver, DpuInitState, FactoryResetBmcState, FailureCause, FailureDetails,
+    FailureSource, HostPlatformConfigurationState, HostReprovisionState, InitialResetPhase,
+    InstallDpuOsState, InstanceNextStateResolver, InstanceState, LockdownInfo, LockdownState,
     MAX_FIRMWARE_UPGRADE_RETRIES, Machine, MachineLastRebootRequested,
     MachineLastRebootRequestedMode, MachineNextStateResolver, MachineState,
     MachineValidationContext, ManagedHostState, ManagedHostStateSnapshot, MeasuringState,
@@ -94,7 +94,7 @@ use model::predicted_machine_interface::PredictedMachineInterface;
 use model::resource_pool::common::CommonPools;
 use model::site_explorer::ExploredEndpoint;
 use sku::{handle_bom_validation_requested, handle_bom_validation_state};
-use sqlx::{PgConnection, PgTransaction};
+use sqlx::PgConnection;
 use state_controller::state_handler::{
     StateHandler, StateHandlerContext, StateHandlerError, StateHandlerOutcome,
 };
@@ -835,21 +835,96 @@ impl MachineStateHandler {
         }
 
         match &mh_state { 
-            ManagedHostState::ConfigureAstra => {
-                let mut txn = ctx.services.db_pool.begin().await?;
-                // Enable Astra if necessary
-                self.enable_astra(&mut txn, mh_snapshot).await?;
+            ManagedHostState::ConfigureAstra {
+                configure_astra_state,
+            } => {
+                match configure_astra_state {
+                    ConfigureAstraState::EnableNics => {
+                        let powercycle_needed =
+                            self.enable_astra_all_nics(mh_snapshot, ctx).await?;
+                        if powercycle_needed {
+                            handler_host_power_control(
+                                mh_snapshot,
+                                ctx,
+                                SystemPowerControl::ACPowercycle,
+                            )
+                            .await?;
+                            return Ok(StateHandlerOutcome::transition(
+                                ManagedHostState::ConfigureAstra {
+                                    configure_astra_state:
+                                        ConfigureAstraState::WaitingForPowercycle,
+                                },
+                            ));
+                        }
 
-                // Now collect the ids of the DPUs in this managed host in dpu_ids,
-                // and our next state should be DpuDiscoveringState with the dpu_ids.
-                let dpu_ids = mh_snapshot.host_snapshot.associated_dpu_machine_ids();
-                Ok(StateHandlerOutcome::transition(
-                    ManagedHostState::DpuDiscoveringState {
-                        dpu_states: DpuDiscoveringStates {
-                            states: dpu_ids.iter().map(|id| (*id, DpuDiscoveringState::Initializing)).collect(),
-                        },
-                    },
-                ).with_txn(txn))
+                        let dpu_ids = mh_snapshot.host_snapshot.associated_dpu_machine_ids();
+                        Ok(StateHandlerOutcome::transition(
+                            ManagedHostState::DpuDiscoveringState {
+                                dpu_states: DpuDiscoveringStates {
+                                    states: dpu_ids
+                                        .iter()
+                                        .map(|id| (*id, DpuDiscoveringState::Initializing))
+                                        .collect(),
+                                },
+                            },
+                        ))
+                    }
+                    ConfigureAstraState::WaitingForPowercycle => {
+                        let basetime = mh_snapshot
+                            .host_snapshot
+                            .status
+                            .last_reboot_requested
+                            .as_ref()
+                            .map(|x| x.time)
+                            .unwrap_or(mh_snapshot.host_snapshot.state.version.timestamp());
+
+                        if wait(&basetime, self.reachability_params.power_down_wait) {
+                            return Ok(StateHandlerOutcome::wait(format!(
+                                "Waiting for host {} AC power cycle grace period",
+                                mh_snapshot.host_snapshot.id
+                            )));
+                        }
+
+                        let redfish_client = ctx
+                            .services
+                            .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
+                            .await?;
+                        let power_state = host_power_state(redfish_client.as_ref()).await?;
+
+                        // ACPowercycle can fall back to ForceOff when unsupported; ensure On.
+                        if power_state != libredfish::PowerState::On
+                            && power_state != libredfish::PowerState::PoweringOn
+                        {
+                            tracing::info!(
+                                machine_id = %mh_snapshot.host_snapshot.id,
+                                %power_state,
+                                "Host not yet On after Astra AC power cycle; powering on"
+                            );
+                            handler_host_power_control(
+                                mh_snapshot,
+                                ctx,
+                                SystemPowerControl::On,
+                            )
+                            .await?;
+                            return Ok(StateHandlerOutcome::wait(format!(
+                                "Waiting for host {} to power on after Astra AC power cycle",
+                                mh_snapshot.host_snapshot.id
+                            )));
+                        }
+
+                        let dpu_ids = mh_snapshot.host_snapshot.associated_dpu_machine_ids();
+                        Ok(StateHandlerOutcome::transition(
+                            ManagedHostState::DpuDiscoveringState {
+                                dpu_states: DpuDiscoveringStates {
+                                    states: dpu_ids
+                                        .iter()
+                                        .map(|id| (*id, DpuDiscoveringState::Initializing))
+                                        .collect(),
+                                },
+                            },
+                        ))
+                    }
+                }
             }
             ManagedHostState::DpuDiscoveringState { .. } => {
                 if mh_snapshot
@@ -1993,7 +2068,32 @@ impl MachineStateHandler {
         }
     }
 
-    async fn enable_astra(&self, txn: &mut PgTransaction<'static>, mh_snapshot: &ManagedHostStateSnapshot) -> Result<(), StateHandlerError> {
+    async fn enable_astra_nic(
+        &self,
+        nic_index: u8,
+        mh_snapshot: &ManagedHostStateSnapshot,
+        ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
+    ) -> Result<(), StateHandlerError> {
+        let redfish_client = ctx
+            .services
+            .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
+            .await?;
+        redfish_client
+            .set_nic_east_west_control_enabled(nic_index, true)
+            .await
+            .map_err(|e| redfish_error("set_nic_east_west_control_enabled", e))?;
+        Ok(())
+    }
+
+    /// Enables EastWestControl on every declared CX9 NIC.
+    ///
+    /// Returns `true` when at least one CX9 NIC was enabled and the caller
+    /// should AC-power-cycle the host for the change to take effect.
+    async fn enable_astra_all_nics(
+        &self,
+        mh_snapshot: &ManagedHostStateSnapshot,
+        ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
+    ) -> Result<bool, StateHandlerError> {
         // Enable Astra if necessary
         // Look at the entry in the expected_machines table for this managed host, and retrieve the host_nics
         // field. If the host_nics is empty, just return.
@@ -2010,6 +2110,8 @@ impl MachineStateHandler {
             });
         };
 
+        let mut txn = ctx.services.db_pool.begin().await?;
+
         // Retrieve the expected_machines table entry for this managed host.
         let expected_machine =
             db::expected_machine::find_by_bmc_mac_address(txn.as_mut(), bmc_mac_address)
@@ -2024,26 +2126,33 @@ impl MachineStateHandler {
                     StateHandlerError::DBError(Box::new(err))
                 })?;
 
+        txn.commit().await?;
+
         // No expected-machine entry means there are no declared host NICs to act on.
         let Some(expected_machine) = expected_machine else {
-            return Ok(());
+            return Ok(false);
         };
 
         let host_nics = expected_machine.data.interfaces;
         if host_nics.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         // At this point, we need to use Redfish to get all the CX cards in the host.
         // The end point to explore is /redfish/v1/Chassis/CX_$i
 
-        for nic in host_nics.iter() {
-            if nic.nic_type != Some("CX9".to_string()) {
-                continue;
-            }
+        let mut enabled_any_cx9 = false;
+        for (nic_index, _nic) in host_nics
+            .iter()
+            .filter(|nic| nic.nic_type.as_deref() == Some("CX9"))
+            .enumerate()
+        {
+            self.enable_astra_nic(nic_index as u8, mh_snapshot, ctx)
+                .await?;
+            enabled_any_cx9 = true;
         }
 
-        Ok(())
+        Ok(enabled_any_cx9)
     }
 
     async fn handle_scout_heartbeat_timeout(

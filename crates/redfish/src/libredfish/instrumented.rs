@@ -334,6 +334,16 @@ impl Redfish for InstrumentedRedfish {
         fn get_evidence<'a>(&'a self, url: &'a str) -> Evidence;
         fn set_host_privilege_level<'a>(&'a self, level: HostPrivilegeLevel) -> ();
         fn set_utc_timezone<'a>(&'a self) -> ();
+        fn get_nic_east_west_control_enabled_all<'a>(&'a self) -> Option<Vec<bool>>;
+        fn get_nic_east_west_control_enabled<'a>(&'a self, nic_index: u8) -> Option<bool>;
+        fn set_nic_east_west_control_enabled_all<'a>(&'a self, enabled: bool) -> ();
+        fn set_nic_east_west_control_enabled<'a>(
+            &'a self,
+            nic_index: u8,
+            enabled: bool,
+        ) -> ();
+        fn get_nic_mac_addresses_all<'a>(&'a self) -> Option<Vec<String>>;
+        fn get_nic_mac_addresses<'a>(&'a self, nic_index: u8) -> Option<String>;
         fn set_ntp_servers<'a>(&'a self, servers: &'a [String]) -> ();
     }
 
