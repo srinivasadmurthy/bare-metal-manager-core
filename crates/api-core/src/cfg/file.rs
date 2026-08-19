@@ -2769,6 +2769,22 @@ impl CarbideConfig {
         conf.enabled
     }
 
+    pub fn is_svpc_enabled(&self) -> bool {
+        let Some(conf) = &self.dpa_config else {
+            return false;
+        };
+
+        conf.svpc_enabled
+    }
+
+    pub fn is_astra_enabled(&self) -> bool {
+        let Some(conf) = &self.dpa_config else {
+            return false;
+        };
+
+        conf.astra_enabled
+    }
+
     pub fn get_dpa_subnet_ip(&self) -> Result<Ipv4Addr, eyre::Report> {
         let Some(conf) = &self.dpa_config else {
             tracing::error!("get_dpa_subnet_ip: DPA config missing");
@@ -2790,15 +2806,17 @@ impl CarbideConfig {
     pub fn mqtt_broker_host(&self) -> Option<String> {
         self.dpa_config
             .as_ref()
-            .map(|conf| conf.mqtt_endpoint.clone())
+            .map(|conf| conf.svpc.mqtt_endpoint.clone())
     }
 
     pub fn mqtt_broker_port(&self) -> Option<u16> {
-        self.dpa_config.as_ref().map(|conf| conf.mqtt_broker_port)
+        self.dpa_config
+            .as_ref()
+            .map(|conf| conf.svpc.mqtt_broker_port)
     }
 
     pub fn get_hb_interval(&self) -> Option<chrono::TimeDelta> {
-        self.dpa_config.as_ref().map(|conf| conf.hb_interval)
+        self.dpa_config.as_ref().map(|conf| conf.svpc.hb_interval)
     }
 
     /// Returns true if the DSX Exchange Event Bus is enabled.
@@ -3736,16 +3754,23 @@ impl From<CarbideConfig> for rpc::forge::RuntimeConfig {
                 .allow_allocation_on_validation_failure,
             dpu_nic_firmware_update_versions: value.dpu_config.dpu_nic_firmware_update_versions,
             dpa_enabled: value.dpa_config.clone().unwrap_or_default().enabled,
-            mqtt_endpoint: value.dpa_config.clone().unwrap_or_default().mqtt_endpoint,
+            mqtt_endpoint: value
+                .dpa_config
+                .clone()
+                .unwrap_or_default()
+                .svpc
+                .mqtt_endpoint,
             mqtt_broker_port: value
                 .dpa_config
                 .clone()
                 .unwrap_or_default()
+                .svpc
                 .mqtt_broker_port as i32,
             mqtt_hb_interval: value
                 .dpa_config
                 .clone()
                 .unwrap_or_default()
+                .svpc
                 .hb_interval
                 .to_string(),
             bom_validation_auto_generate_missing_sku: value
@@ -3781,7 +3806,7 @@ fn default_mqtt_broker_port() -> u16 {
     1884
 }
 
-pub use carbide_dpa_manager::config::{DpaConfig, MqttAuthConfig, MqttAuthMode};
+pub use carbide_dpa_manager::config::{DpaConfig, MqttAuthConfig, MqttAuthMode, SvpcConfig};
 use model::vpc::VpcDefinition;
 
 /// DSX Exchange Event Bus configuration for publishing state change events via MQTT 3.1.1.
@@ -6635,6 +6660,8 @@ enabled = true
     fn deserialize_dpa_config() {
         let toml = r#"
 enabled=true
+
+[svpc]
 mqtt_endpoint = "mqtt.forge"
         "#;
 
@@ -6644,13 +6671,17 @@ mqtt_endpoint = "mqtt.forge"
             dpa_config,
             DpaConfig {
                 enabled: true,
-                mqtt_endpoint: "mqtt.forge".to_string(),
-                mqtt_broker_port: 1884,
-                hb_interval: chrono::TimeDelta::minutes(2),
+                svpc_enabled: false,
+                astra_enabled: false,
                 monitor_run_interval: std::time::Duration::from_secs(60),
                 subnet_ip: Ipv4Addr::UNSPECIFIED,
                 subnet_mask: 0_i32,
-                auth: MqttAuthConfig::default(),
+                svpc: SvpcConfig {
+                    mqtt_endpoint: "mqtt.forge".to_string(),
+                    mqtt_broker_port: 1884,
+                    hb_interval: chrono::TimeDelta::minutes(2),
+                    auth: MqttAuthConfig::default(),
+                },
             }
         );
     }
