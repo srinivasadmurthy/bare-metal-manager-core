@@ -22,12 +22,14 @@ use std::time::Duration;
 
 use bmc_mock::mac_address_pool::MacAddressPool;
 use bmc_mock::{
-    DpuMachineInfo, DpuSettings, HardwareType, HostFirmwareVersions, RackInfo, RackType,
+    DpuMachineInfo, DpuSettings, HardwareType, HostFirmwareVersions, RackInfo, RackPlacement,
+    RackType,
 };
 use carbide_uuid::machine::MachineId;
 use carbide_uuid::rack::{RackId, RackProfileId};
 use clap::Parser;
 use duration_str::deserialize_duration;
+use eyre::Context;
 use mac_address::MacAddress;
 use rpc::forge::DesiredFirmwareVersionEntry;
 use rpc::forge_tls_client::ForgeClientConfig;
@@ -75,6 +77,8 @@ pub struct MachineATronArgs {
 pub struct MachineConfig {
     #[serde(default)]
     pub rack_id: Option<RackId>,
+    #[serde(skip)]
+    pub rack_placement: Option<RackPlacement>,
     #[serde(default = "default_hardware_type")]
     pub hw_type: HardwareType,
     pub host_count: u32,
@@ -89,6 +93,14 @@ pub struct MachineConfig {
         serialize_with = "as_std_duration"
     )]
     pub scout_run_interval: Duration,
+    /// Delay before retrying a failed DiscoverMachine request. The default matches the
+    /// production DPU agent; local development can override it independently of the MAT work loop.
+    #[serde(
+        default = "default_discovery_retry_interval",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "as_std_duration"
+    )]
+    pub discovery_retry_interval: Duration,
     pub oob_dhcp_relay_address: Ipv4Addr,
     pub admin_dhcp_relay_address: Ipv4Addr,
     /// Relay address used when a host DHCPs directly through a plain NIC rather than a managed DPU.
@@ -159,6 +171,12 @@ pub struct WiwynnGb200RackConfig {
         serialize_with = "as_std_duration"
     )]
     pub scout_run_interval: Duration,
+    #[serde(
+        default = "default_discovery_retry_interval",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "as_std_duration"
+    )]
+    pub discovery_retry_interval: Duration,
     pub oob_dhcp_relay_address: Ipv4Addr,
     pub admin_dhcp_relay_address: Ipv4Addr,
     #[serde(default)]
@@ -195,11 +213,13 @@ impl WiwynnGb200RackConfig {
     fn component_machine_config(
         &self,
         rack_id: RackId,
+        rack_placement: RackPlacement,
         hw_type: HardwareType,
         dpu_per_host_count: u32,
     ) -> MachineConfig {
         MachineConfig {
             rack_id: Some(rack_id),
+            rack_placement: Some(rack_placement),
             hw_type,
             host_count: 1,
             vpc_count: 0,
@@ -208,6 +228,7 @@ impl WiwynnGb200RackConfig {
             dpu_reboot_delay: self.dpu_reboot_delay,
             host_reboot_delay: self.host_reboot_delay,
             scout_run_interval: self.scout_run_interval,
+            discovery_retry_interval: self.discovery_retry_interval,
             oob_dhcp_relay_address: self.oob_dhcp_relay_address,
             admin_dhcp_relay_address: self.admin_dhcp_relay_address,
             host_inband_dhcp_relay_address: self.host_inband_dhcp_relay_address,
@@ -233,6 +254,12 @@ pub struct LenovoGb300RackConfig {
         serialize_with = "as_std_duration"
     )]
     pub scout_run_interval: Duration,
+    #[serde(
+        default = "default_discovery_retry_interval",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "as_std_duration"
+    )]
+    pub discovery_retry_interval: Duration,
     pub oob_dhcp_relay_address: Ipv4Addr,
     pub admin_dhcp_relay_address: Ipv4Addr,
     #[serde(default)]
@@ -269,11 +296,13 @@ impl LenovoGb300RackConfig {
     fn component_machine_config(
         &self,
         rack_id: RackId,
+        rack_placement: RackPlacement,
         hw_type: HardwareType,
         dpu_per_host_count: u32,
     ) -> MachineConfig {
         MachineConfig {
             rack_id: Some(rack_id),
+            rack_placement: Some(rack_placement),
             hw_type,
             host_count: 1,
             vpc_count: 0,
@@ -282,6 +311,7 @@ impl LenovoGb300RackConfig {
             dpu_reboot_delay: self.dpu_reboot_delay,
             host_reboot_delay: self.host_reboot_delay,
             scout_run_interval: self.scout_run_interval,
+            discovery_retry_interval: self.discovery_retry_interval,
             oob_dhcp_relay_address: self.oob_dhcp_relay_address,
             admin_dhcp_relay_address: self.admin_dhcp_relay_address,
             host_inband_dhcp_relay_address: self.host_inband_dhcp_relay_address,
@@ -329,16 +359,23 @@ impl RackModelConfig {
     fn component_machine_config(
         &self,
         rack_id: RackId,
+        rack_placement: RackPlacement,
         hardware_type: HardwareType,
         dpu_per_host_count: u32,
     ) -> MachineConfig {
         match self {
-            Self::WiwynnGb200Nvl72 { simulation } => {
-                simulation.component_machine_config(rack_id, hardware_type, dpu_per_host_count)
-            }
-            Self::LenovoGb300Nvl72 { simulation } => {
-                simulation.component_machine_config(rack_id, hardware_type, dpu_per_host_count)
-            }
+            Self::WiwynnGb200Nvl72 { simulation } => simulation.component_machine_config(
+                rack_id,
+                rack_placement,
+                hardware_type,
+                dpu_per_host_count,
+            ),
+            Self::LenovoGb300Nvl72 { simulation } => simulation.component_machine_config(
+                rack_id,
+                rack_placement,
+                hardware_type,
+                dpu_per_host_count,
+            ),
         }
     }
 }
@@ -393,6 +430,14 @@ impl DpuFirmwareVersions {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Compact,
+    Logfmt,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct MachineATronConfig {
     #[serde(default)]
@@ -405,6 +450,9 @@ pub struct MachineATronConfig {
     pub machines: BTreeMap<String, Arc<MachineConfig>>,
     pub carbide_api_url: String,
     pub log_file: Option<String>,
+    /// Format used for logs written to stdout or `log_file`.
+    #[serde(default)]
+    pub log_format: LogFormat,
     pub interface: String,
 
     /// How machine-a-tron obtains DHCP leases for BMCs and directly attached hosts.
@@ -600,11 +648,15 @@ impl MachineATronConfig {
 
         for (rack_id, rack) in configured_racks {
             let rack_type = rack.model.rack_type();
-            let elevation = RackInfo { rack_type }.rack_elevation();
+            let rack_info = RackInfo { rack_type };
+            let elevation = rack_info.rack_elevation().wrap_err_with(|| {
+                format!("rack {rack_id} uses an invalid {rack_type} rack design")
+            })?;
             let rack_key = encoded_rack_key(&rack_id);
             let mut members = Vec::with_capacity(elevation.units.len());
 
             for unit in elevation.units {
+                let placement = rack_info.placement(unit.position);
                 let machine_config_section = format!("rack-{rack_key}--unit-{:02}", unit.position);
                 let dpu_per_host_count = unit
                     .hardware_type
@@ -617,6 +669,7 @@ impl MachineATronConfig {
                             machine_config_section.clone(),
                             Arc::new(rack.model.component_machine_config(
                                 rack_id.clone(),
+                                placement,
                                 unit.hardware_type,
                                 dpu_per_host_count,
                             )),
@@ -625,7 +678,7 @@ impl MachineATronConfig {
                     "rack {rack_id} generated duplicate device identity {machine_config_section}"
                 );
                 members.push(RackMemberRegistration {
-                    position: unit.position,
+                    placement,
                     hardware_type: unit.hardware_type,
                     machine_config_section,
                 });
@@ -828,6 +881,10 @@ fn default_run_interval_working() -> Duration {
     Duration::from_secs(5)
 }
 
+fn default_discovery_retry_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
 fn default_run_interval_idle() -> Duration {
     Duration::from_secs(30)
 }
@@ -975,6 +1032,7 @@ scout_run_interval = "5s"
             dpu_reboot_delay: machine.dpu_reboot_delay,
             host_reboot_delay: machine.host_reboot_delay,
             scout_run_interval: machine.scout_run_interval,
+            discovery_retry_interval: machine.discovery_retry_interval,
             oob_dhcp_relay_address: machine.oob_dhcp_relay_address,
             admin_dhcp_relay_address: machine.admin_dhcp_relay_address,
             host_inband_dhcp_relay_address: machine.host_inband_dhcp_relay_address,
@@ -993,6 +1051,7 @@ scout_run_interval = "5s"
             dpu_reboot_delay: machine.dpu_reboot_delay,
             host_reboot_delay: machine.host_reboot_delay,
             scout_run_interval: machine.scout_run_interval,
+            discovery_retry_interval: machine.discovery_retry_interval,
             oob_dhcp_relay_address: machine.oob_dhcp_relay_address,
             admin_dhcp_relay_address: machine.admin_dhcp_relay_address,
             host_inband_dhcp_relay_address: machine.host_inband_dhcp_relay_address,
@@ -1043,6 +1102,10 @@ scout_run_interval = "5s"
     #[test]
     fn test_serialize_config() {
         let cfg = rack_config();
+        assert_eq!(
+            cfg.machines["config"].discovery_retry_interval,
+            Duration::from_secs(60)
+        );
         cfg.validate().expect("Could not validate config");
         let serialized = toml::to_string(&cfg).expect("Could not serialize config");
         let round_tripped = toml::from_str::<MachineATronConfig>(&serialized)
@@ -1163,11 +1226,19 @@ scout_run_interval = "5s"
                         eyre::ensure!(
                             rack.members
                                 .iter()
-                                .map(|member| member.position)
+                                .map(|member| member.placement.position())
                                 .collect::<BTreeSet<_>>()
                                 .len()
                                 == expected.member_count
                         );
+                        for member in &rack.members {
+                            let machine = first
+                                .machines
+                                .get(&member.machine_config_section)
+                                .expect("rack member must reference a generated machine");
+                            eyre::ensure!(machine.rack_id.as_ref() == Some(&rack.rack_id));
+                            eyre::ensure!(machine.rack_placement == Some(member.placement));
+                        }
                     }
 
                     for machine in first.machines.values() {
@@ -1244,6 +1315,45 @@ scout_run_interval = "5s"
     #[test]
     fn dhcp_uses_api_by_default() {
         assert_eq!(rack_config().dhcp, DhcpType::Api {});
+    }
+
+    #[test]
+    fn log_format_configuration() {
+        #[derive(Deserialize)]
+        struct LoggingConfig {
+            #[serde(default)]
+            log_format: LogFormat,
+        }
+
+        check_values(
+            [
+                Check {
+                    scenario: "format omitted",
+                    input: "",
+                    expect: Some(LogFormat::Compact),
+                },
+                Check {
+                    scenario: "compact format",
+                    input: r#"log_format = "compact""#,
+                    expect: Some(LogFormat::Compact),
+                },
+                Check {
+                    scenario: "logfmt format",
+                    input: r#"log_format = "logfmt""#,
+                    expect: Some(LogFormat::Logfmt),
+                },
+                Check {
+                    scenario: "unknown format",
+                    input: r#"log_format = "json""#,
+                    expect: None,
+                },
+            ],
+            |serialized| {
+                toml::from_str::<LoggingConfig>(serialized)
+                    .ok()
+                    .map(|config| config.log_format)
+            },
+        );
     }
 
     #[test]

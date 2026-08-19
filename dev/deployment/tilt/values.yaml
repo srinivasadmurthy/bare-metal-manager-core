@@ -30,6 +30,10 @@ nico-api:
       value: "1"
   webAuth:
     mode: none
+  componentManager:
+    enabled: false
+  rms:
+    enabled: false
   siteConfig:
     enabled: true
     nicoApiSiteConfig: |
@@ -173,6 +177,8 @@ nico-machine-a-tron:
   enabled: true
   machineATron:
     nicoApiUrl: https://nico-api.nico-system.svc.cluster.local:1079
+  machineDefaults:
+    discoveryRetryInterval: "5s"
   persistence:
     enabled: true
   certificate:
