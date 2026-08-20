@@ -2088,7 +2088,9 @@ impl MachineStateHandler {
         // Note that this entry will be added with the predicted host id, and when we
         // change the predicted host machine id to an actual machine id, we will have
         // to fix up the dpa_interfaces table.
-        let mac_address = redfish_client.get_nic_mac_address(nic_index).await?;
+        let mac_address = redfish_client.get_nic_mac_address(nic_index)
+            .await
+            .map_err(|e| redfish_error("get_nic_mac_address", e))?;
         let mut txn = ctx.services.db_pool.begin().await?;
         db::dpa_interface::ensure(DpaInterface::new(mac_address), &mut txn).await?;
         txn.commit().await?;
