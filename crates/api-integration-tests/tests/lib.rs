@@ -23,7 +23,7 @@ use std::time::{self, Duration};
 
 use ::carbide_utils::HostPortPair;
 use ::machine_a_tron::{
-    BmcMockRegistry, DeviceHandle, DhcpType, MachineATronConfig, MachineConfig,
+    BmcMockRegistry, DeviceHandle, DhcpType, LogFormat, MachineATronConfig, MachineConfig,
 };
 use api_test_helper::utils::TestApiServerArgs;
 use api_test_helper::{
@@ -36,9 +36,12 @@ use eyre::ContextCompat;
 use futures::FutureExt;
 use futures::future::join_all;
 use itertools::Itertools;
+use model::machine_boot_interface::BootInterfaceSelectionSource;
 use sqlx::{Postgres, Row};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+
+const DPU_UNDERLAY_DHCP_RELAY_ADDRESS: Ipv4Addr = Ipv4Addr::new(172, 20, 1, 1);
 
 #[ctor::ctor(unsafe)]
 fn setup() {
@@ -149,8 +152,7 @@ async fn test_integration() -> eyre::Result<()> {
             &test_env,
             &bmc_address_registry,
             &managed_segment_id,
-            // Relay IP in admin net
-            Ipv4Addr::new(172, 20, 0, 2),
+            DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         )
         .boxed(),
         test_machine_a_tron_multidpu(
@@ -158,8 +160,7 @@ async fn test_integration() -> eyre::Result<()> {
             &test_env,
             &bmc_address_registry,
             &managed_segment_id,
-            // Relay IP in admin net
-            Ipv4Addr::new(172, 20, 0, 2),
+            DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         )
         .boxed(),
         test_machine_a_tron_multidpu(
@@ -167,8 +168,7 @@ async fn test_integration() -> eyre::Result<()> {
             &test_env,
             &bmc_address_registry,
             &managed_segment_id,
-            // Relay IP in admin net
-            Ipv4Addr::new(172, 20, 0, 2),
+            DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         )
         .boxed(),
         test_machine_a_tron_multidpu(
@@ -176,8 +176,7 @@ async fn test_integration() -> eyre::Result<()> {
             &test_env,
             &bmc_address_registry,
             &managed_segment_id,
-            // Relay IP in admin net
-            Ipv4Addr::new(172, 20, 0, 2),
+            DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         )
         .boxed(),
         test_machine_a_tron_multidpu(
@@ -185,8 +184,7 @@ async fn test_integration() -> eyre::Result<()> {
             &test_env,
             &bmc_address_registry,
             &managed_segment_id,
-            // Relay IP in admin net
-            Ipv4Addr::new(172, 20, 0, 2),
+            DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         )
         .boxed(),
         test_machine_a_tron_multidpu(
@@ -194,8 +192,7 @@ async fn test_integration() -> eyre::Result<()> {
             &test_env,
             &bmc_address_registry,
             &managed_segment_id,
-            // Relay IP in admin net
-            Ipv4Addr::new(172, 20, 0, 2),
+            DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         )
         .boxed(),
         test_machine_a_tron_zerodpu(
@@ -249,8 +246,7 @@ async fn test_integration() -> eyre::Result<()> {
             tenant_org_id,
             &v4_vpc_prefix_id,
             &v6_vpc_prefix_id,
-            // Relay IP in admin net
-            Ipv4Addr::new(172, 20, 0, 2),
+            DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         )
         .boxed(),
         test_machine_a_tron_dual_stack_l2(
@@ -258,8 +254,7 @@ async fn test_integration() -> eyre::Result<()> {
             &test_env,
             &bmc_address_registry,
             &dual_stack_l2_segment_id,
-            // Relay IP in admin net
-            Ipv4Addr::new(172, 20, 0, 2),
+            DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         )
         .boxed(),
     ]);
@@ -271,6 +266,19 @@ async fn test_integration() -> eyre::Result<()> {
         }
     }
 
+    metrics::wait_for_metric_line(
+        &test_env.carbide_metrics_addrs,
+        r#"carbide_site_explorer_boot_interface_selections_total{mechanism="redfish_serial_number"}"#,
+    )
+    .await?;
+
+    let metric_infos = metrics::collect_metric_infos(&test_env.carbide_metrics_addrs)?;
+    assert!(
+        metric_infos.iter().any(|metric| {
+            metric.name == "carbide_site_explorer_boot_interface_selections_total"
+        }),
+        "the multi-DPU integration paths must exercise boot-interface selection observability",
+    );
     generate_core_metric_docs(&test_env.carbide_metrics_addrs);
 
     cancel_token.cancel();
@@ -473,7 +481,7 @@ async fn test_metrics_integration() -> eyre::Result<()> {
         false,
         &test_env,
         &bmc_address_registry,
-        Ipv4Addr::new(172, 20, 0, 1),
+        DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         |machine_handle| {
             let db_pool = db_pool.clone();
             let carbide_api_addrs = carbide_api_addrs.to_vec();
@@ -624,6 +632,9 @@ async fn test_machine_a_tron_multidpu(
         |machine_handle| {
             let segment_id = segment_id.to_string();
             let carbide_api_addrs = &test_env.carbide_api_addrs;
+            let db_pool = test_env.db_pool.clone();
+            let expected_selection_source = (hw_type == HardwareType::WiwynnGB200Nvl)
+                .then_some(BootInterfaceSelectionSource::RedfishSerialNumber);
             async move {
                 machine_handle
                     .wait_until_machine_up_with_api_state("Ready", Duration::from_secs(90))
@@ -631,6 +642,20 @@ async fn test_machine_a_tron_multidpu(
                 let machine_id = machine_handle
                     .observed_machine_id()
                     .expect("Machine ID should be set if host is ready");
+                if let Some(expected_selection_source) = expected_selection_source {
+                    let selection_source: BootInterfaceSelectionSource = sqlx::query_scalar(
+                        "SELECT selection_source
+                         FROM machine_boot_interfaces
+                         WHERE machine_id = $1",
+                    )
+                    .bind(machine_id)
+                    .fetch_one(&db_pool)
+                    .await?;
+                    assert_eq!(
+                        selection_source, expected_selection_source,
+                        "GB200's Redfish serial fallback must survive the full ingestion handoff",
+                    );
+                }
                 tracing::info!(
                     machine_id = %machine_id,
                     "Machine has made it to Ready, allocating instance",
@@ -709,7 +734,7 @@ async fn test_machine_a_tron_zerodpu(
         false,
         test_env,
         bmc_mock_registry,
-        Ipv4Addr::new(172, 20, 0, 2),
+        DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         |machine_handle| {
             let carbide_api_addrs = &test_env.carbide_api_addrs;
             let flat_vpc_id = flat_vpc_id.to_string();
@@ -771,7 +796,7 @@ async fn test_machine_a_tron_nic_mode(
         true,
         test_env,
         bmc_mock_registry,
-        Ipv4Addr::new(172, 20, 0, 2),
+        DPU_UNDERLAY_DHCP_RELAY_ADDRESS,
         |machine_handle| {
             let carbide_api_addrs = &test_env.carbide_api_addrs;
             let flat_vpc_id = flat_vpc_id.to_string();
@@ -1377,14 +1402,17 @@ where
             "config".to_string(),
             Arc::new(MachineConfig {
                 rack_id: None,
+                rack_placement: None,
                 hw_type,
                 host_count,
                 dpu_per_host_count,
                 dpu_reboot_delay: 1,
                 host_reboot_delay: 1,
+                // MAT currently uses this legacy-named field for DPU OS DHCP. Route that
+                // request through Underlay so it matches the predicted DPU interface.
                 admin_dhcp_relay_address,
-                // Keep this distinct from the Admin relay so NIC-mode tests
-                // fail if machine-a-tron sends host DHCP through Admin.
+                // Keep this distinct from the DPU Underlay relay so NIC-mode tests fail if
+                // machine-a-tron sends direct host DHCP through the DPU network.
                 host_inband_dhcp_relay_address: Some(Ipv4Addr::new(10, 10, 11, 2)),
                 oob_dhcp_relay_address: Ipv4Addr::new(172, 20, 1, 1),
                 vpc_count: 0,
@@ -1393,6 +1421,7 @@ where
                 run_interval_working: Duration::from_millis(100),
                 network_status_run_interval: Duration::from_secs(1),
                 scout_run_interval: Duration::from_secs(1),
+                discovery_retry_interval: Duration::from_millis(100),
                 network_virtualization_type: None,
                 dpus_in_nic_mode,
                 dpu_firmware_versions: None,
@@ -1403,6 +1432,7 @@ where
         carbide_api_url: format!("https://{}:{}", api_addr.ip(), api_addr.port()),
         dhcp: DhcpType::Api {},
         log_file: None,
+        log_format: LogFormat::Compact,
         bmc_mock_port: 0, // unused, we're using dynamic ports on localhost
         bmc_mock_certs_dir: None,
         interface: String::from("UNUSED"), // unused, we're using dynamic ports on localhost

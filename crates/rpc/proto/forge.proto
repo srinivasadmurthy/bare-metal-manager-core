@@ -728,6 +728,9 @@ service Forge {
   // On-demand rack maintenance (full rack or partial)
   rpc OnDemandRackMaintenance(RackMaintenanceOnDemandRequest) returns (RackMaintenanceOnDemandResponse);
 
+  // Terminate active rack maintenance and transition the rack to Error.
+  rpc TerminateRackMaintenance(RackMaintenanceTerminateRequest) returns (RackMaintenanceTerminateResponse);
+
   // TPM CA certs Management
   //rpc TpmDeleteCaCert(TpmCaCertDetails) returns (google.protobuf.Empty);
   rpc TpmAddCaCert(TpmCaCert) returns (TpmCaAddedCaStatus);
@@ -1003,6 +1006,26 @@ service Forge {
   // Helm/docker versions for the carbide DPF mandatory services, from both
   // the carbide config and the live DPUServiceTemplate CRs.
   rpc GetDPFServiceVersions(GetDPFServiceVersionsRequest) returns (DPFServiceVersionsResponse);
+  // Machines DPF is waiting on before a changed DPUService can roll out.
+  //
+  // Required rather than convenient: the release RPC has no fleet-wide form, so
+  // this is the only way to discover which machines to name. Split ids-then-
+  // details because a fleet-wide rollout can leave every host waiting at once,
+  // and the worklist must not become one unbounded response.
+  rpc FindPendingDPUServiceSyncIds(FindPendingDPUServiceSyncIdsRequest) returns (common.MachineIdList);
+  rpc FindPendingDPUServiceSyncsByIds(FindPendingDPUServiceSyncsByIdsRequest) returns (ListPendingDPUServiceSyncsResponse);
+  // One machine's recorded sync history, newest first. Needs no paging: the
+  // database caps retained history per machine.
+  rpc ListDPUServiceSyncHistory(ListDPUServiceSyncHistoryRequest) returns (ListPendingDPUServiceSyncsResponse);
+  // Release the DPF maintenance hold for named machines and complete their
+  // pending DPU service sync.
+  //
+  // Bypasses the host-state requirement carbide applies to itself -- that is
+  // what strands a host which can never reach Ready, and a site that has turned
+  // the automatic rollout off. It does not bypass the DPU currency check: new
+  // services must never land on a DPU whose OS is about to be replaced, and that
+  // holds however the release was asked for.
+  rpc ReleaseDPUServiceSyncHold(ReleaseDPUServiceSyncHoldRequest) returns (ReleaseDPUServiceSyncHoldResponse);
 
   // --- Component management (unified switch + power shelf operations) ---
   rpc ComponentPowerControl(ComponentPowerControlRequest) returns (ComponentPowerControlResponse);
@@ -6979,6 +7002,18 @@ message RackMaintenanceOnDemandResponse {
   // RackMaintenanceOnDemandResponse 
 }
 
+// Requests termination of NICo rack maintenance orchestration. The call is
+// accepted only while the rack is in Maintenance and returns after the durable
+// termination request is recorded, before the asynchronous transition to Error
+// completes. Repeating an accepted request before it is consumed is idempotent.
+// Work already submitted to an external backend is not guaranteed to stop.
+message RackMaintenanceTerminateRequest {
+  common.RackId rack_id = 1;
+}
+
+message RackMaintenanceTerminateResponse {
+}
+
 message AdminPowerControlRequest {
   enum SystemPowerControl {
     // Power on a machine
@@ -9429,6 +9464,100 @@ message DPFServiceVersionsResponse {
   repeated DPFServiceVersion services = 1;
 }
 
+// --- DPU service sync (operator-driven maintenance hold release) ---
+
+// Either a set of host machines, or one instance whose host is resolved
+// server-side.
+//
+// There is deliberately no "all". A fleet-wide release would bypass the pacing
+// the state controller applies to the automatic path and could restart DPU
+// services under every tenant at once.
+message ReleaseDPUServiceSyncHoldRequest {
+  oneof target {
+    // Host machines to release. DPU machine ids are rejected: the hold is per
+    // node, so accepting one would silently widen the request from a single DPU
+    // to every DPU on its host. Assigned hosts are declined -- name the instance
+    // instead.
+    common.MachineIdList machine_ids = 1;
+    // Release the hosts currently holding these instances, even though they are
+    // assigned. Naming an instance is the acknowledgement that its tenant will
+    // be disrupted, and each consent covers only the instance named: if a host
+    // has since been reallocated, that release is declined.
+    InstanceIdList instance_ids = 2;
+  }
+}
+
+enum DPUServiceSyncReleaseStatus {
+  // Explicit zero value so an omitted status cannot read as a success.
+  DPU_SERVICE_SYNC_RELEASE_STATUS_UNSPECIFIED = 0;
+  // The hold was released and the pending action completed.
+  DPU_SERVICE_SYNC_RELEASE_STATUS_RELEASED = 1;
+  // Nothing was owed for this machine. Also what a repeat call returns, which is
+  // what makes this RPC idempotent.
+  DPU_SERVICE_SYNC_RELEASE_STATUS_NOT_PENDING = 2;
+  // Declined: a DPU still differs from its DPUDeployment, so its OS is about to
+  // be replaced. The action stays outstanding. Retrying achieves nothing until
+  // that DPU has been reprovisioned.
+  DPU_SERVICE_SYNC_RELEASE_STATUS_DEFERRED_DPU_OUTDATED = 3;
+  // Declined: the host is assigned and was named by machine id. Name its
+  // instance instead. The action stays outstanding.
+  DPU_SERVICE_SYNC_RELEASE_STATUS_DEFERRED_HOST_ASSIGNED = 4;
+  // The attempt failed part-way. The action stays outstanding; retry.
+  DPU_SERVICE_SYNC_RELEASE_STATUS_FAILED = 5;
+  // Declined: a DPU could not be evaluated at all, usually because Kubernetes
+  // was unreachable. Unlike an outdated DPU this is worth retrying.
+  DPU_SERVICE_SYNC_RELEASE_STATUS_DEFERRED_UNKNOWN = 6;
+}
+
+message DPUServiceSyncReleaseResult {
+  common.MachineId machine_id = 1;
+  DPUServiceSyncReleaseStatus status = 2;
+  // Names the DPU or instance responsible on the deferred statuses, and the
+  // error on FAILED. Empty otherwise.
+  string detail = 3;
+}
+
+message ReleaseDPUServiceSyncHoldResponse {
+  // One result per host acted on, in request order. The instance form names the
+  // host each instance resolved to.
+  repeated DPUServiceSyncReleaseResult results = 1;
+}
+
+message FindPendingDPUServiceSyncIdsRequest {
+}
+
+message FindPendingDPUServiceSyncsByIdsRequest {
+  // Bounded by the server's `max_find_by_ids`, like every other by-ids call.
+  repeated common.MachineId machine_ids = 1;
+}
+
+message ListDPUServiceSyncHistoryRequest {
+  common.MachineId machine_id = 1;
+}
+
+// One recorded DPU service sync. Completed entries appear only in the history
+// form.
+message PendingDPUServiceSync {
+  common.MachineId machine_id = 1;
+  // First time DPF was seen waiting on this machine. Survives repeat requests,
+  // so it measures the whole wait rather than the last observation.
+  google.protobuf.Timestamp requested_at = 2;
+  // The host's managed state. Carbide only releases on its own from Ready, so
+  // this is the field that says why a machine is still waiting.
+  string state = 3;
+  // Set when the host is currently allocated, so tenant impact is visible before
+  // any machine is named.
+  optional common.InstanceId instance_id = 4;
+  optional google.protobuf.Timestamp completed_at = 5;
+  // Absent while outstanding. Note UpdateInitiator.AdminCli is zero, so this
+  // must never be sent as a default value.
+  optional UpdateInitiator completed_by = 6;
+}
+
+message ListPendingDPUServiceSyncsResponse {
+  repeated PendingDPUServiceSync pending = 1;
+}
+
 // ============================================================================
 // Component dispatch types
 // ============================================================================
@@ -9983,6 +10112,31 @@ message RetainedBootInterface {
   google.protobuf.Timestamp recorded_at = 3;
 }
 
+// Why the current desired boot interface target was selected. The target
+// interface may belong to a DPU in DPU or NIC mode, or it may be an integrated
+// or onboard NIC. This records the selection mechanism or authority; it does
+// not describe reconciliation state.
+enum BootInterfaceSelectionSource {
+  // Wire sentinel for an omitted field or a server that does not report this
+  // contract. This is not a persisted selection source.
+  BOOT_INTERFACE_SELECTION_SOURCE_UNSPECIFIED = 0;
+  // An ExpectedMachine primary declaration selected the interface.
+  BOOT_INTERFACE_SELECTION_SOURCE_EXPECTED_MACHINE = 1;
+  // An operator selected the interface through an administrative write.
+  BOOT_INTERFACE_SELECTION_SOURCE_OPERATOR = 2;
+  // Redfish UEFI PCI path ordering selected the interface.
+  BOOT_INTERFACE_SELECTION_SOURCE_REDFISH_UEFI_PCI = 3;
+  // Redfish chassis identifier ordering selected the interface.
+  BOOT_INTERFACE_SELECTION_SOURCE_REDFISH_CHASSIS_ID = 4;
+  // Redfish DPU serial number ordering selected the interface.
+  BOOT_INTERFACE_SELECTION_SOURCE_REDFISH_SERIAL_NUMBER = 5;
+  // Host PCI data in a Scout report selected the interface.
+  BOOT_INTERFACE_SELECTION_SOURCE_SCOUT_REPORT_PCI = 6;
+  // Explicit persisted value for selections that predate source tracking or
+  // whose current source cannot be recovered.
+  BOOT_INTERFACE_SELECTION_SOURCE_LEGACY_UNKNOWN = 7;
+}
+
 message GetMachineBootInterfacesResponse {
   option (carbide.codegen.v1.message_derive) = "serde::Serialize";
   // The desired boot-interface generation, its latest persisted observation,
@@ -10028,6 +10182,14 @@ message GetMachineBootInterfacesResponse {
     optional string reconciling_version = 8;
     // Persisted terminal boot-reconciliation failure, when one exists.
     optional string failure = 9;
+    // Mechanism or authority that selected the current desired target. When
+    // omitted, the proto3 zero value `UNSPECIFIED` means the server reported no
+    // source; that wire sentinel is distinct from persisted `LEGACY_UNKNOWN`.
+    BootInterfaceSelectionSource selection_source = 10;
+    // Time the current target and source decision was established. Adding a
+    // Redfish interface ID for the same MAC preserves it. Absent for legacy
+    // rows whose selection history predates source tracking.
+    google.protobuf.Timestamp selection_updated_at = 11;
   }
 
   common.MachineId machine_id = 1;

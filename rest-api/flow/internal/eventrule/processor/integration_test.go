@@ -55,7 +55,7 @@ func TestProcessorPreparationIntegration(t *testing.T) {
 
 	prepared, err := processor.prepare(ctx, envelope)
 	require.NoError(t, err)
-	require.Equal(t, rackID, prepared.Enriched.ResolvedResource.RackID)
+	require.Equal(t, rackID, prepared.Resource.RackID)
 	require.Equal(t, builtIn.ID, prepared.Rule.ID)
 
 	require.NoError(t, ruleManager.SetEnabled(ctx, rackRule.ID, true))
@@ -94,7 +94,7 @@ func processorCreate(eventType eventrule.Type, name string) eventrule.RuleCreate
 		Metadata:  eventrule.RuleMetadata{Name: name},
 		EventType: eventType,
 		Policy: eventrule.Policy{Actions: []eventrule.Action{
-			eventrule.NewAction("noop", eventrule.ActionCondition{}, eventrule.Noop{}),
+			{Name: "noop", Spec: &eventrule.Noop{}},
 		}},
 	}
 }
@@ -111,7 +111,7 @@ func processorRule(
 		Enabled:   true,
 		EventType: eventType,
 		Policy: eventrule.Policy{Actions: []eventrule.Action{
-			eventrule.NewAction("noop", eventrule.ActionCondition{}, eventrule.Noop{}),
+			{Name: "noop", Spec: &eventrule.Noop{}},
 		}},
 	}
 }

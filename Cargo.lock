@@ -1371,6 +1371,7 @@ dependencies = [
  "bmc-vendor",
  "carbide-api-core",
  "carbide-api-db",
+ "carbide-api-model",
  "carbide-api-test-helper",
  "carbide-kms-provider",
  "carbide-machine-a-tron",
@@ -2451,6 +2452,7 @@ dependencies = [
  "figment",
  "futures",
  "lazy_static",
+ "logfmt",
  "mac_address",
  "metrics-endpoint",
  "rand 0.10.1",
@@ -2714,6 +2716,7 @@ dependencies = [
  "carbide-api-model",
  "carbide-credential-rotation",
  "carbide-health-metrics",
+ "carbide-health-report",
  "carbide-rack",
  "carbide-redfish",
  "carbide-secrets",
@@ -2868,6 +2871,7 @@ dependencies = [
  "carbide-api-db",
  "carbide-api-model",
  "carbide-health-metrics",
+ "carbide-health-report",
  "carbide-instrument",
  "carbide-rack",
  "carbide-secrets",
@@ -3319,6 +3323,7 @@ dependencies = [
  "carbide-api-model",
  "carbide-credential-rotation",
  "carbide-health-metrics",
+ "carbide-health-report",
  "carbide-instrument",
  "carbide-redfish",
  "carbide-secrets",
@@ -7980,6 +7985,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "tokio",
+ "urlencoding",
 ]
 
 [[package]]

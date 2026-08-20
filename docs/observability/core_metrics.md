@@ -106,6 +106,8 @@ This file contains a list of metrics exported by NVIDIA Infra Controller (NICo).
 <tr><td>carbide_gpus_total_count</td><td>gauge</td><td>Number of GPUs in the NICo deployment</td></tr>
 <tr><td>carbide_gpus_usable_count</td><td>gauge</td><td>Number of remaining GPUs in the NICo deployment available for immediate instance creation</td></tr>
 <tr><td>carbide_health_otlp_export_failures_total</td><td>counter</td><td>Number of OTLP export batches dropped after a send failure, by signal and gRPC status code.</td></tr>
+<tr><td>carbide_health_otlp_queue_depth</td><td>gauge</td><td>Number of entries waiting in an OTLP queue, by target and signal.</td></tr>
+<tr><td>carbide_health_otlp_queue_dropped_total</td><td>counter</td><td>Number of OTLP queue entries dropped because a per-target queue reached capacity, by target and signal.</td></tr>
 <tr><td>carbide_health_redfish_sse_event_record_resolution_failures_total</td><td>counter</td><td>Number of Redfish SSE event records dropped after a referenced record could not be resolved, by failure reason.</td></tr>
 <tr><td>carbide_health_report_submissions_total</td><td>counter</td><td>Number of health report submissions to the NICo API, by report target and outcome.</td></tr>
 <tr><td>carbide_host_reprovision_retries_total</td><td>counter</td><td>Number of times a failed host firmware upgrade was retried during host reprovisioning</td></tr>
@@ -247,6 +249,7 @@ This file contains a list of metrics exported by NVIDIA Infra Controller (NICo).
 <tr><td>carbide_site_explorer_bmc_reset_attempts_total</td><td>counter</td><td>Number of Site Explorer BMC reset attempts, by method and status.</td></tr>
 <tr><td>carbide_site_explorer_bmc_reset_count</td><td>gauge</td><td>Number of successful BMC resets in the last SiteExplorer run</td></tr>
 <tr><td>carbide_site_explorer_bmc_reset_timestamp_persistence_failures_total</td><td>counter</td><td>Number of Site Explorer BMC reset timestamp persistence failures, by method.</td></tr>
+<tr><td>carbide_site_explorer_boot_interface_selections_total</td><td>counter</td><td>Number of successful Site Explorer boot interface selections for hosts with more than one explored DPU and effective DPU policy Manage, by selection mechanism.</td></tr>
 <tr><td>carbide_site_explorer_create_machines</td><td>gauge</td><td>Whether site-explorer machine creation is enabled (1) or disabled (0)</td></tr>
 <tr><td>carbide_site_explorer_create_machines_latency_milliseconds</td><td>histogram</td><td>The time it took to perform create_machines inside site-explorer</td></tr>
 <tr><td>carbide_site_explorer_created_machines_count</td><td>gauge</td><td>Number of machine pairs created by Site Explorer after identification</td></tr>
