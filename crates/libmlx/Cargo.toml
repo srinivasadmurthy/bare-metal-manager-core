@@ -95,8 +95,8 @@ carbide-test-support = { path = "../test-support" }
 russh = { workspace = true }
 
 [features]
-#default = ["mockdpa"]
-default = []
+default = ["mockdpa"]
+#default = []
 mockdpa = []
 
 [lints.clippy]

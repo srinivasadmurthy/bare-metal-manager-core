@@ -83,8 +83,8 @@ carbide-test-support = { path = "../test-support" }
 carbide-version = { path = "../version" }
 
 [features]
-default = []
-#default = ["mockdpa"]
+#default = []
+default = ["mockdpa"]
 mockdpa = []
 
 [lints]

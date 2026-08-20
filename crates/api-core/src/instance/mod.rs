@@ -2286,9 +2286,11 @@ pub(crate) async fn validate_spx_partition_ownership(
 pub(crate) fn sort_spx_by_slot(
     spx_hw_info_vec: &[DpaInterface],
 ) -> HashMap<String, Vec<DpaInterface>> {
+    println!("sort_spx_by_slot before sort: {:#?}", spx_hw_info_vec);
     let mut spx_hw_map = HashMap::new();
     let mut sorted_spx_hw_info_vec = spx_hw_info_vec.to_owned();
     sorted_spx_hw_info_vec.sort_by(|a, b| a.pci_name.cmp(&b.pci_name));
+    println!("sort_spx_by_slot after sort: {:#?}", sorted_spx_hw_info_vec);
 
     for spx in sorted_spx_hw_info_vec {
         if let Some(device) = &spx.device_description.clone() {

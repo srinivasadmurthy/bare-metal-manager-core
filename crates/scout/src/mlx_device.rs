@@ -47,7 +47,7 @@ use crate::metrics::{
     ScoutMlxConfigOperationFailed, ScoutMlxConfigRegistryLookupFailed,
     ScoutMlxDeviceOperationFailed, ScoutMlxFirmwareFlashFailed,
     ScoutMlxFirmwareFlasherInitializationFailed, ScoutMlxOperationFailed,
-    ScoutMlxProfileApplyFailed, ScoutMlxProfileOperationFailed, ScoutMlxProfileResetFailed,
+    ScoutMlxProfileOperationFailed,
     ScoutMlxRegistryLookupFailed, ScoutMlxRequestRejected,
 };
 

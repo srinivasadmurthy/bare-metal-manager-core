@@ -209,7 +209,11 @@ pub(super) enum ScoutMlxOperation {
     ReconciliationUnlock,
     ProfileSync,
     ProfileCompare,
+    // Only constructed by the real-hardware `apply_profile`
+    // (`#[cfg(not(feature = "mockdpa"))]`); unused in the default `mockdpa` build.
+    #[cfg_attr(feature = "mockdpa", allow(dead_code))]
     ProfileApply,
+    #[cfg_attr(feature = "mockdpa", allow(dead_code))]
     ProfileReset,
     LockdownLock,
     LockdownUnlock,
@@ -829,6 +833,7 @@ pub(super) struct ScoutMlxProfileResetFailed {
 }
 
 impl ScoutMlxProfileResetFailed {
+    #[cfg_attr(feature = "mockdpa", allow(dead_code))]
     pub(super) fn execute(device: String, error: String) -> Self {
         let failure_stage = ScoutMlxFailureStage::Execute;
         Self {
@@ -862,6 +867,7 @@ pub(super) struct ScoutMlxProfileApplyFailed {
 }
 
 impl ScoutMlxProfileApplyFailed {
+    #[cfg_attr(feature = "mockdpa", allow(dead_code))]
     pub(super) fn execute(device: String, profile: String, error: String) -> Self {
         let failure_stage = ScoutMlxFailureStage::Execute;
         Self {
