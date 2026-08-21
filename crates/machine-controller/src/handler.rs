@@ -2079,18 +2079,18 @@ impl MachineStateHandler {
             .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
             .await?;
         redfish_client
-            .set_nic_east_west_control_enabled(nic_index, true)
+            .set_spx_nic_east_west_control_enabled(nic_index, true)
             .await
-            .map_err(|e| redfish_error("set_nic_east_west_control_enabled", e))?;
+            .map_err(|e| redfish_error("set_spx_nic_east_west_control_enabled", e))?;
 
         // We have successfully enabled EastWestControlEnabled on this card. Get its
         // mac address, and then add an entry for this NIC in the dpa_interface table.
         // Note that this entry will be added with the predicted host id, and when we
         // change the predicted host machine id to an actual machine id, we will have
         // to fix up the dpa_interfaces table.
-        let mac_address = redfish_client.get_nic_mac_address(nic_index)
+        let mac_address = redfish_client.get_spx_nic_mac_address(nic_index)
             .await
-            .map_err(|e| redfish_error("get_nic_mac_address", e))?;
+            .map_err(|e| redfish_error("get_spx_nic_mac_address", e))?;
         let mut txn = ctx.services.db_pool.begin().await?;
         db::dpa_interface::ensure(DpaInterface::new(mac_address), &mut txn).await?;
         txn.commit().await?;
