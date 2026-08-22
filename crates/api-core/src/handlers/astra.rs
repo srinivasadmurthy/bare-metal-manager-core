@@ -51,7 +51,9 @@ pub(super) async fn get_astra_config(
     snapshot: &ManagedHostStateSnapshot,
 ) -> Result<Option<AstraConfig>, Status> {
     if !api.runtime_config.is_dpa_enabled() || !api.runtime_config.is_astra_enabled() {
-        tracing::debug!("DPA is not enabled or Astra is not enabled, skipping Astra config retrieval");
+        tracing::debug!(
+            "DPA is not enabled or Astra is not enabled, skipping Astra config retrieval"
+        );
         return Ok(None);
     }
 
@@ -199,7 +201,9 @@ pub(super) async fn process_astra_config_status(
     astra_config_status: &AstraConfigStatus,
 ) -> Result<(), Status> {
     if !api.runtime_config.is_dpa_enabled() || !api.runtime_config.is_astra_enabled() {
-        tracing::info!("DPA is not enabled or Astra is not enabled, skipping Astra config status processing");
+        tracing::info!(
+            "DPA is not enabled or Astra is not enabled, skipping Astra config status processing"
+        );
         return Ok(());
     }
 

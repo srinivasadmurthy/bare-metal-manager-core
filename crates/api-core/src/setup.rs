@@ -1758,7 +1758,9 @@ async fn initialize_and_start_controllers<'a>(
         let subnet_mask = carbide_config.get_dpa_subnet_mask()?;
 
         if !carbide_config.is_svpc_enabled() && !carbide_config.is_astra_enabled() {
-            tracing::info!("DPA is enabled but neither SVPC nor Astra is enabled. Skipping DPA setup.");
+            tracing::info!(
+                "DPA is enabled but neither SVPC nor Astra is enabled. Skipping DPA setup."
+            );
         }
 
         let mut info: DpaInfo = DpaInfo {
@@ -1791,7 +1793,11 @@ async fn initialize_and_start_controllers<'a>(
             )
             .start(join_set, cancel_token.clone())?;
 
-            tracing::info!("DPA monitor started for SVPC or Astra with subnet_ip: {:?}, subnet_mask: {:?}", subnet_ip, subnet_mask);
+            tracing::info!(
+                "DPA monitor started for SVPC or Astra with subnet_ip: {:?}, subnet_mask: {:?}",
+                subnet_ip,
+                subnet_mask
+            );
         }
     }
 

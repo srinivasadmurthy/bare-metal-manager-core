@@ -51,10 +51,10 @@ use health_report::{
 };
 use itertools::Itertools;
 use libredfish::model::oem::nvidia_dpu::HostPrivilegeLevel;
-use mac_address::MacAddress;
 use libredfish::model::task::TaskState;
 use libredfish::model::update_service::TransferProtocolType;
 use libredfish::{Boot, EnabledDisabled, Redfish, RedfishError, SystemPowerControl};
+use mac_address::MacAddress;
 use machine_validation::{handle_machine_validation_requested, handle_machine_validation_state};
 use measured_boot::records::MeasurementMachineState;
 use model::DpuModel;
@@ -76,18 +76,18 @@ use model::machine::nvlink::nvlink_config_synced;
 use model::machine::{
     AttestationMode, BomValidating, BomValidatingContext, CleanupContext, CleanupState,
     ConfigureAstraState, CreateBossVolumeContext, CreateBossVolumeState, DpuDiscoveringState,
-    DpuInitNextStateResolver, DpuInitState, FactoryResetBmcState, FailureCause, FailureDetails,
-    FailureSource, HostPlatformConfigurationState, HostReprovisionState, InitialResetPhase,
-    InstallDpuOsState, InstanceNextStateResolver, InstanceState, LockdownInfo, LockdownState,
-    MAX_FIRMWARE_UPGRADE_RETRIES, Machine, MachineLastRebootRequested,
-    MachineLastRebootRequestedMode, MachineNextStateResolver, MachineState,
-    MachineValidationContext, ManagedHostState, ManagedHostStateSnapshot, MeasuringState,
-    NetworkConfigUpdateState, NextStateBFBSupport, PerformPowerOperation, PowerDrainState,
-    PowerState, ReadyBootConfigState, ReadyBootConfigTerminalFailure, ReprovisionState, RetryInfo,
-    SecureEraseBossContext, SecureEraseBossState, SetBootOrderInfo, SetBootOrderState,
-    SetSecureBootState, SpdmMeasuringState, StateMachineArea, UefiSetupInfo, UefiSetupState,
-    UnlockHostState, ValidationState, dpf_based_dpu_provisioning_possible, get_display_ids,
-    DpuDiscoveringStates,
+    DpuDiscoveringStates, DpuInitNextStateResolver, DpuInitState, FactoryResetBmcState,
+    FailureCause, FailureDetails, FailureSource, HostPlatformConfigurationState,
+    HostReprovisionState, InitialResetPhase, InstallDpuOsState, InstanceNextStateResolver,
+    InstanceState, LockdownInfo, LockdownState, MAX_FIRMWARE_UPGRADE_RETRIES, Machine,
+    MachineLastRebootRequested, MachineLastRebootRequestedMode, MachineNextStateResolver,
+    MachineState, MachineValidationContext, ManagedHostState, ManagedHostStateSnapshot,
+    MeasuringState, NetworkConfigUpdateState, NextStateBFBSupport, PerformPowerOperation,
+    PowerDrainState, PowerState, ReadyBootConfigState, ReadyBootConfigTerminalFailure,
+    ReprovisionState, RetryInfo, SecureEraseBossContext, SecureEraseBossState, SetBootOrderInfo,
+    SetBootOrderState, SetSecureBootState, SpdmMeasuringState, StateMachineArea, UefiSetupInfo,
+    UefiSetupState, UnlockHostState, ValidationState, dpf_based_dpu_provisioning_possible,
+    get_display_ids,
 };
 use model::machine_boot_interface::MachineBootInterfaceTarget;
 use model::power_manager::PowerHandlingOutcome;
@@ -835,7 +835,7 @@ impl MachineStateHandler {
             }
         }
 
-        match &mh_state { 
+        match &mh_state {
             ManagedHostState::ConfigureAstra {
                 configure_astra_state,
             } => {
@@ -901,12 +901,8 @@ impl MachineStateHandler {
                                 %power_state,
                                 "Host not yet On after Astra AC power cycle; powering on"
                             );
-                            handler_host_power_control(
-                                mh_snapshot,
-                                ctx,
-                                SystemPowerControl::On,
-                            )
-                            .await?;
+                            handler_host_power_control(mh_snapshot, ctx, SystemPowerControl::On)
+                                .await?;
                             return Ok(StateHandlerOutcome::wait(format!(
                                 "Waiting for host {} to power on after Astra AC power cycle",
                                 mh_snapshot.host_snapshot.id
@@ -2098,9 +2094,7 @@ impl MachineStateHandler {
                 missing: "spx_nic_mac_address",
             })?;
         let mac_address = MacAddress::from_str(&mac_address).map_err(|e| {
-            StateHandlerError::GenericError(eyre!(
-                "invalid SPX NIC MAC address {mac_address}: {e}"
-            ))
+            StateHandlerError::GenericError(eyre!("invalid SPX NIC MAC address {mac_address}: {e}"))
         })?;
 
         // Get the model and name of the NIC also, and we will use that information to create

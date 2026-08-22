@@ -50,7 +50,9 @@ pub(super) async fn process_scout_req(
     machine_id: MachineId,
 ) -> CarbideResult<fac::Action> {
     if !api.runtime_config.is_dpa_enabled() || !api.runtime_config.is_svpc_enabled() {
-        tracing::info!("DPA is not enabled or SVPC is not enabled, skipping SVPC process_scout_req");
+        tracing::info!(
+            "DPA is not enabled or SVPC is not enabled, skipping SVPC process_scout_req"
+        );
         return Ok(fac::Action::noop());
     }
 
@@ -508,7 +510,9 @@ pub(crate) async fn publish_mlx_device_report(
     let req = request.into_inner();
 
     if !api.runtime_config.is_dpa_enabled() || !api.runtime_config.is_svpc_enabled() {
-        tracing::info!("DPA is not enabled or SVPC is not enabled, skipping SVPC publish_mlx_device_report");
+        tracing::info!(
+            "DPA is not enabled or SVPC is not enabled, skipping SVPC publish_mlx_device_report"
+        );
         return Ok(Response::new(
             mlx_device_pb::PublishMlxDeviceReportResponse {},
         ));
@@ -665,7 +669,9 @@ pub(crate) async fn publish_mlx_observation_report(
     log_request_data(&request);
 
     if !api.runtime_config.is_dpa_enabled() || !api.runtime_config.is_svpc_enabled() {
-        tracing::info!("DPA is not enabled or SVPC is not enabled, skipping SVPC publish_mlx_observation_report");
+        tracing::info!(
+            "DPA is not enabled or SVPC is not enabled, skipping SVPC publish_mlx_observation_report"
+        );
         return Ok(Response::new(
             mlx_device_pb::PublishMlxObservationReportResponse {},
         ));

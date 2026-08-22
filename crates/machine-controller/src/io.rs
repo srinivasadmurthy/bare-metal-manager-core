@@ -26,10 +26,10 @@ use model::dpa_interface::DpaSearchConfig;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::slas::MachineSlaConfig;
 use model::machine::{
-    self, AttestationMode, DpuDiscoveringState, DpuInitState, HostHealthConfig,
-    MachineMaintenanceOperation, MachineValidatingState, ManagedHostState,
+    self, AttestationMode, ConfigureAstraState, DpuDiscoveringState, DpuInitState,
+    HostHealthConfig, MachineMaintenanceOperation, MachineValidatingState, ManagedHostState,
     ManagedHostStateSnapshot, MeasuringState, ReadyBootConfigState, SpdmMeasuringState,
-    ValidationState, ConfigureAstraState,
+    ValidationState,
 };
 use sqlx::PgConnection;
 use state_controller::io::StateControllerIO;
