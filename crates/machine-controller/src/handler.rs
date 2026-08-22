@@ -59,6 +59,7 @@ use machine_validation::{handle_machine_validation_requested, handle_machine_val
 use measured_boot::records::MeasurementMachineState;
 use model::DpuModel;
 use model::dpa_interface::{DpaInterfaceControllerState, DpaInterfaceType, NewDpaInterface};
+use model::expected_machine::ExpectedInterface;
 use model::firmware::{Firmware, FirmwareComponentType, FirmwareEntry};
 use model::instance::InstanceNetworkSyncStatus;
 use model::instance::config::network::{
@@ -2137,11 +2138,15 @@ impl MachineStateHandler {
         nic_index: u8,
         mh_snapshot: &ManagedHostStateSnapshot,
         ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
+        nic: &ExpectedInterface,
     ) -> Result<(), StateHandlerError> {
+        // Create the redfish client from the machine snapshot.
         let redfish_client = ctx
             .services
             .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
             .await?;
+
+        // Now enable EastWestControlEnabled on this card.
         redfish_client
             .set_spx_nic_east_west_control_enabled(nic_index, true)
             .await
@@ -2164,6 +2169,17 @@ impl MachineStateHandler {
             StateHandlerError::GenericError(eyre!("invalid SPX NIC MAC address {mac_address}: {e}"))
         })?;
 
+        let expected_mac_address = nic.mac_address;
+        // Does this mac address match the mac address in the passed in expected interface?
+        if mac_address != nic.mac_address {
+            tracing::error!(
+                "Actual MAC address {mac_address} does not match expected MAC address {expected_mac_address} for NIC {nic_index}"
+            );
+            return Err(StateHandlerError::GenericError(eyre!(
+                "mac address mismatch: expected {expected_mac_address}, got {mac_address}"
+            )));
+        }
+
         // Get the model and name of the NIC also, and we will use that information to create
         // the dpa_interface object.
         let nic_model_and_name = redfish_client
@@ -2175,8 +2191,10 @@ impl MachineStateHandler {
                 missing: "spx_nic_model_and_name",
             })?;
 
+        // Note that we are creating this dpa_interface object with a machine_id which is a predicted machine id.
+        // When we change the predicted machine id to an actual machine id, we will have to fix up the dpa_interfaces table.
         let mut txn = ctx.services.db_pool.begin().await?;
-        db::dpa_interface::ensure(
+        let mut dpa_interface = db::dpa_interface::ensure(
             NewDpaInterface {
                 machine_id: mh_snapshot.host_snapshot.id,
                 mac_address,
@@ -2188,6 +2206,13 @@ impl MachineStateHandler {
             &mut txn,
         )
         .await?;
+
+        dpa_interface.underlay_ip = nic.fixed_ip;
+
+        // Call the update_ip routine to update the underlay_ip address of this dpa object,
+        // obtaining the underlay ip from the fixed_ip field of the ExpectedInterface object.
+        db::dpa_interface::update_ip(dpa_interface, true, &mut txn).await?;
+
         txn.commit().await?;
         Ok(())
     }
@@ -2249,12 +2274,12 @@ impl MachineStateHandler {
         // The end point to explore is /redfish/v1/Chassis/CX_$i
 
         let mut enabled_any_cx9 = false;
-        for (nic_index, _nic) in host_nics
+        for (nic_index, nic) in host_nics
             .iter()
             .filter(|nic| nic.nic_type.as_deref() == Some("CX9"))
             .enumerate()
         {
-            self.enable_astra_nic(nic_index as u8, mh_snapshot, ctx)
+            self.enable_astra_nic(nic_index as u8, mh_snapshot, ctx, nic)
                 .await?;
             enabled_any_cx9 = true;
         }
