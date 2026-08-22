@@ -51,13 +51,14 @@ use health_report::{
 };
 use itertools::Itertools;
 use libredfish::model::oem::nvidia_dpu::HostPrivilegeLevel;
+use mac_address::MacAddress;
 use libredfish::model::task::TaskState;
 use libredfish::model::update_service::TransferProtocolType;
 use libredfish::{Boot, EnabledDisabled, Redfish, RedfishError, SystemPowerControl};
 use machine_validation::{handle_machine_validation_requested, handle_machine_validation_state};
 use measured_boot::records::MeasurementMachineState;
 use model::DpuModel;
-use model::dpa_interface::DpaInterfaceControllerState;
+use model::dpa_interface::{DpaInterfaceControllerState, DpaInterfaceType, NewDpaInterface};
 use model::firmware::{Firmware, FirmwareComponentType, FirmwareEntry};
 use model::instance::InstanceNetworkSyncStatus;
 use model::instance::config::network::{
@@ -2088,11 +2089,44 @@ impl MachineStateHandler {
         // Note that this entry will be added with the predicted host id, and when we
         // change the predicted host machine id to an actual machine id, we will have
         // to fix up the dpa_interfaces table.
-        let mac_address = redfish_client.get_spx_nic_mac_address(nic_index)
+        let mac_address = redfish_client
+            .get_spx_nic_mac_address(nic_index)
             .await
-            .map_err(|e| redfish_error("get_spx_nic_mac_address", e))?;
+            .map_err(|e| redfish_error("get_spx_nic_mac_address", e))?
+            .ok_or_else(|| StateHandlerError::MissingData {
+                object_id: mh_snapshot.host_snapshot.id.to_string(),
+                missing: "spx_nic_mac_address",
+            })?;
+        let mac_address = MacAddress::from_str(&mac_address).map_err(|e| {
+            StateHandlerError::GenericError(eyre!(
+                "invalid SPX NIC MAC address {mac_address}: {e}"
+            ))
+        })?;
+
+        // Get the model and name of the NIC also, and we will use that information to create
+        // the dpa_interface object.
+        let nic_model_and_name = redfish_client
+            .get_spx_nic_model_and_name(nic_index)
+            .await
+            .map_err(|e| redfish_error("get_spx_nic_model_and_name", e))?
+            .ok_or_else(|| StateHandlerError::MissingData {
+                object_id: mh_snapshot.host_snapshot.id.to_string(),
+                missing: "spx_nic_model_and_name",
+            })?;
+
         let mut txn = ctx.services.db_pool.begin().await?;
-        db::dpa_interface::ensure(DpaInterface::new(mac_address), &mut txn).await?;
+        db::dpa_interface::ensure(
+            NewDpaInterface {
+                machine_id: mh_snapshot.host_snapshot.id,
+                mac_address,
+                device_type: "Network Adapter Ethernet Interface".to_string(),
+                pci_name: nic_model_and_name.name,
+                device_description: Some(nic_model_and_name.model),
+                interface_type: DpaInterfaceType::Astra,
+            },
+            &mut txn,
+        )
+        .await?;
         txn.commit().await?;
         Ok(())
     }
