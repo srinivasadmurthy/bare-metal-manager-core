@@ -752,6 +752,19 @@ pub async fn update_bios_password_set_time(
     Ok(())
 }
 
+pub async fn clear_bios_password_set_time(
+    machine_id: &MachineId,
+    txn: &mut PgConnection,
+) -> Result<(), DatabaseError> {
+    let query = "UPDATE machines SET bios_password_set_time=NULL WHERE id=$1 RETURNING id";
+    sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .fetch_one(txn)
+        .await
+        .map(|_| ())
+        .map_err(|e| DatabaseError::query(query, e))
+}
+
 pub async fn update_discovery_time(
     machine_id: &MachineId,
     txn: &mut PgConnection,
@@ -2579,6 +2592,32 @@ pub async fn set_machine_maintenance_requested(
         .await
         .map_err(|e| DatabaseError::new("set_machine_maintenance_requested", e))?;
     Ok(())
+}
+
+pub async fn set_decommission_requested(
+    txn: &mut PgConnection,
+    machine_id: MachineId,
+) -> DatabaseResult<()> {
+    let query = "UPDATE machines SET decommission_requested = TRUE WHERE id = $1 RETURNING id";
+    sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .fetch_one(txn)
+        .await
+        .map(|_| ())
+        .map_err(|error| DatabaseError::new("set_decommission_requested", error))
+}
+
+pub async fn clear_decommission_requested(
+    txn: &mut PgConnection,
+    machine_id: MachineId,
+) -> DatabaseResult<()> {
+    let query = "UPDATE machines SET decommission_requested = FALSE WHERE id = $1 RETURNING id";
+    sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .fetch_one(txn)
+        .await
+        .map(|_| ())
+        .map_err(|error| DatabaseError::new("clear_decommission_requested", error))
 }
 
 pub async fn clear_machine_maintenance_requested(

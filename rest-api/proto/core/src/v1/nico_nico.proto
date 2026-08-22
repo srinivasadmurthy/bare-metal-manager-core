@@ -341,6 +341,9 @@ service Forge {
   // appropriate customer-facing workflow available or where those workflows fail.
   rpc AdminForceDeleteMachine(AdminForceDeleteMachineRequest) returns (AdminForceDeleteMachineResponse);
 
+  // Starts the managed host decommissioning workflow. The host must be Ready.
+  rpc DecommissionManagedHost(DecommissionManagedHostRequest) returns (DecommissionManagedHostResponse);
+
   // List existing resource pools and their stats
   rpc AdminListResourcePools(ListResourcePoolsRequest) returns (ResourcePools);
 
@@ -3567,10 +3570,9 @@ message InstanceInterfaceStatus {
   // and therefore the address is unknown.
   optional string mac_address = 2;
 
-  // The list of IP addresses that had been assigned to this interface,
-  // based on the requested subnet.
-  // IPv4 precedes IPv6 when both families are assigned.
-  // The list will be empty if interface configuration hasn't been completed
+  // The IP addresses reported for this interface, ordered IPv4 before IPv6.
+  // This list is independent from `prefixes` and is empty when no address is
+  // available.
   repeated string addresses = 3;
 
   // The explicitly configured gateways, in CIDR notation. There is at most one
@@ -3580,12 +3582,12 @@ message InstanceInterfaceStatus {
   // IPv6 when both gateways are explicitly configured.
   repeated string gateways = 4;
 
-  // The list of IP prefixes that have been assigned to this interface
-  // out of the requested subnet (where the prefix allocated to the interface
-  // may be a /30 in the case of FNN, or just a /32 in the case of ETV).
-  //
-  // There is one prefix for each entry in `addresses`, in the same
-  // IPv4-before-IPv6 order.
+  // The prefixes reported for this interface in CIDR notation, ordered IPv4
+  // before IPv6. Prefix lengths follow the selected network and allocation
+  // policy. This list is independent from `addresses`: SLAAC reports an IPv6
+  // prefix without a fixed host address. Consumers must match values by address
+  // family rather than list position. The list is empty when no prefix is
+  // available.
   repeated string prefixes = 5;
 
   optional string device = 6;
@@ -5008,6 +5010,24 @@ message AdminForceDeleteMachineRequest {
 
   // Allow force delete of machine with orphaned dpf crds
   bool allow_delete_with_orphaned_dpf_crds = 5;
+
+  // Delete Site Explorer and DHCP BMC suppressions for the host/DPU BMC MACs
+  // and underlay (OOB) interface MACs. Without this, rediscovery may stay
+  // suppressed after the machine rows are gone.
+  bool delete_bmc_suppressions = 6;
+
+  // Remove retained boot-interface pairs for the host/DPU BMC and interface
+  // MACs. By default, deleting interfaces keeps those pairs so a re-ingested
+  // machine can recover its boot target; set this when a clean rediscovery
+  // without prior boot-target memory is intended.
+  bool delete_retained_boot_interfaces = 7;
+}
+
+message DecommissionManagedHostRequest {
+  common.MachineId machine_id = 1;
+}
+
+message DecommissionManagedHostResponse {
 }
 
 // Response to AdminForceDeleteMachine call
@@ -5161,6 +5181,8 @@ message BMCMetaDataGetResponse {
   optional uint32 ssh_port = 6;
   optional uint32 ipmi_port = 7;
   optional string vendor = 8;
+  // SSH port for the managed system's serial console, not the manager CLI.
+  optional uint32 serial_console_ssh_port = 9;
 }
 
 message MachineCredentialsUpdateRequest {
@@ -5659,10 +5681,9 @@ message InstanceInterfaceStatusObservation {
   // and therefore the address is unknown.
   optional string mac_address = 3;
 
-  // The list of IP addresses that had been assigned to this interface,
-  // based on the requested subnet.
-  // IPv4 precedes IPv6 when both families are assigned.
-  // The list will be empty if interface configuration hasn't been completed
+  // The IP addresses reported for this interface, ordered IPv4 before IPv6.
+  // This list is independent from `prefixes` and is empty when no address is
+  // available.
   repeated string addresses = 4;
 
   // The explicitly configured gateways, in CIDR notation. There is at most one
@@ -5672,12 +5693,12 @@ message InstanceInterfaceStatusObservation {
   // IPv6 when both gateways are explicitly configured.
   repeated string gateways = 5;
 
-  // The list of IP prefixes that have been assigned to this interface
-  // out of the requested subnet (where the prefix allocated to the interface
-  // may be a /30 in the case of FNN, or just a /32 in the case of ETV).
-  //
-  // There is one prefix for each entry in `addresses`, in the same
-  // IPv4-before-IPv6 order.
+  // The prefixes reported for this interface in CIDR notation, ordered IPv4
+  // before IPv6. Prefix lengths follow the selected network and allocation
+  // policy. This list is independent from `addresses`: SLAAC reports an IPv6
+  // prefix without a fixed host address. Consumers must match values by address
+  // family rather than list position. The list is empty when no prefix is
+  // available.
   repeated string prefixes = 6;
 
   // The NSG details for the observed NSG of the interface

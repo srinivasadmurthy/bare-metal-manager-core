@@ -341,6 +341,7 @@ pub(super) async fn update_nvue(
     update_flavor: NvueUpdateFlavor<'_>,
     nc: &rpc::ManagedHostNetworkConfigResponse,
     hbn_device_names: HBNDeviceNames,
+    supplemental_config: Option<&str>,
 ) -> eyre::Result<bool> {
     let hbn_version = match update_flavor {
         NvueUpdateFlavor::StartupFile { .. } => hbn::read_version().await?,
@@ -654,6 +655,19 @@ pub(super) async fn update_nvue(
 
     // next_contents is a YAML-serialized NVUE config.
     let next_contents = nvue::build(conf)?;
+
+    // Merging before the write/push keeps the supplemental content part of the
+    // same atomic NVUE revision on both apply flavors. A blank file (empty or
+    // whitespace-only, hence the trim: a pre-created ConfigMap or a stray
+    // trailing newline) means "no patch" rather than failing reconciliation;
+    // a malformed one fails loudly instead of being silently dropped.
+    let next_contents = match supplemental_config.map(str::trim) {
+        Some(patch) if !patch.is_empty() => {
+            crate::supplemental_config::merge_into_nvue_yaml(&next_contents, patch)
+                .wrap_err("merging supplemental network config")?
+        }
+        _ => next_contents,
+    };
 
     match update_flavor {
         NvueUpdateFlavor::StartupFile {
@@ -1209,19 +1223,16 @@ pub(super) async fn interfaces(
                         version: nsg.version.clone(),
                     });
 
-            // A SLAAC interface retains its desired IPv6 prefix without a
-            // concrete host address. Status keeps address/prefix lists
-            // positionally aligned, so report that family only after an
-            // address is available.
-            let observed_ipv6 = iface
-                .ipv6_interface_config
-                .as_ref()
-                .filter(|ipv6| !ipv6.ip.is_empty());
-            let addresses =
-                build_dual_stack_list(iface.ip.clone(), observed_ipv6.map(|v6| v6.ip.clone()));
+            let addresses = build_dual_stack_list(
+                iface.ip.clone(),
+                iface.ipv6_interface_config.as_ref().map(|v6| v6.ip.clone()),
+            );
             let prefixes = build_dual_stack_list(
                 iface.interface_prefix.clone(),
-                observed_ipv6.map(|v6| v6.interface_prefix.clone()),
+                iface
+                    .ipv6_interface_config
+                    .as_ref()
+                    .map(|v6| v6.interface_prefix.clone()),
             );
             interfaces.push(rpc::InstanceInterfaceStatusObservation {
                 function_type: iface.function_type,
@@ -1999,6 +2010,7 @@ mod tests {
             update_flavor,
             &network_config,
             HBNDeviceNames::hbn_23(),
+            None,
         )
         .await?;
         assert!(
@@ -2049,6 +2061,7 @@ mod tests {
             update_flavor,
             &network_config,
             HBNDeviceNames::hbn_23(),
+            None,
         )
         .await?;
         assert!(
@@ -2099,6 +2112,7 @@ mod tests {
             update_flavor,
             &network_config,
             HBNDeviceNames::hbn_23(),
+            None,
         )
         .await?;
         assert!(
@@ -2158,6 +2172,7 @@ mod tests {
             update_flavor,
             &network_config,
             HBNDeviceNames::hbn_23(),
+            None,
         )
         .await?;
         assert!(
@@ -2197,6 +2212,7 @@ mod tests {
                 update_flavor,
                 &network_config,
                 HBNDeviceNames::hbn_23(),
+                None,
             )
             .await
             .unwrap_err()
@@ -2236,6 +2252,7 @@ mod tests {
             update_flavor,
             &network_config,
             HBNDeviceNames::hbn_23(),
+            None,
         )
         .await?;
         assert!(
@@ -2290,6 +2307,7 @@ mod tests {
             update_flavor,
             &network_config,
             HBNDeviceNames::hbn_23(),
+            None,
         )
         .await?;
         assert!(
@@ -2347,6 +2365,7 @@ mod tests {
             update_flavor,
             &network_config,
             HBNDeviceNames::hbn_23(),
+            None,
         )
         .await?;
         assert!(
@@ -2413,6 +2432,7 @@ mod tests {
             update_flavor,
             &network_config,
             HBNDeviceNames::hbn_23(),
+            None,
         )
         .await?;
         assert!(
@@ -2469,6 +2489,7 @@ mod tests {
             update_flavor,
             &network_config,
             HBNDeviceNames::hbn_23(),
+            None,
         )
         .await?;
         assert!(
@@ -3724,7 +3745,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(deprecated)]
-    async fn ipv6_status_projects_admin_and_tenant_slaac_differently() {
+    async fn ipv6_status_preserves_slaac_prefix_without_host_address() {
         for (
             scenario,
             use_admin_network,
@@ -3747,7 +3768,7 @@ mod tests {
                 "",
                 "2001:db8::/64",
                 vec![],
-                vec![],
+                vec!["2001:db8::/64"],
             ),
             (
                 "admin SLAAC prefix without a host address",

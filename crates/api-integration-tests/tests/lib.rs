@@ -278,6 +278,13 @@ async fn test_integration() -> eyre::Result<()> {
         r#"carbide_site_explorer_boot_interface_selections_total{mechanism="redfish_serial_number"}"#,
     )
     .await?;
+    // MaT exercises a host with multiple DPUs whose lowest Scout PCI slot
+    // matches its stored boot interface.
+    metrics::wait_for_metric_line(
+        &test_env.carbide_metrics_addrs,
+        r#"carbide_scout_pci_evaluations_total{result="agreement"}"#,
+    )
+    .await?;
 
     let metric_infos = metrics::collect_metric_infos(&test_env.carbide_metrics_addrs)?;
     assert!(
@@ -285,6 +292,12 @@ async fn test_integration() -> eyre::Result<()> {
             metric.name == "carbide_site_explorer_boot_interface_selections_total"
         }),
         "the multi-DPU integration paths must exercise boot-interface selection observability",
+    );
+    assert!(
+        metric_infos
+            .iter()
+            .any(|metric| metric.name == "carbide_scout_pci_evaluations_total"),
+        "the MaT Scout path must exercise PCI evaluation observability",
     );
     generate_core_metric_docs(&test_env.carbide_metrics_addrs);
 
@@ -1449,9 +1462,7 @@ where
         log_format: LogFormat::Compact,
         bmc_mock_port: 0, // unused, we're using dynamic ports on localhost
         bmc_mock_certs_dir: None,
-        interface: String::from("UNUSED"), // unused, we're using dynamic ports on localhost
         tui_enabled: false,
-        use_single_bmc_mock: false, // unused, we're constructing machines ourselves
         configure_carbide_bmc_proxy_host: None,
         persist_dir: None,
         cleanup_on_quit: false,
@@ -1472,7 +1483,7 @@ where
         mat_config,
         additional_api_urls,
         &test_env.root_dir,
-        Some(bmc_mock_registry.clone()),
+        bmc_mock_registry.clone(),
         TEST_MAC_POOL.clone(),
     )
     .await

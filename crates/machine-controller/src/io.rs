@@ -26,10 +26,10 @@ use model::dpa_interface::DpaSearchConfig;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::slas::MachineSlaConfig;
 use model::machine::{
-    self, AttestationMode, ConfigureAstraState, DpuDiscoveringState, DpuInitState,
-    HostHealthConfig, MachineMaintenanceOperation, MachineValidatingState, ManagedHostState,
-    ManagedHostStateSnapshot, MeasuringState, ReadyBootConfigState, SpdmMeasuringState,
-    ValidationState,
+    self, AttestationMode, ConfigureAstraState, DecommissioningState, DpuDiscoveringState,
+    DpuInitState, HostHealthConfig, MachineMaintenanceOperation, MachineValidatingState,
+    ManagedHostState, ManagedHostStateSnapshot, MeasuringState, ReadyBootConfigState,
+    SpdmMeasuringState, ValidationState,
 };
 use sqlx::PgConnection;
 use state_controller::io::StateControllerIO;
@@ -327,6 +327,39 @@ impl StateControllerIO for MachineStateControllerIO {
                 ("hostnotready", machine_state_name(machine_state))
             }
             ManagedHostState::Ready => ("ready", ""),
+            ManagedHostState::Decommissioning {
+                decommissioning_state,
+            } => match decommissioning_state {
+                DecommissioningState::SuppressingSiteExplorer => {
+                    ("decommissioning", "suppressingsiteexplorer")
+                }
+                DecommissioningState::DeconfiguringHost { .. } => {
+                    ("decommissioning", "deconfiguringhost")
+                }
+                DecommissioningState::DeconfiguringDpus { .. } => {
+                    ("decommissioning", "deconfiguringdpus")
+                }
+                DecommissioningState::SuppressingOobDhcp => {
+                    ("decommissioning", "suppressingoobdhcp")
+                }
+                DecommissioningState::PowerCyclingHost => ("decommissioning", "powercyclinghost"),
+                DecommissioningState::WaitingForOobDhcpAcknowledgement => {
+                    ("decommissioning", "waitingforoobdhcpacknowledgement")
+                }
+                DecommissioningState::SuppressingBmcDhcp => {
+                    ("decommissioning", "suppressingbmcdhcp")
+                }
+                DecommissioningState::FactoryResettingBmcs { .. } => {
+                    ("decommissioning", "factoryresettingbmcs")
+                }
+                DecommissioningState::WaitingForBmcDhcpAcknowledgement => {
+                    ("decommissioning", "waitingforbmcdhcpacknowledgement")
+                }
+                DecommissioningState::DeletingManagedCredentials => {
+                    ("decommissioning", "deletingmanagedcredentials")
+                }
+                DecommissioningState::Decommissioned => ("decommissioning", "decommissioned"),
+            },
             ManagedHostState::BootConfiguring {
                 boot_config_state, ..
             } => (
