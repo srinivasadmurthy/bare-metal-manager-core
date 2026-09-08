@@ -5,10 +5,11 @@ package dao
 
 import (
 	"fmt"
-	"time"
 
+	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 	dbmodel "github.com/NVIDIA/infra-controller/rest-api/flow/internal/db/model"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/eventrule"
+	eventrulecodec "github.com/NVIDIA/infra-controller/rest-api/flow/internal/eventrule/codec"
 )
 
 // EventActionExecutionTo converts a domain execution to a database model.
@@ -19,25 +20,27 @@ func EventActionExecutionTo(
 		return nil, err
 	}
 
-	var nextAttemptAt *time.Time
-	if !execution.NextAttemptAt.IsZero() {
-		next := execution.NextAttemptAt
-		nextAttemptAt = &next
+	plan, err := eventrulecodec.MarshalExecutionPlan(execution.Plan)
+	if err != nil {
+		return nil, fmt.Errorf("encode execution plan: %w", err)
 	}
+
 	return &dbmodel.EventActionExecution{
 		ID:             execution.ID,
 		EventID:        execution.EventID,
-		RuleID:         execution.RuleID,
-		ActionID:       execution.ActionID,
-		CorrelationKey: execution.CorrelationKey,
+		ActionName:     execution.ActionName,
+		ActionType:     string(execution.Plan.Type()),
+		Plan:           plan,
 		Status:         string(execution.Status),
-		Reason:         string(execution.Reason),
-		Observations:   execution.Observations,
+		Reason:         cutil.GetPtrIfNotZero(string(execution.Reason)),
 		Attempts:       execution.Attempts,
-		StatusMessage:  execution.StatusMessage,
+		ClaimToken:     cutil.GetPtrIfNotZero(execution.ClaimToken),
+		ClaimOwner:     cutil.GetPtrIfNotZero(execution.ClaimOwner),
+		ClaimExpiresAt: cutil.GetPtrIfNotZero(execution.ClaimExpiresAt),
+		StatusMessage:  cutil.GetPtrIfNotZero(execution.StatusMessage),
 		CreatedAt:      execution.CreatedAt,
 		UpdatedAt:      execution.UpdatedAt,
-		NextAttemptAt:  nextAttemptAt,
+		NextAttemptAt:  cutil.GetPtrIfNotZero(execution.NextAttemptAt),
 	}, nil
 }
 
@@ -49,33 +52,50 @@ func EventActionExecutionFrom(
 		return nil, nil
 	}
 
-	var nextAttemptAt time.Time
-	if persisted.NextAttemptAt != nil {
-		nextAttemptAt = *persisted.NextAttemptAt
+	plan, err := eventrulecodec.UnmarshalExecutionPlan(persisted.Plan)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: decode plan: %w",
+			eventrule.ErrInvalidPersistedExecution,
+			err,
+		)
 	}
+
+	if string(plan.Type()) != persisted.ActionType {
+		return nil, fmt.Errorf(
+			"%w: action type %q does not match plan type %q",
+			eventrule.ErrInvalidPersistedExecution,
+			persisted.ActionType,
+			plan.Type(),
+		)
+	}
+
 	execution := &eventrule.Execution{
 		ExecutionState: eventrule.ExecutionState{
 			ExecutionStatusDetails: eventrule.ExecutionStatusDetails{
 				Status:        eventrule.ExecutionStatus(persisted.Status),
-				Reason:        eventrule.ExecutionReason(persisted.Reason),
-				StatusMessage: persisted.StatusMessage,
+				Reason:        eventrule.ExecutionReason(cutil.GetValueOrZero(persisted.Reason)),
+				StatusMessage: cutil.GetValueOrZero(persisted.StatusMessage),
 			},
-			NextAttemptAt: nextAttemptAt,
+			NextAttemptAt: optionalTimeFromPersistence(persisted.NextAttemptAt),
 		},
-		ExecutionIdentity: eventrule.ExecutionIdentity{
-			EventID:        persisted.EventID,
-			RuleID:         persisted.RuleID,
-			ActionID:       persisted.ActionID,
-			CorrelationKey: persisted.CorrelationKey,
-		},
-		ID:           persisted.ID,
-		Observations: persisted.Observations,
-		Attempts:     persisted.Attempts,
-		CreatedAt:    persisted.CreatedAt,
-		UpdatedAt:    persisted.UpdatedAt,
+		ID:         persisted.ID,
+		EventID:    persisted.EventID,
+		ActionName: persisted.ActionName,
+		Plan:       plan,
+		Attempts:   persisted.Attempts,
+		ClaimToken: cutil.GetValueOrZero(persisted.ClaimToken),
+		ClaimOwner: cutil.GetValueOrZero(persisted.ClaimOwner),
+		ClaimExpiresAt: optionalTimeFromPersistence(
+			persisted.ClaimExpiresAt,
+		),
+		CreatedAt: timeFromPersistence(persisted.CreatedAt),
+		UpdatedAt: timeFromPersistence(persisted.UpdatedAt),
 	}
+
 	if err := execution.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %w", eventrule.ErrInvalidPersistedExecution, err)
 	}
+
 	return execution, nil
 }

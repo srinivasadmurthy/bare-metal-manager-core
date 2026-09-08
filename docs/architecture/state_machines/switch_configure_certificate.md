@@ -56,6 +56,8 @@ Job status values use `ConfigureSwitchCertificateState`: `Started`,
 
 ## Domain name (`domain_name`) and mTLS service selection
 
+### Switch state controller
+
 The switch state handler passes:
 
 - `domain_name = None` for both bring-up and maintenance reconfiguration.
@@ -65,22 +67,35 @@ The switch state handler passes:
   from `[switch_state_controller].switch_mtls_services` in site config. When
   omitted or empty, all four service values are used.
 
-NICo has two independent mTLS service lists:
+### Direct ComponentConfigureSwitchCertificate RPC
 
-| Setting | Workflow and target | Omitted or empty behavior |
-|---------|---------------------|---------------------------|
-| `[switch_state_controller].switch_mtls_services` | Per-switch certificate configuration for every switch handled by the switch state controller. | Uses all four service values. |
-| `[rack_state_controller].nmx_cluster_switch_mtls_services` | Rack certificate configuration on the primary switch before NMX cluster setup. | Uses `scale_up_fabric_manager` and `scale_up_fabric_telemetry_interface`. |
+`ComponentConfigureSwitchCertificate` uses the same
+`[switch_state_controller].switch_mtls_services` setting when the RPC runs
+directly because switch state-controller routing is disabled or
+`bypass_state_controller` is `true`. The direct path forwards the request's
+`domain_name` to Component Manager.
 
-A non-empty list replaces the corresponding default. Omission or an empty list
-uses the default.
+When switch state-controller routing is enabled and
+`bypass_state_controller` is `false`, the RPC queues a
+`ReconfigureCertificate` maintenance operation. The switch state handler then
+uses the state-controller behavior described above.
 
-| Service value | Binding target |
-|---------------|----------------|
-| `nvue_api` | NVUE REST API |
-| `scale_up_fabric_telemetry` | NMX-T cluster application (`nmx-telemetry`) |
-| `scale_up_fabric_manager` | NMX-C cluster application (`nmx-controller`) |
-| `scale_up_fabric_telemetry_interface` | NVOS gNMI server mTLS configuration |
+### Service list configuration
+
+`[switch_state_controller].switch_mtls_services` controls certificate bindings
+for both switch state-controller and direct RPC operations. A non-empty list
+replaces the default. Omission or an empty list uses all four values below.
+
+`[rack_state_controller].nmx_cluster_switch_mtls_services` is deprecated. The
+field is accepted and ignored because rack maintenance does not configure
+switch certificates.
+
+| Service value | RMS service description |
+|---------------|-------------------------|
+| `nvue_api` | NVUE REST API service |
+| `scale_up_fabric_telemetry` | Scale-up fabric telemetry service |
+| `scale_up_fabric_manager` | Scale-up fabric manager service |
+| `scale_up_fabric_telemetry_interface` | Scale-up fabric telemetry interface service |
 
 Service selection requests certificate bindings; it does not enable the
 underlying service. The target switch build must support each selected binding.
@@ -90,7 +105,7 @@ underlying service. The target switch build must support each selected binding.
 | `rack_id` is `None` | Bring-up skips certificate configuration and advances to `RotateOsPassword`. Maintenance `ReconfigureCertificate` transitions to `Error`. |
 | Component manager not configured | Bring-up skips certificate configuration. Maintenance `ReconfigureCertificate` transitions to `Error`. |
 | `bmc_mac_address` is `None` | Transition to `Error`. |
-| Missing NVOS MAC/IP, vault credentials, or endpoint row | Transition to `Error` with a descriptive cause (no `0.0.0.0` placeholder). |
+| Missing NVOS MAC/IP, credentials, or endpoint row | Transition to `Error` with a descriptive cause (no `0.0.0.0` placeholder). |
 | CM returns error on `configure_switch_certificate` | `StateHandlerError`; remain in `Start` and retry on the next iteration. |
 | CM returns error on `get_configure_switch_certificate_job_status` | `StateHandlerError`; remain in `WaitForComplete` and retry on the next iteration. |
 | RMS job status is `Started` or `InProgress` | Wait; poll again on the next iteration. |
@@ -160,7 +175,7 @@ sequenceDiagram
     autonumber
     participant SCH as Switch State Handler<br/>(configuring.rs)
     participant DB as PostgreSQL
-    participant Vault as Credential Manager
+    participant Creds as Credential Manager
     participant CM as Component Manager
     participant RMS as RmsBackend
     participant RPC as RMS (librms)
@@ -168,7 +183,7 @@ sequenceDiagram
     Note over SCH: State = Configuring::<br/>ConfigureCertificate(Start)
 
     SCH->>DB: find machine interfaces for switch
-    SCH->>Vault: get SwitchNvosAdmin credentials
+    SCH->>Creds: get SwitchNvosAdmin credentials
     SCH->>CM: configure_switch_certificate(endpoint, domain_name=None, services)
 
     CM->>RMS: NvSwitchManager::configure_switch_certificate
@@ -297,7 +312,6 @@ single-switch, single-job certificate operation.
 | Shared certificate logic | `crates/switch-controller/src/certificate.rs` |
 | Bring-up handler | `crates/switch-controller/src/configuring.rs` |
 | Maintenance handler | `crates/switch-controller/src/maintenance.rs` |
-| Rack NMX cluster certificates | `crates/rack-controller/src/nmx_certificate.rs` |
 | CM facade | `crates/component-manager/src/component_manager.rs` |
 | CM trait | `crates/component-manager/src/nv_switch_manager.rs` |
 | RMS backend | `crates/component-manager/src/rms.rs` |

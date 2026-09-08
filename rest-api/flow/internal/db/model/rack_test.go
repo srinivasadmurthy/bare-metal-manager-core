@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/common/utils"
@@ -45,6 +46,7 @@ func (tr *testRack) modifyLocation(location map[string]any) *testRack {
 
 func TestRackBuildPatch(t *testing.T) {
 	rackID := uuid.New()
+	domainID := uuid.New()
 	now := time.Now()
 
 	shareRack := Rack{
@@ -55,6 +57,7 @@ func TestRackBuildPatch(t *testing.T) {
 		Description:  map[string]any{"type": "compute", "generation": "H100"},
 		Location:     map[string]any{"datacenter": "DC1", "row": "A", "position": 1},
 		Status:       RackStatusNew,
+		NVLDomainID:  domainID,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -226,4 +229,34 @@ func TestRackForceDelete_Idempotent(t *testing.T) {
 	phantom := &Rack{ID: uuid.New()}
 	err = phantom.ForceDelete(ctx, pool.DB)
 	assert.Nil(t, err)
+}
+
+func TestGetRacksByIDsIncludingDeleted(t *testing.T) {
+	ctx := context.Background()
+	if os.Getenv("DB_PORT") == "" {
+		t.Skip("Skipping integration test: no DB environment specified")
+	}
+
+	dbConf, err := cdb.ConfigFromEnv()
+	require.NoError(t, err)
+	pool, err := utils.UnitTestDB(ctx, t, dbConf)
+	require.NoError(t, err)
+
+	racks := []Rack{
+		{Name: "live-rack", Manufacturer: "TestMfg", SerialNumber: "live-rack-serial"},
+		{Name: "deleted-rack", Manufacturer: "TestMfg", SerialNumber: "deleted-rack-serial"},
+	}
+	for i := range racks {
+		require.NoError(t, racks[i].Create(ctx, pool.DB))
+	}
+	require.NoError(t, racks[1].Delete(ctx, pool.DB))
+
+	ids := []uuid.UUID{racks[0].ID, racks[1].ID}
+	liveOnly, err := GetRacksByIDs(ctx, pool.DB, ids, false)
+	require.NoError(t, err)
+	require.Len(t, liveOnly, 1)
+
+	includingDeleted, err := GetRacksByIDsIncludingDeleted(ctx, pool.DB, ids, false)
+	require.NoError(t, err)
+	require.Len(t, includingDeleted, 2)
 }

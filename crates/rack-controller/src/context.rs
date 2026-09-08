@@ -18,10 +18,10 @@
 use std::sync::Arc;
 
 use carbide_health_metrics::PerObjectMetricsRegistry;
-use carbide_rack::rms_client::SwitchSystemImageRmsClient;
 use carbide_rack_controller::config::RackConfig;
 use carbide_rack_controller::metrics::RackMetrics;
 use carbide_secrets::credentials::CredentialManager;
+use component_manager::NvosUpdateManager;
 use component_manager::component_manager::ComponentManager;
 use librms::RmsApi;
 use sqlx::PgPool;
@@ -42,14 +42,16 @@ pub struct RackStateHandlerServices {
     // field is introduced during refactoring. In original code it was
     // full CarbideConfig.
     pub site_config: Arc<RackConfig>,
-    /// Shared client for switch system image RPCs that are not yet exposed through
-    /// librms::RmsApi.
-    pub switch_system_image_rms_client: Option<Arc<dyn SwitchSystemImageRmsClient>>,
+
+    /// Backend-neutral rack NVOS update operations.
+    pub nvos_update_manager: Option<Arc<dyn NvosUpdateManager>>,
     pub credential_manager: Arc<dyn CredentialManager>,
     /// Component manager used for switch operations during rack maintenance.
     pub component_manager: Option<Arc<ComponentManager>>,
-    /// Switch mTLS services passed to RMS during NMX cluster certificate
-    /// configuration. Sourced from `[rack_state_controller].nmx_cluster_switch_mtls_services`.
+
+    /// Switch mTLS services sourced from
+    /// `[rack_state_controller].nmx_cluster_switch_mtls_services`. Unread:
+    /// rack maintenance does not configure switch certificates.
     pub nmx_cluster_switch_mtls_services: Vec<i32>,
 
     /// Fetches SOT firmware-object documents selected by rack profiles.

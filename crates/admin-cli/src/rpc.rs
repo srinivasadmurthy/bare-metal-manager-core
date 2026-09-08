@@ -638,6 +638,86 @@ impl ApiClient {
             .unwrap_or_default())
     }
 
+    pub(crate) async fn get_switch_health_history(
+        &self,
+        switch_id: SwitchId,
+    ) -> CarbideCliResult<Vec<rpc::HealthHistoryRecord>> {
+        let mut result = self
+            .0
+            .find_switch_health_histories(rpc::SwitchHealthHistoriesRequest {
+                switch_ids: vec![switch_id],
+                start_time: None,
+                end_time: None,
+            })
+            .await?;
+
+        Ok(result
+            .histories
+            .remove(&switch_id.to_string())
+            .map(|h| h.records)
+            .unwrap_or_default())
+    }
+
+    pub(crate) async fn get_power_shelf_health_history(
+        &self,
+        power_shelf_id: PowerShelfId,
+    ) -> CarbideCliResult<Vec<rpc::HealthHistoryRecord>> {
+        let mut result = self
+            .0
+            .find_power_shelf_health_histories(rpc::PowerShelfHealthHistoriesRequest {
+                power_shelf_ids: vec![power_shelf_id],
+                start_time: None,
+                end_time: None,
+            })
+            .await?;
+
+        Ok(result
+            .histories
+            .remove(&power_shelf_id.to_string())
+            .map(|h| h.records)
+            .unwrap_or_default())
+    }
+
+    pub(crate) async fn get_rack_health_history(
+        &self,
+        rack_id: RackId,
+    ) -> CarbideCliResult<Vec<rpc::HealthHistoryRecord>> {
+        let mut result = self
+            .0
+            .find_rack_health_histories(rpc::RackHealthHistoriesRequest {
+                rack_ids: vec![rack_id.clone()],
+                start_time: None,
+                end_time: None,
+            })
+            .await?;
+
+        Ok(result
+            .histories
+            .remove(&rack_id.to_string())
+            .map(|h| h.records)
+            .unwrap_or_default())
+    }
+
+    pub(crate) async fn get_machine_health_history(
+        &self,
+        machine_id: MachineId,
+    ) -> CarbideCliResult<Vec<rpc::HealthHistoryRecord>> {
+        let mut result = self
+            .0
+            .find_machine_health_histories(rpc::MachineHealthHistoriesRequest {
+                machine_ids: vec![machine_id],
+                start_time: None,
+                end_time: None,
+            })
+            .await?;
+
+        Ok(result
+            .histories
+            .remove(&machine_id.to_string())
+            .map(|h| h.records)
+            .unwrap_or_default())
+    }
+
     pub(crate) async fn get_segment_state_history(
         &self,
         segment_id: NetworkSegmentId,
@@ -1273,6 +1353,7 @@ impl ApiClient {
                 routing_profile_type: None,
                 routing_profile_overrides: None,
                 power_resource_group: None,
+                slaac_enabled: None,
                 tenant_organization_id: "devenv_test_org".to_string(),
                 tenant_keyset_id: None,
                 network_virtualization_type: Some(
@@ -1338,6 +1419,7 @@ impl ApiClient {
                 routing_profile_type: None,
                 routing_profile_overrides: None,
                 power_resource_group: None,
+                slaac_enabled: None,
                 tenant_organization_id: "devenv_test_org".to_string(),
                 tenant_keyset_id: None,
                 network_virtualization_type: Some(VpcVirtualizationType::Flat.into()),
@@ -1704,11 +1786,17 @@ impl ApiClient {
                     CarbideCliError::GenericError(format!("VPC {vpc_id} was not found"))
                 })?;
 
-            let VpcVirtualizationType::Flat = vpc.network_virtualization_type() else {
+            let network_virtualization_type = vpc
+                .config
+                .as_ref()
+                .and_then(|config| config.network_virtualization_type)
+                .and_then(|value| VpcVirtualizationType::try_from(value).ok())
+                .unwrap_or_default();
+            let VpcVirtualizationType::Flat = network_virtualization_type else {
                 return Err(CarbideCliError::GenericError(format!(
                     "VPC {} is not a flat VPC, is of type {}",
                     vpc_id,
-                    vpc.network_virtualization_type().as_str_name()
+                    network_virtualization_type.as_str_name()
                 )));
             };
 

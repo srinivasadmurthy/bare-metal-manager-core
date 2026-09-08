@@ -259,7 +259,7 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 
 	vpc7 := testVPCBuildVPC(t, dbSession, "test-vpc-7", ip, tn, st, cutil.GetPtr(cdbm.VpcEthernetVirtualizer), cutil.GetPtr(uuid.New()), nil, tnu, cdbm.VpcStatusReady)
 	// Set created earlier than the inventory receipt interval
-	_, err := dbSession.DB.Exec("UPDATE vpc SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)), vpc7.ID.String())
+	_, err := dbSession.DB.Exec("UPDATE vpc SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), vpc7.ID.String())
 	assert.NoError(t, err)
 
 	vpc8 := testVPCBuildVPC(t, dbSession, "test-vpc-8", ip, tn, st, cutil.GetPtr(cdbm.VpcEthernetVirtualizer), cutil.GetPtr(uuid.New()), nil, tnu, cdbm.VpcStatusReady)
@@ -270,13 +270,22 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 
 	vpc11 := testVPCBuildVPC(t, dbSession, "test-vpc-11", ip, tn, st, cutil.GetPtr(cdbm.VpcEthernetVirtualizer), cutil.GetPtr(uuid.New()), nil, tnu, cdbm.VpcStatusReady)
 	// Set created earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE vpc SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)), vpc11.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE vpc SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), vpc11.ID.String())
 	assert.NoError(t, err)
 
 	vpcDAO := cdbm.NewVpcDAO(dbSession)
 	vpc8, err = vpcDAO.Update(ctx, nil, cdbm.VpcUpdateInput{VpcID: vpc8.ID, Status: cutil.GetPtr(cdbm.VpcStatusError), IsMissingOnSite: cutil.GetPtr(true)})
 	assert.NoError(t, err)
-	vpc2, err = vpcDAO.Update(ctx, nil, cdbm.VpcUpdateInput{VpcID: vpc2.ID, RoutingProfile: cutil.GetPtr("EXTERNAL")})
+	vpc2, err = vpcDAO.Update(ctx, nil, cdbm.VpcUpdateInput{
+		VpcID:          vpc2.ID,
+		RoutingProfile: cutil.GetPtr("EXTERNAL"),
+		SlaacEnabled:   cutil.GetPtr(true),
+	})
+	assert.NoError(t, err)
+	vpc3, err = vpcDAO.Update(ctx, nil, cdbm.VpcUpdateInput{
+		VpcID:        vpc3.ID,
+		SlaacEnabled: cutil.GetPtr(true),
+	})
 	assert.NoError(t, err)
 	// Seed cached profile data so an inventory omission must actively clear it.
 	vpc2, err = vpcDAO.Update(ctx, nil, cdbm.VpcUpdateInput{
@@ -308,11 +317,15 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 	vpc14 := testVPCBuildVPC(t, dbSession, "test-vpc-14", ip, tn, st, nil, cutil.GetPtr(uuid.New()), nil, tnu, cdbm.VpcStatusReady)
 	vpc15 := testVPCBuildVPC(t, dbSession, "test-vpc-15", ip, tn, st, nil, cutil.GetPtr(uuid.New()), nil, tnu, cdbm.VpcStatusReady)
 	vpc16 := testVPCBuildVPC(t, dbSession, "test-vpc-16", ip, tn, st, nil, cutil.GetPtr(uuid.New()), nil, tnu, cdbm.VpcStatusReady)
+	reportedPowerResourceGroup := "reported-power-resource-group"
+	existingPowerResourceGroup := "existing-power-resource-group"
 
 	// Seed the replace and clear cases with the first NSG association.
 	vpc15, err = vpcDAO.Update(ctx, nil, cdbm.VpcUpdateInput{VpcID: vpc15.ID, NetworkSecurityGroupID: cutil.GetPtr(networkSecurityGroupA.ID)})
 	require.NoError(t, err)
 	vpc16, err = vpcDAO.Update(ctx, nil, cdbm.VpcUpdateInput{VpcID: vpc16.ID, NetworkSecurityGroupID: cutil.GetPtr(networkSecurityGroupA.ID)})
+	require.NoError(t, err)
+	vpc15, err = vpcDAO.Update(ctx, nil, cdbm.VpcUpdateInput{VpcID: vpc15.ID, PowerResourceGroup: &existingPowerResourceGroup})
 	require.NoError(t, err)
 
 	// Build VPC inventory that is paginated
@@ -331,7 +344,7 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 
 		vpc := testVPCBuildVPC(t, dbSession, fmt.Sprintf("test-vpc-paged-%d", i), ip, tn, st3, cutil.GetPtr(cdbm.VpcEthernetVirtualizer), cutil.GetPtr(uuid.New()), labels, tnu, cdbm.VpcStatusReady)
 		// Update creation timestamp to be earlier than inventory processing interval
-		_, err = dbSession.DB.Exec("UPDATE vpc SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval*2)), vpc.ID.String())
+		_, err = dbSession.DB.Exec("UPDATE vpc SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval*2)), vpc.ID.String())
 		assert.NoError(t, err)
 		pagedVpcs = append(pagedVpcs, vpc)
 		pagedInvIds = append(pagedInvIds, vpc.ControllerVpcID.String())
@@ -342,7 +355,9 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 		ctrlVpc := &corev1.Vpc{
 			Id:   &corev1.VpcId{Value: pagedVpcs[i].ControllerVpcID.String()},
 			Name: pagedVpcs[i].Name,
-			Vni:  util.GetUint32Ptr(uint32(i)),
+			Config: &corev1.VpcConfig{
+				Vni: util.GetUint32Ptr(uint32(i)),
+			},
 			Status: &corev1.VpcStatus{
 				Vni: util.GetUint32Ptr(uint32(i)),
 			},
@@ -415,7 +430,9 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 		routingProfileClearedVpcs         []*cdbm.Vpc
 		routingProfileStateUpdatedVpc     *cdbm.Vpc
 		routingProfileStateClearedVpc     *cdbm.Vpc
+		expectedSlaacEnabled              map[uuid.UUID]bool
 		expectedNetworkSecurityGroupIDs   map[uuid.UUID]*string
+		expectedPowerResourceGroups       map[uuid.UUID]*string
 		readyStatusDetailVpcs             []*cdbm.Vpc
 		requiredMetadataUpdate            bool
 		metadataVpcUpdate                 *cdbm.Vpc
@@ -463,6 +480,7 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 							Name: vpc1.ID.String(),
 							Config: &corev1.VpcConfig{
 								NetworkVirtualizationType: &nwvt,
+								SlaacEnabled:              cutil.GetPtr(true),
 								RoutingProfileType:        cutil.GetPtr("INTERNAL"),
 								RoutingProfileOverrides: &corev1.VpcRoutingProfileOverrides{
 									LeakDefaultRouteFromUnderlay: cutil.GetPtr(false),
@@ -486,6 +504,9 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 						{
 							Id:   &corev1.VpcId{Value: vpc3.ControllerVpcID.String()},
 							Name: vpc3.ID.String(),
+							Config: &corev1.VpcConfig{
+								SlaacEnabled: cutil.GetPtr(false),
+							},
 						},
 						{
 							Id:   &corev1.VpcId{Value: vpc4.ControllerVpcID.String()},
@@ -524,6 +545,7 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 							Name: vpc14.ID.String(),
 							Config: &corev1.VpcConfig{
 								NetworkSecurityGroupId: cutil.GetPtr(networkSecurityGroupA.ID),
+								PowerResourceGroup:     &reportedPowerResourceGroup,
 							},
 						},
 						{
@@ -548,9 +570,19 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 			routingProfileClearedVpcs:         []*cdbm.Vpc{vpc2},
 			routingProfileStateUpdatedVpc:     vpc1,
 			routingProfileStateClearedVpc:     vpc2,
+			expectedSlaacEnabled: map[uuid.UUID]bool{
+				vpc1.ID: true,
+				vpc2.ID: true,
+				vpc3.ID: false,
+			},
 			expectedNetworkSecurityGroupIDs: map[uuid.UUID]*string{
 				vpc14.ID: cutil.GetPtr(networkSecurityGroupA.ID),
 				vpc15.ID: cutil.GetPtr(networkSecurityGroupB.ID),
+				vpc16.ID: nil,
+			},
+			expectedPowerResourceGroups: map[uuid.UUID]*string{
+				vpc14.ID: &reportedPowerResourceGroup,
+				vpc15.ID: nil,
 				vpc16.ID: nil,
 			},
 			deletedVpcs:           []*cdbm.Vpc{vpc5, vpc6, vpc10},
@@ -673,6 +705,8 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 
 			mv.siteClientPool.IDClientMap[tt.args.siteID.String()] = tt.fields.clientPoolClient
 
+			cwu.TestInventoryAgeUpdatedTimestamp(tt.args.ctx, t, dbSession, (*cdbm.Vpc)(nil))
+
 			_, err := mv.UpdateVpcsInDB(tt.args.ctx, tt.args.siteID, tt.args.vpcInventory)
 			assert.Equal(t, tt.wantErr, err != nil)
 
@@ -713,6 +747,13 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 				assert.Equal(t, expectedNetworkSecurityGroupID, updatedVPC.NetworkSecurityGroupID)
 			}
 
+			// Site inventory sets, clears, or preserves nil power resource groups.
+			for vpcID, expectedPowerResourceGroup := range tt.expectedPowerResourceGroups {
+				updatedVPC, gerr := vpcDAO.GetByID(ctx, nil, vpcID, nil)
+				require.NoError(t, gerr)
+				assert.Equal(t, expectedPowerResourceGroup, updatedVPC.PowerResourceGroup)
+			}
+
 			// Check that VPC status was updated in DB for VPC1
 			if tt.updatedVpc != nil {
 				updatedVPC, _ := vpcDAO.GetByID(ctx, nil, tt.updatedVpc.ID, nil)
@@ -738,6 +779,12 @@ func TestManageVpc_UpdateVpcsInDB(t *testing.T) {
 			for _, vpc := range tt.routingProfileClearedVpcs {
 				clearedRoutingProfileVPC, _ := vpcDAO.GetByID(ctx, nil, vpc.ID, nil)
 				assert.Nil(t, clearedRoutingProfileVPC.RoutingProfile)
+			}
+
+			for vpcID, expectedSlaacEnabled := range tt.expectedSlaacEnabled {
+				updatedSlaacVpc, gerr := vpcDAO.GetByID(ctx, nil, vpcID, nil)
+				require.NoError(t, gerr)
+				assert.Equal(t, expectedSlaacEnabled, updatedSlaacVpc.SlaacEnabled)
 			}
 
 			// Controller-reported desired and effective profiles must be cached together.
@@ -850,6 +897,7 @@ func TestManageVpc_UpdateVpcsInDB_AutoCreatesAndRestores(t *testing.T) {
 		Config: &corev1.VpcConfig{
 			TenantOrganizationId:      tenantOrg,
 			NetworkVirtualizationType: &networkVirtualizationType,
+			SlaacEnabled:              cutil.GetPtr(true),
 			RoutingProfileType:        &routingProfile,
 			Vni:                       &requestedVni,
 		},
@@ -887,6 +935,7 @@ func TestManageVpc_UpdateVpcsInDB_AutoCreatesAndRestores(t *testing.T) {
 		assert.Equal(t, cdbm.Labels{"origin": "site"}, createdVpc.Labels)
 		require.NotNil(t, createdVpc.NetworkVirtualizationType)
 		assert.Equal(t, cdbm.VpcFNN, *createdVpc.NetworkVirtualizationType)
+		assert.True(t, createdVpc.SlaacEnabled)
 		require.NotNil(t, createdVpc.RoutingProfile)
 		assert.Equal(t, "INTERNAL", *createdVpc.RoutingProfile)
 		require.NotNil(t, createdVpc.Vni)
@@ -958,6 +1007,10 @@ func TestManageVpc_UpdateVpcsInDB_AutoCreatesAndRestores(t *testing.T) {
 		require.Len(t, deletedVpcs, 1)
 		require.NotNil(t, deletedVpcs[0].Deleted)
 
+		// The undelete is deferred while the delete is newer than the staleness threshold, so
+		// backdate it past that.
+		cwu.TestInventoryAgeDeletedTimestamp(ctx, t, dbSession, (*cdbm.Vpc)(nil), controllerVpcID)
+		cwu.TestInventoryAgeUpdatedTimestamp(ctx, t, dbSession, (*cdbm.Vpc)(nil))
 		_, err = manager.UpdateVpcsInDB(ctx, site.ID, inventory)
 		require.NoError(t, err)
 		restoredVpc, err := vpcDAO.GetByID(ctx, nil, controllerVpcID, nil)
@@ -965,6 +1018,7 @@ func TestManageVpc_UpdateVpcsInDB_AutoCreatesAndRestores(t *testing.T) {
 		assert.Nil(t, restoredVpc.Deleted)
 		assert.False(t, restoredVpc.IsMissingOnSite)
 		assert.Equal(t, cdbm.VpcStatusReady, restoredVpc.Status)
+		assert.True(t, restoredVpc.SlaacEnabled)
 		require.NotNil(t, restoredVpc.ControllerVpcID)
 		assert.Equal(t, controllerVpcID, *restoredVpc.ControllerVpcID)
 		require.NotNil(t, restoredVpc.Vni)
@@ -1280,7 +1334,7 @@ func Test_VpcMetrics_Delete_DeletingOnly(t *testing.T) {
 
 	site := util.TestSetupSite(t, dbSession)
 	reg := prometheus.NewRegistry()
-	lifecycleMetrics := NewManageVpcLifecycleMetrics(reg, dbSession)
+	lifecycleMetrics := NewManageVpcLifecycleMetrics(reg, dbSession, "nico_rest_workflow")
 	testVpcID := uuid.New()
 
 	// Set precise timestamps
@@ -1300,7 +1354,7 @@ func Test_VpcMetrics_Delete_DeletingOnly(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify metric was emitted with correct duration (200ms)
-	util.TestAssertMetricExistsTimes(t, reg, "cloud_workflow_vpc_operation_latency_seconds", 1, map[string]string{
+	util.TestAssertMetricExistsTimes(t, reg, "nico_rest_workflow_vpc_operation_latency_seconds", 1, map[string]string{
 		"operation_type": "delete",
 		"from_status":    cdbm.VpcStatusDeleting,
 		"to_status":      "Deleted",
@@ -1315,7 +1369,7 @@ func Test_VpcMetrics_Delete_MultipleDeleting(t *testing.T) {
 
 	site := util.TestSetupSite(t, dbSession)
 	reg := prometheus.NewRegistry()
-	lifecycleMetrics := NewManageVpcLifecycleMetrics(reg, dbSession)
+	lifecycleMetrics := NewManageVpcLifecycleMetrics(reg, dbSession, "nico_rest_workflow")
 	testVpcID := uuid.New()
 
 	// Set precise timestamps
@@ -1343,7 +1397,7 @@ func Test_VpcMetrics_Delete_MultipleDeleting(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify metric was emitted (should use first deleting timestamp, duration 300ms)
-	util.TestAssertMetricExistsTimes(t, reg, "cloud_workflow_vpc_operation_latency_seconds", 1, map[string]string{
+	util.TestAssertMetricExistsTimes(t, reg, "nico_rest_workflow_vpc_operation_latency_seconds", 1, map[string]string{
 		"operation_type": "delete",
 		"from_status":    cdbm.VpcStatusDeleting,
 		"to_status":      "Deleted",
@@ -1358,7 +1412,7 @@ func Test_VpcMetrics_Delete_NoDeleting(t *testing.T) {
 
 	site := util.TestSetupSite(t, dbSession)
 	reg := prometheus.NewRegistry()
-	lifecycleMetrics := NewManageVpcLifecycleMetrics(reg, dbSession)
+	lifecycleMetrics := NewManageVpcLifecycleMetrics(reg, dbSession, "nico_rest_workflow")
 	testVpcID := uuid.New()
 
 	// Set precise timestamps
@@ -1377,5 +1431,5 @@ func Test_VpcMetrics_Delete_NoDeleting(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify NO metric was emitted (no deleting status found)
-	util.TestAssertMetricExistsTimes(t, reg, "cloud_workflow_vpc_operation_latency_seconds", 0, nil, 0)
+	util.TestAssertMetricExistsTimes(t, reg, "nico_rest_workflow_vpc_operation_latency_seconds", 0, nil, 0)
 }

@@ -25,10 +25,12 @@ use async_trait::async_trait;
 
 use crate::crds::bfbs_generated::BFB;
 use crate::crds::bluefieldsoftwares_generated::BlueFieldSoftware;
+use crate::crds::dpfoperatorconfigs_generated::DPFOperatorConfig;
 use crate::crds::dpuclusters_generated::DPUCluster;
 use crate::crds::dpudeployments_generated::DPUDeployment;
 use crate::crds::dpudevices_generated::DPUDevice;
 use crate::crds::dpuflavors_generated::DPUFlavor;
+use crate::crds::dpuflavortemplates_generated::DPUFlavorTemplate;
 use crate::crds::dpunodemaintenances_generated::DPUNodeMaintenance;
 use crate::crds::dpunodes_generated::DPUNode;
 use crate::crds::dpus_generated::DPU;
@@ -81,6 +83,12 @@ pub trait DpuRepository: Send + Sync {
     ) -> Result<(), DpfError>;
     async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError>;
 
+    /// Delete a DPU only when its Kubernetes UID matches `uid`.
+    ///
+    /// The UID check must be part of the delete operation so a DPU recreated
+    /// under the same name cannot be deleted using an earlier observation.
+    async fn delete_if_uid(&self, name: &str, namespace: &str, uid: &str) -> Result<(), DpfError>;
+
     /// Watch for DPU changes and invoke the handler for each object.
     ///
     /// The returned future runs until the watch is cancelled. The handler's
@@ -106,6 +114,12 @@ pub trait DpuDeviceRepository: Send + Sync {
     async fn get(&self, name: &str, namespace: &str) -> Result<Option<DPUDevice>, DpfError>;
     async fn list(&self, namespace: &str) -> Result<Vec<DPUDevice>, DpfError>;
     async fn create(&self, device: &DPUDevice) -> Result<DPUDevice, DpfError>;
+    async fn patch(
+        &self,
+        name: &str,
+        namespace: &str,
+        patch: serde_json::Value,
+    ) -> Result<(), DpfError>;
     async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError>;
 }
 
@@ -145,6 +159,14 @@ pub trait DpuNodeMaintenanceRepository: Send + Sync {
 pub trait DpuFlavorRepository: Send + Sync {
     async fn get(&self, name: &str, namespace: &str) -> Result<Option<DPUFlavor>, DpfError>;
     async fn create(&self, flavor: &DPUFlavor) -> Result<DPUFlavor, DpfError>;
+}
+
+/// Repository for DPUFlavorTemplate resources.
+#[async_trait]
+pub trait DpuFlavorTemplateRepository: Send + Sync {
+    async fn get(&self, name: &str, namespace: &str)
+    -> Result<Option<DPUFlavorTemplate>, DpfError>;
+    async fn create(&self, template: &DPUFlavorTemplate) -> Result<DPUFlavorTemplate, DpfError>;
 }
 
 /// Repository for DPUSet resources.
@@ -208,6 +230,14 @@ pub trait DpuServiceConfigurationRepository: Send + Sync {
 pub trait DpuServiceRepository: Send + Sync {
     async fn get(&self, name: &str, namespace: &str) -> Result<Option<DPUService>, DpfError>;
     async fn list(&self, namespace: &str) -> Result<Vec<DPUService>, DpfError>;
+    async fn create(&self, service: &DPUService) -> Result<DPUService, DpfError>;
+    async fn patch(
+        &self,
+        name: &str,
+        namespace: &str,
+        patch: serde_json::Value,
+    ) -> Result<(), DpfError>;
+    async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError>;
 }
 
 /// Repository for DPUServiceNAD resources.
@@ -245,6 +275,17 @@ pub trait K8sConfigRepository: Send + Sync {
         name: &str,
         namespace: &str,
     ) -> Result<Option<BTreeMap<String, String>>, DpfError>;
+    /// Create a ConfigMap, reporting `false` when one already exists.
+    ///
+    /// Distinct from `apply_configmap`, which force-applies and would overwrite
+    /// content the object already holds.
+    async fn create_configmap(
+        &self,
+        name: &str,
+        namespace: &str,
+        data: BTreeMap<String, String>,
+    ) -> Result<bool, DpfError>;
+
     async fn apply_configmap(
         &self,
         name: &str,
@@ -271,6 +312,9 @@ pub trait K8sConfigRepository: Send + Sync {
 /// Repository for DPFOperatorConfig resources.
 #[async_trait]
 pub trait DpfOperatorConfigRepository: Send + Sync {
+    async fn get(&self, name: &str, namespace: &str)
+    -> Result<Option<DPFOperatorConfig>, DpfError>;
+
     async fn patch(
         &self,
         name: &str,
@@ -291,6 +335,7 @@ pub trait DpfRepository:
     + DpuNodeRepository
     + DpuNodeMaintenanceRepository
     + DpuFlavorRepository
+    + DpuFlavorTemplateRepository
     + DpuSetRepository
     + DpuClusterRepository
     + DpuDeploymentRepository

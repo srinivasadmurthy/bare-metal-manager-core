@@ -23,14 +23,14 @@ use std::sync::Arc;
 use carbide_network::BaseMac;
 use carbide_utils::arch::CpuArchitecture;
 use carbide_utils::none_if_empty::NoneIfEmpty;
-use carbide_uuid::machine::{MachineId, MachineType};
+use carbide_uuid::machine::{DpuMachineId, MachineId, MachineType};
 use carbide_uuid::power_shelf::{PowerShelfId, PowerShelfIdSource, PowerShelfType};
 use carbide_uuid::switch::{SwitchId, SwitchIdSource, SwitchType};
 use chrono::{DateTime, Utc};
 use config_version::ConfigVersion;
 use itertools::Itertools;
-use lazy_static::lazy_static;
 use mac_address::MacAddress;
+#[cfg(test)]
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -41,7 +41,10 @@ use crate::errors::{ErrorCode, ErrorSubsystem, ModelError, ModelResult, Operator
 use crate::firmware::{Firmware, FirmwareComponentType};
 use crate::hardware_info::{DmiData, HardwareInfo, HardwareInfoError};
 use crate::machine::machine_id::{MissingHardwareInfo, from_hardware_info_with_type};
-use crate::machine_boot_interface::{MachineBootInterface, MachineBootInterfaceTarget};
+use crate::machine_boot_interface::{
+    BootInterfaceSelectionSource, MachineBootInterface, MachineBootInterfaceTarget,
+};
+use crate::pci::{UefiPciOrderingKey, UefiPciOrderingKeyParseError, normalize_uefi_device_path};
 use crate::power_shelf::power_shelf_id;
 use crate::switch::switch_id;
 
@@ -330,8 +333,8 @@ impl ExploredEndpoint {
 }
 
 impl EndpointExplorationReport {
-    /// The boot interface MAC for this endpoint's explored default -- the boot
-    /// interface site-explorer records before any machine owns the endpoint.
+    /// The boot interface selection for this endpoint's explored default -- the
+    /// selection Site Explorer records before any machine owns the endpoint.
     ///
     /// A declared `ExpectedInterface.primary` wins when this report has that NIC
     /// as a full pair -- its MAC present on a system ethernet interface with a
@@ -341,18 +344,21 @@ impl EndpointExplorationReport {
     /// whose id this report has not resolved yet falls back, alongside the
     /// no-declaration case, to the automatic pick: the lowest-PCI DPU host-PF
     /// interface.
-    pub fn fetch_host_primary_interface_mac(
+    pub fn select_host_primary_interface(
         &self,
         explored_dpus: &[ExploredDpu],
         declared_primary: Option<MacAddress>,
-    ) -> Option<MacAddress> {
+    ) -> Option<HostPrimaryInterfaceSelection> {
         // A declared primary wins as long as the report has it as a full pair
         // (`find_interface_id_for_mac` scans every system ethernet interface,
         // integrated NICs included).
         if let Some(declared) = declared_primary
             && self.find_interface_id_for_mac(declared).is_some()
         {
-            return Some(declared);
+            return Some(HostPrimaryInterfaceSelection {
+                mac_address: declared,
+                source: BootInterfaceSelectionSource::ExpectedMachine,
+            });
         }
 
         let system = self.systems.first()?;
@@ -378,40 +384,37 @@ impl EndpointExplorationReport {
             })
             .collect::<Vec<&EthernetInterface>>();
 
-        // If any of the interface does not contain pci path, return None.
-        if interfaces.iter().any(|x| x.uefi_device_path.is_none()) {
-            return None;
-        }
-
-        let Some(first) = interfaces.first() else {
-            // PCI path is missing from all interfaces, can't sort based on pci path.
-            return None;
-        };
-
-        let interface_with_min_pci = interfaces.iter().fold(first, |acc, x| {
-            // It can never be none as verified above.
-            if let (Some(pci_path), Some(existing_path)) =
-                (&x.uefi_device_path, &acc.uefi_device_path)
-            {
-                let path = &pci_path.0;
-                let existing_path = &existing_path.0;
-
-                if let Ok(res) =
-                    version_compare::compare_to(path, existing_path, version_compare::Cmp::Lt)
-                    && res
-                {
-                    return x;
-                }
-
-                return acc;
-            }
-
-            acc
-        });
+        let interfaces = interfaces
+            .into_iter()
+            .map(|interface| {
+                let ordering_key = interface.uefi_device_path.as_ref()?.ordering_key().ok()?;
+                Some((interface, ordering_key))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let (interface_with_min_pci, _) = interfaces
+            .into_iter()
+            .min_by(|(_, left), (_, right)| left.cmp(right))?;
 
         // If we know the bootable interface name, find the MAC address associated with it.
-        interface_with_min_pci.mac_address
+        interface_with_min_pci
+            .mac_address
+            .map(|mac_address| HostPrimaryInterfaceSelection {
+                mac_address,
+                source: BootInterfaceSelectionSource::RedfishUefiPci,
+            })
     }
+}
+
+/// A host primary interface decision made from one Site Explorer report.
+///
+/// Keeping the selected MAC beside the exact input that selected it prevents a
+/// later fallback or target resolution step from recording the wrong source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostPrimaryInterfaceSelection {
+    /// MAC address selected as the host's primary boot interface.
+    pub mac_address: MacAddress,
+    /// Exact mechanism that selected `mac_address`.
+    pub source: BootInterfaceSelectionSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -586,14 +589,19 @@ pub struct ExploredDpu {
     /// The MAC address that is visible to the host (provided by the DPU)
     #[serde(with = "serialize_option_display", default)]
     pub host_pf_mac_address: Option<MacAddress>,
+    /// The trimmed, nonblank host BMC `Chassis.id` associated with this DPU's
+    /// serial number. Conflicting IDs leave this unset so Site Explorer can
+    /// fall back to ordering by DPU serial number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_chassis_id: Option<String>,
 
     #[serde(skip)]
     pub report: Arc<EndpointExplorationReport>,
 }
 
 impl ExploredDpu {
-    pub fn machine_id_if_valid_report(&self) -> ModelResult<&MachineId> {
-        let Some(machine_id) = self.report.machine_id.as_ref() else {
+    pub fn machine_id_if_valid_report(&self) -> ModelResult<DpuMachineId> {
+        let Some(machine_id) = self.report.machine_id else {
             return Err(ModelError::MissingArgument("Missing Machine ID"));
         };
 
@@ -609,7 +617,7 @@ impl ExploredDpu {
             return Err(ModelError::MissingArgument("Missing Service Info"));
         }
 
-        Ok(machine_id)
+        Ok(machine_id.try_into()?)
     }
 
     pub fn bmc_firmware_version(&self) -> Option<String> {
@@ -1106,6 +1114,32 @@ impl EndpointExplorationReport {
             .unwrap_or_default()
     }
 
+    /// BMC firmware observed directly from the exact `BMC` inventory entry.
+    pub fn observed_host_bmc_version(&self) -> Option<&str> {
+        self.service
+            .iter()
+            .find(|service| service.id == "FirmwareInventory")
+            .and_then(|service| {
+                service
+                    .inventories
+                    .iter()
+                    .find(|inventory| inventory.id == "BMC")
+            })
+            .and_then(|inventory| inventory.version.as_deref())
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+    }
+
+    /// Host BIOS/UEFI version observed on the `System_0` resource.
+    pub fn system_bios_version(&self) -> Option<&str> {
+        self.systems
+            .iter()
+            .find(|system| system.id == "System_0")
+            .and_then(|system| system.bios_version.as_deref())
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+    }
+
     pub fn dpu_component_version(&self, component: FirmwareComponentType) -> Option<String> {
         match component {
             FirmwareComponentType::Bmc => self.dpu_bmc_version(),
@@ -1467,6 +1501,12 @@ pub struct ComputerSystem {
     pub sku: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_order: Option<BootOrder>,
+    /// Version reported by the Redfish `ComputerSystem.BiosVersion` property.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bios_version: Option<String>,
+    /// SSH port for the system's Redfish serial-console service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_console_ssh_port: Option<u16>,
 }
 
 pub fn base_mac_deserialize<'a, D>(deserializer: D) -> Result<Option<BaseMac>, D::Error>
@@ -1545,58 +1585,19 @@ pub struct EthernetInterface {
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize, Clone)]
 pub struct UefiDevicePath(String);
 
-lazy_static! {
-    // Not anchored at start: GB300/Grace UEFI device paths prefix the PciRoot
-    // node with vendor/MMIO nodes, e.g.
-    // VenHw(<guid>)/MemoryMapped(0xB,...)/PciRoot(0x16)/Pci(0x0,0x0)/Pci(0x0,0x0)
-    // An `^PciRoot` anchor never matches those and aborts the whole exploration
-    // (`Could not match regex in PCI Device Path`). Match PciRoot wherever it appears.
-    static ref PCI_ROOT_REGEX: Regex =
-        Regex::new(r"PciRoot\(([^)]*)\)").expect("must always compile");
-    static ref PCI_NODE_REGEX: Regex = Regex::new(r"/Pci\(([^)]*)\)").expect("must always compile");
+impl UefiDevicePath {
+    fn ordering_key(&self) -> Result<UefiPciOrderingKey, UefiPciOrderingKeyParseError> {
+        UefiPciOrderingKey::from_normalized_uefi_path(&self.0)
+    }
 }
 
 impl FromStr for UefiDevicePath {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // UEFI 2.10 §10.3.4: PciRoot followed by one or more Pci nodes,
-        // e.g. PciRoot(0x8)/Pci(0x2,0xa)/Pci(0x0,0x0) (NIC behind a bridge) or
-        //      PciRoot(0x7)/Pci(0x0,0x0)            (NIC on a root port).
-        // Trailing /MAC(...) is optional and discarded.
-
-        let st = s.rsplit_once("/MAC").map(|x| x.0).unwrap_or(s);
-
-        let mut pci = vec![];
-        let mut push_group = |group: &str| -> Result<(), String> {
-            for hex in group.split(',') {
-                let hex_int = u32::from_str_radix(&hex.to_lowercase().replace("0x", ""), 16)
-                    .map_err(|e| {
-                        format!("Can't convert pci address to int {hex}, error: {e} for pci: {s}")
-                    })?;
-                pci.push(hex_int.to_string());
-            }
-            Ok(())
-        };
-
-        let root = PCI_ROOT_REGEX
-            .captures(st)
-            .and_then(|c| c.get(1))
-            .ok_or_else(|| format!("Could not match regex in PCI Device Path {s}."))?;
-        push_group(root.as_str())?;
-
-        let mut had_pci = false;
-        for cap in PCI_NODE_REGEX.captures_iter(st) {
-            if let Some(g) = cap.get(1) {
-                had_pci = true;
-                push_group(g.as_str())?;
-            }
-        }
-        if !had_pci {
-            return Err(format!("Could not match regex in PCI Device Path {s}."));
-        }
-
-        Ok(UefiDevicePath(pci.join(".")))
+        normalize_uefi_device_path(s)
+            .map(UefiDevicePath)
+            .map_err(|error| format!("could not parse PCI device path {s}: {error}"))
     }
 }
 
@@ -3457,13 +3458,14 @@ mod tests {
             dpus: vec![ExploredDpu {
                 bmc_ip: "1.2.3.5".parse().unwrap(),
                 host_pf_mac_address: Some("11:22:33:44:55:66".parse().unwrap()),
+                host_chassis_id: Some("Riser_Slot2_BlueField_3_Card".to_string()),
                 report: Default::default(),
             }],
         };
         let serialized = serde_json::to_string(&host).unwrap();
         assert_eq!(
             serialized,
-            r#"{"HostBmcIp":"1.2.3.4","Dpus":[{"BmcIp":"1.2.3.5","HostPfMacAddress":"11:22:33:44:55:66"}]}"#
+            r#"{"HostBmcIp":"1.2.3.4","Dpus":[{"BmcIp":"1.2.3.5","HostPfMacAddress":"11:22:33:44:55:66","HostChassisId":"Riser_Slot2_BlueField_3_Card"}]}"#
         );
         assert_eq!(
             serde_json::from_str::<ExploredManagedHost>(&serialized).unwrap(),
@@ -3475,6 +3477,7 @@ mod tests {
             dpus: vec![ExploredDpu {
                 bmc_ip: "1.2.3.5".parse().unwrap(),
                 host_pf_mac_address: None,
+                host_chassis_id: None,
                 report: Default::default(),
             }],
         };
@@ -3523,6 +3526,8 @@ mod tests {
                 power_state: PowerState::On,
                 sku: None,
                 boot_order: None,
+                bios_version: None,
+                serial_console_ssh_port: None,
             }],
             chassis: vec![Chassis {
                 id: "NIC.Slot.1".to_string(),
@@ -3569,6 +3574,96 @@ mod tests {
     }
 
     #[test]
+    fn observed_host_bmc_version_requires_exact_non_blank_inventory() {
+        let report_with_inventory = |id: &str, version: &str| EndpointExplorationReport {
+            service: vec![Service {
+                id: "FirmwareInventory".to_string(),
+                inventories: vec![Inventory {
+                    id: id.to_string(),
+                    version: Some(version.to_string()),
+                    ..Default::default()
+                }],
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            report_with_inventory("BMC-Primary", "1.0.0").observed_host_bmc_version(),
+            None,
+            "only the exact Lenovo GB300 BMC inventory ID is accepted"
+        );
+        assert_eq!(
+            report_with_inventory("BMC", " \t ").observed_host_bmc_version(),
+            None,
+            "blank BMC versions are treated as absent"
+        );
+        assert_eq!(
+            report_with_inventory("BMC", " 1.0.0 ").observed_host_bmc_version(),
+            Some("1.0.0"),
+            "the exact BMC inventory version is trimmed"
+        );
+    }
+
+    #[test]
+    fn system_bios_version_selects_system_0_and_rejects_blank_values() {
+        let report = EndpointExplorationReport {
+            systems: vec![
+                ComputerSystem {
+                    id: "HGX_Baseboard_0".to_string(),
+                    bios_version: Some("wrong-system-version".to_string()),
+                    ..Default::default()
+                },
+                ComputerSystem {
+                    id: "System_0".to_string(),
+                    bios_version: Some(" GBHC01A_01.05.0 ".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            report.system_bios_version(),
+            Some("GBHC01A_01.05.0"),
+            "System_0 must be selected even when the HGX baseboard appears first"
+        );
+
+        let blank_report = EndpointExplorationReport {
+            systems: vec![ComputerSystem {
+                id: "System_0".to_string(),
+                bios_version: Some("  ".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            blank_report.system_bios_version(),
+            None,
+            "blank System_0 BIOS versions are treated as absent"
+        );
+    }
+
+    #[test]
+    fn computer_system_bios_version_is_json_compatible() {
+        let system = ComputerSystem {
+            id: "System_0".to_string(),
+            bios_version: Some("GBHC01A_01.05.0".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&system).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ComputerSystem>(&json).unwrap(),
+            system,
+            "BiosVersion must round-trip through the exploration-report JSON"
+        );
+
+        let without_bios = serde_json::from_str::<ComputerSystem>(r#"{"Id":"System_0"}"#).unwrap();
+        assert_eq!(
+            without_bios.bios_version, None,
+            "older JSON without BiosVersion must remain deserializable"
+        );
+    }
+
+    #[test]
     fn generate_machine_id_for_dpu() {
         let mut report = EndpointExplorationReport {
             endpoint_type: EndpointType::Bmc,
@@ -3595,6 +3690,8 @@ mod tests {
                 power_state: PowerState::On,
                 sku: None,
                 boot_order: None,
+                bios_version: None,
+                serial_console_ssh_port: None,
             }],
             chassis: vec![Chassis {
                 id: "NIC.Slot.1".to_string(),
@@ -3669,7 +3766,7 @@ mod tests {
             [
                 Case {
                     scenario: "two Pci nodes",
-                    input: "PciRoot(0x2)/Pci(0x1,0x0)/Pci(0x0,0x1)",
+                    input: "PciRoot(0X2)/Pci(0x1,0X0)/Pci(0X0,0x1)",
                     expect: Yields("2.1.0.0.1".to_string()),
                 },
                 Case {
@@ -3690,9 +3787,19 @@ mod tests {
                     expect: Yields("0.1.0.0.0.0.0".to_string()),
                 },
                 Case {
+                    scenario: "vendor and memory-mapped prefix",
+                    input: "VenHw(1E5A432C-0466-4D31-B009-D4D9239271D3)/MemoryMapped(0xB,0x14140000,0x14141FFF)/PciRoot(0x16)/Pci(0x0,0x0)/Pci(0x0,0x0)",
+                    expect: Yields("22.0.0.0.0".to_string()),
+                },
+                Case {
                     // PciRoot without any Pci node should fail.
                     scenario: "PciRoot without any Pci node",
                     input: "PciRoot(0x7)/MAC(525400A8282F,0x1)",
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "embedded hexadecimal prefix",
+                    input: "PciRoot(0x10x2)/Pci(0x0,0x0)",
                     expect: Fails,
                 },
             ],
@@ -3700,6 +3807,25 @@ mod tests {
             // errors, so discard it; yield the dotted address on success.
             |path| UefiDevicePath::from_str(path).map(|u| u.0).map_err(drop),
         );
+
+        let malformed = "PciRoot(0x7)/Pci(not-hex,0x0)";
+        assert!(
+            UefiDevicePath::from_str(malformed)
+                .unwrap_err()
+                .contains(malformed)
+        );
+    }
+
+    #[test]
+    fn uefi_device_path_json_remains_a_normalized_string() {
+        let path = UefiDevicePath::from_str(
+            "PciRoot(0x11)/Pci(0x1,0x0)/Pci(0x0,0xa)/MAC(A088C20C87C6,0x1)",
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&path).unwrap();
+        assert_eq!(json, r#""17.1.0.0.10""#);
+        assert_eq!(serde_json::from_str::<UefiDevicePath>(&json).unwrap(), path);
     }
 
     #[test]

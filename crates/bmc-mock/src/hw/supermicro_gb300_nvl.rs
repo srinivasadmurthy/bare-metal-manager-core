@@ -172,6 +172,7 @@ impl SupermicroGB300Nvl<'_> {
                     log_services: None,
                     manufacturer: Some("NVIDIA".into()),
                     model: Some("GB300 1CPU:2GPU Board PC".into()),
+                    bios_version: None,
                     oem: redfish::computer_system::Oem::Generic,
                     callbacks: None,
                     secure_boot_available: false,
@@ -193,34 +194,13 @@ impl SupermicroGB300Nvl<'_> {
                     // SMC GB300: Supermicro host system reporting product "GB NVL".
                     manufacturer: Some("Supermicro".into()),
                     model: Some("GB NVL".into()),
+                    bios_version: None,
                     oem: redfish::computer_system::Oem::Generic,
                     callbacks: Some(callbacks),
                     // This firmware exposes the SecureBoot resource but omits
                     // SecureBootEnable, so there is no usable status to report.
                     secure_boot_available: false,
-                    serial_console: Some(
-                        redfish::serial_console::builder()
-                            .max_concurrent_sessions(1)
-                            .ssh(
-                                &redfish::serial_console::protocol_builder()
-                                    .service_enabled(true)
-                                    .port(22)
-                                    .shared_with_manager_cli(true)
-                                    .console_entry_command("cd system1/sol1; start")
-                                    .hot_key_sequence_display(
-                                        "press <Enter>, <Esc>, and then <T> to terminate session",
-                                    )
-                                    .build(),
-                            )
-                            .ipmi(
-                                &redfish::serial_console::protocol_builder()
-                                    .service_enabled(true)
-                                    .port(623)
-                                    .hot_key_sequence_display("Press ~.  - terminate connection")
-                                    .build(),
-                            )
-                            .build(),
-                    ),
+                    serial_console: Some(hw::openbmc::enabled_serial_console()),
                     serial_number: Some(self.system_0_serial_number.to_string().into()),
                     storage: None,
                     processors: None,

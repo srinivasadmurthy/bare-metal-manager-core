@@ -17,9 +17,15 @@ import (
 
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/converter/protobuf"
 	dbquery "github.com/NVIDIA/infra-controller/rest-api/flow/internal/db/query"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/firmwareauth"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/operation"
 	operationrun "github.com/NVIDIA/infra-controller/rest-api/flow/internal/operationrun"
 	operationrunmanager "github.com/NVIDIA/infra-controller/rest-api/flow/internal/operationrun/manager"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/secret"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/operations"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/deviceinfo"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/devicetypes"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/inventoryobjects/rack"
 	pb "github.com/NVIDIA/infra-controller/rest-api/flow/pkg/proto/v1"
 )
 
@@ -44,6 +50,94 @@ func TestCreateOperationRunCallsManager(t *testing.T) {
 	require.NotEmpty(t, manager.createdRun.Selector)
 	require.NotEmpty(t, manager.createdRun.Options)
 	require.NotEmpty(t, manager.createdRun.OperationTemplate)
+}
+
+func TestCreateOperationRunEncryptsFirmwareAuthenticationData(t *testing.T) {
+	manager := &mockOperationRunManager{createID: uuid.New()}
+	cipher := newServiceTestCipher(t)
+	server := &FlowServerImpl{
+		operationRunManager: manager,
+		dataCipher:          cipher,
+	}
+	req := validCreateOperationRunRequest()
+	authenticationData := "shared-token"
+	req.Configuration.Operation.GetUpgradeFirmware().AuthenticationData =
+		sharedServiceAuthenticationData(authenticationData)
+
+	_, err := server.CreateOperationRun(context.Background(), req)
+
+	require.NoError(t, err)
+	require.NotContains(
+		t,
+		string(manager.createdRun.OperationTemplate),
+		authenticationData,
+	)
+	var operationTemplate operationrun.Operation
+	require.NoError(
+		t,
+		operationrun.UnmarshalConfig(
+			manager.createdRun.OperationTemplate,
+			&operationTemplate,
+		),
+	)
+	firmwareInfo, ok := operationTemplate.Payload.(*operations.FirmwareControlTaskInfo)
+	require.True(t, ok)
+	got, err := firmwareauth.DecryptFor(
+		cipher,
+		firmwareInfo.AuthenticationData,
+		devicetypes.ComponentTypeCompute,
+	)
+	require.NoError(t, err)
+	require.Equal(t, authenticationData, got)
+}
+
+func TestCreateOperationRunAuthenticationDataStatusCodes(t *testing.T) {
+	tests := []struct {
+		name               string
+		cipher             *secret.Cipher
+		authenticationData *pb.FirmwareAuthenticationData
+		subTargets         []string
+		wantCode           codes.Code
+	}{
+		{
+			name:               "invalid input",
+			cipher:             newServiceTestCipher(t),
+			authenticationData: &pb.FirmwareAuthenticationData{},
+			wantCode:           codes.InvalidArgument,
+		},
+		{
+			name:               "missing cipher",
+			authenticationData: sharedServiceAuthenticationData("token"),
+			wantCode:           codes.FailedPrecondition,
+		},
+		{
+			name:               "authentication with dpu-only subtargets",
+			cipher:             newServiceTestCipher(t),
+			authenticationData: sharedServiceAuthenticationData("token"),
+			subTargets:         []string{"dpu"},
+			wantCode:           codes.InvalidArgument,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := validCreateOperationRunRequest()
+			req.Configuration.Operation.GetUpgradeFirmware().AuthenticationData =
+				tt.authenticationData
+			req.Configuration.Operation.GetUpgradeFirmware().SubTargets =
+				tt.subTargets
+			manager := &mockOperationRunManager{}
+			server := &FlowServerImpl{
+				operationRunManager: manager,
+				dataCipher:          tt.cipher,
+			}
+
+			_, err := server.CreateOperationRun(context.Background(), req)
+
+			require.Equal(t, tt.wantCode, status.Code(err))
+			require.Zero(t, manager.createCalls)
+		})
+	}
 }
 
 func TestCreateOperationRunRejectsInvalidRequest(t *testing.T) {
@@ -301,13 +395,22 @@ func TestListOperationRunsRejectsInvalidFilter(t *testing.T) {
 
 func TestListOperationRunTargetsReturnsTargets(t *testing.T) {
 	runID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	target := testOperationRunTarget(runID, 1, operationrun.OperationRunTargetStatusBlocked)
 	manager := &mockOperationRunManager{
 		listTargets: []*operationrun.OperationRunTarget{
-			testOperationRunTarget(runID, 1, operationrun.OperationRunTargetStatusBlocked),
+			target,
 		},
 		listTargetsTotal: 2,
 	}
-	server := &FlowServerImpl{operationRunManager: manager}
+	inventory := newMockManager()
+	inventory.racks[target.RackID] = &rack.Rack{
+		Info:       deviceinfo.DeviceInfo{ID: target.RackID},
+		ExternalID: "rack-01",
+	}
+	server := &FlowServerImpl{
+		operationRunManager: manager,
+		inventoryManager:    inventory,
+	}
 
 	resp, err := server.ListOperationRunTargets(
 		context.Background(),
@@ -337,6 +440,17 @@ func TestListOperationRunTargetsReturnsTargets(t *testing.T) {
 		pb.OperationRunTargetStatus_OPERATION_RUN_TARGET_STATUS_BLOCKED,
 		resp.GetTargets()[0].GetStatus(),
 	)
+	require.Equal(t, "rack-01", resp.GetTargets()[0].GetRackExternalId())
+
+	t.Run("rack without recoverable external ID is rejected", func(t *testing.T) {
+		delete(inventory.racks, target.RackID)
+		resp, err := server.ListOperationRunTargets(
+			context.Background(),
+			&pb.ListOperationRunTargetsRequest{OperationRunId: protobuf.UUIDTo(runID)},
+		)
+		require.Nil(t, resp)
+		require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	})
 }
 
 func TestListOperationRunTargetsRejectsInvalidID(t *testing.T) {

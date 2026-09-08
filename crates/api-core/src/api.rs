@@ -34,13 +34,13 @@ use carbide_ib_fabric::ib::IBFabricManager;
 use carbide_machine_controller::dpf::DpfOperations;
 use carbide_machine_controller::io::MachineStateControllerIO;
 use carbide_rack::bms_client::BmsDsxExchangeHandle;
-use carbide_redfish::libredfish::RedfishClientPool;
+use carbide_redfish::libredfish::{BmcCredentialOps, RedfishClientPool};
 use carbide_secrets::certificates::CertificateProvider;
 use carbide_secrets::credentials::{
     BmcCredentialType, CredentialKey, CredentialManager, CredentialType, Credentials,
 };
-use carbide_site_explorer::{EndpointExplorationService, EndpointExplorer};
-use carbide_uuid::machine::{MachineId, MachineInterfaceId};
+use carbide_site_explorer::{AuthenticatedBmc, EndpointExplorationService, EndpointExplorer};
+use carbide_uuid::machine::{MachineId, MachineIdSubtypeTrait, MachineInterfaceId};
 use db::db_read::PgPoolReader;
 use db::work_lock_manager::WorkLockManagerHandle;
 use db::{DatabaseError, DatabaseResult, WithTransaction};
@@ -69,6 +69,11 @@ pub struct Api {
     pub(crate) credential_manager: Arc<dyn CredentialManager>,
     pub(crate) certificate_provider: Arc<dyn CertificateProvider>,
     pub(crate) redfish_pool: Arc<dyn RedfishClientPool>,
+    /// Credential-lifecycle operations (password set/rotate/clear, candidate
+    /// validation). A sealed trait implemented only by the direct pool, so
+    /// handing these to a wrapper pool is a compile error (a wrong-pool
+    /// guard, not a wire-path guarantee -- see [`BmcCredentialOps`]).
+    pub(crate) bmc_credential_ops: Arc<dyn BmcCredentialOps>,
     pub(crate) bmc_session_manager: Arc<crate::credentials::BmcSessionManager>,
     pub(crate) eth_data: EthVirtData,
     pub(crate) common_pools: Arc<CommonPools>,
@@ -78,6 +83,9 @@ pub struct Api {
     pub(crate) dpu_health_log_limiter: LogLimiter<MachineId>,
     pub dynamic_settings: DynamicSettings,
     pub(crate) endpoint_explorer: Arc<dyn EndpointExplorer>,
+    /// Authenticated BMC client for admin operations, supplied independently of
+    /// endpoint exploration.
+    pub(crate) bmc_client: Arc<dyn AuthenticatedBmc>,
     pub(crate) endpoint_exploration_service: Arc<EndpointExplorationService>,
     pub(crate) scout_stream_registry: ConnectionRegistry,
     #[allow(unused)]
@@ -412,6 +420,13 @@ impl Forge for Api {
         crate::handlers::power_shelf::find_by_ids(self, request).await
     }
 
+    async fn decommission_power_shelf(
+        &self,
+        request: Request<rpc::DecommissionPowerShelfRequest>,
+    ) -> Result<Response<rpc::DecommissionPowerShelfResponse>, Status> {
+        crate::handlers::power_shelf::decommission_power_shelf(self, request).await
+    }
+
     async fn delete_power_shelf(
         &self,
         request: Request<rpc::PowerShelfDeletionRequest>,
@@ -459,6 +474,13 @@ impl Forge for Api {
         request: Request<rpc::SwitchDeletionRequest>,
     ) -> Result<Response<rpc::SwitchDeletionResult>, Status> {
         crate::handlers::switch::delete_switch(self, request).await
+    }
+
+    async fn decommission_switch(
+        &self,
+        request: Request<rpc::DecommissionSwitchRequest>,
+    ) -> Result<Response<rpc::DecommissionSwitchResponse>, Status> {
+        crate::handlers::switch::decommission_switch(self, request).await
     }
 
     async fn admin_force_delete_switch(
@@ -564,6 +586,13 @@ impl Forge for Api {
         request: Request<rpc::InstanceReleaseRequest>,
     ) -> Result<Response<rpc::InstanceReleaseResult>, Status> {
         crate::handlers::instance::release(self, request).await
+    }
+
+    async fn release_instances(
+        &self,
+        request: Request<rpc::BatchInstanceReleaseRequest>,
+    ) -> Result<Response<rpc::BatchInstanceReleaseResponse>, Status> {
+        crate::handlers::instance::batch_release(self, request).await
     }
 
     async fn update_instance_phone_home_last_contact(
@@ -934,6 +963,13 @@ impl Forge for Api {
         crate::handlers::power_shelf::find_power_shelf_state_histories(self, request).await
     }
 
+    async fn find_power_shelf_health_histories(
+        &self,
+        request: Request<rpc::PowerShelfHealthHistoriesRequest>,
+    ) -> Result<Response<rpc::HealthHistories>, Status> {
+        crate::handlers::power_shelf::find_power_shelf_health_histories(self, request).await
+    }
+
     async fn find_rack_state_histories(
         &self,
         request: tonic::Request<rpc::RackStateHistoriesRequest>,
@@ -941,11 +977,25 @@ impl Forge for Api {
         crate::handlers::rack::find_rack_state_histories(self, request).await
     }
 
+    async fn find_rack_health_histories(
+        &self,
+        request: Request<rpc::RackHealthHistoriesRequest>,
+    ) -> Result<Response<rpc::HealthHistories>, Status> {
+        crate::handlers::rack::find_rack_health_histories(self, request).await
+    }
+
     async fn find_switch_state_histories(
         &self,
         request: Request<rpc::SwitchStateHistoriesRequest>,
     ) -> Result<Response<rpc::StateHistories>, Status> {
         crate::handlers::switch::find_switch_state_histories(self, request).await
+    }
+
+    async fn find_switch_health_histories(
+        &self,
+        request: Request<rpc::SwitchHealthHistoriesRequest>,
+    ) -> Result<Response<rpc::HealthHistories>, Status> {
+        crate::handlers::switch::find_switch_health_histories(self, request).await
     }
 
     async fn find_machine_health_histories(
@@ -1206,6 +1256,13 @@ impl Forge for Api {
         crate::handlers::machine::admin_force_delete_machine(self, request).await
     }
 
+    async fn decommission_managed_host(
+        &self,
+        request: Request<rpc::DecommissionManagedHostRequest>,
+    ) -> Result<Response<rpc::DecommissionManagedHostResponse>, Status> {
+        crate::handlers::managed_host::decommission_managed_host(self, request).await
+    }
+
     /// Example TOML data in request.text:
     ///
     /// [lo-ip]
@@ -1402,6 +1459,16 @@ impl Forge for Api {
             .await
     }
 
+    async fn trigger_nic_lockdown_credential_rotation(
+        &self,
+        request: Request<rpc::NicLockdownCredentialRotationRequest>,
+    ) -> Result<Response<()>, Status> {
+        crate::handlers::nic_lockdown_credential_rotation::trigger_nic_lockdown_credential_rotation(
+            self, request,
+        )
+        .await
+    }
+
     async fn mark_manual_firmware_upgrade_complete(
         &self,
         request: Request<MachineId>,
@@ -1474,6 +1541,13 @@ impl Forge for Api {
         request: Request<rpc::AdminBmcResetRequest>,
     ) -> Result<Response<rpc::AdminBmcResetResponse>, Status> {
         crate::handlers::bmc_endpoint_explorer::admin_bmc_reset(self, request).await
+    }
+
+    async fn admin_gpu_reset(
+        &self,
+        request: Request<rpc::AdminGpuResetRequest>,
+    ) -> Result<Response<rpc::AdminGpuResetResponse>, Status> {
+        crate::handlers::gpu_reset::admin_gpu_reset(self, request).await
     }
 
     async fn disable_secure_boot(
@@ -2531,6 +2605,16 @@ impl Forge for Api {
         request: Request<rpc::MachineValidationTestEnableDisableTestRequest>,
     ) -> Result<Response<rpc::MachineValidationTestEnableDisableTestResponse>, Status> {
         crate::handlers::machine_validation::machine_validation_test_enable_disable_test(
+            self, request,
+        )
+        .await
+    }
+
+    async fn machine_validation_test_approve_full_host(
+        &self,
+        request: Request<rpc::MachineValidationTestFullHostApprovalRequest>,
+    ) -> Result<Response<rpc::MachineValidationTestFullHostApprovalResponse>, Status> {
+        crate::handlers::machine_validation::machine_validation_test_approve_full_host(
             self, request,
         )
         .await
@@ -3695,7 +3779,7 @@ pub struct DefaultCredential {
     _key: String,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl DefaultCredential {
     pub(crate) fn key(&self) -> &str {
         &self._key
@@ -3784,11 +3868,11 @@ impl Api {
     #[track_caller]
     pub(crate) fn load_machine(
         &self,
-        machine_id: &MachineId,
+        machine_id: &impl MachineIdSubtypeTrait,
         search_config: MachineSearchConfig,
     ) -> impl Future<Output = CarbideResult<(Machine, db::Transaction<'_>)>> {
         let loc = Location::caller();
-        let machine_id = *machine_id;
+        let machine_id = machine_id.to_machine_id();
         async move {
             let mut txn =
                 db::Transaction::begin_with_location(&self.database_connection, loc).await?;

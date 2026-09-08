@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	stracer "github.com/NVIDIA/infra-controller/rest-api/db/pkg/tracer"
@@ -45,16 +46,16 @@ var (
 	}
 )
 
-// Config should be kept flat to allow simple merging
-// of updates at the postgres/jsonb level.  We use jsonb_set + ||
-// to allow "partial" updates, but any nesting here would prevent
-// that.
+// Config stays flat so PostgreSQL JSONB concatenation can apply partial
+// updates without replacing unrelated settings.
 type SiteConfig struct {
 	NetworkSecurityGroup             bool `json:"network_security_group"`
 	NativeNetworking                 bool `json:"native_networking"`
+	VpcSlaac                         bool `json:"vpc_slaac"`
 	NVLinkPartition                  bool `json:"nvlink_partition"`
 	Flow                             bool `json:"flow"`
 	ImageBasedOperatingSystem        bool `json:"image_based_operating_system"`
+	DPSPowerManagement               bool `json:"dps_power_management"`
 	MaxNetworkSecurityGroupRuleCount *int `json:"max_network_security_group_rule_count"`
 }
 
@@ -79,6 +80,7 @@ type Site struct {
 	SerialConsoleMaxSessionLength *int                    `bun:"serial_console_max_session_length"`
 	IsInfinityEnabled             bool                    `bun:"is_infinity_enabled,notnull"`
 	InventoryReceived             *time.Time              `bun:"inventory_received"`
+	InventoryIntervalSeconds      *int                    `bun:"inventory_interval_seconds"`
 	Status                        string                  `bun:"status,notnull"`
 	Created                       time.Time               `bun:"created,nullzero,notnull,default:current_timestamp"`
 	Updated                       time.Time               `bun:"updated,nullzero,notnull,default:current_timestamp"`
@@ -98,6 +100,20 @@ type SiteLocation struct {
 
 type SiteContact struct {
 	Email string `json:"email"`
+}
+
+// IsTimeWithinStaleInventoryThreshold reports whether actionTime is recent enough that an
+// arriving inventory may predate it, which means the inventory should not be acted on for that
+// object. The threshold follows the collection interval the Site Agent reports, and falls back
+// to the default for a Site that has not reported one yet, so an unreported Site keeps the
+// protection it had before the field existed. The Site Agent refuses a schedule slower than
+// cutil.MaxInventoryReceiptInterval, so the reported interval is followed as given.
+func (st *Site) IsTimeWithinStaleInventoryThreshold(actionTime time.Time) bool {
+	interval := cutil.DefaultInventoryReceiptInterval
+	if st != nil && st.InventoryIntervalSeconds != nil && *st.InventoryIntervalSeconds > 0 {
+		interval = time.Duration(*st.InventoryIntervalSeconds) * time.Second
+	}
+	return time.Since(actionTime) < interval+cutil.StaleInventoryBuffer
 }
 
 type SiteCreateInput struct {
@@ -126,9 +142,11 @@ type SiteCreateInput struct {
 type SiteConfigUpdateInput struct {
 	NetworkSecurityGroup             *bool `json:"network_security_group,omitempty"`
 	NativeNetworking                 *bool `json:"native_networking,omitempty"`
+	VpcSlaac                         *bool `json:"vpc_slaac,omitempty"`
 	NVLinkPartition                  *bool `json:"nvlink_partition,omitempty"`
 	Flow                             *bool `json:"flow,omitempty"`
 	ImageBasedOperatingSystem        *bool `json:"image_based_operating_system,omitempty"`
+	DPSPowerManagement               *bool `json:"dps_power_management,omitempty"`
 	MaxNetworkSecurityGroupRuleCount *int  `json:"max_network_security_group_rule_count,omitempty"`
 }
 
@@ -148,6 +166,7 @@ type SiteUpdateInput struct {
 	SerialConsoleMaxSessionLength *int
 	IsInfinityEnabled             *bool
 	InventoryReceived             *time.Time
+	InventoryIntervalSeconds      *int
 	Status                        *string
 	Location                      *SiteLocation
 	Contact                       *SiteContact
@@ -158,9 +177,11 @@ type SiteUpdateInput struct {
 type SiteConfigFilterInput struct {
 	NetworkSecurityGroup             *bool `json:"network_security_group,omitempty"`
 	NativeNetworking                 *bool `json:"native_networking,omitempty"`
+	VpcSlaac                         *bool `json:"vpc_slaac,omitempty"`
 	NVLinkPartition                  *bool `json:"nvlink_partition,omitempty"`
 	Flow                             *bool `json:"flow,omitempty"`
 	ImageBasedOperatingSystem        *bool `json:"image_based_operating_system,omitempty"`
+	DPSPowerManagement               *bool `json:"dps_power_management,omitempty"`
 	MaxNetworkSecurityGroupRuleCount *int  `json:"max_network_security_group_rule_count,omitempty"`
 }
 
@@ -544,6 +565,12 @@ func (ssd SiteSQLDAO) Update(ctx context.Context, tx *db.Tx, input SiteUpdateInp
 		ssd.tracerSpan.SetAttribute(stDAOSpan, "inventory_received", *input.InventoryReceived)
 	}
 
+	if input.InventoryIntervalSeconds != nil {
+		st.InventoryIntervalSeconds = input.InventoryIntervalSeconds
+		updatedFields = append(updatedFields, "inventory_interval_seconds")
+		ssd.tracerSpan.SetAttribute(stDAOSpan, "inventory_interval_seconds", *input.InventoryIntervalSeconds)
+	}
+
 	if input.Status != nil {
 		st.Status = *input.Status
 		updatedFields = append(updatedFields, "status")
@@ -581,7 +608,7 @@ func (ssd SiteSQLDAO) Update(ctx context.Context, tx *db.Tx, input SiteUpdateInp
 	if input.Config != nil {
 		_, err := db.GetIDB(tx, ssd.dbSession).NewUpdate().
 			Model(st).
-			Set("config = config || ?::jsonb, updated = current_timestamp", input.Config).
+			Set("config = COALESCE(config, '{}'::jsonb) || ?::jsonb, updated = current_timestamp", input.Config).
 			Where("id = ?", st.ID).
 			Exec(ctx)
 

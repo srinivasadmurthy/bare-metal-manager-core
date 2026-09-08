@@ -45,13 +45,17 @@ REST_POSTGRES_USER="${LOCAL_DEV_REST_POSTGRES_USER:-nico_rest}"
 REST_POSTGRES_PASSWORD="${LOCAL_DEV_REST_POSTGRES_PASSWORD:-nico_rest}"
 TEMPORAL_NAMESPACE="temporal"
 
-VAULT_NAMESPACE="${VAULT_NAMESPACE:-vault}"
-VAULT_ADDR="${LOCAL_DEV_VAULT_ADDR:-http://vault.${VAULT_NAMESPACE}.svc.cluster.local:8200}"
+# Kubernetes namespace hosting the local development Vault. Keep this distinct
+# from VAULT_NAMESPACE, which selects a Vault Enterprise/HCP namespace.
+VAULT_KUBERNETES_NAMESPACE="${LOCAL_DEV_VAULT_KUBERNETES_NAMESPACE:-vault}"
+VAULT_ADDR="${LOCAL_DEV_VAULT_ADDR:-http://vault.${VAULT_KUBERNETES_NAMESPACE}.svc.cluster.local:8200}"
 VAULT_TOKEN="${LOCAL_DEV_VAULT_TOKEN:-root}"
 VAULT_KV_MOUNT="${LOCAL_DEV_VAULT_KV_MOUNT:-secrets}"
 VAULT_PKI_MOUNT="${LOCAL_DEV_VAULT_PKI_MOUNT:-certs}"
 VAULT_PKI_ROLE_NAME="${LOCAL_DEV_VAULT_PKI_ROLE_NAME:-nico-cluster}"
 VAULT_AUTH_MODE="${LOCAL_DEV_VAULT_AUTH_MODE:-root-token}"
+VAULT_ADMIN_CA_FILE="${LOCAL_DEV_VAULT_ADMIN_CA_FILE:-}"
+ADMIN_ROOT_CERT_PEM=""
 
 CERT_ISSUER_KIND="${LOCAL_DEV_CERT_ISSUER_KIND:-Issuer}"
 CERT_ISSUER_NAME="${LOCAL_DEV_CERT_ISSUER_NAME:-local-ca-issuer}"
@@ -314,13 +318,13 @@ apply_local_vault() {
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: ${VAULT_NAMESPACE}
+  name: ${VAULT_KUBERNETES_NAMESPACE}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: vault
-  namespace: ${VAULT_NAMESPACE}
+  namespace: ${VAULT_KUBERNETES_NAMESPACE}
 spec:
   replicas: 1
   selector:
@@ -357,7 +361,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: vault
-  namespace: ${VAULT_NAMESPACE}
+  namespace: ${VAULT_KUBERNETES_NAMESPACE}
 spec:
   selector:
     app: vault
@@ -367,10 +371,10 @@ spec:
       targetPort: 8200
 EOF
 
-  kubectl rollout status statefulset/vault -n "${VAULT_NAMESPACE}" --timeout=180s >/dev/null
+  kubectl rollout status statefulset/vault -n "${VAULT_KUBERNETES_NAMESPACE}" --timeout=180s >/dev/null
 
   log "Configuring Vault mounts and local role"
-  kubectl exec -n "${VAULT_NAMESPACE}" statefulset/vault -- sh -lc "
+  kubectl exec -n "${VAULT_KUBERNETES_NAMESPACE}" statefulset/vault -- sh -lc "
     set -euo pipefail
     export VAULT_ADDR=http://127.0.0.1:8200
     export VAULT_TOKEN='${VAULT_TOKEN}'
@@ -409,6 +413,102 @@ EOF
       echo '{\"UsernamePassword\":{\"username\":\"root\",\"password\":\"vault-password\"}}' | \
       vault kv put '${VAULT_KV_MOUNT}/machines/all_hosts/site_default/uefi-metadata-items/auth' - >/dev/null
   " >/dev/null
+}
+
+load_admin_root_cert_pem() {
+  if [[ -n "${VAULT_ADMIN_CA_FILE}" ]]; then
+    if [[ ! -f "${VAULT_ADMIN_CA_FILE}" || ! -r "${VAULT_ADMIN_CA_FILE}" ]]; then
+      printf 'Vault admin CA file is not a readable regular file: %s\n' \
+        "${VAULT_ADMIN_CA_FILE}" >&2
+      exit 1
+    fi
+    ADMIN_ROOT_CERT_PEM="$(<"${VAULT_ADMIN_CA_FILE}")"
+  elif [[ "${INSTALL_VAULT}" == "1" ]]; then
+    log "Reading the local Vault PKI CA for Core admin-client trust"
+    ADMIN_ROOT_CERT_PEM="$(
+      kubectl exec -n "${VAULT_KUBERNETES_NAMESPACE}" statefulset/vault -- \
+        env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN="${VAULT_TOKEN}" \
+        vault read -field=certificate "${VAULT_PKI_MOUNT}/cert/ca"
+    )"
+  else
+    return
+  fi
+
+  require_bin awk
+  require_bin openssl
+
+  if ! printf '%s\n' "${ADMIN_ROOT_CERT_PEM}" | awk '
+    BEGIN {
+      in_certificate = 0
+      certificate_count = 0
+      certificate_has_data = 0
+      invalid = 0
+    }
+    {
+      sub(/\r$/, "")
+      if ($0 == "-----BEGIN CERTIFICATE-----") {
+        if (in_certificate) {
+          invalid = 1
+          exit
+        }
+        in_certificate = 1
+        certificate_has_data = 0
+        next
+      }
+      if ($0 == "-----END CERTIFICATE-----") {
+        if (!in_certificate || !certificate_has_data) {
+          invalid = 1
+          exit
+        }
+        in_certificate = 0
+        certificate_count++
+        next
+      }
+      if (in_certificate) {
+        if ($0 !~ /^[A-Za-z0-9+\/=]+$/) {
+          invalid = 1
+          exit
+        }
+        certificate_has_data = 1
+        next
+      }
+      if ($0 !~ /^[[:space:]]*$/) {
+        invalid = 1
+        exit
+      }
+    }
+    END {
+      exit(invalid || in_certificate || certificate_count == 0)
+    }
+  '; then
+    printf '%s\n' \
+      'Vault admin CA must contain only bare PEM CERTIFICATE blocks and whitespace' >&2
+    exit 1
+  fi
+
+  local certificate_pem=""
+  local line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    if [[ "${line}" == "-----BEGIN CERTIFICATE-----" ]]; then
+      certificate_pem="${line}"$'\n'
+      continue
+    fi
+    if [[ -z "${certificate_pem}" ]]; then
+      continue
+    fi
+
+    certificate_pem+="${line}"$'\n'
+    if [[ "${line}" != "-----END CERTIFICATE-----" ]]; then
+      continue
+    fi
+    if ! openssl x509 -noout <<<"${certificate_pem}" >/dev/null 2>&1; then
+      printf '%s\n' \
+        'Vault admin CA contains a CERTIFICATE block that is not valid X.509' >&2
+      exit 1
+    fi
+    certificate_pem=""
+  done <<<"${ADMIN_ROOT_CERT_PEM}"
 }
 
 apply_local_issuer() {
@@ -597,7 +697,8 @@ write_generated_values() {
   fi
 
   mkdir -p "$(dirname -- "${VALUES_FILE}")"
-  cat > "${VALUES_FILE}" <<EOF
+  {
+    cat <<EOF
 global:
   certificate:
     issuerRef:
@@ -606,6 +707,14 @@ global:
       group: ${CERT_ISSUER_GROUP}
 
 nico-api:
+EOF
+    if [[ -n "${ADMIN_ROOT_CERT_PEM}" ]]; then
+      printf '%s\n' \
+        '  siteConfig:' \
+        '    adminRootCertPem: |'
+      printf '%s\n' "${ADMIN_ROOT_CERT_PEM}" | sed 's/^/      /'
+    fi
+    cat <<EOF
   automountServiceAccountToken: ${automount}
   migrationJob:
     enabled: true
@@ -626,6 +735,7 @@ nico-bmc-proxy:
   databaseConfig: {}
 ${disable_tls_enforcement}
 EOF
+  } > "${VALUES_FILE}"
 }
 
 print_summary() {
@@ -654,6 +764,7 @@ main() {
   apply_core_objects
   apply_local_postgres
   apply_local_vault
+  load_admin_root_cert_pem
   apply_local_issuer
   sync_nico_roots_secret
   apply_rest_ca

@@ -4,15 +4,81 @@
 package model
 
 import (
+	"encoding/json"
 	"testing"
 
+	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 	flowv1 "github.com/NVIDIA/infra-controller/rest-api/proto/flow/gen/v1"
 	"github.com/stretchr/testify/assert"
 )
 
+func TestAPIRackJSONContract(t *testing.T) {
+	description := "Core rack description"
+	modelName := "NICO-QA-RACK"
+	apiRack := NewAPIRack(&flowv1.Rack{
+		ExternalId: "rack-01",
+		Info: &flowv1.DeviceInfo{
+			Model:       &modelName,
+			Description: &description,
+		},
+		Location: &flowv1.Location{Datacenter: "DC1"},
+	}, false)
+
+	got, err := json.Marshal(apiRack)
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{
+		"id":"rack-01",
+		"name":"",
+		"manufacturer":"",
+		"model":"NICO-QA-RACK",
+		"serialNumber":"",
+		"description":"Core rack description",
+		"nvLinkDomainIds":[],
+		"location":{"region":"","datacenter":"DC1","room":"","position":""},
+		"taskStats":{"pendingTaskCount":0,"activeTaskCount":0}
+	}`, string(got))
+}
+
+func TestAPIComponentDiffJSONContract(t *testing.T) {
+	got, err := json.Marshal(APIComponentDiff{})
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{"type":"","id":null,"macAddress":null}`, string(got))
+}
+
+func TestAPIComponentDiff_FromProto(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   *flowv1.ComponentDiff
+		wantID  *string
+		wantMAC *string
+	}{
+		{
+			name:   "component ID",
+			input:  &flowv1.ComponentDiff{ComponentId: "machine-01"},
+			wantID: cutil.GetPtr("machine-01"),
+		},
+		{
+			name:    "missing component MAC",
+			input:   &flowv1.ComponentDiff{ComponentMacAddress: "aa:bb:cc:dd:ee:ff"},
+			wantMAC: cutil.GetPtr("aa:bb:cc:dd:ee:ff"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got APIComponentDiff
+			got.FromProto(tt.input)
+			assert.Equal(t, tt.wantID, got.ID)
+			assert.Equal(t, tt.wantMAC, got.MACAddress)
+		})
+	}
+}
+
 func TestNewAPIRack(t *testing.T) {
 	description := "Test rack description"
 	model := "NVL72"
+	domainID := "59202b81-65fb-45ec-b3b8-91ab0ad3f34a"
+	domainID2 := "cfa95885-186f-49b7-993f-dccd417a67cb"
 
 	tests := []struct {
 		name           string
@@ -29,8 +95,9 @@ func TestNewAPIRack(t *testing.T) {
 		{
 			name: "basic rack without components",
 			rack: &flowv1.Rack{
+				ExternalId: "core-rack-1",
 				Info: &flowv1.DeviceInfo{
-					Id:           &flowv1.UUID{Id: "test-rack-id"},
+					Id:           &flowv1.UUID{Id: "flow-rack-uuid"},
 					Name:         "test-rack",
 					Manufacturer: "NVIDIA",
 					Model:        &model,
@@ -46,7 +113,7 @@ func TestNewAPIRack(t *testing.T) {
 			},
 			withComponents: false,
 			want: &APIRack{
-				ID:           "test-rack-id",
+				ID:           "core-rack-1",
 				Name:         "test-rack",
 				Manufacturer: "NVIDIA",
 				Model:        "NVL72",
@@ -62,10 +129,26 @@ func TestNewAPIRack(t *testing.T) {
 			},
 		},
 		{
+			name: "rack with NVLink domain memberships",
+			rack: &flowv1.Rack{
+				ExternalId: "core-rack-in-domain",
+				Info:       &flowv1.DeviceInfo{Id: &flowv1.UUID{Id: "flow-rack-uuid"}},
+				NvlDomainIds: []*flowv1.UUID{
+					{Id: domainID},
+					{Id: domainID2},
+				},
+			},
+			want: &APIRack{
+				ID:              "core-rack-in-domain",
+				NVLinkDomainIDs: []string{domainID, domainID2},
+			},
+		},
+		{
 			name: "rack with components",
 			rack: &flowv1.Rack{
+				ExternalId: "core-rack-with-components",
 				Info: &flowv1.DeviceInfo{
-					Id:   &flowv1.UUID{Id: "rack-with-components"},
+					Id:   &flowv1.UUID{Id: "flow-rack-uuid"},
 					Name: "rack-1",
 				},
 				Components: []*flowv1.Component{
@@ -81,12 +164,15 @@ func TestNewAPIRack(t *testing.T) {
 						Position: &flowv1.RackPosition{
 							SlotId: 1,
 						},
-						ComponentId: "nico-machine-123",
-						Status:      &flowv1.ComponentOperationStatus{Phase: flowv1.Phase_PHASE_READY},
-						LeakStatus:  flowv1.LeakStatus_LEAK_STATUS_NOT_DETECTED,
+						ComponentId:    "nico-machine-123",
+						RackExternalId: "core-rack-with-components",
+						Status:         &flowv1.ComponentOperationStatus{Phase: flowv1.Phase_PHASE_READY},
+						LeakStatus:     flowv1.LeakStatus_LEAK_STATUS_NOT_DETECTED,
 					},
 					{
-						Type: flowv1.ComponentType_COMPONENT_TYPE_TORSWITCH,
+						Type:           flowv1.ComponentType_COMPONENT_TYPE_TORSWITCH,
+						ComponentId:    "nico-switch-456",
+						RackExternalId: "core-rack-with-components",
 						Info: &flowv1.DeviceInfo{
 							Id:   &flowv1.UUID{Id: "comp-2"},
 							Name: "switch-1",
@@ -99,12 +185,12 @@ func TestNewAPIRack(t *testing.T) {
 			},
 			withComponents: true,
 			want: &APIRack{
-				ID:   "rack-with-components",
+				ID:   "core-rack-with-components",
 				Name: "rack-1",
 				Components: []*APIRackComponent{
 					{
-						ID:              "comp-1",
-						ComponentID:     "nico-machine-123",
+						ID:              "nico-machine-123",
+						RackID:          "core-rack-with-components",
 						Type:            "Compute",
 						Name:            "compute-node-1",
 						SerialNumber:    "CSN001",
@@ -115,7 +201,8 @@ func TestNewAPIRack(t *testing.T) {
 						LeakStatus:      "NoLeak",
 					},
 					{
-						ID:              "comp-2",
+						ID:              "nico-switch-456",
+						RackID:          "core-rack-with-components",
 						Type:            "TORSwitch",
 						Name:            "switch-1",
 						SlotID:          48,
@@ -128,8 +215,9 @@ func TestNewAPIRack(t *testing.T) {
 		{
 			name: "rack with components but withComponents=false",
 			rack: &flowv1.Rack{
+				ExternalId: "core-rack-id",
 				Info: &flowv1.DeviceInfo{
-					Id:   &flowv1.UUID{Id: "rack-id"},
+					Id:   &flowv1.UUID{Id: "flow-rack-uuid"},
 					Name: "rack-name",
 				},
 				Components: []*flowv1.Component{
@@ -144,7 +232,7 @@ func TestNewAPIRack(t *testing.T) {
 			},
 			withComponents: false,
 			want: &APIRack{
-				ID:         "rack-id",
+				ID:         "core-rack-id",
 				Name:       "rack-name",
 				Components: nil,
 			},
@@ -167,6 +255,7 @@ func TestNewAPIRack(t *testing.T) {
 			assert.Equal(t, tt.want.Model, got.Model)
 			assert.Equal(t, tt.want.SerialNumber, got.SerialNumber)
 			assert.Equal(t, tt.want.Description, got.Description)
+			assert.ElementsMatch(t, tt.want.NVLinkDomainIDs, got.NVLinkDomainIDs)
 
 			if tt.want.Location != nil {
 				assert.NotNil(t, got.Location)
@@ -182,7 +271,6 @@ func TestNewAPIRack(t *testing.T) {
 				for i, wantComp := range tt.want.Components {
 					gotComp := got.Components[i]
 					assert.Equal(t, wantComp.ID, gotComp.ID)
-					assert.Equal(t, wantComp.ComponentID, gotComp.ComponentID)
 					assert.Equal(t, wantComp.Type, gotComp.Type)
 					assert.Equal(t, wantComp.Name, gotComp.Name)
 					assert.Equal(t, wantComp.SerialNumber, gotComp.SerialNumber)

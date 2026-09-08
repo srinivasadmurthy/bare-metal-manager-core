@@ -71,6 +71,44 @@ automountServiceAccountToken: true
 annotations:
   configmap.reloader.stakater.com/reload: '{{ include "nico-api.name" . }}-config-files,{{ include "nico-api.name" . }}-site-config-files'
 
+## Scheduling
+##
+## `affinity`, `nodeSelector` and `tolerations` are plain pass-throughs. Setting
+## `affinity` disables the `databaseAffinity` convenience below.
+affinity: {}
+nodeSelector: {}
+tolerations: []
+
+## Prefer -- never require -- scheduling nico-api onto the PostgreSQL primary's
+## node.
+##
+## nico-api holds the admin-segment advisory lock across application round trips
+## to the database, so a large share of that lock's hold time is network latency
+## rather than query time. The same 4,500-host ingestion measured a 1.32x
+## throughput difference between co-located and cross-node placement (local RTT
+## 0.073ms vs 0.473ms), with no other variable changed.
+##
+## Expressed as a soft preference on purpose:
+##   * `preferredDuringScheduling...` -- if the primary's node is full, cordoned
+##     or unreachable, nico-api still schedules normally. It never blocks a
+##     deployment or a node failover.
+##   * `...IgnoredDuringExecution` -- when Patroni promotes a new primary the
+##     `spilo-role=master` label moves, and nico-api is deliberately NOT evicted
+##     to follow it. Staying up beats chasing the 1.32x.
+##
+## The selector targets the Zalando/Spilo operator's convention. If your
+## PostgreSQL is deployed differently, point `matchLabels` at whatever marks
+## your primary, or set `enabled: false`. An unmatched preference is simply
+## ignored by the scheduler, so a wrong label costs nothing but the benefit.
+databaseAffinity:
+  enabled: true
+  weight: 100
+  topologyKey: kubernetes.io/hostname
+  namespaces:
+    - postgres
+  matchLabels:
+    spilo-role: master
+
 resources:
   limits:
     cpu: 3
@@ -78,6 +116,11 @@ resources:
   requests:
     cpu: 1500m
     memory: 8Gi
+
+## Soft open-file limit applied before startup. Clamped to the runtime hard
+## limit when it exceeds it. null falls back to 65536; non-null values must be
+## a positive integer (validated at render).
+fileDescriptorLimit: 65536
 
 ## Optional init containers (general-purpose pass-through)
 initContainers: []
@@ -149,6 +192,52 @@ certificate:
   # Dev/sim only: IP SANs for direct-IP TLS (e.g. API VIP). Leave empty in production.
   ipAddresses: []
 
+## Optional NVSwitch control-plane certificates. Both leaves use the
+## same existing issuer, which defaults to the vault-nico-issuer deployed by
+## the standard NICo prerequisites. Both profiles are disabled by default.
+nvSwitchTls:
+  issuerRef:
+    kind: ClusterIssuer
+    name: vault-nico-issuer
+    group: cert-manager.io
+
+  ## Dedicated NICo client identity for direct mTLS connections to NMX-C.
+  ## When enabled, the generated Secret is mounted read-only at mountPath.
+  nicoClient:
+    enabled: false
+    name: nvswitch-nico-client-certificate
+    secretName: nvswitch-nico-client-certificate
+    mountPath: /var/run/secrets/nvswitch-client
+    duration: 720h0m0s
+    renewBefore: 360h0m0s
+    ## At least one URI SAN is required when enabled. Any cert-manager approver
+    ## policy must allow the exact identity.
+    uris: []
+    privateKey:
+      algorithm: ECDSA
+      size: 384
+      rotationPolicy: Always
+
+  ## Server identity installed on NVUE/NMX-C by the site's switch installer.
+  ## This chart only creates the Secret; it deliberately does not mount it into
+  ## nico-api. Enable it only when this release should own the server artifact.
+  switchServer:
+    enabled: false
+    name: nvswitch-server-certificate
+    secretName: nvswitch-server-certificate
+    duration: 720h0m0s
+    renewBefore: 360h0m0s
+    ## Configure the SAN type that matches nmx_c_tls_authority. At least one
+    ## DNS name or IP address is required when this certificate is enabled.
+    dnsNames: []
+    ipAddresses: []
+    ## Optional identity metadata, subject to the issuer/approver policy.
+    uris: []
+    privateKey:
+      algorithm: ECDSA
+      size: 384
+      rotationPolicy: Always
+
 migrationJob:
   sslMode: require
 
@@ -158,29 +247,54 @@ migrationJob:
 ## with additional time for queue finalization.
 terminationGracePeriodSeconds: 240
 
-## Container command (override to customise startup).
+## Script body executed after setting the file descriptor limit. The template
+## prepends /bin/sh -c and the ulimit wrapper; this value is the script body.
 ## Picks /opt/nico/nico-api if present (renamed image), else /opt/carbide/carbide-api
 ## (current image). Configmaps are mounted at both /etc/nico and /etc/forge paths
 ## so the binary finds its expected config regardless of which it picks.
-command:
-  - /bin/sh
-  - -c
-  - |
-    if [ -x /opt/nico/nico-api ]; then
-      exec /opt/nico/nico-api run \
-        --config-path /etc/nico/nico-api/nico-api-config.toml \
-        --site-config-path /etc/nico/nico-api/site/nico-api-site-config.toml
-    else
-      exec /opt/carbide/carbide-api run \
-        --config-path /etc/forge/carbide-api/carbide-api-config.toml \
-        --site-config-path /etc/forge/carbide-api/site/carbide-api-site-config.toml
-    fi
+command: |
+  if [ -x /opt/nico/nico-api ]; then
+    exec /opt/nico/nico-api run \
+      --config-path /etc/nico/nico-api/nico-api-config.toml \
+      --site-config-path /etc/nico/nico-api/site/nico-api-site-config.toml
+  else
+    exec /opt/carbide/carbide-api run \
+      --config-path /etc/forge/carbide-api/carbide-api-config.toml \
+      --site-config-path /etc/forge/carbide-api/site/carbide-api-site-config.toml
+  fi
 
 ## Environment variables for nico-api
 env:
   VAULT_PKI_ROLE_NAME: "nico-cluster"
   RUST_BACKTRACE: "full"
   RUST_LIB_BACKTRACE: "0"
+
+## Optional operator-managed static credential file. The chart mounts one key
+## from an existing Secret and configures nico-api to watch it; no credential
+## content is rendered into this chart's ConfigMaps or values. The selected key
+## must contain JSON or YAML. UFM entries have this shape (both fields are
+## required; an empty password selects the default SPIFFE client certificate):
+##
+## ufm_auth_by_fabric:
+##   default:
+##     username: ignored-for-token-or-certificate-auth
+##     password: bearer-token-or-empty
+##
+## In the default local_first mode, these entries override matching persistent
+## backend credentials. Set ufmSource to local to require local entries for
+## every configured fabric and disable persistent-backend UFM access.
+credentials:
+  # local_first preserves environment/file overrides with persistent-backend
+  # fallback. backend ignores local UFM entries. local requires every configured
+  # fabric in the environment/file sources and rejects backend mutations.
+  ufmSource: local_first
+  file:
+    existingSecret:
+      name: ""
+      key: credentials.yaml
+    mountPath: /var/run/secrets/nico/credentials
+    # Must be greater than zero.
+    pollInterval: "60s"
 
 ## Optional Figment dictionary for CARBIDE_API_DSX_EXCHANGE_EVENT_BUS.
 dsxExchangeEventBusConfig: ""
@@ -202,7 +316,8 @@ componentManager:
   enabled: true
   ## Backend per role. computeTray: rms | core | mock. nvSwitch: rms | nsm |
   ## mock. powerShelf: rms | psm | mock. The binary defaults all three to rms;
-  ## nsm/psm select the standalone managers instead of RMS.
+  ## nsm/psm select externally managed standalone services instead of RMS. The
+  ## NICo deployment charts do not install those services.
   computeTrayBackend: "rms"
   nvSwitchBackend: "rms"
   powerShelfBackend: "rms"
@@ -366,6 +481,7 @@ hostname: "nico.local"
 
 vaultClusterInfo: {}
 #  VAULT_SERVICE: "https://vault.example.com"
+#  VAULT_NAMESPACE: "admin/team-a"
 #  NICO_VAULT_MOUNT: "secrets"
 #  NICO_VAULT_PKI_MOUNT: "nicoca"
 

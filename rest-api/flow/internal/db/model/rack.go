@@ -25,7 +25,7 @@ type Rack struct {
 	bun.BaseModel `bun:"table:rack,alias:r"`
 
 	ID   uuid.UUID `bun:"id,pk,type:uuid,default:gen_random_uuid()"`
-	Name string    `bun:"name,notnull,unique:rack_name_idx"`
+	Name string    `bun:"name,notnull"`
 	// Manufacturer and SerialNumber are descriptive chassis labels, not
 	// identity: a mirrored rack is identified by ExternalID. nullzero maps the
 	// empty string to SQL NULL, so a rack missing either half occupies no slot
@@ -311,6 +311,30 @@ func GetRacksByIDs(
 
 	if withComponents {
 		q = q.Relation("Components").Relation("Components.BMCs")
+	}
+
+	if err := q.Scan(ctx); err != nil {
+		return nil, err
+	}
+
+	return racks, nil
+}
+
+// GetRacksByIDsIncludingDeleted retrieves multiple racks by UUID, including
+// soft-deleted rows.
+func GetRacksByIDsIncludingDeleted(
+	ctx context.Context,
+	idb bun.IDB,
+	ids []uuid.UUID,
+	withComponents bool,
+) ([]Rack, error) {
+	var racks []Rack
+	q := idb.NewSelect().Model(&racks).Where("id IN (?)", bun.In(ids)).WhereAllWithDeleted()
+
+	if withComponents {
+		q = q.Relation("Components", func(q *bun.SelectQuery) *bun.SelectQuery {
+			return q.WhereAllWithDeleted()
+		}).Relation("Components.BMCs")
 	}
 
 	if err := q.Scan(ctx); err != nil {

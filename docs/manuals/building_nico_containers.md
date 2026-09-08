@@ -12,7 +12,7 @@ submodules, Docker with cross-architecture emulation, and the cargo build toolin
 in one idempotent step:
 
 ```sh
-git clone git@github.com:NVIDIA/infra-controller.git
+git clone git@github.com:dsx-ai-factory/infra-controller.git
 cd infra-controller
 make bootstrap          # or: ./scripts/setup-build-host.sh
 ```
@@ -29,7 +29,7 @@ steps on an `apt`-based distribution such as Ubuntu 24.04:
 2. [Add the correct hook for your shell](https://direnv.net/docs/hook.html)
 3. Install rustup: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` (select Option 1)
 4. Start a new shell to pick up changes made from direnv and rustup.
-5. Clone NICo - `git clone git@github.com:NVIDIA/infra-controller.git infra-controller`
+5. Clone NICo - `git clone git@github.com:dsx-ai-factory/infra-controller.git infra-controller`
 6. `cd infra-controller`
 7. `direnv allow`
 8. `git submodule update --init --recursive`
@@ -40,7 +40,6 @@ steps on an `apt`-based distribution such as Ubuntu 24.04:
 11. `echo "kernel.apparmor_restrict_unprivileged_userns=0" | sudo tee /etc/sysctl.d/99-userns.conf`
 12. `sudo usermod -aG docker $(id -un)`
 13. `reboot`
-
 
 ## Build all images with one command
 
@@ -61,6 +60,28 @@ under your own registry; authenticate Docker to that registry before running the
 make images IMAGE_REGISTRY=my-registry.example.com/nico IMAGE_TAG=v1.0.0
 ```
 
+By default, every image group is built for both `amd64` and `arm64`. Each group has its
+own override variable if you only need one architecture:
+
+- `NICO_ARCHES` — the NICo control-plane images (`images-base`, `images-core`,
+  `images-rest`, `images-machine-validation`)
+- `BOOT_ARTIFACTS_ARCHES` — the x86 boot-artifact image (`images-boot-artifacts`)
+- `DPU_ARCHES` — the DPU BFB boot-artifact image (`images-bfb`)
+
+```sh
+make images-all NICO_ARCHES=amd64 DPU_ARCHES=arm64
+```
+
+A single-architecture build still produces a valid tag at `$(IMAGE_TAG)` (the multi-arch
+manifest just has one entry). Values other than `amd64`/`arm64` fail fast with an error.
+
+`images-machine-validation` additionally requires `NICO_ARCHES` to include `amd64`:
+the `machine-validation-runner` intermediate image it embeds is always built for
+`amd64` regardless of which architectures you're publishing, and it depends on the
+amd64 Core runtime base container that `images-base` only pushes when `amd64` is
+requested. `NICO_ARCHES=arm64` alone fails fast with an error; use
+`NICO_ARCHES="amd64 arm64"` (the default) or `NICO_ARCHES=amd64`.
+
 Each architecture is built separately before the bare tag is assembled. This matches CI
 and is required for the REST Dockerfiles: a single combined Buildx invocation would reuse
 one builder stage and could copy an amd64 binary into the arm64 image. Building the
@@ -73,8 +94,11 @@ need to build or debug a single image.
 
 ### Verifying the build
 
-After `make images-all` completes, verify that all 14 deployable image tags contain both
-platforms:
+After `make images-all` completes, verify that each of the 14 deployable image tags
+contains the platforms you actually built. Set `NICO_ARCHES`, `BOOT_ARTIFACTS_ARCHES`,
+and `DPU_ARCHES` below to whatever you passed to `make` (they default to `amd64 arm64`,
+matching the Makefile); the script derives each image's expected platform list from its
+group automatically, so a narrowed selection doesn't produce false failures.
 
 ```bash
 images=(
@@ -83,12 +107,29 @@ images=(
   nico-psm nico-nsm nico-mcp machine-validation
   boot-artifacts-x86_64 boot-artifacts-aarch64
 )
+
+# Mirrors the Makefile defaults; set these to whatever you passed to `make`.
+NICO_ARCHES="${NICO_ARCHES:-amd64 arm64}"
+BOOT_ARTIFACTS_ARCHES="${BOOT_ARTIFACTS_ARCHES:-amd64 arm64}"
+DPU_ARCHES="${DPU_ARCHES:-amd64 arm64}"
+
+expected_platforms_for() {
+  local arches
+  case "$1" in
+    boot-artifacts-x86_64) arches="${BOOT_ARTIFACTS_ARCHES}" ;;
+    boot-artifacts-aarch64) arches="${DPU_ARCHES}" ;;
+    *) arches="${NICO_ARCHES}" ;;
+  esac
+  echo "${arches}" | tr ' ' '\n' | sed 's#^#linux/#' | sort | paste -sd, -
+}
+
 for image in "${images[@]}"; do
+  expected="$(expected_platforms_for "${image}")"
   platforms="$(docker buildx imagetools inspect --raw \
     "${IMAGE_REGISTRY}/${image}:${IMAGE_TAG}" | \
     jq -r '[.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | unique | sort | join(",")')"
-  if [ "${platforms}" != "linux/amd64,linux/arm64" ]; then
-    printf 'FAIL %s: %s\n' "${image}" "${platforms}" >&2
+  if [ "${platforms}" != "${expected}" ]; then
+    printf 'FAIL %s: got %s, want %s\n' "${image}" "${platforms}" "${expected}" >&2
     exit 1
   fi
   printf 'PASS %s: %s\n' "${image}" "${platforms}"
@@ -176,11 +217,12 @@ docker build --file dev/docker/Dockerfile.build-artifacts-container-cross-aarch6
 ```
 
 ## Building the admin-cli
+
 The `admin-cli` build does not produce a container. It produces a binary:
 
 `$REPO_ROOT/target/release/nico-admin-cli`
 
-```
+```text
 BUILD_CONTAINER_X86_URL="nico-buildcontainer-x86_64" cargo make build-cli
 ```
 

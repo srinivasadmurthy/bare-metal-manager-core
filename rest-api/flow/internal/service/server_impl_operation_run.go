@@ -14,8 +14,10 @@ import (
 
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/converter/protobuf"
 	dbquery "github.com/NVIDIA/infra-controller/rest-api/flow/internal/db/query"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/firmwareauth"
 	operationrun "github.com/NVIDIA/infra-controller/rest-api/flow/internal/operationrun"
 	operationrunmanager "github.com/NVIDIA/infra-controller/rest-api/flow/internal/operationrun/manager"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/inventoryobjects/rack"
 	pb "github.com/NVIDIA/infra-controller/rest-api/flow/pkg/proto/v1"
 )
 
@@ -23,7 +25,20 @@ func (rs *FlowServerImpl) CreateOperationRun(
 	ctx context.Context,
 	req *pb.CreateOperationRunRequest,
 ) (*pb.CreateOperationRunResponse, error) {
-	run, err := protobuf.OperationRunFrom(req)
+	upgrade := req.GetConfiguration().GetOperation().GetUpgradeFirmware()
+	authenticationData, err := firmwareauth.Encrypt(
+		rs.dataCipher,
+		upgrade.GetAuthenticationData(),
+		upgrade.GetSubTargets(),
+	)
+	if err != nil {
+		return nil, firmwareAuthenticationStatusError(err)
+	}
+
+	run, err := protobuf.OperationRunFromWithFirmwareAuthentication(
+		req,
+		authenticationData,
+	)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -170,6 +185,31 @@ func (rs *FlowServerImpl) ListOperationRunTargets(
 	result, err := convertSlice(targets, protobuf.OperationRunTargetTo)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
+	}
+	rackIDs := make([]uuid.UUID, 0, len(targets))
+	for _, target := range targets {
+		rackIDs = append(rackIDs, target.RackID)
+	}
+	var racks []*rack.Rack
+	if len(rackIDs) > 0 {
+		racks, err = rs.inventoryManager.GetRacksByIDsIncludingDeleted(ctx, rackIDs, false)
+		if err != nil {
+			return nil, operationRunStatusError(codes.Internal, err)
+		}
+	}
+	externalByID := make(map[string]string, len(racks))
+	for _, rack := range racks {
+		if rack != nil {
+			externalByID[rack.Info.ID.String()] = rack.ExternalID
+		}
+	}
+	for _, target := range result {
+		rackID := target.GetRackId().GetId()
+		externalID := externalByID[rackID]
+		if externalID == "" {
+			return nil, status.Errorf(codes.FailedPrecondition, "rack %q has no external ID", rackID)
+		}
+		target.RackExternalId = externalID
 	}
 
 	return &pb.ListOperationRunTargetsResponse{

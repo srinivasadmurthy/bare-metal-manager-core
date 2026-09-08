@@ -15,12 +15,14 @@ import (
 	zlogadapter "logur.dev/adapter/zerolog"
 	"logur.dev/logur"
 
+	"go.opentelemetry.io/otel"
 	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/contrib/opentelemetry"
 	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/worker"
 
 	computils "github.com/NVIDIA/infra-controller/rest-api/site-agent/pkg/components/utils"
+	swu "github.com/NVIDIA/infra-controller/rest-api/site-workflow/pkg/util"
 )
 
 // Orchestrator - Workflow Orchestrator
@@ -70,6 +72,15 @@ func workflowOrchestrator() error {
 
 	var clientInterceptors []interceptor.ClientInterceptor
 	var workerInterceptors []interceptor.WorkerInterceptor
+
+	// otelErr, not err: `var err error` is declared further down.
+	otelInterceptor, otelErr := opentelemetry.NewTracingInterceptor(
+		opentelemetry.TracerOptions{TextMapPropagator: otel.GetTextMapPropagator()})
+	if otelErr != nil {
+		return fmt.Errorf("creating Temporal tracing interceptor: %w", otelErr)
+	}
+	clientInterceptors = append(clientInterceptors, otelInterceptor)
+	workerInterceptors = append(workerInterceptors, otelInterceptor)
 
 	// Create logger for temporal using
 	// zero logger
@@ -142,17 +153,9 @@ func workflowOrchestrator() error {
 		HostPort:          fmt.Sprintf("%s:%s", ManagerAccess.Conf.EB.Temporal.Host, ManagerAccess.Conf.EB.Temporal.Port),
 		Namespace:         ManagerAccess.Conf.EB.Temporal.TemporalPublishNamespace,
 		ConnectionOptions: publishClientConnOptions,
-		DataConverter: converter.NewCompositeDataConverter(
-			converter.NewNilPayloadConverter(),
-			converter.NewByteSlicePayloadConverter(),
-			converter.NewProtoJSONPayloadConverterWithOptions(converter.ProtoJSONPayloadConverterOptions{
-				AllowUnknownFields: true,
-			}),
-			converter.NewProtoPayloadConverter(),
-			converter.NewJSONPayloadConverter(),
-		),
-		Interceptors: clientInterceptors,
-		Logger:       tLogger,
+		DataConverter:     swu.NewTemporalDataConverter(),
+		Interceptors:      clientInterceptors,
+		Logger:            tLogger,
 	}
 
 	if ManagerAccess.Data.EB.Conf.UtMode {
@@ -171,17 +174,9 @@ func workflowOrchestrator() error {
 		HostPort:          fmt.Sprintf("%s:%s", ManagerAccess.Conf.EB.Temporal.Host, ManagerAccess.Conf.EB.Temporal.Port),
 		Namespace:         ManagerAccess.Conf.EB.Temporal.TemporalSubscribeNamespace,
 		ConnectionOptions: subscribeClientConnOptions,
-		DataConverter: converter.NewCompositeDataConverter(
-			converter.NewNilPayloadConverter(),
-			converter.NewByteSlicePayloadConverter(),
-			converter.NewProtoJSONPayloadConverterWithOptions(converter.ProtoJSONPayloadConverterOptions{
-				AllowUnknownFields: true,
-			}),
-			converter.NewProtoPayloadConverter(),
-			converter.NewJSONPayloadConverter(),
-		),
-		Interceptors: clientInterceptors,
-		Logger:       tLogger,
+		DataConverter:     swu.NewTemporalDataConverter(),
+		Interceptors:      clientInterceptors,
+		Logger:            tLogger,
 	}
 
 	if ManagerAccess.Data.EB.Conf.UtMode {

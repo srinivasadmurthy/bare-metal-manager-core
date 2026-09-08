@@ -17,7 +17,7 @@ The chart is designed for production environments where NICo manages the full li
 | 3  | **nico-dhcp** | Kea DHCP server for bare-metal PXE boot and IP assignment. |
 | 4  | **nico-dns** | Authoritative DNS server (StatefulSet) for managed machines and VPCs. |
 | 5  | **nico-dsx-exchange-consumer** | Consumes DSX exchange messages for machine telemetry and state updates. Disabled by default. |
-| 6  | **nico-flow** | Workflow / Temporal-backed orchestration component. Disabled by default. |
+| 6  | **nico-flow** | Task, policy, and automation service. Installed separately by `setup.sh` unless `--skip-flow` is used; not rendered by the umbrella chart. |
 | 7  | **nico-hardware-health** | Collects and reports hardware health metrics from managed machines. |
 | 8  | **nico-ntp** | chrony NTP servers (3-replica StatefulSet, per-pod LoadBalancer VIPs). DPUs and bare-metal hosts sync against these per the kea DHCP `ntpServer` advertisement. |
 | 9  | **nico-pxe** | PXE boot server (HTTP-based) for OS provisioning workflows. |
@@ -29,7 +29,7 @@ The chart is designed for production environments where NICo manages the full li
 - **Kubernetes** 1.27+
 - **Helm** 3.12+
 - **cert-manager** with a `ClusterIssuer` configured (default issuer name: `vault-nico-issuer`)
-- **HashiCorp Vault** for PKI certificate issuance and secret storage
+- **HashiCorp Vault** for PKI certificate issuance and, by default, secret storage. NICo can keep its managed credentials in Postgres instead; see [Secrets Storage](../docs/configuration/secrets-storage.md).
 - **PostgreSQL** (SSL-enabled) for the `nico-api` database backend
 - **Prometheus Operator CRDs** if you enable `ServiceMonitor` resources
 - **Required Kubernetes Secrets and ConfigMaps** (Vault tokens, database credentials, SSO secrets, etc.)
@@ -73,6 +73,61 @@ Top-level `global:` values are automatically passed to all subcharts.
 | `global.certificate.issuerRef.group` | cert-manager issuer API group | `cert-manager.io` |
 | `global.spiffe.trustDomain` | SPIFFE trust domain for mTLS | `nico.local` |
 | `global.labels` | Common labels applied to all resources | See `values.yaml` |
+
+### NVSwitch mTLS Certificates
+
+`nico-api.nvSwitchTls` can ask cert-manager to issue NICo's dedicated NMX-C
+client identity and, optionally, the NVSwitch server identity. Both leaves
+use the existing `nvSwitchTls.issuerRef`, which defaults to
+`vault-nico-issuer`. NMX-C/NVUE must trust the CA behind that issuer when NICo
+connects, and NICo uses the CA returned in its client Secret to verify the
+server certificate presented by the switch.
+
+The profiles are deliberately fixed to the capabilities each peer needs:
+
+- `nicoClient` uses `digital signature` and `client auth`. Its Secret is
+  mounted read-only in the nico-api container as `tls.crt`, `tls.key`, and
+  `ca.crt`.
+- `switchServer` uses `digital signature`, `server auth`, and `client auth`.
+  Its Secret is created in the NICo namespace but is never mounted into
+  nico-api. A switch installer or operator must copy the certificate, private
+  key, and CA to NMX-C/NVUE and bind them there.
+
+Both profiles are off by default. Enable `switchServer` only when this Helm
+release should own the server artifact. Configure `dnsNames` or `ipAddresses`,
+as appropriate, with a SAN that exactly matches `nmx_c_tls_authority` in the
+NICo site configuration.
+
+```yaml
+nico-api:
+  nvSwitchTls:
+    issuerRef:
+      kind: ClusterIssuer
+      name: vault-nico-issuer
+      group: cert-manager.io
+    nicoClient:
+      enabled: true
+      uris:
+        - spiffe://switch.local/nico-system/sa/nico-nmxc
+    switchServer:
+      enabled: true
+      dnsNames:
+        - nmxc.example.internal
+
+  siteConfig:
+    enabled: true
+    nicoApiSiteConfig: |
+      [nvlink_config]
+      enabled = true
+      nmx_c_tls_ca_cert_path = "/var/run/secrets/nvswitch-client/ca.crt"
+      nmx_c_tls_client_cert_path = "/var/run/secrets/nvswitch-client/tls.crt"
+      nmx_c_tls_client_key_path = "/var/run/secrets/nvswitch-client/tls.key"
+      nmx_c_tls_authority = "nmxc.example.internal"
+```
+
+The configured issuer and any cert-manager approver policy must allow both
+requested URI/DNS identities, durations, key profile, and usages. Creating the
+Kubernetes Secret does not install or bind the server identity on a switch.
 
 ### Grafana Dashboards
 
@@ -135,7 +190,7 @@ nico-dns:
 nico-dsx-exchange-consumer:
   enabled: false       # DSX exchange telemetry consumer (off by default)
 nico-flow:
-  enabled: false       # Temporal-backed workflow orchestrator (off by default)
+  enabled: false       # Off in the umbrella; setup.sh installs a separate release by default
 nico-hardware-health:
   enabled: true        # Hardware health monitoring
 nico-ntp:
@@ -251,10 +306,10 @@ nico-dns:
 
 ### Service Dependencies
 
-```
-                         +------------------+
-                         |   nico-api    |  <-- PostgreSQL, Vault
-                         +--------+---------+
+```text
+                         +-----------------+
+                         |    nico-api     |  <-- PostgreSQL, Vault
+                         +--------+--------+
                                   |
           +-----------+-----------+-----------+-----------+
           |           |           |           |           |
@@ -299,6 +354,10 @@ helm diff upgrade nico ./helm \
   -f values-production.yaml
 ```
 
+Deployments upgrading from a Flow release that bundled PSM and NSM must first
+follow the
+[preserve-or-overwrite guidance](../helm-prereqs/README.md#upgrading-deployments-that-bundled-psm-and-nsm).
+
 ### Upgrading from pre-2.0.0 (carbide/forge naming)
 
 Starting with v2.0.0 the chart defaults changed from the legacy `carbide`/`forge` naming
@@ -308,6 +367,7 @@ names, SPIFFE identities, and trust domains are already `nico`-prefixed.
 > **Cutting over to nico naming on an existing site:** if you want to fully migrate an
 > existing site from `carbide`/`forge` naming to `nico` naming rather than preserving the
 > old names in-place, the safe procedure is:
+>
 > 1. Back up the PostgreSQL database (`pg_dump`).
 > 2. Uninstall the current release (`helm uninstall nico -n forge-system`).
 > 3. Re-install from scratch with the new defaults and your target namespace
@@ -405,6 +465,28 @@ This is also available as a ready-to-use overlay at
   `nico-ssh-console-rs` to dial `carbide-api` (the name the Service has after `nameOverride`),
   rather than the new default `nico-api`. Without this, those services build a URL pointing at
   a Service that does not exist.
+
+## Testing
+
+This chart includes unit tests using the [helm-unittest](https://github.com/helm-unittest/helm-unittest) plugin.
+
+### Running tests locally
+
+```bash
+# Install the plugin (once)
+helm plugin install https://github.com/helm-unittest/helm-unittest.git
+
+# Run all tests
+helm unittest helm --with-subchart
+
+# Disabled-by-default subcharts must be tested separately
+helm unittest helm/charts/nico-flow
+helm unittest helm/charts/nico-machine-a-tron
+helm unittest helm/charts/nico-machine-a-tron/charts/mat-k8s-controller
+helm unittest helm/charts/unbound
+```
+
+Test files live in `tests/` directories within each chart. CI runs these tests automatically on every PR.
 
 ## Uninstalling
 

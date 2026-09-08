@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::DpuMachineId;
 use config_version::Versioned;
 use model::instance::config::InstanceConfig;
 use model::instance::config::extension_services::InstanceExtensionServicesConfig;
@@ -70,8 +70,8 @@ impl TryFrom<InstanceStatus> for rpc::InstanceStatus {
 /// and the interfaces therefore won't match.
 #[allow(clippy::too_many_arguments)]
 pub fn instance_status_from_config_and_observation(
-    dpu_id_to_device_map: HashMap<String, Vec<MachineId>>,
-    primary_dpu_machine_id: Option<MachineId>,
+    dpu_id_to_device_map: HashMap<String, Vec<DpuMachineId>>,
+    primary_dpu_machine_id: Option<DpuMachineId>,
     instance_config: Versioned<&InstanceConfig>,
     network_config: Versioned<&InstanceNetworkConfig>,
     ib_config: Versioned<&InstanceInfinibandConfig>,
@@ -90,8 +90,7 @@ pub fn instance_status_from_config_and_observation(
 ) -> Result<InstanceStatus, RpcDataConversionError> {
     let mut instance_config_synced = SyncState::Synced;
 
-    let operator_managed_networking =
-        !network_config.interfaces.is_empty() && network_config.is_host_inband();
+    let operator_managed_networking = network_config.uses_operator_managed_networking();
 
     for network_obs in observations.network.values() {
         if let Some(version_obs) = network_obs.instance_config_version
@@ -124,15 +123,17 @@ pub fn instance_status_from_config_and_observation(
         );
 
     let extension_services =
-        model::instance::status::extension_service::InstanceExtensionServicesStatus::from_config_and_observations(
+        model::instance::status::extension_service::InstanceExtensionServicesStatus::from_config_and_type_observations(
             &used_dpu_ids,
             extension_services_config,
             &observations.extension_services,
+            delete_requested,
         );
     let extension_services_ready =
         model::instance::status::extension_service::is_extension_services_ready(
             &extension_services,
         );
+
     let nvlink = model::instance::status::nvlink::InstanceNvLinkStatus::from_config_and_observation(
         nvlink_config,
         nvlink_status,
@@ -303,8 +304,8 @@ mod tests {
 
     #[test]
     fn test_tenant_state() {
-        let machine_id: MachineId =
-            MachineId::from_str("fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0")
+        let machine_id =
+            DpuMachineId::from_str("fm100dtjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0")
                 .unwrap();
 
         assert_eq!(

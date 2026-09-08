@@ -1,4 +1,4 @@
-# machine-a-tron Build & Deployment Guide <Badge intent="info">Upcoming</Badge>
+# machine-a-tron Build & Deployment Guide <Badge intent="info">v2.1</Badge> <Badge intent="launch" minimal>New</Badge>
 
 machine-a-tron is a bare-metal simulator for NICo testing. It hosts mock DPUs and
 servers via Redfish BMC, allowing end-to-end NICo flows without real hardware. This
@@ -6,12 +6,7 @@ guide documents everything needed to build the container image and deploy it on 
 cluster.
 
 <Note title="Version availability">
-Everything in this guide — the `nico-machine-a-tron` Helm chart,
-`helm-prereqs/setup-machine-a-tron.sh`, and the values files it references —
-landed on `main` in July 2026 (#2764) and is **not present in v2.0.x
-releases**. If your checkout is a `v2.0.0` tag or the `release/v2.0` branch,
-these paths will not exist; use a checkout of `main` (or the first release
-that includes them) to follow this guide.
+Everything in this guide — the `nico-machine-a-tron` Helm chart, `helm-prereqs/setup-machine-a-tron.sh`, and the values files it references — is available as of NVIDIA Infra Controller v2.1.
 </Note>
 
 ## Overview
@@ -274,7 +269,7 @@ Add this to the nico-core site config under `[site_explorer]`:
 
 ```toml
 [site_explorer]
-bmc_proxy = "nico-machine-a-tron-bmc-mock.nico-mat.svc.cluster.local:1266"
+bmc_proxy = "nico-machine-a-tron-default-bmc-mock.nico-mat.svc.cluster.local:1266"
 ```
 
 **Use the cross-namespace FQDN.** site-explorer runs inside nico-api in
@@ -298,7 +293,7 @@ to work: when set, machine-a-tron calls nico-api's `set_dynamic_config` to set
 `bmc_proxy` at runtime, but that call is rejected with `PermissionDenied` unless
 `allow_changing_bmc_proxy` is true. The two mechanisms are complementary — the
 values file ships `configureBmcProxyHost:
-"nico-machine-a-tron-bmc-mock.nico-mat.svc.cluster.local"` (FQDN, same
+"nico-machine-a-tron-default-bmc-mock.nico-mat.svc.cluster.local"` (FQDN, same
 cross-namespace requirement), and the nico-core `bmc_proxy` setting both
 enables that path and covers the case where the runtime call has not happened
 yet.
@@ -469,7 +464,7 @@ The `machine_dhcp_records` view inner-joins the singleton control row `machine_i
 | Machine creation fails `No IP addresses left in prefix <admin-cidr>` | Admin pool too small: creation needs one host-PF IP per DPU | Fit `hostCount×dpuPerHostCount` ≤ usable admin-pool IPs (the script auto-fits) |
 | `No IP addresses left in prefix ...`; machines stuck in `BmcInit` | OOB DHCP pool too small for host×DPU count | Sizing: `hostCount + hostCount×dpuPerHostCount` ≤ usable pool IPs; use ≥ /27 or reduce counts |
 | Redfish `connection refused` on every endpoint despite bmc_proxy set | Bare service name resolves against nico-system, not nico-mat | Use the cross-namespace FQDN in `bmc_proxy` |
-| Redfish redirect ignored; `endpoint_explorations=0` | Wrong config field (`override_target_host` is not real) | Use `bmc_proxy = "nico-machine-a-tron-bmc-mock.nico-mat.svc.cluster.local:1266"` under `[site_explorer]` |
+| Redfish redirect ignored; `endpoint_explorations=0` | Wrong config field (`override_target_host` is not real) | Use `bmc_proxy = "nico-machine-a-tron-default-bmc-mock.nico-mat.svc.cluster.local:1266"` under `[site_explorer]` |
 | `Refusing to create managed host, expected machines entry not found` | No `expected_machines` row for the discovered BMC MAC | Set `machineATron.registerExpectedMachines: true` (default) so machine-a-tron auto-registers them |
 | `Refusing to create managed host`; machine-a-tron logs `PermissionDenied` on registration | nico-api build lacks the `Machineatron` → `AddExpectedMachine` RBAC grant | Rebuild nico-api with the grant (internal_rbac_rules.rs); the setup script also has a DB fallback |
 | `SIGSEGV` compiling `aws-lc-sys` | QEMU emulates the `.S` assembler, which crashes | True cross-compilation (native arm64 host → x86_64 target) instead of QEMU |

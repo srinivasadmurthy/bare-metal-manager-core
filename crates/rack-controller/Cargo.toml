@@ -26,6 +26,7 @@ repository.workspace = true
 carbide-api-db = { path = "../api-db", default-features = false }
 carbide-api-model = { path = "../api-model", default-features = false }
 carbide-health-metrics = { path = "../health-metrics", default-features = false }
+carbide-health-report = { path = "../health-report", default-features = false }
 carbide-instrument = { path = "../instrument" }
 carbide-rack = { path = "../rack", default-features = false }
 carbide-secrets = { path = "../secrets", default-features = false }
@@ -47,7 +48,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }
-tonic = { workspace = true }
 
 [dev-dependencies]
 carbide-instrument = { path = "../instrument", features = ["test-support"] }

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
@@ -60,6 +60,76 @@ pub fn template_for(vtype: VpcVirtualizationType) -> eyre::Result<&'static str> 
 /// This value is added to the priority value specified
 /// by users for their NSG rules.
 const NETWORK_SECURITY_GROUP_RULE_PRIORITY_START: u32 = 2000;
+
+const VPC_ISOLATION_RULE_INDEX_START: usize = 10;
+const SITE_FABRIC_RULE_INDEX_START: usize = 1000;
+
+/// Deduplicated ACL prefixes and the first index available after their rules.
+struct PreparedAclPrefixes {
+    prefixes: Vec<Prefix>,
+    next_index: usize,
+}
+
+/// Builds a stable CIDR union and resolves duplicate indices within one ACL namespace.
+fn deduplicate_acl_prefixes(
+    prefixes: impl IntoIterator<Item = Prefix>,
+) -> eyre::Result<PreparedAclPrefixes> {
+    let mut seen_prefixes = HashSet::new();
+
+    // ACL rule order is observable, so preserve the first occurrence of each prefix.
+    let mut unique_prefixes = prefixes
+        .into_iter()
+        .filter(|prefix| seen_prefixes.insert(prefix.Prefix.clone()))
+        .collect::<Vec<_>>();
+    let mut next_index = unique_prefixes
+        .iter()
+        .map(|prefix| {
+            prefix
+                .Index
+                .parse::<usize>()
+                .wrap_err_with(|| format!("invalid ACL rule index {}", prefix.Index))
+        })
+        .collect::<eyre::Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(VPC_ISOLATION_RULE_INDEX_START - 1)
+        .checked_add(1)
+        .ok_or_else(|| eyre::eyre!("VPC isolation rule index overflow"))?;
+    let mut used_indices = HashSet::new();
+
+    for prefix in &mut unique_prefixes {
+        // Preserve established indices; move only a distinct prefix that reuses one.
+        if !used_indices.insert(prefix.Index.clone()) {
+            prefix.Index = next_index.to_string();
+            used_indices.insert(prefix.Index.clone());
+            next_index = next_index
+                .checked_add(1)
+                .ok_or_else(|| eyre::eyre!("VPC isolation rule index overflow"))?;
+        }
+    }
+
+    Ok(PreparedAclPrefixes {
+        prefixes: unique_prefixes,
+        next_index,
+    })
+}
+
+/// Reassigns one ACL prefix list to a collision-free contiguous index range.
+fn reindex_acl_prefixes(prefixes: &[Prefix], start_index: usize) -> eyre::Result<Vec<Prefix>> {
+    prefixes
+        .iter()
+        .enumerate()
+        .map(|(offset, prefix)| {
+            let index = start_index
+                .checked_add(offset)
+                .ok_or_else(|| eyre::eyre!("ACL rule index overflow"))?;
+            Ok(Prefix {
+                Index: index.to_string(),
+                Prefix: prefix.Prefix.clone(),
+            })
+        })
+        .collect()
+}
 
 /// This limits the number of rules we'll allow into the set for
 /// nvue.  We do not expect to ever hit this as the rules should
@@ -182,6 +252,11 @@ fn parse_prefixes(prefixes: &[String]) -> Vec<IpNet> {
 
 pub fn build(conf: NvueConfig) -> eyre::Result<String> {
     let template = template_for(conf.vpc_virtualization_type)?;
+    let is_etv = matches!(
+        conf.vpc_virtualization_type,
+        VpcVirtualizationType::EthernetVirtualizer
+            | VpcVirtualizationType::EthernetVirtualizerWithNvue
+    );
     let is_dpu_os = conf.is_dpu_os;
     let fmds_gateway_vlan = conf.fmds_gateway_vlan;
     // HostInterfaces is the legacy template shape. The same host-facing values
@@ -379,7 +454,10 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
             Index: format!("{}", (base_i + 1) * 10),
             VlanID: network.vlan,
             HostIP: network.host_ip.clone(),
-            HostIPv6: network.host_ipv6.clone(),
+            HostIPv6: network
+                .host_ipv6
+                .clone()
+                .filter(|address| !address.is_empty()),
             HostRoute: network.host_route.clone(),
             HostIPv6Route: network.host_ipv6_route.clone(),
             // HasRoutingProfile means this port has an interface override; otherwise templates inherit from the VPC profile.
@@ -438,6 +516,7 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         if port.HasFmdsGateway {
             fmds_gateway_matched = true;
         }
+        let port_has_neighbor = !port.HostIP.is_empty() || port.HostIPv6.is_some();
 
         let (vpc_peer_ipv4, vpc_peer_ipv6) =
             split_prefixes_by_family(&network.vpc_peer_prefixes, None, 1);
@@ -462,6 +541,7 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
                 }
                 v.PortPrefixes.extend_from_slice(&port.VpcPrefixes);
                 v.PortPrefixesIpv6.extend_from_slice(&port.VpcPrefixesIpv6);
+                v.HasNeighbors |= port_has_neighbor;
                 v.PortConfigs.push(port.clone());
             })
             .or_insert_with(|| TmplVpc {
@@ -469,6 +549,7 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
                 L3VNI: l3_vni,
                 HasVrfLoopback: network.tenant_vrf_loopback_ip.is_some(),
                 VrfLoopback: network.tenant_vrf_loopback_ip.unwrap_or_default(),
+                HasNeighbors: port_has_neighbor,
                 PortConfigs: vec![port.clone()],
                 HasVpcPeerPrefixes: !vpc_peer_ipv4.is_empty(),
                 VpcPeerPrefixes: vpc_peer_ipv4,
@@ -483,6 +564,8 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
                 RoutingProfile: routing_profile.clone(),
                 PortPrefixes: port.VpcPrefixes.clone(),
                 PortPrefixesIpv6: port.VpcPrefixesIpv6.clone(),
+                SiteFabricPrefixes: vec![],
+                SiteFabricPrefixesIpv6: vec![],
             });
 
         port_configs.push(port);
@@ -506,13 +589,66 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         egress_ipv6_override_rules,
     ) = prepare_network_security_group_rules(conf.network_security_policy_override_rules)?;
 
-    // The original VPC isolation would add site fabric prefixes to deny prefixes,
-    // with site_fabric_prefixes coming first.
-    // This is just an easy way to maintain the ordering of the original behavior.
-    let deny_prefix_index_offset = conf.site_fabric_prefixes.len();
+    let (site_fabric_ipv4, site_fabric_ipv6) = split_prefixes_by_family(
+        &conf.site_fabric_prefixes,
+        None,
+        SITE_FABRIC_RULE_INDEX_START,
+    );
 
     let mut vpcs = vpc_configs.into_values().collect::<Vec<TmplVpc>>();
     vpcs.sort_by_key(|a| a.L3VNI);
+    for vpc in &mut vpcs {
+        let PreparedAclPrefixes {
+            prefixes: ipv4_prefixes,
+            next_index: ipv4_next_index,
+        } = deduplicate_acl_prefixes(std::mem::take(&mut vpc.PortPrefixes))?;
+        let PreparedAclPrefixes {
+            prefixes: ipv6_prefixes,
+            next_index: ipv6_next_index,
+        } = deduplicate_acl_prefixes(std::mem::take(&mut vpc.PortPrefixesIpv6))?;
+        vpc.SiteFabricPrefixes = reindex_acl_prefixes(
+            &site_fabric_ipv4,
+            ipv4_next_index.max(SITE_FABRIC_RULE_INDEX_START),
+        )?;
+        vpc.SiteFabricPrefixesIpv6 = reindex_acl_prefixes(
+            &site_fabric_ipv6,
+            ipv6_next_index.max(SITE_FABRIC_RULE_INDEX_START),
+        )?;
+        vpc.PortPrefixes = ipv4_prefixes;
+        vpc.PortPrefixesIpv6 = ipv6_prefixes;
+    }
+
+    let (vpc_isolation_prefixes, etv_isolation_next_index) = if is_etv {
+        let PreparedAclPrefixes {
+            prefixes,
+            next_index,
+        } = deduplicate_acl_prefixes(
+            port_configs
+                .iter()
+                .flat_map(|port| port.VpcPrefixes.iter().cloned()),
+        )?;
+        (prefixes, next_index)
+    } else {
+        (vec![], VPC_ISOLATION_RULE_INDEX_START)
+    };
+    let site_fabric_ipv4 = if is_etv {
+        reindex_acl_prefixes(
+            &site_fabric_ipv4,
+            etv_isolation_next_index.max(SITE_FABRIC_RULE_INDEX_START),
+        )?
+    } else {
+        site_fabric_ipv4
+    };
+
+    // Preserve the established deny-rule floor unless ETV permits occupy it.
+    let legacy_deny_prefix_rule_index_start = SITE_FABRIC_RULE_INDEX_START
+        .checked_add(conf.site_fabric_prefixes.len())
+        .ok_or_else(|| eyre::eyre!("deny-prefix rule index overflow"))?;
+    let deny_prefix_rule_index_start = if is_etv && !has_network_security_group {
+        legacy_deny_prefix_rule_index_start.max(etv_isolation_next_index)
+    } else {
+        legacy_deny_prefix_rule_index_start
+    };
 
     let mut tenant_host_routes_to_underlay = Vec::new();
     let mut tenant_host_routes_to_underlay_ipv6 = Vec::new();
@@ -537,10 +673,8 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
 
     let (anycast_ipv4, anycast_ipv6) =
         split_prefixes_by_family(&conf.anycast_site_prefixes, None, 1000);
-    let (site_fabric_ipv4, site_fabric_ipv6) =
-        split_prefixes_by_family(&conf.site_fabric_prefixes, None, 1000);
     let (deny_ipv4, deny_ipv6) =
-        split_prefixes_by_family(&conf.deny_prefixes, None, 1000 + deny_prefix_index_offset);
+        split_prefixes_by_family(&conf.deny_prefixes, None, deny_prefix_rule_index_start);
 
     let params = TmplNvue {
         HasBgpLeafSessionPassword: conf.bgp_leaf_session_password.is_some(),
@@ -605,6 +739,7 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         Tenant: TmplComputeTenant {
             RoutingProfile: deprecated_tenant_routing_profile,
             Vpcs: vpcs,
+            VpcIsolationPrefixes: vpc_isolation_prefixes,
             VrfName: conf.ct_vrf_name,
             L3VNI: conf.ct_l3_vni.unwrap_or_default().to_string(),
             PortConfigs: port_configs,
@@ -1246,8 +1381,10 @@ pub struct L3Domain {
 /// IPv6 configuration for a port.
 #[derive(Clone, Deserialize, Debug)]
 pub struct Ipv6PortConfig {
-    /// DPU-side IPv6 address in CIDR notation (e.g. "2001:db8::0/127").
-    /// For FNN L3 linknets, this is the ::0 end of the /127 (RFC 6164).
+    /// IPv6 value configured on the DPU in CIDR notation (for example,
+    /// "2001:db8::0/127"). Stateful FNN uses the ::0 end of a /127 linknet
+    /// (RFC 6164). SLAAC carries the selected /64 without a concrete host
+    /// address.
     pub gateway_cidr: String,
     /// SVI IP for L2 segments -- the DPU's gateway address on the VLAN.
     pub svi_ip: Option<String>,
@@ -1451,6 +1588,8 @@ struct TmplInterfaceRoutingProfile {
 struct TmplComputeTenant {
     Vpcs: Vec<TmplVpc>,
     PortConfigs: Vec<TmplConfigPort>,
+    /// Deduplicated IPv4 prefixes used only by ETV's tenant-wide VPC isolation policies.
+    VpcIsolationPrefixes: Vec<Prefix>,
     NetworkSecurityGroups: Vec<TmplNetworkSecurityGroup>,
 
     // TODO:  Everything thing from here down should remain for pre-FNN purposes,
@@ -1531,6 +1670,7 @@ struct TmplVpc {
     HasVrfLoopback: bool,
     VrfLoopback: String,
 
+    HasNeighbors: bool,
     PortConfigs: Vec<TmplConfigPort>,
 
     HasVpcPeerPrefixes: bool,
@@ -1544,6 +1684,10 @@ struct TmplVpc {
     /// The list of prefixes for all ports/interfaces that belong to this VPC.
     PortPrefixes: Vec<Prefix>,
     PortPrefixesIpv6: Vec<Prefix>,
+    /// Site-fabric deny prefixes indexed within this FNN VPC's IPv4 isolation ACL.
+    SiteFabricPrefixes: Vec<Prefix>,
+    /// Site-fabric deny prefixes indexed within this FNN VPC's IPv6 isolation ACL.
+    SiteFabricPrefixesIpv6: Vec<Prefix>,
 
     HasVpcPeerVnis: bool,
     VpcPeerVnis: Vec<TmplVni>,
@@ -1674,6 +1818,30 @@ mod tests {
             Index: index.to_string(),
             Prefix: cidr.to_string(),
         }
+    }
+
+    /// Verifies a distinct prefix that reuses an occupied key is relocated after the existing
+    /// range, because deduplication alone cannot make that ACL mapping valid.
+    #[test]
+    fn test_deduplicate_acl_prefixes_relocates_distinct_index_collision() {
+        // Keep two established indices and collide a third distinct prefix with the latter.
+        let prepared = deduplicate_acl_prefixes(vec![
+            prefix("10", "10.0.0.0/24"),
+            prefix("20", "10.0.1.0/24"),
+            prefix("20", "10.0.2.0/24"),
+        ])
+        .expect("prefix preparation should succeed");
+
+        // Only the conflicting rule moves, and the next free index advances with it.
+        assert_eq!(
+            prepared.prefixes,
+            vec![
+                prefix("10", "10.0.0.0/24"),
+                prefix("20", "10.0.1.0/24"),
+                prefix("21", "10.0.2.0/24"),
+            ]
+        );
+        assert_eq!(prepared.next_index, 22);
     }
 
     #[test]
@@ -2305,6 +2473,167 @@ mod tests {
         conf
     }
 
+    /// Verifies repeated VPC-wide prefixes from multiple ports produce one permit rule per
+    /// CIDR, because duplicate YAML rule keys prevent NVUE from applying the entire config.
+    #[test]
+    fn test_build_deduplicates_shared_vpc_isolation_prefixes() {
+        // Model Core's repeated VPC-wide list at the old 10-rule collision boundary.
+        let mut conf = dual_stack_fnn_config();
+        conf.site_fabric_prefixes = vec!["192.0.2.0/24".into(), "fd00::/32".into()];
+        let shared_ipv4_prefixes = (0..11)
+            .map(|index| format!("10.{index}.0.0/16"))
+            .collect::<Vec<_>>();
+        let shared_ipv6_prefixes = (0..11)
+            .map(|index| format!("2001:db8:{index:x}::/48"))
+            .collect::<Vec<_>>();
+        let shared_prefixes = shared_ipv4_prefixes
+            .iter()
+            .chain(&shared_ipv6_prefixes)
+            .cloned()
+            .collect::<Vec<_>>();
+        conf.ct_port_configs[0].vpc_prefixes = shared_prefixes.clone();
+        conf.ct_port_configs.push(PortConfig {
+            interface_name: "pf0vf1_if".into(),
+            vlan: 101,
+            host_ip: "172.16.0.1".into(),
+            host_route: "172.16.0.0/31".into(),
+            host_ipv6: None,
+            host_ipv6_route: None,
+            vni: Some(1001),
+            l3_vni: Some(100),
+            gateway_cidr: "172.16.0.0/31".into(),
+            ipv6_port_config: None,
+            vpc_prefixes: shared_prefixes,
+            vpc_peer_prefixes: vec![],
+            vpc_peer_vnis: vec![],
+            svi_ip: None,
+            tenant_vrf_loopback_ip: Some("10.0.0.2".into()),
+            is_l2_segment: false,
+            is_phy: false,
+            network_security_group_id: None,
+            routing_profile: None,
+            interface_routing_profile: None,
+        });
+
+        // Parsing exercises the duplicate-key rejection boundary from the report.
+        let output = build(conf).expect("build should succeed");
+        let documents: serde_yaml::Value =
+            serde_yaml::from_str(&output).expect("output should have unique YAML keys");
+        let acl = &documents.as_sequence().unwrap()[1]["set"]["acl"];
+
+        // Both families preserve established indices and render each unique permit once.
+        let assert_isolation_rules = |policy: &str, expected: &[String]| {
+            let rules = &acl[policy]["rule"];
+            assert_eq!(
+                rules["20"]["match"]["ip"]["dest-ip"].as_str(),
+                Some(expected[10].as_str())
+            );
+            let rules = rules
+                .as_mapping()
+                .expect("isolation rules should be a mapping");
+            let permit_prefixes = rules
+                .values()
+                .filter(|rule| !rule["action"]["permit"].is_null())
+                .map(|rule| {
+                    rule["match"]["ip"]["dest-ip"]
+                        .as_str()
+                        .expect("permit rule should have a destination prefix")
+                        .to_string()
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                permit_prefixes,
+                expected.iter().cloned().collect::<BTreeSet<_>>()
+            );
+            assert_eq!(rules.len(), expected.len() + 1);
+        };
+        assert_isolation_rules("p0010_vpc_100_isolation_ipv4", &shared_ipv4_prefixes);
+        assert_isolation_rules("p0010_vpc_100_isolation_ipv6", &shared_ipv6_prefixes);
+    }
+
+    /// Verifies FNN site-fabric indices move only for an occupied rule key in the same VPC and
+    /// address family, because each per-VPC policy is a separate YAML mapping.
+    #[test]
+    fn test_build_scopes_fnn_site_fabric_indices_to_each_acl() {
+        // Fill one VPC's IPv6 permit range through index 1000 and keep a second VPC small.
+        let mut conf = dual_stack_fnn_config();
+        conf.site_fabric_prefixes = vec!["192.0.2.0/24".into(), "fd00::/32".into()];
+        conf.ct_port_configs[0].vpc_prefixes = (0..991)
+            .map(|index| format!("2001:db8:{index:x}::/64"))
+            .collect();
+        conf.ct_port_configs.push(PortConfig {
+            interface_name: "pf0vf1_if".into(),
+            vlan: 101,
+            host_ip: "172.16.0.1".into(),
+            host_route: "172.16.0.0/31".into(),
+            host_ipv6: None,
+            host_ipv6_route: None,
+            vni: Some(1001),
+            l3_vni: Some(200),
+            gateway_cidr: "172.16.0.0/31".into(),
+            ipv6_port_config: None,
+            vpc_prefixes: vec!["10.20.0.0/16".into(), "2001:db9::/48".into()],
+            vpc_peer_prefixes: vec![],
+            vpc_peer_vnis: vec![],
+            svi_ip: None,
+            tenant_vrf_loopback_ip: Some("10.0.0.3".into()),
+            is_l2_segment: false,
+            is_phy: false,
+            network_security_group_id: None,
+            routing_profile: None,
+            interface_routing_profile: None,
+        });
+
+        // Render the independent VPC/family ACL mappings.
+        let output = build(conf).expect("build should succeed");
+        let documents: serde_yaml::Value =
+            serde_yaml::from_str(&output).expect("output should have unique YAML keys");
+        let acl = &documents.as_sequence().unwrap()[1]["set"]["acl"];
+
+        // Only the high-index VPC's IPv6 site rule moves beyond the occupied key.
+        let assert_site_rule = |policy: &str, index: &str, expected: &str| {
+            let rule = &acl[policy]["rule"][index];
+            assert!(!rule["action"]["deny"].is_null());
+            assert_eq!(rule["match"]["ip"]["dest-ip"].as_str(), Some(expected));
+        };
+        assert_site_rule("p0010_vpc_100_isolation_ipv4", "1000", "192.0.2.0/24");
+        assert_site_rule("p0010_vpc_100_isolation_ipv6", "1001", "fd00::/32");
+        assert_site_rule("p0010_vpc_200_isolation_ipv4", "1000", "192.0.2.0/24");
+        assert_site_rule("p0010_vpc_200_isolation_ipv6", "1000", "fd00::/32");
+    }
+
+    /// Verifies ETV advances site and deny rules only beyond permits in their respective
+    /// tenant-wide ACL mappings, because those policies do not share their rule keys.
+    #[test]
+    fn test_build_scopes_etv_site_and_deny_indices_to_each_acl() {
+        // Occupy ETV permit indices through 1001 in both tenant-wide policies.
+        let mut conf = dual_stack_fnn_config();
+        conf.is_fnn = false;
+        conf.vpc_virtualization_type = VpcVirtualizationType::EthernetVirtualizer;
+        conf.ct_routing_profile = None;
+        conf.site_fabric_prefixes = vec!["192.0.2.0/24".into()];
+        conf.deny_prefixes = vec!["198.51.100.0/24".into()];
+        conf.ct_port_configs[0].vpc_prefixes = (0..992)
+            .map(|index| format!("10.{}.{}.0/24", index / 256, index % 256))
+            .collect();
+
+        // Render and inspect the two independent ETV ACL mappings.
+        let output = build(conf).expect("build should succeed");
+        let documents: serde_yaml::Value =
+            serde_yaml::from_str(&output).expect("output should have unique YAML keys");
+        let acl = &documents.as_sequence().unwrap()[1]["set"]["acl"];
+
+        // Both policies may independently use 1002 after their common permit range.
+        assert_eq!(
+            acl["p0010_vpc_isolation_ipv4"]["rule"]["1002"]["match"]["ip"]["dest-ip"].as_str(),
+            Some("192.0.2.0/24")
+        );
+        assert_eq!(
+            acl["p0000_deny_prefixes_ipv4"]["rule"]["1002"]["match"]["ip"]["dest-ip"].as_str(),
+            Some("198.51.100.0/24")
+        );
+    }
+
     #[test]
     fn test_build_fnn_dual_stack_interface() {
         let mut conf = dual_stack_fnn_config();
@@ -2328,7 +2657,13 @@ mod tests {
         port.host_ip.clear();
         port.host_route.clear();
         port.gateway_cidr.clear();
+        port.host_ipv6 = Some(String::new());
+        port.host_ipv6_route = None;
         port.svi_ip = None;
+        port.ipv6_port_config
+            .as_mut()
+            .expect("fixture should have an IPv6 port config")
+            .gateway_cidr = "2001:db8::/64".into();
         port.vpc_prefixes
             .retain(|prefix| matches!(prefix.parse::<IpNet>(), Ok(IpNet::V6(_))));
 
@@ -2338,6 +2673,11 @@ mod tests {
             .expect("fixture should have an access VLAN");
         vlan.ip.clear();
         vlan.network.clear();
+        vlan.ipv6_vlan_config
+            .as_mut()
+            .expect("fixture should have an IPv6 VLAN config")
+            .ip
+            .clear();
 
         let output = build(conf).expect("build should succeed");
         let docs: serde_yaml::Value =
@@ -2346,10 +2686,17 @@ mod tests {
 
         assert_eq!(
             yaml_mapping_keys(&set["interface"]["pf0vf0_if"]["ip"]["address"]),
-            address_set(&["2001:db8::0/127"]),
+            address_set(&["2001:db8::/64"]),
         );
-        let neighbors = &set["vrf"]["vpc_100"]["router"]["bgp"]["neighbor"];
-        assert_eq!(yaml_mapping_keys(neighbors), address_set(&["2001:db8::1"]),);
+        let bgp = &set["vrf"]["vpc_100"]["router"]["bgp"];
+        assert!(
+            bgp.get("neighbor").is_none(),
+            "interface with no host address must omit the empty neighbor map"
+        );
+        assert!(
+            !has_null_leaf(&docs),
+            "interface with no host address rendered a null config leaf:\n\n{output}"
+        );
     }
 
     #[test]

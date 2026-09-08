@@ -44,7 +44,7 @@ If you use a coding agent that has shell access, point it at [`cli/INSTALL.md`](
 
 ```text
 Install nicocli following the instructions at
-https://github.com/NVIDIA/infra-controller/rest-api/blob/main/cli/INSTALL.md
+https://github.com/dsx-ai-factory/infra-controller/blob/main/rest-api/cli/INSTALL.md
 ```
 
 ### Inside the nico-rest-api container
@@ -127,6 +127,10 @@ auth:
     token_url: http://localhost:8080/realms/nico-dev/protocol/openid-connect/token
     client_id: nico-api
     client_secret: nico-local-secret
+    # scopes: [openid]
+    # client_auth_method: client_secret_post
+    # token_parameters:
+    #   audience: nico
     # Run `nicocli login` to authenticate; it will prompt for username/password
     # and persist the resulting bearer token (and refresh token) here.
 
@@ -159,7 +163,7 @@ These flags apply to every command and override the corresponding config values.
 
 ### Configuring with environment variables
 
-Every field in `~/.nico/config.yaml` can also be set via a `NICO_*` environment variable. When both a config value and an env var are present, the env var wins; an explicit command-line flag still beats both. Set any of these in your shell instead of editing the config file:
+The scalar fields listed below can also be set via a `NICO_*` environment variable. When both a config value and an env var are present, the env var wins; an explicit command-line flag still beats both. Set any of these in your shell instead of editing the config file:
 
 | Env Var | Config field | Notes |
 |---------|--------------|-------|
@@ -182,6 +186,13 @@ Every field in `~/.nico/config.yaml` can also be set via a `NICO_*` environment 
 | `NICO_API_KEY_TOKEN` | `auth.api_key.token` | Persisted token after NGC exchange |
 
 `NICO_KEYCLOAK_URL` and `NICO_KEYCLOAK_REALM` do not map to a single config field; they feed the login command and construct the OIDC `token_url` at login time.
+
+Client-credentials configurations can also set `auth.oidc.scopes` as a YAML list,
+`auth.oidc.token_parameters` as a map of additional non-secret form parameters,
+and `auth.oidc.client_auth_method` to `client_secret_post` or
+`client_secret_basic`. The default remains `scope=openid` with
+`client_secret_post`. Reserved OAuth and credential fields cannot be overridden
+through `token_parameters`.
 
 To see exactly which `NICO_*` variables are in use right now, pass `--debug` on any command:
 
@@ -296,7 +307,7 @@ Commands follow `nicocli <resource> [sub-resource] <action> [args] [flags]`.
 
 Nested API paths appear as sub-resource groups:
 
-```
+```text
 nicocli allocation list
 nicocli allocation constraint list
 nicocli allocation constraint create <allocationId>
@@ -319,7 +330,7 @@ nicocli completion fish > ~/.config/fish/completions/nicocli.fish
 
 Each environment (local dev, staging, prod) gets its own config file in `~/.nico/`:
 
-```
+```text
 ~/.nico/config.yaml           # default (local dev)
 ~/.nico/config.staging.yaml   # staging
 ~/.nico/config.prod.yaml      # production

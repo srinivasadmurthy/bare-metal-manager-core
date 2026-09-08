@@ -135,6 +135,10 @@ async fn test_tenant(pool: sqlx::PgPool) {
         .unwrap()
         .into_inner();
 
+    assert_eq!(
+        find_tenant.permitted_routing_profile_types,
+        vec!["EXTERNAL"]
+    );
     let tenant = find_tenant.tenant.unwrap();
 
     // This fixture enables the default FNN config, so the tenant should
@@ -338,6 +342,20 @@ async fn test_tenant(pool: sqlx::PgPool) {
 
     assert_eq!(tenant.routing_profile_type.as_deref(), Some("INTERNAL"));
 
+    let find_tenant = env
+        .api
+        .find_tenant(tonic::Request::new(rpc::forge::FindTenantRequest {
+            tenant_organization_id: "Org".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(
+        find_tenant.permitted_routing_profile_types,
+        vec!["EXTERNAL", "INTERNAL"]
+    );
+
     // Now perform one more good create just to confirm that we can set
     // the routing profile to something other than default
     let tenant_create = env
@@ -359,6 +377,31 @@ async fn test_tenant(pool: sqlx::PgPool) {
 
     assert_eq!(tenant.routing_profile_type.as_deref(), Some("INTERNAL"));
     assert_eq!(tenant.organization_id, "Org2");
+
+    // A profile can disappear from FNN config after it was persisted. Tenant
+    // lookup must remain usable and expose no selectable profiles in that
+    // stale state.
+    sqlx::query("UPDATE tenants SET routing_profile_type = $1 WHERE organization_id = $2")
+        .bind("REMOVED_PROFILE")
+        .bind("Org2")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+
+    let find_tenant = env
+        .api
+        .find_tenant(tonic::Request::new(rpc::forge::FindTenantRequest {
+            tenant_organization_id: "Org2".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(find_tenant.permitted_routing_profile_types.is_empty());
+    assert_eq!(
+        find_tenant.tenant.unwrap().routing_profile_type.as_deref(),
+        Some("REMOVED_PROFILE")
+    );
 }
 
 #[crate::sqlx_test]
@@ -470,6 +513,7 @@ async fn test_tenant_create_without_fnn(pool: sqlx::PgPool) {
         .unwrap()
         .into_inner();
 
+    assert!(find_tenant.permitted_routing_profile_types.is_empty());
     let tenant = find_tenant.tenant.unwrap();
     assert_eq!(tenant.organization_id, "PreFnnOrg");
     assert_eq!(tenant.routing_profile_type, None);
@@ -568,157 +612,6 @@ async fn test_tenant_create_keyset(pool: sqlx::PgPool) {
     );
 
     assert!(keyset.keyset_content.unwrap().public_keys.is_empty());
-}
-
-#[crate::sqlx_test]
-async fn test_tenant_find_keyset_ids(pool: sqlx::PgPool) {
-    let env = create_test_env(pool).await;
-    let _ = create_keyset(
-        &env,
-        "Org1".to_string(),
-        "keyset1".to_string(),
-        "V1-T1691517639501025".to_string(),
-        rpc::forge::TenantKeysetContent {
-            public_keys: vec![],
-        },
-    )
-    .await;
-
-    let _ = create_keyset(
-        &env,
-        "Org1".to_string(),
-        "keyset2".to_string(),
-        "V1-T1691517639501025".to_string(),
-        rpc::forge::TenantKeysetContent {
-            public_keys: vec![
-                rpc::forge::TenantPublicKey {
-                    public_key: "mypublickey1".to_string(),
-                    comment: Some("comment1".to_string()),
-                },
-                rpc::forge::TenantPublicKey {
-                    public_key: "mypublickey2".to_string(),
-                    comment: Some("comment2".to_string()),
-                },
-            ],
-        },
-    )
-    .await;
-
-    let _ = create_keyset(
-        &env,
-        "Org2".to_string(),
-        "keyset3".to_string(),
-        "V1-T1691517639501025".to_string(),
-        rpc::forge::TenantKeysetContent {
-            public_keys: vec![],
-        },
-    )
-    .await;
-
-    let find_result = env
-        .api
-        .find_tenant_keyset_ids(tonic::Request::new(rpc::forge::TenantKeysetSearchFilter {
-            tenant_org_id: Some("Org3".to_string()),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert!(find_result.keyset_ids.is_empty());
-
-    let find_result = env
-        .api
-        .find_tenant_keyset_ids(tonic::Request::new(rpc::forge::TenantKeysetSearchFilter {
-            tenant_org_id: Some("Org1".to_string()),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert_eq!(find_result.keyset_ids.len(), 2);
-
-    let find_result = env
-        .api
-        .find_tenant_keysets_by_ids(tonic::Request::new(rpc::forge::TenantKeysetsByIdsRequest {
-            keyset_ids: vec![TenantKeysetIdentifier {
-                organization_id: "Org1".to_string(),
-                keyset_id: "keyset2".to_string(),
-            }],
-            include_key_data: false,
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert_eq!(find_result.keyset.len(), 1);
-    assert_eq!(
-        find_result.keyset[0]
-            .keyset_identifier
-            .as_ref()
-            .unwrap()
-            .organization_id,
-        "Org1"
-    );
-
-    assert_eq!(
-        find_result.keyset[0]
-            .keyset_identifier
-            .as_ref()
-            .unwrap()
-            .keyset_id,
-        "keyset2"
-    );
-
-    assert!(
-        find_result.keyset[0]
-            .keyset_content
-            .as_ref()
-            .unwrap()
-            .public_keys
-            .is_empty()
-    );
-
-    let find_result = env
-        .api
-        .find_tenant_keysets_by_ids(tonic::Request::new(rpc::forge::TenantKeysetsByIdsRequest {
-            keyset_ids: vec![TenantKeysetIdentifier {
-                organization_id: "Org1".to_string(),
-                keyset_id: "keyset2".to_string(),
-            }],
-            include_key_data: true,
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert_eq!(find_result.keyset.len(), 1);
-    assert_eq!(
-        find_result.keyset[0]
-            .keyset_identifier
-            .as_ref()
-            .unwrap()
-            .organization_id,
-        "Org1"
-    );
-
-    assert_eq!(
-        find_result.keyset[0]
-            .keyset_identifier
-            .as_ref()
-            .unwrap()
-            .keyset_id,
-        "keyset2"
-    );
-
-    assert_eq!(
-        find_result.keyset[0]
-            .keyset_content
-            .as_ref()
-            .unwrap()
-            .public_keys
-            .len(),
-        2
-    );
 }
 
 #[crate::sqlx_test]

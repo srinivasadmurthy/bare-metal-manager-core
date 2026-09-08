@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -95,7 +97,6 @@ var argResourceMap = map[string]string{
 }
 
 var history []string
-var historyPos int
 
 // RunREPL starts the interactive REPL loop with inline autocomplete.
 func RunREPL(s *Session) error {
@@ -121,8 +122,11 @@ func RunREPL(s *Session) error {
 	for {
 		line, err := readLineWithSuggestions(s, cmdNames)
 		if err != nil {
-			fmt.Println("\nGoodbye.")
-			return nil
+			if err == io.EOF {
+				fmt.Println("\nGoodbye.")
+				return nil
+			}
+			return err
 		}
 
 		line = strings.TrimSpace(line)
@@ -346,19 +350,27 @@ func splitCommandArguments(input string) ([]string, error) {
 	return args, nil
 }
 
-func readLineWithSuggestions(s *Session, cmdNames []string) (string, error) {
+func readLineWithSuggestions(s *Session, cmdNames []string) (_ string, err error) {
 	restore, err := RawMode()
 	if err != nil {
 		return "", err
 	}
 	defer func() {
-		restore()
+		if restore != nil {
+			restoreErr := restore()
+			if restoreErr != nil {
+				if err == nil {
+					err = restoreErr
+				} else {
+					err = errors.Join(err, restoreErr)
+				}
+			}
+		}
 		ShowCursor()
 	}()
 
 	prompt := s.PromptString()
 	line := ""
-	historyPos = -1
 	selectedSuggestion := -1
 	prevSuggestionCount := 0
 
@@ -409,14 +421,13 @@ func readLineWithSuggestions(s *Session, cmdNames []string) (string, error) {
 		case key.Char == KeyCtrlC:
 			line = ""
 			selectedSuggestion = -1
-			historyPos = -1
 			clearSuggestionLines(prevSuggestionCount)
 			prevSuggestionCount = 0
 			renderInput()
 
 		case key.Char == KeyCtrlD:
 			clearSuggestionLines(prevSuggestionCount)
-			return "", fmt.Errorf("EOF")
+			return "", io.EOF
 
 		case key.Char == KeyEnter || key.Char == KeyNewline:
 			suggestions := allSuggestions()
@@ -426,7 +437,6 @@ func readLineWithSuggestions(s *Session, cmdNames []string) (string, error) {
 			if selectedSuggestion >= 0 && selectedSuggestion < len(suggestions) {
 				line = suggestions[selectedSuggestion]
 				selectedSuggestion = -1
-				historyPos = -1
 				clearSuggestionLines(prevSuggestionCount)
 				prevSuggestionCount = 0
 				renderInput()
@@ -435,7 +445,6 @@ func readLineWithSuggestions(s *Session, cmdNames []string) (string, error) {
 			clearSuggestionLines(prevSuggestionCount)
 			ClearLine()
 			fmt.Print("\r" + prompt + line + "\r\n")
-			historyPos = -1
 			return line, nil
 
 		case key.Char == '\t':
@@ -473,18 +482,23 @@ func readLineWithSuggestions(s *Session, cmdNames []string) (string, error) {
 				prevSuggestionCount = 0
 				ClearLine()
 				fmt.Print("\r" + prompt + line + "\r\n")
-				restore()
-				chosen := selectFromHistory()
-				var rawErr error
-				restore, rawErr = RawMode()
-				if rawErr != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to enter raw mode: %v\n", rawErr)
+				restoreErr := restore()
+				restore = nil
+				if restoreErr != nil {
+					return "", restoreErr
+				}
+				chosen, historyErr := selectFromHistory()
+				if historyErr != nil {
+					return "", historyErr
+				}
+				restore, err = RawMode()
+				if err != nil {
+					return "", err
 				}
 				if chosen != "" {
 					line = chosen
 				}
 				selectedSuggestion = -1
-				historyPos = -1
 			}
 			renderInput()
 
@@ -507,14 +521,12 @@ func readLineWithSuggestions(s *Session, cmdNames []string) (string, error) {
 			if len(line) > 0 {
 				line = line[:len(line)-1]
 				selectedSuggestion = -1
-				historyPos = -1
 			}
 			renderInput()
 
 		case key.Char >= 32 && key.Char < 127:
 			line += string(key.Char)
 			selectedSuggestion = -1
-			historyPos = -1
 			renderInput()
 
 		default:
@@ -806,7 +818,7 @@ func runScopeSet(s *Session, resourceType, nameOrID string) {
 			return
 		}
 	} else {
-		item, err = s.Resolver.Resolve(context.Background(), resourceType, strings.Title(resourceType))
+		item, err = s.Resolver.Resolve(context.Background(), resourceType, generatedParameterLabel(resourceType))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s %v\n\n", Red("Error:"), err)
 			return
@@ -864,9 +876,9 @@ type jwtAccessClaim struct {
 
 // selectFromHistory opens a windowed Select picker with the command history.
 // Returns the chosen command, or empty string if cancelled.
-func selectFromHistory() string {
+func selectFromHistory() (string, error) {
 	if len(history) == 0 {
-		return ""
+		return "", nil
 	}
 	// Show most recent first.
 	items := make([]SelectItem, len(history))
@@ -874,10 +886,13 @@ func selectFromHistory() string {
 		items[len(history)-1-i] = SelectItem{Label: cmd, ID: cmd}
 	}
 	selected, err := Select("History", items)
-	if err != nil {
-		return ""
+	if err == errSelectionCancelled {
+		return "", nil
 	}
-	return selected.ID
+	if err != nil {
+		return "", err
+	}
+	return selected.ID, nil
 }
 
 func extractOrgsFromJWT(tokenStr string) []string {

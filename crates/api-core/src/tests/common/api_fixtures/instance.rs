@@ -130,7 +130,7 @@ impl<'a, 'b> TestInstanceBuilder<'a, 'b> {
             .api
             .allocate_instance(tonic::Request::new(rpc::InstanceAllocationRequest {
                 instance_id: None,
-                machine_id: Some(self.mh.host().id),
+                machine_id: Some(self.mh.host().id.into()),
                 instance_type_id: None,
                 config: Some(self.config),
                 metadata: self.metadata,
@@ -421,6 +421,17 @@ pub(in crate::tests) async fn advance_created_instance_into_state(
     )
     .await;
 
+    env.run_machine_state_controller_iteration_until_state_matches(
+        &mh.host().id,
+        20,
+        ManagedHostState::Assigned {
+            instance_state: model::machine::InstanceState::WaitingForRebootToReady,
+        },
+    )
+    .await;
+    env.run_machine_state_controller_iteration().await;
+    mh.host().reboot_completed().await;
+
     // State controller continues to run till target state
     env.run_machine_state_controller_iteration_until_state_condition(
         &mh.host().id,
@@ -659,6 +670,7 @@ pub(in crate::tests) async fn handle_delete_post_bootingwithdiscoveryimage(
     .await;
 }
 
+#[allow(dead_code)]
 pub(in crate::tests) async fn update_instance_network_status_observation(
     dpu_id: &MachineId,
     obs: &InstanceNetworkStatusObservation,

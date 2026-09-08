@@ -10,11 +10,14 @@ import (
 	"slices"
 
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel"
 	temporalactivity "go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/contrib/opentelemetry"
 	"go.temporal.io/sdk/worker"
 	temporalworkflow "go.temporal.io/sdk/workflow"
 
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/clients/temporal"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/secret"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/capabilityrequirements"
 	taskcommon "github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/common"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/componentmanager"
@@ -39,6 +42,11 @@ type Config struct {
 
 	// ComponentManagerRegistry is the registry containing initialized component managers.
 	ComponentManagerRegistry *componentmanager.Registry
+
+	// DataCipher decrypts optional sensitive operation fields only inside the
+	// final activity that needs their plaintext value. A nil cipher leaves
+	// operations without authentication data available.
+	DataCipher *secret.Cipher
 }
 
 // Validate checks that the configuration is complete and consistent.
@@ -62,7 +70,6 @@ func (c *Config) Validate() error {
 			WorkflowQueue,
 		)
 	}
-
 	return nil
 }
 
@@ -100,7 +107,12 @@ func (c *Config) Build(
 
 	// Bind dependencies into an Activities instance so each manager has its
 	// own isolated copy — no shared mutable globals between managers.
-	acts := activity.New(updater, reportUpdater, c.ComponentManagerRegistry)
+	acts := activity.New(
+		updater,
+		reportUpdater,
+		c.ComponentManagerRegistry,
+		c.DataCipher,
+	)
 
 	publisherClient, err := temporal.New(c.ClientConf)
 	if err != nil {
@@ -113,10 +125,23 @@ func (c *Config) Build(
 		return nil, err
 	}
 
+	// The client interceptor (temporal.New) writes the context onto the
+	// workflow; without the matching worker interceptor here it arrives and
+	// stops, and every Core call an activity makes starts a fresh root.
+	tracingInterceptor, err := opentelemetry.NewTracingInterceptor(
+		opentelemetry.TracerOptions{TextMapPropagator: otel.GetTextMapPropagator()})
+	if err != nil {
+		publisherClient.Client().Close()
+		subscriberClient.Client().Close()
+		return nil, fmt.Errorf("creating Temporal tracing interceptor: %w", err)
+	}
+
 	allActivities := acts.All()
 	allWorkflows := workflow.GetAllWorkflows()
 	workers := make(map[string]worker.Worker)
 	for queue, options := range c.WorkerOptions {
+		// options is a copy of the map value, so this does not mutate c.
+		options.Interceptors = append(options.Interceptors, tracingInterceptor)
 		worker := worker.New(subscriberClient.Client(), queue, options)
 		for name, fn := range allActivities {
 			worker.RegisterActivityWithOptions(

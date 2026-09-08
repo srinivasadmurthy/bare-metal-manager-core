@@ -5,6 +5,7 @@ package tui
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,53 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSession_fetchTenantIPBlocks(t *testing.T) {
+	providerRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/org/acme/nico/infrastructure-provider/current":
+			providerRequests++
+			_, _ = io.WriteString(w, `{"id":"provider-a"}`)
+		case "/v2/org/acme/nico/tenant/current":
+			_, _ = io.WriteString(w, `{"id":"tenant-a"}`)
+		case "/v2/org/acme/nico/ipblock":
+			assert.Equal(t, "site-a", r.URL.Query().Get("siteId"))
+			assert.Equal(t, "tenant-a", r.URL.Query().Get("tenantId"))
+			assert.Empty(t, r.URL.Query().Get("infrastructureProviderId"))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[{"id":"provider-id","name":"provider","siteId":"site-a","status":"Ready","tenantId":null,"protocolVersion":"IPv4"},{"id":"other-tenant-id","name":"other tenant","siteId":"site-a","status":"Ready","tenantId":"tenant-b","protocolVersion":"IPv4"},{"id":"tenant-id","name":"tenant","siteId":"site-a","status":"Ready","tenantId":"tenant-a","protocolVersion":"IPv4"}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := appcli.NewClient(server.URL, "acme", "token", nil, false)
+	session := NewSession(client, "acme", "")
+	session.Scope.SiteID = "site-a"
+	ctx := context.Background()
+
+	providerID, err := session.getInfrastructureProviderID(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, "provider-a", providerID)
+
+	items, tenantID, err := session.fetchTenantIPBlocks(ctx)
+
+	require.NoError(t, err)
+	assert.Equal(t, "tenant-a", tenantID)
+	assert.Equal(t, 1, providerRequests)
+	require.Len(t, items, 3)
+	assert.Empty(t, items[0].Extra["tenantId"])
+	assert.Equal(t, "tenant-b", items[1].Extra["tenantId"])
+	assert.Equal(t, "tenant-a", items[2].Extra["tenantId"])
+	assert.Equal(t, "IPv4", items[2].Extra["protocolVersion"])
+
+	selectItems := buildIPBlockSelectItems(items, tenantID)
+	require.Len(t, selectItems, 2)
+	assert.Equal(t, "tenant-id", selectItems[0].ID)
+	assert.Equal(t, ipBlockManualEntrySentinel, selectItems[1].ID)
+}
 
 type specializedRequestSnapshot struct {
 	method        string
@@ -404,6 +452,144 @@ func TestSpecializedCommand_StructuredAPIErrorsRemainActionable(t *testing.T) {
 	assert.Contains(t, runErr.Error(), "API error 422: metadata unavailable")
 	assert.Contains(t, runErr.Error(), `"field":"siteId"`)
 	assert.NotContains(t, output, "metadata unavailable")
+}
+
+func TestCmdInstanceUpdate_SendsAttributeOnlyPatch(t *testing.T) {
+	var requestCount atomic.Int32
+	requests := make(chan specializedRequestSnapshot, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestNumber := requestCount.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		snapshot := specializedRequestSnapshot{
+			method: r.Method,
+			path:   r.URL.Path,
+			body:   string(body),
+		}
+		if requestNumber == 1 {
+			requests <- snapshot
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"instance-1","name":"new-name"}`)
+	}))
+	defer server.Close()
+
+	session := NewSession(
+		appcli.NewClient(server.URL, "acme", "token", nil, false),
+		"acme",
+		"",
+	)
+	session.Cache.Set("instance", []NamedItem{{Name: "instance-one", ID: "instance-1"}})
+	session.Cache.Set("operating-system", []NamedItem{})
+
+	output, runErr := runSpecializedCommandWithInput(t, "new-name\n\nn\n", func() error {
+		return specializedRegressionCommand(t, "instance update").Run(session, []string{"instance-1"})
+	})
+
+	require.NoError(t, runErr)
+	request := <-requests
+	assert.Equal(t, int32(1), requestCount.Load())
+	assert.Equal(t, http.MethodPatch, request.method)
+	assert.Equal(t, "/v2/org/acme/nico/instance/instance-1", request.path)
+	assert.JSONEq(t, `{"name":"new-name"}`, request.body)
+	assert.Contains(t, output, "Instance updated: new-name (instance-1)")
+}
+
+func TestCmdVPCCreate(t *testing.T) {
+	tests := []struct {
+		name                   string
+		routingProfileResponse string
+		createResponse         string
+		input                  string
+		expectedBody           string
+		expectedLog            string
+		unexpectedLog          string
+		expectedConfirmation   string
+	}{
+		{
+			name:                   "sends a selected alternative profile",
+			routingProfileResponse: `{"defaultRoutingProfile":"external","permittedRoutingProfiles":["external","internal"]}`,
+			createResponse:         `{"id":"vpc-1","name":"profile-vpc","routingProfile":"internal"}`,
+			input:                  "profile-vpc\n\ninternal\n",
+			expectedBody:           `{"name":"profile-vpc","routingProfile":"internal","siteId":"site-1"}`,
+			expectedLog:            "--routing-profile internal",
+			expectedConfirmation:   "routing profile: internal",
+		},
+		{
+			name:                   "reports the Core-resolved profile when the inherited default changes",
+			routingProfileResponse: `{"defaultRoutingProfile":"external","permittedRoutingProfiles":["external"]}`,
+			createResponse:         `{"id":"vpc-1","name":"profile-vpc","routingProfile":"internal"}`,
+			input:                  "profile-vpc\n\n\n",
+			expectedBody:           `{"name":"profile-vpc","siteId":"site-1"}`,
+			unexpectedLog:          "--routing-profile",
+			expectedConfirmation:   "routing profile: internal",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var mu sync.Mutex
+			requests := []specializedRequestSnapshot{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				mu.Lock()
+				requests = append(requests, specializedRequestSnapshot{
+					method: r.Method,
+					path:   r.URL.Path,
+					query:  r.URL.RawQuery,
+					body:   string(body),
+				})
+				mu.Unlock()
+
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/v2/org/acme/nico/tenant/current/routing-profile":
+					_, _ = io.WriteString(w, test.routingProfileResponse)
+				case "/v2/org/acme/nico/vpc":
+					w.WriteHeader(http.StatusCreated)
+					_, _ = io.WriteString(w, test.createResponse)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			session := NewSession(appcli.NewClient(server.URL, "acme", "token", nil, false), "acme", "")
+			session.Cache.Set("site", []NamedItem{{
+				Name: "native-site",
+				ID:   "site-1",
+				Raw:  map[string]interface{}{"capabilities": map[string]interface{}{"nativeNetworking": true}},
+			}})
+
+			output, runErr := runSpecializedCommandWithInput(t, test.input, func() error {
+				return specializedRegressionCommand(t, "vpc create").Run(session, nil)
+			})
+
+			require.NoError(t, runErr)
+			mu.Lock()
+			got := append([]specializedRequestSnapshot(nil), requests...)
+			mu.Unlock()
+			require.Len(t, got, 2)
+			assert.Equal(t, http.MethodGet, got[0].method)
+			assert.Equal(t, "/v2/org/acme/nico/tenant/current/routing-profile", got[0].path)
+			assert.Equal(t, "siteId=site-1", got[0].query)
+			assert.Equal(t, http.MethodPost, got[1].method)
+			assert.Equal(t, "/v2/org/acme/nico/vpc", got[1].path)
+			assert.JSONEq(t, test.expectedBody, got[1].body)
+			assert.Contains(t, output, "Routing profile (external (tenant default))")
+			if test.expectedLog != "" {
+				assert.Contains(t, output, test.expectedLog)
+			}
+			if test.unexpectedLog != "" {
+				assert.NotContains(t, output, test.unexpectedLog)
+			}
+			assert.Contains(t, output, test.expectedConfirmation)
+		})
+	}
 }
 
 func specializedRegressionCommand(t *testing.T, name string) Command {

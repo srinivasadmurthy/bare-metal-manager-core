@@ -24,7 +24,8 @@ use futures::{StreamExt, stream};
 
 use super::DiscoveryIterationStats;
 use super::cleanup::{
-    stop_ineligible_nmxc_collectors, stop_removed_bmc_collectors, stop_stale_switch_collectors,
+    stop_ineligible_nmxc_collectors, stop_removed_bmc_collectors,
+    stop_stale_power_shelf_collectors, stop_stale_switch_collectors,
 };
 use super::context::{CollectorKind, DiscoveryLoopContext};
 use super::identity::ensure_primary_system_uuid;
@@ -100,6 +101,7 @@ pub async fn run_discovery_iteration(
                 tracing::warn!(
                     ?error,
                     bmc_address = ?endpoint.addr,
+                    rack_id = endpoint.rack_id.as_ref().map(tracing::field::display),
                     "Could not resolve primary ComputerSystem UUID; continuing without it"
                 );
             }
@@ -124,6 +126,7 @@ pub async fn run_discovery_iteration(
     // old collector cleanup before respawn so a late CollectorRemoved cannot
     // unregister the replacement's metrics.
     stop_stale_switch_collectors(ctx, &sharded_endpoints).await;
+    stop_stale_power_shelf_collectors(ctx, &sharded_endpoints).await;
 
     let active_endpoints = active_keys(&sharded_endpoints);
     stop_removed_bmc_collectors(ctx, &active_endpoints).await;
@@ -141,6 +144,7 @@ pub async fn run_discovery_iteration(
             tracing::error!(
                 ?error,
                 %endpoint_key,
+                rack_id = endpoint.rack_id.as_ref().map(tracing::field::display),
                 "Could not spawn collectors for endpoint"
             );
 

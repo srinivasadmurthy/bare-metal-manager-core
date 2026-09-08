@@ -57,29 +57,30 @@ func testTemporalSiteClientPool(t *testing.T) *sc.ClientPool {
 	return tSiteClientPool
 }
 
-func TestPrimaryResolvedVpcPrefixID(t *testing.T) {
+func TestResolvedVpcPrefixIDs(t *testing.T) {
 	ipv4 := &corev1.VpcPrefixId{Value: uuid.NewString()}
 	ipv6 := &corev1.VpcPrefixId{Value: uuid.NewString()}
 
 	tests := []struct {
-		name     string
-		prefixes *corev1.InstanceInterfaceResolvedVpcPrefixes
-		want     *corev1.VpcPrefixId
+		name          string
+		prefixes      *corev1.InstanceInterfaceResolvedVpcPrefixes
+		wantPrimary   *corev1.VpcPrefixId
+		wantSecondary *corev1.VpcPrefixId
 	}{
-		{name: "unresolved", prefixes: nil, want: nil},
+		{name: "unresolved", prefixes: nil},
 		{
 			name: "IPv4-only uses IPv4",
 			prefixes: &corev1.InstanceInterfaceResolvedVpcPrefixes{
 				Ipv4VpcPrefixId: ipv4,
 			},
-			want: ipv4,
+			wantPrimary: ipv4,
 		},
 		{
 			name: "IPv6-only uses IPv6",
 			prefixes: &corev1.InstanceInterfaceResolvedVpcPrefixes{
 				Ipv6VpcPrefixId: ipv6,
 			},
-			want: ipv6,
+			wantPrimary: ipv6,
 		},
 		{
 			name: "dual-stack keeps IPv4 primary",
@@ -87,13 +88,57 @@ func TestPrimaryResolvedVpcPrefixID(t *testing.T) {
 				Ipv4VpcPrefixId: ipv4,
 				Ipv6VpcPrefixId: ipv6,
 			},
-			want: ipv4,
+			wantPrimary:   ipv4,
+			wantSecondary: ipv6,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, primaryResolvedVpcPrefixID(tt.prefixes))
+			primary, secondary := resolvedVpcPrefixIDs(tt.prefixes)
+			assert.Equal(t, tt.wantPrimary, primary)
+			assert.Equal(t, tt.wantSecondary, secondary)
+		})
+	}
+}
+
+func TestGetDevicelessInterfaceKey(t *testing.T) {
+	prefixID := uuid.NewString()
+	tests := []struct {
+		name              string
+		isPhysical        bool
+		virtualFunctionID *int
+		want              string
+	}{
+		{
+			name:       "physical function",
+			isPhysical: true,
+			want:       prefixID + "-physical",
+		},
+		{
+			name: "legacy virtual function without ID",
+			want: prefixID + "-virtual",
+		},
+		{
+			name:              "virtual function zero",
+			virtualFunctionID: cutil.GetPtr(0),
+			want:              prefixID + "-virtual-0",
+		},
+		{
+			name:              "virtual function fifteen",
+			virtualFunctionID: cutil.GetPtr(15),
+			want:              prefixID + "-virtual-15",
+		},
+	}
+
+	keys := make(map[string]bool, len(tests))
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := getDevicelessInterfaceKey(prefixID, test.isPhysical, test.virtualFunctionID)
+
+			assert.Equal(t, test.want, got)
+			assert.False(t, keys[got], "reconciliation keys must be unique for a shared VPC prefix")
+			keys[got] = true
 		})
 	}
 }
@@ -135,6 +180,22 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 		tnu,
 	)
 	require.NotNil(t, ipBlock)
+	ipv6IPBlock := util.TestBuildBuildIPBlock(
+		t,
+		dbSession,
+		"test-vpc-selection-ipv6-block",
+		site,
+		ip,
+		&tenant.ID,
+		cdbm.IPBlockRoutingTypeDatacenterOnly,
+		"2001:db8::",
+		64,
+		cdbm.IPBlockProtocolVersionV6,
+		false,
+		cdbm.IPBlockStatusReady,
+		tnu,
+	)
+	require.NotNil(t, ipv6IPBlock)
 	buildPrefix := func(name, prefix string) *cdbm.VpcPrefix {
 		vpcPrefix := util.TestBuildVPCPrefix(
 			t,
@@ -154,6 +215,21 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 	}
 	deviceLessPrefix := buildPrefix("test-vpc-selection-prefix-1", "192.0.2.0/28")
 	devicePrefix := buildPrefix("test-vpc-selection-prefix-2", "192.0.2.16/28")
+	ipv6PrefixValue := "2001:db8::/120"
+	ipv6Prefix := util.TestBuildVPCPrefix(
+		t,
+		dbSession,
+		"test-vpc-selection-ipv6-prefix",
+		site,
+		tenant,
+		vpc.ID,
+		&ipv6IPBlock.ID,
+		&ipv6PrefixValue,
+		cutil.GetPtr(120),
+		cdbm.VpcPrefixStatusReady,
+		tnu,
+	)
+	require.NotNil(t, ipv6Prefix)
 
 	instanceDAO := cdbm.NewInstanceDAO(dbSession)
 	buildInstance := func(name string) *cdbm.Instance {
@@ -171,7 +247,7 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 		require.NoError(t, createErr)
 		_, createErr = dbSession.DB.Exec(
 			"UPDATE instance SET updated = ? WHERE id = ?",
-			time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2),
+			time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2),
 			instance.ID,
 		)
 		require.NoError(t, createErr)
@@ -181,9 +257,25 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 	deviceLessInstance := buildInstance("device-less-vpc-selection")
 	deviceInstance := buildInstance("device-vpc-selection")
 	shortStatusInstance := buildInstance("short-vpc-selection-status")
+	nilConfigInstance := buildInstance("nil-config-vpc-selection")
+	reportedPowerProfile := "reported-power-profile"
+	existingPowerProfile := "existing-power-profile"
+	_, err = dbSession.DB.Exec(
+		"UPDATE instance SET power_profile = ?, updated = ? WHERE id = ?",
+		existingPowerProfile,
+		time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2),
+		deviceInstance.ID,
+	)
+	require.NoError(t, err)
+	_, err = dbSession.DB.Exec(
+		"UPDATE instance SET power_profile = ?, is_missing_on_site = true, updated = ? WHERE id = ?",
+		existingPowerProfile,
+		time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2),
+		nilConfigInstance.ID,
+	)
+	require.NoError(t, err)
 	interfaceDAO := cdbm.NewInterfaceDAO(dbSession)
-	familyMode := cdbm.InterfaceVpcIPFamilyModeIPv4Only
-	createInterface := func(instanceID uuid.UUID, isPhysical bool, device *string, deviceInstance, virtualFunctionID *int) *cdbm.Interface {
+	createInterface := func(instanceID uuid.UUID, familyMode cdbm.InterfaceVpcIPFamilyMode, isPhysical bool, device *string, deviceInstance, virtualFunctionID *int) *cdbm.Interface {
 		ifc, createErr := interfaceDAO.Create(ctx, nil, cdbm.InterfaceCreateInput{
 			InstanceID:        instanceID,
 			VpcID:             &vpc.ID,
@@ -201,19 +293,19 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 
 	// Keep device-less and device-selected modes on separate Instances, as API
 	// validation requires.
-	deviceLessIfc := createInterface(deviceLessInstance.ID, true, nil, nil, nil)
+	deviceLessIfc := createInterface(deviceLessInstance.ID, cdbm.InterfaceVpcIPFamilyModeDualStack, true, nil, nil, nil)
 	device := "BlueField"
 	deviceInstanceID := 1
 	virtualFunctionID := 2
-	deviceIfc := createInterface(deviceInstance.ID, false, &device, &deviceInstanceID, &virtualFunctionID)
-	shortStatusIfc := createInterface(shortStatusInstance.ID, true, nil, nil, nil)
+	deviceIfc := createInterface(deviceInstance.ID, cdbm.InterfaceVpcIPFamilyModeIPv4Only, false, &device, &deviceInstanceID, &virtualFunctionID)
+	shortStatusIfc := createInterface(shortStatusInstance.ID, cdbm.InterfaceVpcIPFamilyModeIPv4Only, true, nil, nil, nil)
 
 	deviceLessMac := "02:00:00:00:00:01"
 	deviceMac := "02:00:00:00:00:02"
-	selection := func() *corev1.InstanceInterfaceConfig_Vpc {
+	selection := func(familyMode corev1.InstanceInterfaceIpFamilyMode) *corev1.InstanceInterfaceConfig_Vpc {
 		return &corev1.InstanceInterfaceConfig_Vpc{Vpc: &corev1.InstanceInterfaceVpcSelection{
 			VpcId:      &corev1.VpcId{Value: controllerVpcID.String()},
-			FamilyMode: corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV4_ONLY,
+			FamilyMode: familyMode,
 		}}
 	}
 	status := func(prefixID uuid.UUID, macAddress, address string, virtualFunctionID *uint32) *corev1.InstanceInterfaceStatus {
@@ -232,6 +324,8 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 	// select a device. Repeated inventory must continue matching it by VPC intent.
 	observedDevice := "observed-device"
 	deviceLessStatus := status(deviceLessPrefix.ID, deviceLessMac, "192.0.2.10", nil)
+	deviceLessStatus.Addresses = append(deviceLessStatus.Addresses, "2001:db8::10")
+	deviceLessStatus.ResolvedVpcPrefixes.Ipv6VpcPrefixId = &corev1.VpcPrefixId{Value: ipv6Prefix.ID.String()}
 	deviceLessStatus.Device = &observedDevice
 	deviceStatus := status(devicePrefix.ID, deviceMac, "192.0.2.20", cutil.GetPtr(uint32(virtualFunctionID)))
 	deviceStatus.Device = &device
@@ -240,9 +334,17 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 	inventory := &corev1.InstanceInventory{Instances: []*corev1.Instance{
 		{
 			Id: &corev1.InstanceId{Value: deviceLessInstance.ControllerInstanceID.String()},
-			Config: &corev1.InstanceConfig{Network: &corev1.InstanceNetworkConfig{Interfaces: []*corev1.InstanceInterfaceConfig{
-				{FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkDetails: selection()},
-			}}},
+			Config: &corev1.InstanceConfig{
+				PowerProfile: &reportedPowerProfile,
+				Network: &corev1.InstanceNetworkConfig{Interfaces: []*corev1.InstanceInterfaceConfig{
+					{
+						FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+						NetworkDetails: selection(
+							corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_DUAL_STACK,
+						),
+					},
+				}},
+			},
 			Status: &corev1.InstanceStatus{
 				Tenant: &corev1.InstanceTenantStatus{State: corev1.TenantState_READY},
 				Network: &corev1.InstanceNetworkStatus{
@@ -255,8 +357,10 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 			Id: &corev1.InstanceId{Value: deviceInstance.ControllerInstanceID.String()},
 			Config: &corev1.InstanceConfig{Network: &corev1.InstanceNetworkConfig{Interfaces: []*corev1.InstanceInterfaceConfig{
 				{
-					FunctionType:      corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
-					NetworkDetails:    selection(),
+					FunctionType: corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
+					NetworkDetails: selection(
+						corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV4_ONLY,
+					),
 					Device:            &device,
 					DeviceInstance:    uint32(deviceInstanceID),
 					VirtualFunctionId: cutil.GetPtr(uint32(virtualFunctionID)),
@@ -273,7 +377,12 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 		{
 			Id: &corev1.InstanceId{Value: shortStatusInstance.ControllerInstanceID.String()},
 			Config: &corev1.InstanceConfig{Network: &corev1.InstanceNetworkConfig{Interfaces: []*corev1.InstanceInterfaceConfig{
-				{FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION, NetworkDetails: selection()},
+				{
+					FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+					NetworkDetails: selection(
+						corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV4_ONLY,
+					),
+				},
 			}}},
 			Status: &corev1.InstanceStatus{
 				Tenant: &corev1.InstanceTenantStatus{State: corev1.TenantState_READY},
@@ -281,6 +390,11 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 					ConfigsSynced: corev1.SyncState_SYNCED,
 				},
 			},
+		},
+		{
+			Id:     &corev1.InstanceId{Value: nilConfigInstance.ControllerInstanceID.String()},
+			Config: nil,
+			Status: &corev1.InstanceStatus{Tenant: &corev1.InstanceTenantStatus{State: corev1.TenantState_READY}},
 		},
 	}}
 
@@ -291,7 +405,14 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify both resolved data and the original VPC selection intent persisted.
-	assertResolvedInterface := func(ifc *cdbm.Interface, expectedPrefixID uuid.UUID, expectedMac, expectedAddress string) *cdbm.Interface {
+	assertResolvedInterface := func(
+		ifc *cdbm.Interface,
+		expectedPrefixID uuid.UUID,
+		expectedSecondaryPrefixID *uuid.UUID,
+		expectedFamilyMode cdbm.InterfaceVpcIPFamilyMode,
+		expectedMac string,
+		expectedAddresses []string,
+	) *cdbm.Interface {
 		updated, getErr := interfaceDAO.GetByID(ctx, nil, ifc.ID, nil)
 		require.NoError(t, getErr)
 		require.NotNil(t, updated.VpcPrefixID)
@@ -300,34 +421,86 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 		require.NotNil(t, updated.MacAddress)
 		assert.Equal(t, expectedPrefixID, *updated.VpcPrefixID)
 		assert.Equal(t, vpc.ID, *updated.VpcID)
-		assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeIPv4Only, *updated.VpcIPFamilyMode)
+		assert.Equal(t, expectedSecondaryPrefixID, updated.SecondaryVpcPrefixID)
+		assert.Equal(t, expectedFamilyMode, *updated.VpcIPFamilyMode)
 		assert.Equal(t, expectedMac, *updated.MacAddress)
-		assert.Equal(t, []string{expectedAddress}, updated.IPAddresses)
+		assert.Equal(t, expectedAddresses, updated.IPAddresses)
 		assert.Equal(t, cdbm.InterfaceStatusReady, updated.Status)
 		return updated
 	}
-	updatedDeviceLessIfc := assertResolvedInterface(deviceLessIfc, deviceLessPrefix.ID, deviceLessMac, "192.0.2.10")
+	updatedDeviceLessIfc := assertResolvedInterface(
+		deviceLessIfc,
+		deviceLessPrefix.ID,
+		&ipv6Prefix.ID,
+		cdbm.InterfaceVpcIPFamilyModeDualStack,
+		deviceLessMac,
+		[]string{"192.0.2.10", "2001:db8::10"},
+	)
 	require.NotNil(t, updatedDeviceLessIfc.Device)
 	assert.Equal(t, observedDevice, *updatedDeviceLessIfc.Device)
-	updatedDeviceIfc := assertResolvedInterface(deviceIfc, devicePrefix.ID, deviceMac, "192.0.2.20")
+	updatedDeviceIfc := assertResolvedInterface(
+		deviceIfc,
+		devicePrefix.ID,
+		nil,
+		cdbm.InterfaceVpcIPFamilyModeIPv4Only,
+		deviceMac,
+		[]string{"192.0.2.20"},
+	)
 	require.NotNil(t, updatedDeviceIfc.Device)
 	assert.Equal(t, device, *updatedDeviceIfc.Device)
+
+	reportedProfilePersisted, err := instanceDAO.GetByID(ctx, nil, deviceLessInstance.ID, nil)
+	require.NoError(t, err)
+	require.NotNil(t, reportedProfilePersisted.PowerProfile)
+	assert.Equal(t, reportedPowerProfile, *reportedProfilePersisted.PowerProfile)
+
+	existingProfileCleared, err := instanceDAO.GetByID(ctx, nil, deviceInstance.ID, nil)
+	require.NoError(t, err)
+	assert.Nil(t, existingProfileCleared.PowerProfile)
 
 	// A config without an aligned status entry must leave its Interface untouched.
 	shortStatusUnchanged, err := interfaceDAO.GetByID(ctx, nil, shortStatusIfc.ID, nil)
 	require.NoError(t, err)
 	assert.Nil(t, shortStatusUnchanged.VpcPrefixID)
+	assert.Nil(t, shortStatusUnchanged.SecondaryVpcPrefixID)
 	assert.Equal(t, vpc.ID, *shortStatusUnchanged.VpcID)
 	assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeIPv4Only, *shortStatusUnchanged.VpcIPFamilyMode)
 	assert.Nil(t, shortStatusUnchanged.MacAddress)
 	assert.Equal(t, cdbm.InterfaceStatusPending, shortStatusUnchanged.Status)
 
-	// Pending inventory is not authoritative enough to clear resolution.
+	// An incomplete inventory entry must not panic or clear persisted state.
+	nilConfigUnchanged, err := instanceDAO.GetByID(ctx, nil, nilConfigInstance.ID, nil)
+	require.NoError(t, err)
+	require.NotNil(t, nilConfigUnchanged.PowerProfile)
+	assert.Equal(t, existingPowerProfile, *nilConfigUnchanged.PowerProfile)
+	assert.True(t, nilConfigUnchanged.IsMissingOnSite)
+
+	// Pending inventory is not authoritative enough to clear either resolution.
 	inventory.Instances[0].Status.Network.Interfaces[0].ResolvedVpcPrefixes = nil
 	inventory.Instances[0].Status.Network.ConfigsSynced = corev1.SyncState_PENDING
 	_, err = dbSession.DB.Exec(
 		"UPDATE instance SET updated = ? WHERE id = ?",
-		time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2),
+		time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2),
+		deviceLessInstance.ID,
+	)
+	require.NoError(t, err)
+	_, err = manager.UpdateInstancesInDB(ctx, site.ID, inventory)
+	require.NoError(t, err)
+
+	pendingEmptyResolution, err := interfaceDAO.GetByID(ctx, nil, deviceLessIfc.ID, nil)
+	require.NoError(t, err)
+	require.NotNil(t, pendingEmptyResolution.VpcPrefixID)
+	assert.Equal(t, deviceLessPrefix.ID, *pendingEmptyResolution.VpcPrefixID)
+	require.NotNil(t, pendingEmptyResolution.SecondaryVpcPrefixID)
+	assert.Equal(t, ipv6Prefix.ID, *pendingEmptyResolution.SecondaryVpcPrefixID)
+
+	// Pending partial inventory also preserves an omitted secondary resolution.
+	inventory.Instances[0].Status.Network.Interfaces[0].ResolvedVpcPrefixes = &corev1.InstanceInterfaceResolvedVpcPrefixes{
+		Ipv4VpcPrefixId: &corev1.VpcPrefixId{Value: deviceLessPrefix.ID.String()},
+	}
+	_, err = dbSession.DB.Exec(
+		"UPDATE instance SET updated = ? WHERE id = ?",
+		time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2),
 		deviceLessInstance.ID,
 	)
 	require.NoError(t, err)
@@ -338,17 +511,37 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, pendingResolution.VpcPrefixID)
 	assert.Equal(t, deviceLessPrefix.ID, *pendingResolution.VpcPrefixID)
+	require.NotNil(t, pendingResolution.SecondaryVpcPrefixID)
+	assert.Equal(t, ipv6Prefix.ID, *pendingResolution.SecondaryVpcPrefixID)
 	assert.Equal(t, cdbm.InterfaceStatusReady, pendingResolution.Status)
 	require.NotNil(t, pendingResolution.VpcID)
 	assert.Equal(t, vpc.ID, *pendingResolution.VpcID)
 	require.NotNil(t, pendingResolution.VpcIPFamilyMode)
-	assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeIPv4Only, *pendingResolution.VpcIPFamilyMode)
+	assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeDualStack, *pendingResolution.VpcIPFamilyMode)
 
-	// Synchronized inventory authoritatively clears stale resolution.
+	// Synchronized partial inventory authoritatively clears only the stale
+	// secondary resolution while preserving the reported primary.
 	inventory.Instances[0].Status.Network.ConfigsSynced = corev1.SyncState_SYNCED
 	_, err = dbSession.DB.Exec(
 		"UPDATE instance SET updated = ? WHERE id = ?",
-		time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2),
+		time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2),
+		deviceLessInstance.ID,
+	)
+	require.NoError(t, err)
+	_, err = manager.UpdateInstancesInDB(ctx, site.ID, inventory)
+	require.NoError(t, err)
+
+	primaryOnlyResolution, err := interfaceDAO.GetByID(ctx, nil, deviceLessIfc.ID, nil)
+	require.NoError(t, err)
+	require.NotNil(t, primaryOnlyResolution.VpcPrefixID)
+	assert.Equal(t, deviceLessPrefix.ID, *primaryOnlyResolution.VpcPrefixID)
+	assert.Nil(t, primaryOnlyResolution.SecondaryVpcPrefixID)
+
+	// Synchronized inventory with no resolution clears the remaining primary.
+	inventory.Instances[0].Status.Network.Interfaces[0].ResolvedVpcPrefixes = nil
+	_, err = dbSession.DB.Exec(
+		"UPDATE instance SET updated = ? WHERE id = ?",
+		time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2),
 		deviceLessInstance.ID,
 	)
 	require.NoError(t, err)
@@ -358,10 +551,11 @@ func TestManageInstance_UpdateInstancesInDBVpcSelectionInventory(t *testing.T) {
 	clearedResolution, err := interfaceDAO.GetByID(ctx, nil, deviceLessIfc.ID, nil)
 	require.NoError(t, err)
 	assert.Nil(t, clearedResolution.VpcPrefixID)
+	assert.Nil(t, clearedResolution.SecondaryVpcPrefixID)
 	require.NotNil(t, clearedResolution.VpcID)
 	assert.Equal(t, vpc.ID, *clearedResolution.VpcID)
 	require.NotNil(t, clearedResolution.VpcIPFamilyMode)
-	assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeIPv4Only, *clearedResolution.VpcIPFamilyMode)
+	assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeDualStack, *clearedResolution.VpcIPFamilyMode)
 }
 
 func TestManageInstance_deleteInstanceFromDB(t *testing.T) {
@@ -542,6 +736,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	machine11 := util.TestBuildMachine(t, dbSession, ip.ID, site.ID, nil, cutil.GetPtr(true), cdbm.MachineStatusReady)
 	machine13 := util.TestBuildMachine(t, dbSession, ip.ID, site.ID, nil, cutil.GetPtr(true), cdbm.MachineStatusReady)
 	machine15 := util.TestBuildMachine(t, dbSession, ip.ID, site.ID, nil, cutil.GetPtr(true), cdbm.MachineStatusReady)
+	machine19 := util.TestBuildMachine(t, dbSession, ip.ID, site.ID, nil, cutil.GetPtr(true), cdbm.MachineStatusReady)
 
 	allocation := util.TestBuildAllocation(t, dbSession, ip, tenant, site, "testAllocation")
 	instanceType := util.TestBuildInstanceType(t, dbSession, ip, site, "testInstanceType")
@@ -577,7 +772,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set created earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance1.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance1.ID.String())
 	assert.NoError(t, err)
 
 	interface1 := util.TestBuildInterface(t, dbSession, &instance1.ID, &subnet1.ID, nil, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusPending)
@@ -597,7 +792,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.NotNil(t, ibInterface3)
 
 	// Make Deleting InfiniBand row old enough to pass IsTimeWithinStaleInventoryThreshold deferral during inventory reconcile
-	_, err = dbSession.DB.Exec("UPDATE infiniband_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), ibInterface3.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE infiniband_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), ibInterface3.ID.String())
 	assert.NoError(t, err)
 
 	// NVLink Interfaces
@@ -611,7 +806,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.NotNil(t, nvlinkInterface3)
 
 	// Set updated earlier than the inventory receipt interval for nvlinkInterface3 so it can be deleted
-	_, err = dbSession.DB.Exec("UPDATE nvlink_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), nvlinkInterface3.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE nvlink_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), nvlinkInterface3.ID.String())
 	assert.NoError(t, err)
 
 	nvlinkInterface4 := util.TestBuildNVLinkInterface(t, dbSession, instance1.ID, site.ID, nvllPartition1.ID, cutil.GetPtr(""), 3, nil, nil, cdbm.NVLinkInterfaceStatusPending)
@@ -643,7 +838,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set created earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance2.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance2.ID.String())
 	assert.NoError(t, err)
 
 	instance2Subnet := util.TestBuildInterface(t, dbSession, &instance2.ID, &subnet1.ID, nil, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusPending)
@@ -681,11 +876,11 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	)
 	assert.Nil(t, err)
 	// Set created earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)), instance3.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance3.ID.String())
 	assert.NoError(t, err)
 
 	// Set updated earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance3.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance3.ID.String())
 	assert.NoError(t, err)
 
 	instance3Subnet := util.TestBuildInterface(t, dbSession, &instance3.ID, &subnet1.ID, nil, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusPending)
@@ -716,7 +911,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set updated earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance4.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance4.ID.String())
 	assert.NoError(t, err)
 
 	instance4Subnet := util.TestBuildInterface(t, dbSession, &instance4.ID, &subnet1.ID, nil, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusError)
@@ -749,7 +944,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set created earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance5.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance5.ID.String())
 	assert.NoError(t, err)
 
 	// Instance 6 is in Error state and gets restored to Ready state from inventory
@@ -781,7 +976,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set updated earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance6.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance6.ID.String())
 	assert.NoError(t, err)
 
 	// Instance 7 does not have controller Instance ID set and is present in inventory, and gets controller Instance ID set
@@ -809,7 +1004,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set updated earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance7.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance7.ID.String())
 	assert.NoError(t, err)
 
 	// Instance 8 is in Terminating state and has no controller ID, gets deleted on inventory update
@@ -837,7 +1032,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set updated earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance8.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance8.ID.String())
 	assert.NoError(t, err)
 
 	// Instance 9 is in Ready state and power status is Rebooting, gets set to BootCompleted
@@ -866,7 +1061,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set updated earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance9.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance9.ID.String())
 	assert.NoError(t, err)
 
 	var vfID uint32 = 1
@@ -900,11 +1095,11 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	)
 	assert.NoError(t, err)
 	// Update creation timestamp to be earlier than inventory processing interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET is_missing_on_site = true, created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance10.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET is_missing_on_site = true, created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance10.ID.String())
 	assert.NoError(t, err)
 
 	// Set updated earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance10.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance10.ID.String())
 	assert.NoError(t, err)
 
 	// Create status detail for instance 10
@@ -940,7 +1135,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set created earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance11.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance11.ID.String())
 	assert.NoError(t, err)
 
 	// Replicate the bug fix test
@@ -1046,7 +1241,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set created earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance15.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance15.ID.String())
 	assert.NoError(t, err)
 
 	ifcvpc_deleting := util.TestBuildInterface(t, dbSession, &instance15.ID, nil, &vpcPrefix1.ID, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusDeleting)
@@ -1092,7 +1287,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set created earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance16.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance16.ID.String())
 	assert.NoError(t, err)
 
 	// Instance 17 starts with nil TPM EK certificate and gets updated with a certificate value
@@ -1124,7 +1319,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set created earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance17.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance17.ID.String())
 	assert.NoError(t, err)
 
 	// Sample base64 encoded TPM EK certificate (truncated for brevity but realistic format)
@@ -1157,7 +1352,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.Nil(t, err)
 
 	// Set created earlier than the inventory receipt interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance18.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance18.ID.String())
 	assert.NoError(t, err)
 
 	interface18_1 := util.TestBuildInterface(t, dbSession, &instance18.ID, &subnet1.ID, nil, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusPending)
@@ -1177,9 +1372,70 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.NotNil(t, ibInterface18_3)
 
 	for _, ibd := range []*cdbm.InfiniBandInterface{ibInterface18_1, ibInterface18_2, ibInterface18_3} {
-		_, err = dbSession.DB.Exec("UPDATE infiniband_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), ibd.ID.String())
+		_, err = dbSession.DB.Exec("UPDATE infiniband_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), ibd.ID.String())
 		assert.NoError(t, err)
 	}
+
+	// Instance 19 verifies that a device-less PF and VF sharing one VPC Prefix
+	// reconcile independently by function identity and VF ID.
+	instance19, err := instanceDAO.Create(
+		ctx,
+		nil,
+		cdbm.InstanceCreateInput{
+			Name:                     "test-instance-19",
+			Description:              cutil.GetPtr("Test description"),
+			TenantID:                 tenant.ID,
+			InfrastructureProviderID: ip.ID,
+			SiteID:                   site.ID,
+			InstanceTypeID:           &instanceType.ID,
+			VpcID:                    vpc.ID,
+			MachineID:                &machine19.ID,
+			ControllerInstanceID:     cutil.GetPtr(uuid.New()),
+			OperatingSystemID:        cutil.GetPtr(operatingSystem.ID),
+			Labels:                   map[string]string{},
+			Status:                   cdbm.InstanceStatusProvisioning,
+			CreatedBy:                tnu.ID,
+		},
+	)
+	assert.NoError(t, err)
+	_, err = dbSession.DB.Exec(
+		"UPDATE instance SET updated = ? WHERE id = ?",
+		time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2),
+		instance19.ID.String(),
+	)
+	assert.NoError(t, err)
+
+	deviceLessFNNPhysicalInterface := util.TestBuildInterface(
+		t,
+		dbSession,
+		&instance19.ID,
+		nil,
+		&vpcPrefix1.ID,
+		true,
+		nil,
+		nil,
+		nil,
+		&tnu.ID,
+		cdbm.InterfaceStatusPending,
+	)
+	assert.NotNil(t, deviceLessFNNPhysicalInterface)
+	deviceLessFNNVirtualFunctionID := 5
+	deviceLessFNNVirtualInterface := util.TestBuildInterface(
+		t,
+		dbSession,
+		&instance19.ID,
+		nil,
+		&vpcPrefix1.ID,
+		false,
+		nil,
+		nil,
+		&deviceLessFNNVirtualFunctionID,
+		&tnu.ID,
+		cdbm.InterfaceStatusPending,
+	)
+	assert.NotNil(t, deviceLessFNNVirtualInterface)
+	deviceLessFNNPhysicalMacAddress := "2F-FC-34-AE-9C-31"
+	deviceLessFNNVirtualMacAddress := "2F-FC-34-AE-9C-32"
 
 	// Build DPU Extension Services and Deployments for testing
 	dpuExtensionService1 := util.TestBuildDpuExtensionService(t, dbSession, "test-dpu-ext-service-1", site, tenant, "ovs-offload", cutil.GetPtr("1"), nil, []string{}, cdbm.DpuExtensionServiceStatusReady, ipu)
@@ -1197,7 +1453,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	assert.NotNil(t, dpuExtServiceDeployment2)
 
 	// Set updated earlier than the inventory receipt interval for dpuExtServiceDeployment2 so it can be deleted
-	_, err = dbSession.DB.Exec("UPDATE dpu_extension_service_deployment SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), dpuExtServiceDeployment2.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE dpu_extension_service_deployment SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), dpuExtServiceDeployment2.ID.String())
 	assert.NoError(t, err)
 
 	instanceInventory := &corev1.InstanceInventory{
@@ -1508,6 +1764,47 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 				},
 			},
 			{
+				Id: &corev1.InstanceId{Value: instance19.ControllerInstanceID.String()},
+				Config: &corev1.InstanceConfig{
+					Network: &corev1.InstanceNetworkConfig{
+						Interfaces: []*corev1.InstanceInterfaceConfig{
+							{
+								FunctionType: corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+								NetworkDetails: &corev1.InstanceInterfaceConfig_VpcPrefixId{
+									VpcPrefixId: &corev1.VpcPrefixId{Value: vpcPrefix1.ID.String()},
+								},
+							},
+							{
+								FunctionType: corev1.InterfaceFunctionType_VIRTUAL_FUNCTION,
+								NetworkDetails: &corev1.InstanceInterfaceConfig_VpcPrefixId{
+									VpcPrefixId: &corev1.VpcPrefixId{Value: vpcPrefix1.ID.String()},
+								},
+								VirtualFunctionId: cutil.GetPtr(uint32(deviceLessFNNVirtualFunctionID)),
+							},
+						},
+					},
+				},
+				Status: &corev1.InstanceStatus{
+					Tenant: &corev1.InstanceTenantStatus{
+						State: corev1.TenantState_READY,
+					},
+					Network: &corev1.InstanceNetworkStatus{
+						Interfaces: []*corev1.InstanceInterfaceStatus{
+							{
+								MacAddress: &deviceLessFNNPhysicalMacAddress,
+								Addresses:  []string{"192.0.2.31"},
+							},
+							{
+								VirtualFunctionId: cutil.GetPtr(uint32(deviceLessFNNVirtualFunctionID)),
+								MacAddress:        &deviceLessFNNVirtualMacAddress,
+								Addresses:         []string{"192.0.2.32"},
+							},
+						},
+						ConfigsSynced: corev1.SyncState_SYNCED,
+					},
+				},
+			},
+			{
 				Id:     &corev1.InstanceId{Value: instance13.ID.String()},
 				Config: &corev1.InstanceConfig{},
 				Status: &corev1.InstanceStatus{
@@ -1642,11 +1939,11 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 
 		assert.NoError(t, err)
 		// Update creation timestamp to be earlier than inventory processing interval
-		_, err = dbSession.DB.Exec("UPDATE instance SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), ins.ID.String())
+		_, err = dbSession.DB.Exec("UPDATE instance SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), ins.ID.String())
 		assert.NoError(t, err)
 
 		// Update updated timestamp to be earlier than inventory processing interval
-		_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), ins.ID.String())
+		_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), ins.ID.String())
 		assert.NoError(t, err)
 
 		pagedIns = append(pagedIns, ins)
@@ -1713,7 +2010,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 	)
 	assert.NoError(t, err)
 	// Update creation timestamp to be earlier than inventory processing interval
-	_, err = dbSession.DB.Exec("UPDATE instance SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), instance12.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET created = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), instance12.ID.String())
 	assert.NoError(t, err)
 
 	// --- Site 4: NVLink Interface deletion strategy test scenarios ---
@@ -1738,12 +2035,12 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 		Labels: map[string]string{}, Status: cdbm.InstanceStatusProvisioning, CreatedBy: tnu.ID,
 	})
 	assert.Nil(t, err)
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), nvlinkDelInstA.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), nvlinkDelInstA.ID.String())
 	assert.NoError(t, err)
 	_ = util.TestBuildInterface(t, dbSession, &nvlinkDelInstA.ID, &subnet4.ID, nil, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusPending)
 
 	nvlifcDelA1 := util.TestBuildNVLinkInterface(t, dbSession, nvlinkDelInstA.ID, site4.ID, nvllPartition4.ID, cutil.GetPtr(""), 0, cutil.GetPtr(gpuGuidDel1), nil, cdbm.NVLinkInterfaceStatusDeleting)
-	_, err = dbSession.DB.Exec("UPDATE nvlink_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), nvlifcDelA1.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE nvlink_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), nvlifcDelA1.ID.String())
 	assert.NoError(t, err)
 
 	nvlifcDelA2 := util.TestBuildNVLinkInterface(t, dbSession, nvlinkDelInstA.ID, site4.ID, nvllPartition4.ID, cutil.GetPtr(""), 1, cutil.GetPtr(gpuGuidDel2), nil, cdbm.NVLinkInterfaceStatusPending)
@@ -1758,12 +2055,12 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 		Labels: map[string]string{}, Status: cdbm.InstanceStatusProvisioning, CreatedBy: tnu.ID,
 	})
 	assert.Nil(t, err)
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), nvlinkDelInstB.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), nvlinkDelInstB.ID.String())
 	assert.NoError(t, err)
 	_ = util.TestBuildInterface(t, dbSession, &nvlinkDelInstB.ID, &subnet4.ID, nil, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusPending)
 
 	nvlifcDelB1 := util.TestBuildNVLinkInterface(t, dbSession, nvlinkDelInstB.ID, site4.ID, nvllPartition4.ID, cutil.GetPtr(""), 0, cutil.GetPtr(gpuGuidDel3), nil, cdbm.NVLinkInterfaceStatusDeleting)
-	_, err = dbSession.DB.Exec("UPDATE nvlink_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), nvlifcDelB1.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE nvlink_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), nvlifcDelB1.ID.String())
 	assert.NoError(t, err)
 
 	nvlifcDelB2 := util.TestBuildNVLinkInterface(t, dbSession, nvlinkDelInstB.ID, site4.ID, nvllPartition4.ID, cutil.GetPtr(""), 1, cutil.GetPtr(gpuGuidDel3), nil, cdbm.NVLinkInterfaceStatusPending)
@@ -1778,12 +2075,12 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 		Labels: map[string]string{}, Status: cdbm.InstanceStatusProvisioning, CreatedBy: tnu.ID,
 	})
 	assert.Nil(t, err)
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), nvlinkDelInstC.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), nvlinkDelInstC.ID.String())
 	assert.NoError(t, err)
 	_ = util.TestBuildInterface(t, dbSession, &nvlinkDelInstC.ID, &subnet4.ID, nil, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusPending)
 
 	nvlifcDelC1 := util.TestBuildNVLinkInterface(t, dbSession, nvlinkDelInstC.ID, site4.ID, nvllPartition4.ID, cutil.GetPtr(""), 0, cutil.GetPtr(gpuGuidDel4), nil, cdbm.NVLinkInterfaceStatusDeleting)
-	_, err = dbSession.DB.Exec("UPDATE nvlink_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), nvlifcDelC1.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE nvlink_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), nvlifcDelC1.ID.String())
 	assert.NoError(t, err)
 	nvlifcDelC1.Instance = nvlinkDelInstC
 
@@ -1796,7 +2093,7 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 		Labels: map[string]string{}, Status: cdbm.InstanceStatusProvisioning, CreatedBy: tnu.ID,
 	})
 	assert.Nil(t, err)
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), nvlinkDelInstD.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), nvlinkDelInstD.ID.String())
 	assert.NoError(t, err)
 	_ = util.TestBuildInterface(t, dbSession, &nvlinkDelInstD.ID, &subnet4.ID, nil, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusPending)
 
@@ -1814,12 +2111,12 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 		Labels: map[string]string{}, Status: cdbm.InstanceStatusProvisioning, CreatedBy: tnu.ID,
 	})
 	assert.Nil(t, err)
-	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), nvlinkDelInstE.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE instance SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), nvlinkDelInstE.ID.String())
 	assert.NoError(t, err)
 	_ = util.TestBuildInterface(t, dbSession, &nvlinkDelInstE.ID, &subnet4.ID, nil, true, nil, nil, nil, &tnu.ID, cdbm.InterfaceStatusPending)
 
 	nvlifcDelE1 := util.TestBuildNVLinkInterface(t, dbSession, nvlinkDelInstE.ID, site4.ID, nvllPartition4.ID, cutil.GetPtr(""), 0, cutil.GetPtr(gpuGuidDel1), nil, cdbm.NVLinkInterfaceStatusDeleting)
-	_, err = dbSession.DB.Exec("UPDATE nvlink_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.InventoryReceiptInterval)*2), nvlifcDelE1.ID.String())
+	_, err = dbSession.DB.Exec("UPDATE nvlink_interface SET updated = ? WHERE id = ?", time.Now().Add(-time.Duration(cutil.DefaultInventoryReceiptInterval)*2), nvlifcDelE1.ID.String())
 	assert.NoError(t, err)
 	nvlifcDelE1.Instance = nvlinkDelInstE
 
@@ -2005,6 +2302,8 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 		clearedInlineRoutingProfileInterfaces []*cdbm.Interface
 		vpcPrefixInterfaces                   []*cdbm.Interface
 		multiDPUInterfaces                    []*cdbm.Interface
+		deviceLessFNNPhysicalInterface        *cdbm.Interface
+		deviceLessFNNVirtualInterface         *cdbm.Interface
 		deletedInfiniBandInterfaces           []*cdbm.InfiniBandInterface
 		readyInfiniBandInterfaces             []*cdbm.InfiniBandInterface
 		updatedDpuExtServiceDeployments       []*cdbm.DpuExtensionServiceDeployment
@@ -2047,6 +2346,8 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 			readyInfiniBandInterfaces:             []*cdbm.InfiniBandInterface{ibInterface1, ibInterface2},
 			multiDPUInterfaces:                    []*cdbm.Interface{ifcvpc0, ifcvpc1, ifcvpc0_1, ifcvpc1_1},
 			vpcPrefixInterfaces:                   []*cdbm.Interface{ifcvpc0, ifcvpc1, ifcvpc0_1, ifcvpc1_1},
+			deviceLessFNNPhysicalInterface:        deviceLessFNNPhysicalInterface,
+			deviceLessFNNVirtualInterface:         deviceLessFNNVirtualInterface,
 			updatedDpuExtServiceDeployments:       []*cdbm.DpuExtensionServiceDeployment{dpuExtServiceDeployment1},
 			deletedDpuExtServiceDeployments:       []*cdbm.DpuExtensionServiceDeployment{dpuExtServiceDeployment2},
 			readyNVLinkInterfaces:                 []*cdbm.NVLinkInterface{nvlinkInterface1, nvlinkInterface2},
@@ -2324,6 +2625,24 @@ func TestManageInstance_UpdateInstancesInDB(t *testing.T) {
 				}
 			}
 
+			if tc.deviceLessFNNPhysicalInterface != nil {
+				physicalInterface, err := ifcDAO.GetByID(ctx, nil, tc.deviceLessFNNPhysicalInterface.ID, nil)
+				require.NoError(t, err)
+				assert.Equal(t, cdbm.InterfaceStatusReady, physicalInterface.Status)
+				require.NotNil(t, physicalInterface.MacAddress)
+				assert.Equal(t, deviceLessFNNPhysicalMacAddress, *physicalInterface.MacAddress)
+				assert.Equal(t, []string{"192.0.2.31"}, physicalInterface.IPAddresses)
+
+				virtualInterface, err := ifcDAO.GetByID(ctx, nil, tc.deviceLessFNNVirtualInterface.ID, nil)
+				require.NoError(t, err)
+				assert.Equal(t, cdbm.InterfaceStatusReady, virtualInterface.Status)
+				require.NotNil(t, virtualInterface.MacAddress)
+				assert.Equal(t, deviceLessFNNVirtualMacAddress, *virtualInterface.MacAddress)
+				assert.Equal(t, []string{"192.0.2.32"}, virtualInterface.IPAddresses)
+				require.NotNil(t, virtualInterface.VirtualFunctionID)
+				assert.Equal(t, deviceLessFNNVirtualFunctionID, *virtualInterface.VirtualFunctionID)
+			}
+
 			for _, instPropStatus := range tc.instanceInventory.NetworkSecurityGroupPropagations {
 				updatedInstance, _ := instanceDAO.GetByID(ctx, nil, uuid.MustParse(instPropStatus.Id), nil)
 
@@ -2535,7 +2854,7 @@ func Test_InstanceMetrics_Create_PendingToReady(t *testing.T) {
 
 	site := util.TestSetupSite(t, dbSession)
 	reg := prometheus.NewRegistry()
-	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession)
+	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession, "nico_rest_workflow")
 	testInstanceID := uuid.New()
 
 	// Set precise timestamps
@@ -2558,7 +2877,7 @@ func Test_InstanceMetrics_Create_PendingToReady(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify metric was emitted with correct duration
-	util.TestAssertMetricExistsTimes(t, reg, "cloud_workflow_instance_operation_latency_seconds", 1, map[string]string{
+	util.TestAssertMetricExistsTimes(t, reg, "nico_rest_workflow_instance_operation_latency_seconds", 1, map[string]string{
 		"operation_type": "create",
 		"from_status":    cdbm.InstanceStatusPending,
 		"to_status":      cdbm.InstanceStatusReady,
@@ -2573,7 +2892,7 @@ func Test_InstanceMetrics_Create_PendingErrorReady(t *testing.T) {
 
 	site := util.TestSetupSite(t, dbSession)
 	reg := prometheus.NewRegistry()
-	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession)
+	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession, "nico_rest_workflow")
 	testInstanceID := uuid.New()
 
 	// Set precise timestamps
@@ -2600,7 +2919,7 @@ func Test_InstanceMetrics_Create_PendingErrorReady(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify metric was emitted with correct duration
-	util.TestAssertMetricExistsTimes(t, reg, "cloud_workflow_instance_operation_latency_seconds", 1, map[string]string{
+	util.TestAssertMetricExistsTimes(t, reg, "nico_rest_workflow_instance_operation_latency_seconds", 1, map[string]string{
 		"operation_type": "create",
 		"from_status":    cdbm.InstanceStatusPending,
 		"to_status":      cdbm.InstanceStatusReady,
@@ -2615,7 +2934,7 @@ func Test_InstanceMetrics_Create_ReadyErrorReady(t *testing.T) {
 
 	site := util.TestSetupSite(t, dbSession)
 	reg := prometheus.NewRegistry()
-	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession)
+	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession, "nico_rest_workflow")
 	testInstanceID := uuid.New()
 
 	// Set precise timestamps
@@ -2645,7 +2964,7 @@ func Test_InstanceMetrics_Create_ReadyErrorReady(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify NO metric was emitted (duplicate ready status)
-	util.TestAssertMetricExistsTimes(t, reg, "cloud_workflow_instance_operation_latency_seconds", 0, nil, 0)
+	util.TestAssertMetricExistsTimes(t, reg, "nico_rest_workflow_instance_operation_latency_seconds", 0, nil, 0)
 }
 
 // Test Instance Metrics - DELETE operations
@@ -2657,7 +2976,7 @@ func Test_InstanceMetrics_Delete_TerminatingOnly(t *testing.T) {
 
 	site := util.TestSetupSite(t, dbSession)
 	reg := prometheus.NewRegistry()
-	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession)
+	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession, "nico_rest_workflow")
 	testInstanceID := uuid.New()
 
 	// Set precise timestamps
@@ -2677,7 +2996,7 @@ func Test_InstanceMetrics_Delete_TerminatingOnly(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify metric was emitted with correct duration
-	util.TestAssertMetricExistsTimes(t, reg, "cloud_workflow_instance_operation_latency_seconds", 1, map[string]string{
+	util.TestAssertMetricExistsTimes(t, reg, "nico_rest_workflow_instance_operation_latency_seconds", 1, map[string]string{
 		"operation_type": "delete",
 		"from_status":    cdbm.InstanceStatusTerminating,
 		"to_status":      cdbm.InstanceStatusTerminated,
@@ -2692,7 +3011,7 @@ func Test_InstanceMetrics_Delete_MultipleTerminating(t *testing.T) {
 
 	site := util.TestSetupSite(t, dbSession)
 	reg := prometheus.NewRegistry()
-	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession)
+	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession, "nico_rest_workflow")
 	testInstanceID := uuid.New()
 
 	// Set precise timestamps
@@ -2720,7 +3039,7 @@ func Test_InstanceMetrics_Delete_MultipleTerminating(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify metric was emitted (should use first terminating timestamp, duration 300ms)
-	util.TestAssertMetricExistsTimes(t, reg, "cloud_workflow_instance_operation_latency_seconds", 1, map[string]string{
+	util.TestAssertMetricExistsTimes(t, reg, "nico_rest_workflow_instance_operation_latency_seconds", 1, map[string]string{
 		"operation_type": "delete",
 		"from_status":    cdbm.InstanceStatusTerminating,
 		"to_status":      cdbm.InstanceStatusTerminated,
@@ -2735,7 +3054,7 @@ func Test_InstanceMetrics_Delete_NoTerminating(t *testing.T) {
 
 	site := util.TestSetupSite(t, dbSession)
 	reg := prometheus.NewRegistry()
-	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession)
+	lifecycleMetrics := NewManageInstanceLifecycleMetrics(reg, dbSession, "nico_rest_workflow")
 	testInstanceID := uuid.New()
 
 	// Set precise timestamps
@@ -2754,5 +3073,5 @@ func Test_InstanceMetrics_Delete_NoTerminating(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify NO metric was emitted (no terminating status found)
-	util.TestAssertMetricExistsTimes(t, reg, "cloud_workflow_instance_operation_latency_seconds", 0, nil, 0)
+	util.TestAssertMetricExistsTimes(t, reg, "nico_rest_workflow_instance_operation_latency_seconds", 0, nil, 0)
 }

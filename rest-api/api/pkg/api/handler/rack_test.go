@@ -170,11 +170,12 @@ func TestGetRackHandler_Handle(t *testing.T) {
 
 	handler := NewGetRackHandler(dbSession, nil, scp, cfg)
 
-	rackID := uuid.New().String()
+	rackID := "core-rack-01"
 
 	mockRack := &flowv1.Rack{
+		ExternalId: rackID,
 		Info: &flowv1.DeviceInfo{
-			Id:           &flowv1.UUID{Id: rackID},
+			Id:           &flowv1.UUID{Id: uuid.NewString()},
 			Name:         "Rack-001",
 			Manufacturer: "NVIDIA",
 		},
@@ -269,7 +270,11 @@ func TestGetRackHandler_Handle(t *testing.T) {
 			mockWorkflowRun := &tmocks.WorkflowRun{}
 			mockWorkflowRun.On("GetID").Return("test-workflow-id")
 			testFlowProxyReply(t, mockWorkflowRun, &flowv1.GetRackInfoResponse{Rack: tt.mockRack})
-			testFlowProxyDispatch(t, mockTemporalClient, mockWorkflowRun, flowv1.Flow_GetRackInfoByID_FullMethodName, nil)
+			testFlowProxyMethodDispatch(t, mockTemporalClient, mockWorkflowRun, flowv1.Flow_GetRackInfoByID_FullMethodName, func(args mock.Arguments) {
+				var request flowv1.GetRackInfoByIDRequest
+				testFlowProxyRequest(t, args, &request)
+				assert.Equal(t, tt.rackID, request.GetId().GetId())
+			})
 			scp.IDClientMap[site.ID.String()] = mockTemporalClient
 
 			q := url.Values{}
@@ -747,6 +752,7 @@ func TestValidateRackHandler_Handle(t *testing.T) {
 			// Setup mock Temporal client
 			mockTemporalClient := &tmocks.Client{}
 			mockWorkflowRun := &tmocks.WorkflowRun{}
+			dispatchedRackID := ""
 			mockWorkflowRun.On("GetID").Return("test-workflow-id")
 			if tt.mockResponse != nil {
 				testFlowProxyReply(t, mockWorkflowRun, &flowv1.ValidateComponentsResponse{
@@ -760,7 +766,19 @@ func TestValidateRackHandler_Handle(t *testing.T) {
 			} else {
 				testFlowProxyReply(t, mockWorkflowRun, &flowv1.ValidateComponentsResponse{})
 			}
-			testFlowProxyDispatch(t, mockTemporalClient, mockWorkflowRun, flowv1.Flow_ValidateComponents_FullMethodName, nil)
+			testFlowProxyMethodDispatch(
+				t,
+				mockTemporalClient,
+				mockWorkflowRun,
+				flowv1.Flow_ValidateComponents_FullMethodName,
+				func(args mock.Arguments) {
+					flowRequest := &flowv1.ValidateComponentsRequest{}
+					testFlowProxyRequest(t, args, flowRequest)
+					targets := flowRequest.GetTargetSpec().GetRacks().GetTargets()
+					require.Len(t, targets, 1)
+					dispatchedRackID = targets[0].GetExternalId()
+				},
+			)
 			scp.IDClientMap[site.ID.String()] = mockTemporalClient
 
 			// Build query string
@@ -791,6 +809,7 @@ func TestValidateRackHandler_Handle(t *testing.T) {
 			if tt.expectedStatus != http.StatusOK {
 				return
 			}
+			assert.Equal(t, tt.rackID, dispatchedRackID)
 
 			// Verify response
 			var apiResult model.APIRackValidationResult
@@ -1324,15 +1343,17 @@ func TestUpdateRackFirmwareHandler_Handle(t *testing.T) {
 		rackID         string
 		body           string
 		mockTaskIDs    []*flowv1.UUID
+		expectedAuth   string
 		expectedStatus int
 	}{
 		{
-			name:           "success - firmware update with version",
+			name:           "success - firmware update with authentication data",
 			reqOrg:         org,
 			user:           providerUser,
 			rackID:         rackID,
-			body:           fmt.Sprintf(`{"siteId":"%s","version":"24.11.0"}`, site.ID.String()),
+			body:           fmt.Sprintf(`{"siteId":"%s","version":"24.11.0","authenticationData":{"shared":"rack-token"}}`, site.ID.String()),
 			mockTaskIDs:    []*flowv1.UUID{{Id: uuid.NewString()}},
+			expectedAuth:   "rack-token",
 			expectedStatus: http.StatusOK,
 		},
 		{
@@ -1376,7 +1397,16 @@ func TestUpdateRackFirmwareHandler_Handle(t *testing.T) {
 			mockWorkflowRun := &tmocks.WorkflowRun{}
 			mockWorkflowRun.On("GetID").Return("test-workflow-id")
 			testFlowProxyReply(t, mockWorkflowRun, &flowv1.SubmitTaskResponse{TaskIds: tt.mockTaskIDs})
-			mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(mockWorkflowRun, nil)
+			mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Run(func(args mock.Arguments) {
+					if tt.expectedAuth == "" {
+						return
+					}
+					flowReq := &flowv1.UpgradeFirmwareRequest{}
+					testFlowProxyRequestWithSecrets(t, args, site.ID.String(), tt.expectedAuth, flowReq)
+					assert.Equal(t, tt.expectedAuth, flowReq.GetAuthenticationData().GetShared())
+				}).
+				Return(mockWorkflowRun, nil)
 			scp.IDClientMap[site.ID.String()] = mockTemporalClient
 
 			path := fmt.Sprintf("/v2/org/%s/nico/rack/%s/firmware", tt.reqOrg, tt.rackID)
@@ -1672,14 +1702,16 @@ func TestBatchUpdateRackFirmwareHandler_Handle(t *testing.T) {
 		user           *cdbm.User
 		body           string
 		mockTaskIDs    []*flowv1.UUID
+		expectedAuth   string
 		expectedStatus int
 	}{
 		{
-			name:           "success - firmware update all racks (no filter)",
+			name:           "success - firmware update all racks with authentication data",
 			reqOrg:         org,
 			user:           providerUser,
-			body:           fmt.Sprintf(`{"siteId":"%s"}`, site.ID.String()),
+			body:           fmt.Sprintf(`{"siteId":"%s","authenticationData":{"shared":"batch-rack-token"}}`, site.ID.String()),
 			mockTaskIDs:    []*flowv1.UUID{{Id: uuid.NewString()}, {Id: uuid.NewString()}},
+			expectedAuth:   "batch-rack-token",
 			expectedStatus: http.StatusOK,
 		},
 		{
@@ -1712,7 +1744,16 @@ func TestBatchUpdateRackFirmwareHandler_Handle(t *testing.T) {
 			mockWorkflowRun := &tmocks.WorkflowRun{}
 			mockWorkflowRun.On("GetID").Return("test-workflow-id")
 			testFlowProxyReply(t, mockWorkflowRun, &flowv1.SubmitTaskResponse{TaskIds: tt.mockTaskIDs})
-			mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(mockWorkflowRun, nil)
+			mockTemporalClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Run(func(args mock.Arguments) {
+					if tt.expectedAuth == "" {
+						return
+					}
+					flowReq := &flowv1.UpgradeFirmwareRequest{}
+					testFlowProxyRequestWithSecrets(t, args, site.ID.String(), tt.expectedAuth, flowReq)
+					assert.Equal(t, tt.expectedAuth, flowReq.GetAuthenticationData().GetShared())
+				}).
+				Return(mockWorkflowRun, nil)
 			scp.IDClientMap[site.ID.String()] = mockTemporalClient
 
 			path := fmt.Sprintf("/v2/org/%s/nico/rack/firmware", tt.reqOrg)
@@ -1748,11 +1789,9 @@ func TestBatchUpdateRackFirmwareHandler_Handle(t *testing.T) {
 	}
 }
 
-// TestRackHandlers_RuleIDPassThrough asserts that a `ruleId` from the REST
-// request body lands in the Flow proto's `rule_id` field for each of the
-// three rack-scoped operation flows (power, firmware, bring-up). This locks
-// down the wiring through the shared Execute* helpers in handler/util/common.
-func TestRackHandlers_RuleIDPassThrough(t *testing.T) {
+// TestRackHandlers_RequestPassThrough asserts the identifiers sent by each
+// rack-scoped operation handler through the shared Execute* helpers.
+func TestRackHandlers_RequestPassThrough(t *testing.T) {
 	e := echo.New()
 	dbSession := testRackInitDB(t)
 	defer dbSession.Close()
@@ -1770,12 +1809,13 @@ func TestRackHandlers_RuleIDPassThrough(t *testing.T) {
 	ruleID := uuid.NewString()
 
 	cases := []struct {
-		name       string
-		path       string
-		body       string
-		handler    echo.HandlerFunc
-		flowReq    proto.Message
-		extractRID func(req proto.Message) string
+		name          string
+		path          string
+		body          string
+		handler       echo.HandlerFunc
+		flowReq       proto.Message
+		extractRID    func(req proto.Message) string
+		extractRackID func(req proto.Message) string
 	}{
 		{
 			name: "power - PowerOnRackRequest carries rule_id",
@@ -1787,6 +1827,9 @@ func TestRackHandlers_RuleIDPassThrough(t *testing.T) {
 			flowReq: &flowv1.PowerOnRackRequest{},
 			extractRID: func(req proto.Message) string {
 				return req.(*flowv1.PowerOnRackRequest).GetRuleId().GetId()
+			},
+			extractRackID: func(req proto.Message) string {
+				return req.(*flowv1.PowerOnRackRequest).GetTargetSpec().GetRacks().GetTargets()[0].GetExternalId()
 			},
 		},
 		{
@@ -1800,6 +1843,9 @@ func TestRackHandlers_RuleIDPassThrough(t *testing.T) {
 			extractRID: func(req proto.Message) string {
 				return req.(*flowv1.UpgradeFirmwareRequest).GetRuleId().GetId()
 			},
+			extractRackID: func(req proto.Message) string {
+				return req.(*flowv1.UpgradeFirmwareRequest).GetTargetSpec().GetRacks().GetTargets()[0].GetExternalId()
+			},
 		},
 		{
 			name: "bring-up - BringUpRackRequest carries rule_id",
@@ -1811,6 +1857,9 @@ func TestRackHandlers_RuleIDPassThrough(t *testing.T) {
 			flowReq: &flowv1.BringUpRackRequest{},
 			extractRID: func(req proto.Message) string {
 				return req.(*flowv1.BringUpRackRequest).GetRuleId().GetId()
+			},
+			extractRackID: func(req proto.Message) string {
+				return req.(*flowv1.BringUpRackRequest).GetTargetSpec().GetRacks().GetTargets()[0].GetExternalId()
 			},
 		},
 	}
@@ -1851,6 +1900,7 @@ func TestRackHandlers_RuleIDPassThrough(t *testing.T) {
 
 			require.True(t, dispatched, "the Flow proxy workflow was not started")
 			assert.Equal(t, ruleID, tc.extractRID(tc.flowReq))
+			assert.Equal(t, rackID, tc.extractRackID(tc.flowReq))
 		})
 	}
 }

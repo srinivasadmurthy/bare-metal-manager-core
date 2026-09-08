@@ -48,6 +48,8 @@ Create a VPC Prefix for the org.
 
 Org must have a Tenant entity. User must have authorization role with `TENANT_ADMIN` suffix.
 
+The VPC must be Ready and use FNN, and its Site must be Registered. `ipBlockId` must identify a Ready tenant IP Block at the VPC's Site. The selected IP Block determines whether the VPC Prefix uses IPv4 or IPv6.
+
 	@param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
 	@param org Name of the Org
 	@return ApiCreateVpcPrefixRequest
@@ -313,7 +315,7 @@ func (r ApiGetAllVpcPrefixRequest) IncludeRelation(includeRelation string) ApiGe
 	return r
 }
 
-// When true, each VPC Prefix object includes usage statistics using the same structure as IP Block usage. Prefix and IP usage data is derived by evaluating associated Ethernet interfaces. Each Interface associated with a VPC Prefix consumes a &#x60;/31&#x60; prefix.
+// When true, each VPC Prefix with IPv4 includes IPv4 usage statistics using the same structure as IP Block usage. Usage is derived from associated Ethernet interfaces and their IPv4 addresses. IP usage counts two addresses per interface, while prefix usage counts each distinct &#x60;/31&#x60; containing an assigned IPv4 address.
 func (r ApiGetAllVpcPrefixRequest) IncludeUsageStats(includeUsageStats bool) ApiGetAllVpcPrefixRequest {
 	r.includeUsageStats = &includeUsageStats
 	return r
@@ -493,7 +495,7 @@ func (r ApiGetVpcPrefixRequest) IncludeRelation(includeRelation string) ApiGetVp
 	return r
 }
 
-// When true, each VPC Prefix object includes usage statistics using the same structure as IP Block usage. Prefix and IP usage data is derived by evaluating associated Ethernet interfaces. Each Interface associated with a VPC Prefix consumes a &#x60;/31&#x60; prefix.
+// When true, a VPC Prefix with IPv4 includes IPv4 usage statistics using the same structure as IP Block usage. Usage is derived from associated Ethernet interfaces and their IPv4 addresses. IP usage counts two addresses per interface, while prefix usage counts each distinct &#x60;/31&#x60; containing an assigned IPv4 address.
 func (r ApiGetVpcPrefixRequest) IncludeUsageStats(includeUsageStats bool) ApiGetVpcPrefixRequest {
 	r.includeUsageStats = &includeUsageStats
 	return r

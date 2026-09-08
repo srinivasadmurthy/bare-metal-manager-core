@@ -22,7 +22,7 @@ use carbide_secrets::credentials::{
     BmcCredentialType, CredentialKey, CredentialManager, Credentials,
 };
 use carbide_utils::none_if_empty::NoneIfEmpty;
-use carbide_uuid::machine::{MachineId, MachineType};
+use carbide_uuid::machine::{HostMachineId, MachineId, MachineIdSubtype, PredictedHostMachineId};
 use db::Transaction;
 use itertools::Itertools;
 use librms::RmsApi;
@@ -34,11 +34,12 @@ use model::hardware_info::HardwareInfo;
 use model::machine::machine_id::host_id_from_dpu_hardware_info;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::{
-    CURRENT_STATE_MODEL_VERSION, DpuDiscoveringState, DpuDiscoveringStates, Machine,
-    MachineInterfaceSnapshot, ManagedHostState, pick_boot_interface, pick_boot_prediction,
+    CURRENT_STATE_MODEL_VERSION, ConfigureAstraState, Machine, MachineInterfaceSnapshot,
+    ManagedHostState, pick_boot_interface, pick_boot_prediction,
 };
 use model::machine_boot_interface::{
-    MachineBootInterface, MachineBootInterfaceTarget, canonical_redfish_boot_interface_id,
+    BootInterfaceSelectionSource, MachineBootInterface, MachineBootInterfaceTarget,
+    canonical_redfish_boot_interface_id,
 };
 use model::machine_interface::InterfaceType;
 use model::machine_interface_address::MachineInterfaceAssociation;
@@ -46,14 +47,16 @@ use model::network_segment::NetworkSegmentType;
 use model::predicted_machine_interface::{NewPredictedMachineInterface, PredictedMachineInterface};
 use model::rack_type::RackProfileConfig;
 use model::resource_pool::common::CommonPools;
-use model::site_explorer::{EndpointExplorationReport, ExploredDpu, ExploredManagedHost};
+use model::site_explorer::{
+    EndpointExplorationReport, ExploredDpu, ExploredManagedHost, HostPrimaryInterfaceSelection,
+};
 use sqlx::{PgConnection, PgPool};
 
-use crate::SiteExplorerConfig;
 use crate::errors::{SiteExplorerError, SiteExplorerResult};
 use crate::explored_endpoint_index::ExploredEndpointIndex;
 use crate::managed_host::ManagedHost;
 use crate::metrics::{SiteExplorationMetrics, SiteExplorerMachineSlotTrayPersistenceFailed};
+use crate::{IdentifiedManagedHost, SiteExplorerConfig};
 
 const DESIRED_BOOT_INTERFACE_RECONCILE_PAGE_SIZE: i64 = 100;
 
@@ -92,18 +95,25 @@ impl MachineCreator {
     pub(crate) async fn create_machines(
         &self,
         metrics: &mut SiteExplorationMetrics,
-        explored_managed_hosts: &mut [(ExploredManagedHost, EndpointExplorationReport)],
+        explored_managed_hosts: &mut [IdentifiedManagedHost],
         expected_explored_endpoint_index: &ExploredEndpointIndex,
     ) -> SiteExplorerResult<()> {
         // TODO: Improve the efficiency of this method. Right now we perform 3 database transactions
         // for every identified ManagedHost even if we don't create any objects.
         // We can perform a single query upfront to identify which ManagedHosts don't yet have Machines
-        for (host, report) in explored_managed_hosts {
+        for identified in explored_managed_hosts {
+            let host = &identified.explored_host;
             let expected_machine =
                 expected_explored_endpoint_index.matched_expected_machine(&host.host_bmc_ip);
 
             match self
-                .create_managed_host(host, report, expected_machine, &self.database_connection)
+                .create_managed_host_with_selection(
+                    host,
+                    &mut identified.report,
+                    expected_machine,
+                    identified.primary_interface_selection,
+                    &self.database_connection,
+                )
                 .await
             {
                 Ok(true) => {
@@ -149,7 +159,9 @@ impl MachineCreator {
 
             for machine_id in machine_ids {
                 let mut txn = Transaction::begin(&self.database_connection).await?;
-                match reconcile_desired_boot_interface(txn.as_pgconn(), &machine_id).await {
+                match reconcile_desired_boot_interface(txn.as_pgconn(), &machine_id, None, None)
+                    .await
+                {
                     Ok(()) => {
                         if let Err(error) = txn.commit().await {
                             tracing::warn!(
@@ -189,6 +201,23 @@ impl MachineCreator {
         explored_host: &ExploredManagedHost,
         report: &mut EndpointExplorationReport,
         expected_machine: Option<&ExpectedMachine>,
+        pool: &PgPool,
+    ) -> SiteExplorerResult<bool> {
+        self.create_managed_host_with_selection(explored_host, report, expected_machine, None, pool)
+            .await
+    }
+
+    /// Creates a managed host with its transient report selection available for
+    /// the initial desired boot interface metadata.
+    ///
+    /// The source is recorded only when its selected MAC becomes the durable
+    /// target; target resolution may legitimately choose another interface.
+    async fn create_managed_host_with_selection(
+        &self,
+        explored_host: &ExploredManagedHost,
+        report: &mut EndpointExplorationReport,
+        expected_machine: Option<&ExpectedMachine>,
+        primary_interface_selection: Option<HostPrimaryInterfaceSelection>,
         pool: &PgPool,
     ) -> SiteExplorerResult<bool> {
         let Some(expected_machine) = expected_machine else {
@@ -258,7 +287,7 @@ impl MachineCreator {
             // machine_id_if_valid_report makes sure that all optional fields on dpu_report are
             // actually set (like the machine-id etc) and returns the machine_id if everything
             // is valid.
-            let dpu_machine_id = *dpu_report.machine_id_if_valid_report()?;
+            let dpu_machine_id = dpu_report.machine_id_if_valid_report()?;
             dpu_ids.push(dpu_machine_id);
         }
 
@@ -317,7 +346,10 @@ impl MachineCreator {
 
             self.reconcile_host_admin_addresses(&mut txn, &host_machine_id)
                 .await?;
-            reconcile_desired_boot_interface(&mut txn, &host_machine_id).await?;
+            // The primary on an existing host may predate source
+            // tracking. Do not infer its historical selector from today's
+            // exploration or ExpectedMachine data.
+            reconcile_desired_boot_interface(&mut txn, &host_machine_id, None, None).await?;
 
             txn.commit().await?;
             return Ok(false);
@@ -360,14 +392,8 @@ impl MachineCreator {
         db::machine::update_state(
             &mut txn,
             &host_machine_id,
-            &ManagedHostState::DpuDiscoveringState {
-                dpu_states: DpuDiscoveringStates {
-                    states: dpu_ids
-                        .iter()
-                        .copied()
-                        .map(|id| (id, DpuDiscoveringState::Initializing))
-                        .collect(),
-                },
+            &ManagedHostState::ConfigureAstra {
+                configure_astra_state: ConfigureAstraState::EnableNics,
             },
         )
         .await?;
@@ -400,7 +426,16 @@ impl MachineCreator {
         // interfaces have been attached and primary flags are final.
         self.reconcile_host_admin_addresses(&mut txn, &host_machine_id)
             .await?;
-        reconcile_desired_boot_interface(&mut txn, &host_machine_id).await?;
+
+        reconcile_desired_boot_interface(
+            &mut txn,
+            // TODO: ManagedHost will eventually have a HostMachineId as its machine_id and
+            // conversion will become unnecessary.
+            &host_machine_id,
+            primary_interface_selection,
+            machine_data.and_then(ExpectedMachineData::declared_primary_mac),
+        )
+        .await?;
 
         let rms_node_identity = if let (Some(rack_id), Some(_)) =
             (&expected_machine.data.rack_id, &self.rms_client)
@@ -493,7 +528,7 @@ impl MachineCreator {
         report: &mut EndpointExplorationReport,
         bmc_mac_address: MacAddress,
         machine_data: Option<&ExpectedMachineData>,
-    ) -> SiteExplorerResult<Option<MachineId>> {
+    ) -> SiteExplorerResult<Option<HostMachineId>> {
         // If there's already a machine with the same MAC address as this endpoint, return false. We
         // can't rely on matching the machine_id, as it may have migrated to a stable MachineID
         // already.
@@ -513,18 +548,19 @@ impl MachineCreator {
         let endpoint_machine_id =
             db::machine_topology::find_machine_id_by_bmc_mac(&mut *txn, bmc_mac_address).await?;
 
-        let mut existing_predicted_host_machine_id = None;
+        let mut existing_predicted_host_machine_id: Option<PredictedHostMachineId> = None;
         for mac_address in &mac_addresses {
             if let Some(machine) = db::machine::find_by_mac_address(txn, mac_address).await? {
-                match machine.id.machine_type() {
-                    MachineType::Host => {
+                match machine.id.machine_id_subtype() {
+                    MachineIdSubtype::StableHost(stable_machine_id) => {
                         // ExpectedMachine is ingestion policy, not a way to
                         // rewrite interfaces on an already managed host.
-                        reconcile_desired_boot_interface(txn, &machine.id).await?;
+                        reconcile_desired_boot_interface(txn, &stable_machine_id, None, None)
+                            .await?;
                         return Ok(None);
                     }
-                    MachineType::PredictedHost => {
-                        if endpoint_machine_id != Some(machine.id) {
+                    MachineIdSubtype::PredictedHost(predicted_machine_id) => {
+                        if endpoint_machine_id.as_ref() != Some(&predicted_machine_id) {
                             tracing::warn!(
                                 %mac_address,
                                 predicted_machine_id = %machine.id,
@@ -534,9 +570,9 @@ impl MachineCreator {
                             );
                             return Ok(None);
                         }
-                        existing_predicted_host_machine_id = Some(machine.id);
+                        existing_predicted_host_machine_id = Some(predicted_machine_id);
                     }
-                    _ => {
+                    MachineIdSubtype::Dpu(_) => {
                         // Preserve the existing collision behavior for a MAC
                         // already owned by a non-host machine.
                         return Ok(None);
@@ -552,13 +588,19 @@ impl MachineCreator {
                 db::predicted_machine_interface::find_by_mac_address(&mut *txn, *mac_address)
                     .await?
             {
-                match prediction.machine_id.machine_type() {
-                    MachineType::Host => {
-                        reconcile_desired_boot_interface(txn, &prediction.machine_id).await?;
+                match prediction.machine_id.machine_id_subtype() {
+                    MachineIdSubtype::StableHost(stable_machine_id) => {
+                        reconcile_desired_boot_interface(
+                            txn,
+                            stable_machine_id.as_host_machine_id(),
+                            None,
+                            None,
+                        )
+                        .await?;
                         return Ok(None);
                     }
-                    MachineType::PredictedHost => {
-                        if endpoint_machine_id != Some(prediction.machine_id) {
+                    MachineIdSubtype::PredictedHost(predicted_machine_id) => {
+                        if endpoint_machine_id.as_ref() != Some(&predicted_machine_id) {
                             tracing::warn!(
                                 %mac_address,
                                 predicted_machine_id = %prediction.machine_id,
@@ -568,7 +610,7 @@ impl MachineCreator {
                             );
                             return Ok(None);
                         }
-                        existing_predicted_host_machine_id = Some(prediction.machine_id);
+                        existing_predicted_host_machine_id = Some(predicted_machine_id);
                     }
                     _ => return Ok(None),
                 }
@@ -623,15 +665,22 @@ impl MachineCreator {
                 primary_mac,
             )
             .await?;
-            reconcile_desired_boot_interface(txn, &machine_id).await?;
+            reconcile_desired_boot_interface(
+                txn,
+                machine_id.as_host_machine_id(),
+                None,
+                declared_primary,
+            )
+            .await?;
             return Ok(None);
         }
 
         let machine_id = match managed_host.machine_id.as_ref() {
-            Some(machine_id) => machine_id,
+            Some(machine_id) => *machine_id,
             None => {
                 // Mint a predicted-host machine_id from the exploration report
-                report.generate_machine_id(true)?.unwrap()
+                PredictedHostMachineId::try_from(*report.generate_machine_id(true)?.unwrap())?
+                    .into()
             }
         };
 
@@ -639,7 +688,7 @@ impl MachineCreator {
 
         let existing_machine = db::machine::find_one(
             &mut *txn,
-            machine_id,
+            &machine_id,
             MachineSearchConfig {
                 include_predicted_host: true,
                 ..Default::default()
@@ -663,23 +712,29 @@ impl MachineCreator {
                 predicted_host_mac_addresses = ?mac_addresses,
                 "Predicted host already exists, with different mac addresses from this one. Potentially multiple machines with same serial number?"
             );
-            reconcile_desired_boot_interface(txn, &existing_machine.id).await?;
+            reconcile_desired_boot_interface(txn, &existing_machine.id.try_into()?, None, None)
+                .await?;
             return Ok(None);
         }
 
-        self.create_machine_from_explored_managed_host(txn, managed_host, machine_id, machine_data)
-            .await?;
+        self.create_machine_from_explored_managed_host(
+            txn,
+            managed_host,
+            &machine_id,
+            machine_data,
+        )
+        .await?;
 
         Self::reconcile_zero_dpu_host_interfaces(
             txn,
-            machine_id,
+            &machine_id,
             &mac_addresses,
             &report_boot_interface_ids,
             primary_mac,
         )
         .await?;
 
-        Ok(Some(*machine_id))
+        Ok(Some(machine_id))
     }
 
     /// Reconciles every discovered Host candidate with a zero-DPU host.
@@ -882,7 +937,7 @@ impl MachineCreator {
     async fn own_declared_host_boot_nic(
         &self,
         txn: &mut PgConnection,
-        host_machine_id: &MachineId,
+        host_machine_id: &HostMachineId,
         report: &EndpointExplorationReport,
         machine_data: Option<&ExpectedMachineData>,
     ) -> SiteExplorerResult<()> {
@@ -901,7 +956,7 @@ impl MachineCreator {
                 // Owned by a DIFFERENT machine: the declaration names a MAC that
                 // already belongs elsewhere -- surface it rather than silently
                 // dropping the declared boot NIC (mirrors create_zero_dpu_machine).
-                if existing_machine_id != *host_machine_id {
+                if existing_machine_id != host_machine_id.into() {
                     return Err(SiteExplorerError::AlreadyFoundError {
                         kind: "MachineInterface",
                         id: declared_mac.to_string(),
@@ -919,7 +974,7 @@ impl MachineCreator {
             }
             db::machine_interface::associate_interface_with_machine(
                 &existing.id,
-                MachineInterfaceAssociation::Machine(*host_machine_id),
+                MachineInterfaceAssociation::Machine((*host_machine_id).into()),
                 txn,
             )
             .await?;
@@ -937,7 +992,7 @@ impl MachineCreator {
         if let Some(existing_prediction) =
             db::predicted_machine_interface::find_by_mac_address(&mut *txn, declared_mac).await?
         {
-            if existing_prediction.machine_id != *host_machine_id {
+            if existing_prediction.machine_id != (*host_machine_id).into() {
                 return Err(SiteExplorerError::AlreadyFoundError {
                     kind: "PredictedMachineInterface",
                     id: declared_mac.to_string(),
@@ -1154,7 +1209,7 @@ impl MachineCreator {
         explored_host: &ManagedHost<'_>,
         explored_dpu: &ExploredDpu,
         machine_data: Option<&ExpectedMachineData>,
-    ) -> SiteExplorerResult<MachineId> {
+    ) -> SiteExplorerResult<HostMachineId> {
         let dpu_hw_info = explored_dpu.hardware_info()?;
         // Create Host proactively.
         // In case host interface is created, this method will return existing one, instead
@@ -1188,7 +1243,7 @@ impl MachineCreator {
 
         db::machine_interface::associate_interface_with_machine(
             &host_machine_interface.id,
-            MachineInterfaceAssociation::Machine(host_machine_id),
+            MachineInterfaceAssociation::Machine(host_machine_id.into()),
             txn,
         )
         .await?;
@@ -1275,7 +1330,7 @@ impl MachineCreator {
     async fn reconcile_host_admin_addresses(
         &self,
         txn: &mut PgConnection,
-        host_machine_id: &MachineId,
+        host_machine_id: &HostMachineId,
     ) -> SiteExplorerResult<bool> {
         let active_config_changed =
             db::machine_interface::reconcile_admin_addresses_for_host(txn, host_machine_id).await?;
@@ -1316,7 +1371,7 @@ impl MachineCreator {
         host_machine_interface: &MachineInterfaceSnapshot,
         explored_dpu: &ExploredDpu,
         machine_data: Option<&ExpectedMachineData>,
-    ) -> SiteExplorerResult<MachineId> {
+    ) -> SiteExplorerResult<HostMachineId> {
         match &explored_host.machine_id {
             Some(host_machine_id) => {
                 // This is not the primary interface for this host
@@ -1350,7 +1405,7 @@ impl MachineCreator {
 
                 db::machine_interface::set_primary_interface(&host_machine_interface.id, true, txn)
                     .await?;
-                Ok(host_machine_id)
+                Ok(host_machine_id.into())
             }
         }
     }
@@ -1364,7 +1419,7 @@ impl MachineCreator {
         explored_host: &ExploredManagedHost,
         explored_dpu: &ExploredDpu,
         machine_data: Option<&ExpectedMachineData>,
-    ) -> SiteExplorerResult<MachineId> {
+    ) -> SiteExplorerResult<PredictedHostMachineId> {
         let dpu_hw_info = explored_dpu.hardware_info()?;
         let predicted_machine_id = host_id_from_dpu_hardware_info(&dpu_hw_info).map_err(|e| {
             SiteExplorerError::InvalidArgument(format!("hardware info missing: {e}"))
@@ -1390,27 +1445,24 @@ impl MachineCreator {
         )
         .await?;
 
-        Ok(predicted_machine_id)
+        Ok(PredictedHostMachineId::try_from(predicted_machine_id)?)
     }
 }
 
 /// Initializes the durable desired boot interface from Site Explorer's settled
-/// interface ownership, or enriches a persisted MAC-only target with a newly
-/// observed Redfish interface id.
+/// interface ownership, or enriches a persisted target that has only a MAC
+/// with a newly observed Redfish interface ID.
 ///
-/// The initial read stays lock-free so a completed pair does not serialize
+/// The initial read does not lock, so a completed pair does not serialize
 /// unrelated machine updates on every exploration. The mutation helpers lock
-/// and recheck the two allowed transitions: unset to initialized, and same-MAC
-/// `MacOnly` to `Pair`.
+/// and recheck the two allowed transitions: unset to initialized, and a
+/// `MacOnly` target to a `Pair` for the same MAC.
 async fn reconcile_desired_boot_interface(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
+    primary_interface_selection: Option<HostPrimaryInterfaceSelection>,
+    declared_primary: Option<MacAddress>,
 ) -> SiteExplorerResult<()> {
-    let machine_type = machine_id.machine_type();
-    if !machine_type.is_host() && !machine_type.is_predicted_host() {
-        return Ok(());
-    }
-
     let desired = db::machine_desired_boot_interface::get(&mut *txn, machine_id).await?;
 
     if matches!(
@@ -1434,8 +1486,15 @@ async fn reconcile_desired_boot_interface(
 
     match (desired.as_ref().map(|desired| &desired.value), update) {
         (None, Some(target)) => {
-            db::machine_desired_boot_interface::initialize_if_unset(txn, machine_id, &target)
-                .await?;
+            let selection_source =
+                initial_selection_source(&target, primary_interface_selection, declared_primary);
+            db::machine_desired_boot_interface::initialize_if_unset(
+                txn,
+                machine_id,
+                &target,
+                selection_source,
+            )
+            .await?;
         }
         (
             Some(MachineBootInterfaceTarget::MacOnly(mac_address)),
@@ -1454,6 +1513,28 @@ async fn reconcile_desired_boot_interface(
     }
 
     Ok(())
+}
+
+/// Returns `ExpectedMachine` when the declared MAC became durable, otherwise
+/// returns the report source only when its MAC matches the durable target.
+/// `LegacyUnknown` covers every other target, including one chosen by a report
+/// fallback when Redfish could not resolve the declared interface and the
+/// fallback selected a different MAC.
+fn initial_selection_source(
+    target: &MachineBootInterfaceTarget,
+    report_selection: Option<HostPrimaryInterfaceSelection>,
+    declared_primary: Option<MacAddress>,
+) -> BootInterfaceSelectionSource {
+    let target_mac = target.mac_address();
+    if declared_primary == Some(target_mac) {
+        return BootInterfaceSelectionSource::ExpectedMachine;
+    }
+
+    report_selection
+        .filter(|selection| selection.mac_address == target_mac)
+        .map_or(BootInterfaceSelectionSource::LegacyUnknown, |selection| {
+            selection.source
+        })
 }
 
 /// Returns the only desired-target transition Site Explorer should attempt.
@@ -2097,6 +2178,74 @@ mod tests {
             ],
             |(desired, interfaces, predictions)| {
                 desired_boot_interface_update(desired.as_ref(), &interfaces, &predictions)
+            },
+        );
+    }
+
+    #[test]
+    fn initial_selection_source_must_match_the_durable_target() {
+        let target_mac = MacAddress::new([0x02, 0, 0, 0, 0, 1]);
+        let other_mac = MacAddress::new([0x02, 0, 0, 0, 0, 2]);
+        let target = MachineBootInterfaceTarget::MacOnly(target_mac);
+        let selection = |mac_address, source| HostPrimaryInterfaceSelection {
+            mac_address,
+            source,
+        };
+
+        check_values(
+            [
+                Check {
+                    scenario: "matching ExpectedMachine declaration wins over report fallback",
+                    input: (
+                        Some(selection(
+                            other_mac,
+                            BootInterfaceSelectionSource::RedfishSerialNumber,
+                        )),
+                        Some(target_mac),
+                    ),
+                    expect: BootInterfaceSelectionSource::ExpectedMachine,
+                },
+                Check {
+                    scenario: "matching UEFI selection is retained",
+                    input: (
+                        Some(selection(
+                            target_mac,
+                            BootInterfaceSelectionSource::RedfishUefiPci,
+                        )),
+                        None,
+                    ),
+                    expect: BootInterfaceSelectionSource::RedfishUefiPci,
+                },
+                Check {
+                    scenario: "matching serial fallback is retained",
+                    input: (
+                        Some(selection(
+                            target_mac,
+                            BootInterfaceSelectionSource::RedfishSerialNumber,
+                        )),
+                        None,
+                    ),
+                    expect: BootInterfaceSelectionSource::RedfishSerialNumber,
+                },
+                Check {
+                    scenario: "different report selection is not attributed to target",
+                    input: (
+                        Some(selection(
+                            other_mac,
+                            BootInterfaceSelectionSource::RedfishUefiPci,
+                        )),
+                        None,
+                    ),
+                    expect: BootInterfaceSelectionSource::LegacyUnknown,
+                },
+                Check {
+                    scenario: "unexplained target stays explicitly unknown",
+                    input: (None, None),
+                    expect: BootInterfaceSelectionSource::LegacyUnknown,
+                },
+            ],
+            |(report_selection, declared_primary)| {
+                initial_selection_source(&target, report_selection, declared_primary)
             },
         );
     }

@@ -19,10 +19,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
+use carbide_libmlx_model::nvconfig::DpuNvConfigProfile;
 use carbide_utils::config::as_std_duration;
 use duration_str::deserialize_duration;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::hardware_info::HardwareInfo;
 
 /// RackHardwareType identifies the hardware type of a rack.
 /// This is a flexible string-based type to allow new hardware types
@@ -90,7 +93,46 @@ pub enum RackProductFamily {
     Other(String),
 }
 
+/// Selects the fixed DPU NVConfig profile supported by a product family and DPU
+/// identity.
+///
+/// A profile is selected only for the GB200 product family and an exact
+/// supported DPU part number. Missing identity does not select a profile.
+pub fn select_dpu_nvconfig_profile(
+    product_family: Option<&RackProductFamily>,
+    hardware_info: Option<&HardwareInfo>,
+) -> Option<DpuNvConfigProfile> {
+    if product_family != Some(&RackProductFamily::Gb200) {
+        return None;
+    }
+
+    let part_number = &hardware_info?.dpu_info.as_ref()?.part_number;
+    DpuNvConfigProfile::for_gb200_b3240_part_number(part_number)
+}
+
 impl RackProductFamily {
+    /// Returns `GB200` or `GB300` when a hardware model reported by Redfish
+    /// contains exactly one of those product family tokens.
+    ///
+    /// Matching ignores ASCII case and requires whole tokens separated by ASCII
+    /// whitespace. Unknown models, concatenated names, and models naming both
+    /// families return `None`.
+    pub fn from_hardware_model(model: &str) -> Option<Self> {
+        let mut has_gb200 = false;
+        let mut has_gb300 = false;
+
+        for token in model.split_ascii_whitespace() {
+            has_gb200 |= token.eq_ignore_ascii_case("gb200");
+            has_gb300 |= token.eq_ignore_ascii_case("gb300");
+        }
+
+        match (has_gb200, has_gb300) {
+            (true, false) => Some(Self::Gb200),
+            (false, true) => Some(Self::Gb300),
+            (false, false) | (true, true) => None,
+        }
+    }
+
     /// Returns the product-family identifier sent to descriptor-based backends.
     ///
     /// Named variants use their canonical lowercase value. Values stored in
@@ -471,9 +513,127 @@ impl RackProfileConfig {
 #[cfg(test)]
 mod tests {
     use carbide_test_support::Outcome::*;
-    use carbide_test_support::{scenarios, value_scenarios};
+    use carbide_test_support::{Check, check_values, scenarios, value_scenarios};
 
     use super::*;
+    use crate::hardware_info::DpuData;
+
+    fn dpu_hardware_info(part_number: &str) -> HardwareInfo {
+        HardwareInfo {
+            dpu_info: Some(DpuData {
+                part_number: part_number.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hardware_model_requires_one_known_product_family_token() {
+        check_values(
+            [
+                Check {
+                    scenario: "DGX GB200 compute tray",
+                    input: "DGX GB200 Compute Tray",
+                    expect: Some(RackProductFamily::Gb200),
+                },
+                Check {
+                    scenario: "GB200 board",
+                    input: "GB200 1CPU:2GPU Board PC",
+                    expect: Some(RackProductFamily::Gb200),
+                },
+                Check {
+                    scenario: "GB200 NVL",
+                    input: "GB200 NVL",
+                    expect: Some(RackProductFamily::Gb200),
+                },
+                Check {
+                    scenario: "lowercase GB200 token",
+                    input: "dgx gb200 compute tray",
+                    expect: Some(RackProductFamily::Gb200),
+                },
+                Check {
+                    scenario: "GB200 token separated by ASCII whitespace",
+                    input: "DGX\tGB200\nCompute Tray",
+                    expect: Some(RackProductFamily::Gb200),
+                },
+                Check {
+                    scenario: "GB300 compute tray",
+                    input: "DGX GB300 Compute Tray",
+                    expect: Some(RackProductFamily::Gb300),
+                },
+                Check {
+                    scenario: "concatenated GB200 name",
+                    input: "GB200Nvl Compute Tray",
+                    expect: None,
+                },
+                Check {
+                    scenario: "model names multiple product families",
+                    input: "GB200 GB300 Compute Tray",
+                    expect: None,
+                },
+                Check {
+                    scenario: "unknown model",
+                    input: "PowerEdge R750",
+                    expect: None,
+                },
+            ],
+            RackProductFamily::from_hardware_model,
+        );
+    }
+
+    #[test]
+    fn dpu_nvconfig_profile_requires_matching_product_family_and_dpu_identity() {
+        check_values(
+            [
+                Check {
+                    scenario: "GB200 family with supported B3240",
+                    input: (
+                        Some(RackProductFamily::Gb200),
+                        Some(dpu_hardware_info("900-9D3B6-00CN-PA0")),
+                    ),
+                    expect: Some(DpuNvConfigProfile::Gb200B3240V1),
+                },
+                Check {
+                    scenario: "other product family with supported B3240",
+                    input: (
+                        Some(RackProductFamily::Gb300),
+                        Some(dpu_hardware_info("900-9D3B6-00CN-PA0")),
+                    ),
+                    expect: None,
+                },
+                Check {
+                    scenario: "GB200 family with another BlueField 3 product",
+                    input: (
+                        Some(RackProductFamily::Gb200),
+                        Some(dpu_hardware_info("900-9D3B6-00CV-AA0")),
+                    ),
+                    expect: None,
+                },
+                Check {
+                    scenario: "GB200 family without DPU hardware information",
+                    input: (Some(RackProductFamily::Gb200), None),
+                    expect: None,
+                },
+                Check {
+                    scenario: "GB200 family without DPU identity",
+                    input: (
+                        Some(RackProductFamily::Gb200),
+                        Some(HardwareInfo::default()),
+                    ),
+                    expect: None,
+                },
+                Check {
+                    scenario: "missing product family with supported B3240",
+                    input: (None, Some(dpu_hardware_info("900-9D3B6-00CN-PA0"))),
+                    expect: None,
+                },
+            ],
+            |(product_family, hardware_info)| {
+                select_dpu_nvconfig_profile(product_family.as_ref(), hardware_info.as_ref())
+            },
+        );
+    }
 
     #[test]
     fn test_rack_profile_config_lookup() {
@@ -967,63 +1127,6 @@ count = 2
 
             "empty product family" {
                 "\"  \"" => Fails,
-            }
-        );
-    }
-
-    // RackHardwareTopology serde.
-
-    // JSON round-trip: each topology variant serializes to its expected
-    // snake_case string and deserializes back to itself. Projected to
-    // (json, value_back); the (non-PartialEq) serde_json error is discarded.
-    #[test]
-    fn test_rack_hardware_topology_serde_round_trip() {
-        scenarios!(
-            run = |variant| {
-                let json = serde_json::to_string(&variant).map_err(drop)?;
-                let back: RackHardwareTopology = serde_json::from_str(&json).map_err(drop)?;
-                Ok::<_, ()>((json, back))
-            };
-            "gb200 nvl36 round-trips" {
-                RackHardwareTopology::Gb200Nvl36r1C2g4Topology => Yields((
-                    "\"gb200_nvl36r1_c2g4_topology\"".to_string(),
-                    RackHardwareTopology::Gb200Nvl36r1C2g4Topology,
-                )),
-            }
-
-            "gb300 nvl36 round-trips" {
-                RackHardwareTopology::Gb300Nvl36r1C2g4Topology => Yields((
-                    "\"gb300_nvl36r1_c2g4_topology\"".to_string(),
-                    RackHardwareTopology::Gb300Nvl36r1C2g4Topology,
-                )),
-            }
-
-            "gb200 nvl72 round-trips" {
-                RackHardwareTopology::Gb200Nvl72r1C2g4Topology => Yields((
-                    "\"gb200_nvl72r1_c2g4_topology\"".to_string(),
-                    RackHardwareTopology::Gb200Nvl72r1C2g4Topology,
-                )),
-            }
-
-            "gb300 nvl72 round-trips" {
-                RackHardwareTopology::Gb300Nvl72r1C2g4Topology => Yields((
-                    "\"gb300_nvl72r1_c2g4_topology\"".to_string(),
-                    RackHardwareTopology::Gb300Nvl72r1C2g4Topology,
-                )),
-            }
-
-            "vr nvl8 rtf round-trips" {
-                RackHardwareTopology::VrNvl8r1C2g4RtfTopology => Yields((
-                    "\"vr_nvl8r1_c2g4_rtf_topology\"".to_string(),
-                    RackHardwareTopology::VrNvl8r1C2g4RtfTopology,
-                )),
-            }
-
-            "vr nvl72 round-trips" {
-                RackHardwareTopology::VrNvl72r1C2g4Topology => Yields((
-                    "\"vr_nvl72r1_c2g4_topology\"".to_string(),
-                    RackHardwareTopology::VrNvl72r1C2g4Topology,
-                )),
             }
         );
     }

@@ -6,10 +6,12 @@ package operations
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/secret"
 	taskcommon "github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/common"
 )
 
@@ -30,6 +32,9 @@ func ExtractRuleID(info json.RawMessage) *uuid.UUID {
 }
 
 type Operation interface {
+	Clone() Operation
+	// Validate checks the complete operation payload and guarantees that Type
+	// and CodeString identify a supported task operation.
 	Validate() error
 	Marshal() (json.RawMessage, error)
 	Unmarshal(data json.RawMessage) error
@@ -39,39 +44,48 @@ type Operation interface {
 }
 
 func New(typ taskcommon.TaskType, info json.RawMessage) (Operation, error) {
+	operation, err := newEmpty(typ)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(info, operation); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal %s task info: %w", operationTypeName(typ), err)
+	}
+
+	return operation, nil
+}
+
+func newEmpty(typ taskcommon.TaskType) (Operation, error) {
 	switch typ {
 	case taskcommon.TaskTypePowerControl:
-		var taskInfo PowerControlTaskInfo
-		if err := json.Unmarshal(info, &taskInfo); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal power control task info: %w", err) //nolint
-		}
-		return &taskInfo, nil
+		return &PowerControlTaskInfo{}, nil
 	case taskcommon.TaskTypeFirmwareControl:
-		var taskInfo FirmwareControlTaskInfo
-		if err := json.Unmarshal(info, &taskInfo); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal firmware control task info: %w", err) //nolint
-		}
-		return &taskInfo, nil
+		return &FirmwareControlTaskInfo{}, nil
 	case taskcommon.TaskTypeInjectExpectation:
-		var taskInfo InjectExpectationTaskInfo
-		if err := json.Unmarshal(info, &taskInfo); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal inject expectation task info: %w", err) //nolint
-		}
-		return &taskInfo, nil
+		return &InjectExpectationTaskInfo{}, nil
 	case taskcommon.TaskTypeBringUp:
-		var taskInfo BringUpTaskInfo
-		if err := json.Unmarshal(info, &taskInfo); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal bring-up task info: %w", err) //nolint
-		}
-		return &taskInfo, nil
+		return &BringUpTaskInfo{}, nil
 	case taskcommon.TaskTypeDecommission:
-		var taskInfo DecommissionTaskInfo
-		if err := json.Unmarshal(info, &taskInfo); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal decommission task info: %w", err) //nolint
-		}
-		return &taskInfo, nil
+		return &DecommissionTaskInfo{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported task type: %s", typ)
+	}
+}
+
+func operationTypeName(typ taskcommon.TaskType) string {
+	switch typ {
+	case taskcommon.TaskTypePowerControl:
+		return "power control"
+	case taskcommon.TaskTypeFirmwareControl:
+		return "firmware control"
+	case taskcommon.TaskTypeInjectExpectation:
+		return "inject expectation"
+	case taskcommon.TaskTypeBringUp:
+		return "bring-up"
+	case taskcommon.TaskTypeDecommission:
+		return "decommission"
+	default:
+		return string(typ)
 	}
 }
 
@@ -89,11 +103,22 @@ type PowerControlTaskInfo struct {
 }
 
 func (t *PowerControlTaskInfo) Validate() error {
-	if t.Operation == PowerOperationUnknown {
+	if t == nil {
+		return fmt.Errorf("power control operation is required")
+	}
+	if _, ok := powerOperationCodes[t.Operation]; !ok {
 		return fmt.Errorf("invalid power control operation")
 	}
+	return validateOperationTypeAndCode(t)
+}
 
-	return nil
+// Clone returns an independent copy of the operation.
+func (t *PowerControlTaskInfo) Clone() Operation {
+	if t == nil {
+		return nil
+	}
+	cloned := *t
+	return &cloned
 }
 
 func (t *PowerControlTaskInfo) Marshal() (json.RawMessage, error) {
@@ -128,7 +153,20 @@ type InjectExpectationTaskInfo struct {
 }
 
 func (t *InjectExpectationTaskInfo) Validate() error {
-	return nil
+	if t == nil {
+		return fmt.Errorf("inject expectation operation is required")
+	}
+	return validateOperationTypeAndCode(t)
+}
+
+// Clone returns an independent copy of the operation.
+func (t *InjectExpectationTaskInfo) Clone() Operation {
+	if t == nil {
+		return nil
+	}
+	cloned := *t
+	cloned.Info = slices.Clone(t.Info)
+	return &cloned
 }
 
 func (t *InjectExpectationTaskInfo) Marshal() (json.RawMessage, error) {
@@ -171,7 +209,19 @@ type BringUpTaskInfo struct {
 }
 
 func (t *BringUpTaskInfo) Validate() error {
-	return nil
+	if t == nil {
+		return fmt.Errorf("bring-up operation is required")
+	}
+	return validateOperationTypeAndCode(t)
+}
+
+// Clone returns an independent copy of the operation.
+func (t *BringUpTaskInfo) Clone() Operation {
+	if t == nil {
+		return nil
+	}
+	cloned := *t
+	return &cloned
 }
 
 func (t *BringUpTaskInfo) Marshal() (json.RawMessage, error) {
@@ -240,14 +290,36 @@ type FirmwareControlTaskInfo struct {
 	// maintenance windows and recorded as a warning log on the worker
 	// that executes the task; authorisation lives upstream.
 	OverrideReadinessCheck bool `json:"override_readiness_check,omitempty"`
+	// AuthenticationData remains encrypted while this payload is persisted in
+	// Flow or carried by Temporal. The final FirmwareControl activity decrypts
+	// it and sets AccessToken only on its in-memory copy.
+	AuthenticationData *secret.EncryptedData `json:"authentication_data,omitempty"`
+	AccessToken        string                `json:"-"`
 }
 
 func (t *FirmwareControlTaskInfo) Validate() error {
-	if t.Operation == FirmwareOperationUnknown {
+	if t == nil {
+		return fmt.Errorf("firmware control operation is required")
+	}
+	if _, ok := firmwareOperationCodes[t.Operation]; !ok {
 		return fmt.Errorf("invalid firmware control operation")
 	}
+	return validateOperationTypeAndCode(t)
+}
 
-	return nil
+// Clone returns an independent copy of the operation.
+func (t *FirmwareControlTaskInfo) Clone() Operation {
+	if t == nil {
+		return nil
+	}
+	cloned := *t
+	cloned.SubTargets = slices.Clone(t.SubTargets)
+	if t.AuthenticationData != nil {
+		authenticationData := *t.AuthenticationData
+		authenticationData.Ciphertext = slices.Clone(t.AuthenticationData.Ciphertext)
+		cloned.AuthenticationData = &authenticationData
+	}
+	return &cloned
 }
 
 func (t *FirmwareControlTaskInfo) Marshal() (json.RawMessage, error) {
@@ -283,7 +355,19 @@ type DecommissionTaskInfo struct {
 }
 
 func (t *DecommissionTaskInfo) Validate() error {
-	return nil
+	if t == nil {
+		return fmt.Errorf("decommission operation is required")
+	}
+	return validateOperationTypeAndCode(t)
+}
+
+// Clone returns an independent copy of the operation.
+func (t *DecommissionTaskInfo) Clone() Operation {
+	if t == nil {
+		return nil
+	}
+	cloned := *t
+	return &cloned
 }
 
 func (t *DecommissionTaskInfo) Marshal() (json.RawMessage, error) {
@@ -311,6 +395,14 @@ func (t *DecommissionTaskInfo) Description() string {
 
 func (t *DecommissionTaskInfo) CodeString() string {
 	return taskcommon.OpCodeDecommission
+}
+
+func validateOperationTypeAndCode(operation Operation) error {
+	taskType := operation.Type()
+	if !taskType.IsValid() {
+		return fmt.Errorf("task operation type %q is invalid", taskType)
+	}
+	return taskcommon.OperationCode(operation.CodeString()).ValidateFor(taskType)
 }
 
 // SetFirmwareUpdateTimeWindowRequest is the request for setting firmware update time window.

@@ -3,7 +3,7 @@
 
 .PHONY: test postgres-up postgres-down ensure-postgres postgres-wait clean check-source-headers fix-source-headers check-command-bundle
 .PHONY: build docker-build docker-build-local
-.PHONY: test-ipam test-site-agent test-site-manager test-workflow test-db test-api test-auth test-common test-cert-manager test-site-workflow test-flow test-powershelf-manager test-nvswitch-manager test-proto migrate core-mock-server-build core-mock-server-start core-mock-server-stop flow-mock-server-build flow-mock-server-start flow-mock-server-stop
+.PHONY: test-ipam test-site-agent test-site-manager test-workflow test-db test-api test-auth test-common test-cert-manager test-site-workflow test-flow test-powershelf-manager test-nvswitch-manager test-proto test-sdk-simple migrate core-mock-server-build core-mock-server-start core-mock-server-stop flow-mock-server-build flow-mock-server-start flow-mock-server-stop
 .PHONY: validate-openapi preview-openapi generate-client
 .PHONY: core-proto core-proto-clean core-proto-fetch core-proto-fmt core-protogen flow-proto flow-protogen tools-build tools-clean
 .PHONY: pre-commit-install pre-commit-run pre-commit-update
@@ -260,7 +260,10 @@ test-nvswitch-manager:
 		DB_NAME=$(POSTGRES_DB) \
 		go test -p 1 ./... -count=1
 
-test: test-ipam test-db test-api test-auth test-common test-cert-manager test-site-workflow test-site-manager test-workflow test-site-agent test-flow test-powershelf-manager test-nvswitch-manager test-proto
+test-sdk-simple:
+	go test ./sdk/simple -count=1
+
+test: test-ipam test-db test-api test-auth test-common test-cert-manager test-site-workflow test-site-manager test-workflow test-site-agent test-flow test-powershelf-manager test-nvswitch-manager test-proto test-sdk-simple
 
 build:
 	mkdir -p $(BUILD_DIR)
@@ -297,15 +300,16 @@ docker-build:
 	fi
 	@set -e; \
 	for image in $(REST_IMAGES); do \
+		tags=""; \
 		for arch in $(DOCKER_ARCHES); do \
+			tag=$(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-$$arch; \
 			docker buildx build --platform linux/$$arch --push \
 				--build-arg TARGETOS=linux --build-arg TARGETARCH=$$arch \
-				-t $(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-$$arch \
+				-t $$tag \
 				-f $(DOCKERFILE_DIR)/Dockerfile.$$image .; \
+			tags="$$tags $$tag"; \
 		done; \
-		docker buildx imagetools create -t $(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG) \
-			$(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-amd64 \
-			$(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-arm64; \
+		docker buildx imagetools create -t $(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG) $$tags; \
 	done
 
 core-proto:
@@ -561,34 +565,8 @@ kind-reset-infra: docker-build-local
 	kubectl -n temporal rollout status deployment/temporal-matching --timeout=360s || true
 	kubectl -n temporal rollout status deployment/temporal-worker --timeout=360s || true
 	@echo "Creating Temporal namespaces with TLS (idempotent, with retry)..."
-	@# rollout status reporting the frontend Available does not guarantee it is
-	@# yet serving registration RPCs, so a single-shot create can lose the race
-	@# and (previously) be silently swallowed by `|| true`, leaving the cloud
-	@# worker stuck in CrashLoopBackOff ("Namespace cloud is not found").
-	@# The loop's success condition is a confirmed `describe`, not a successful
-	@# `create`: `create` returning OK does not guarantee the namespace is
-	@# immediately visible (propagation lag), so we re-check with `describe` and
-	@# retry transient NOT_FOUND responses. Fail loudly if it never confirms.
 	@for ns in cloud site; do \
-		echo "Registering Temporal namespace: $$ns"; \
-		ok=""; \
-		for attempt in $$(seq 1 30); do \
-			if kubectl -n temporal exec deploy/temporal-admintools -- temporal operator namespace describe --namespace $$ns --address temporal-frontend.temporal:7233 \
-				--tls-cert-path /var/secrets/temporal/certs/server-interservice/tls.crt \
-				--tls-key-path /var/secrets/temporal/certs/server-interservice/tls.key \
-				--tls-ca-path /var/secrets/temporal/certs/server-interservice/ca.crt \
-				--tls-server-name interservice.server.temporal.local >/dev/null 2>&1; then \
-				echo "  namespace $$ns confirmed"; ok=1; break; \
-			fi; \
-			kubectl -n temporal exec deploy/temporal-admintools -- temporal operator namespace create --namespace $$ns --address temporal-frontend.temporal:7233 \
-				--tls-cert-path /var/secrets/temporal/certs/server-interservice/tls.crt \
-				--tls-key-path /var/secrets/temporal/certs/server-interservice/tls.key \
-				--tls-ca-path /var/secrets/temporal/certs/server-interservice/ca.crt \
-				--tls-server-name interservice.server.temporal.local || true; \
-			echo "  attempt $$attempt: namespace $$ns not confirmed yet, retrying in 5s..."; \
-			sleep 5; \
-		done; \
-		[ -n "$$ok" ] || { echo "ERROR: Temporal namespace $$ns was not created" >&2; exit 1; }; \
+		./scripts/setup-local.sh temporal-namespace "$$ns" || exit 1; \
 	done
 	@echo "Temporal Helm deployment ready"
 

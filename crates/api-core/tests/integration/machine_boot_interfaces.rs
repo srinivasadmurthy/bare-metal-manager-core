@@ -26,14 +26,18 @@ use carbide_test_harness::test_support::fixture_config::{
     FixtureDefault as _, ManagedHostConfigExt as _,
 };
 use mac_address::MacAddress;
+use model::expected_machine::{ExpectedInterface, ExpectedMachineData};
 use model::network_segment::NetworkSegmentType;
 use model::predicted_machine_interface::NewPredictedMachineInterface;
-use model::test_support::ManagedHostConfig;
+use model::test_support::{DpuConfig, ManagedHostConfig};
 use rpc::forge;
 use rpc::forge::forge_server::Forge;
 use rpc::forge::get_machine_boot_interfaces_response::reconciliation::State as ReconciliationState;
 
-async fn init(pool: PgPool) -> (TestHarness, TestManagedHost) {
+async fn init_with_config(
+    pool: PgPool,
+    config: ManagedHostConfig,
+) -> (TestHarness, TestManagedHost) {
     let env = TestHarness::builder(pool).build().await;
     let domain = env.test_domain().await;
     let network_controller = env.network_controller();
@@ -42,10 +46,61 @@ async fn init(pool: PgPool) -> (TestHarness, TestManagedHost) {
     let site_explorer = env.default_test_site_explorer();
     let (host, _) = env
         .managed_host_builder(&site_explorer, underlay_segment)
-        .with_config(ManagedHostConfig::default().with_dpu_count(1))
+        .with_config(config)
         .build()
         .await;
     (env, host)
+}
+
+async fn init(pool: PgPool) -> (TestHarness, TestManagedHost) {
+    init_with_config(pool, ManagedHostConfig::default().with_dpu_count(1)).await
+}
+
+#[sqlx_test]
+async fn test_expected_machine_selection_source_survives_ingestion(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dpu = DpuConfig::default();
+    let declared_primary = dpu.host_mac_address;
+    let config = ManagedHostConfig::default()
+        .with_dpus(vec![dpu])
+        .with_expected_machine_data(ExpectedMachineData {
+            interfaces: vec![ExpectedInterface {
+                mac_address: declared_primary,
+                primary: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    let (env, host) = init_with_config(pool, config).await;
+
+    let report = env
+        .api()
+        .get_machine_boot_interfaces(tonic::Request::new(
+            forge::GetMachineBootInterfacesRequest {
+                machine_id: Some(host.host.id.into()),
+            },
+        ))
+        .await?
+        .into_inner();
+    let reconciliation = report
+        .reconciliation
+        .expect("ingestion should initialize desired boot reconciliation");
+
+    assert_eq!(
+        reconciliation.selection_source(),
+        forge::BootInterfaceSelectionSource::ExpectedMachine,
+    );
+    assert_eq!(
+        reconciliation
+            .desired_boot_interface
+            .as_ref()
+            .map(|target| target.mac_address.as_str()),
+        Some(declared_primary.to_string().as_str()),
+    );
+    assert!(reconciliation.selection_updated_at.is_some());
+
+    Ok(())
 }
 
 #[sqlx_test]
@@ -112,13 +167,15 @@ async fn test_get_machine_boot_interfaces_gathers_all_four_stores(
         // the owned primary -- naming the same boot NIC, so it adds no new
         // distinct boot-MAC signal and leaves the divergence verdict to the
         // conflicting prediction.
-        let bmc_ip: std::net::IpAddr =
-            db::machine_topology::find_machine_bmc_pairs_by_machine_id(txn.as_mut(), vec![host_id])
-                .await?
-                .into_iter()
-                .find_map(|(_, ip)| ip)
-                .expect("the ingested host should have a BMC address")
-                .parse()?;
+        let bmc_ip: std::net::IpAddr = db::machine_topology::find_machine_bmc_pairs_by_machine_id(
+            txn.as_mut(),
+            vec![host_id.into()],
+        )
+        .await?
+        .into_iter()
+        .find_map(|(_, ip)| ip)
+        .expect("the ingested host should have a BMC address")
+        .parse()?;
         db::explored_endpoints::set_boot_interface(
             bmc_ip,
             &model::machine_boot_interface::MachineBootInterface {
@@ -145,17 +202,17 @@ async fn test_get_machine_boot_interfaces_gathers_all_four_stores(
         .api()
         .get_machine_boot_interfaces(tonic::Request::new(
             forge::GetMachineBootInterfacesRequest {
-                machine_id: Some(host_id),
+                machine_id: Some(host_id.into()),
             },
         ))
         .await?
         .into_inner();
 
-    assert_eq!(report.machine_id, Some(host_id));
+    assert_eq!(report.machine_id, Some(host_id.into()));
 
     // The desired-state view names the boot target Site Explorer persisted for
     // this host. The fixture runs Site Explorer but no machine-controller
-    // iteration, so the generation is still pending in DPU discovery.
+    // iteration, so the host still sits in its initial ConfigureAstra state.
     let reconciliation = report
         .reconciliation
         .as_ref()
@@ -178,8 +235,17 @@ async fn test_get_machine_boot_interfaces_gathers_all_four_stores(
         "the unverified desired generation should still be pending"
     );
     assert_eq!(
-        reconciliation.machine_state, "DPUDiscovering/Initializing",
+        reconciliation.machine_state, "ConfigureAstra/EnableNics",
         "the managed-host state should explain where reconciliation is waiting"
+    );
+    assert_eq!(
+        reconciliation.selection_source(),
+        forge::BootInterfaceSelectionSource::RedfishUefiPci,
+        "the fixture's complete UEFI paths should survive ingestion as the exact selection source",
+    );
+    assert!(
+        reconciliation.selection_updated_at.is_some(),
+        "a newly recorded selection source should report when it was selected",
     );
 
     // Store 1: the owned rows include the primary, and the primary is flagged.
@@ -313,7 +379,7 @@ async fn test_get_machine_boot_interfaces_agrees_when_only_owned_rows_exist(
         .api()
         .get_machine_boot_interfaces(tonic::Request::new(
             forge::GetMachineBootInterfacesRequest {
-                machine_id: Some(host_id),
+                machine_id: Some(host_id.into()),
             },
         ))
         .await?

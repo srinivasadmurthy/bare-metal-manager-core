@@ -25,7 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret};
-use kube::api::{ListParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::runtime::controller::Action;
 use kube::runtime::{Controller, watcher};
 use kube::{Api, Client, Resource};
@@ -34,10 +34,12 @@ use tokio_util::sync::CancellationToken;
 use super::traits::*;
 use crate::crds::bfbs_generated::BFB;
 use crate::crds::bluefieldsoftwares_generated::BlueFieldSoftware;
+use crate::crds::dpfoperatorconfigs_generated::DPFOperatorConfig;
 use crate::crds::dpuclusters_generated::DPUCluster;
 use crate::crds::dpudeployments_generated::DPUDeployment;
 use crate::crds::dpudevices_generated::DPUDevice;
 use crate::crds::dpuflavors_generated::DPUFlavor;
+use crate::crds::dpuflavortemplates_generated::DPUFlavorTemplate;
 use crate::crds::dpunodemaintenances_generated::DPUNodeMaintenance;
 use crate::crds::dpunodes_generated::DPUNode;
 use crate::crds::dpus_generated::DPU;
@@ -184,6 +186,19 @@ impl DpuRepository for KubeRepository {
         Ok(())
     }
 
+    async fn delete_if_uid(&self, name: &str, namespace: &str, uid: &str) -> Result<(), DpfError> {
+        let api: Api<DPU> = self.api(namespace);
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some(uid.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        api.delete(name, &params).await?;
+        Ok(())
+    }
+
     fn watch<F, Fut>(
         &self,
         namespace: &str,
@@ -242,6 +257,18 @@ impl DpuDeviceRepository for KubeRepository {
         let namespace = device.meta().namespace.as_deref().unwrap_or("default");
         let api = self.api(namespace);
         Ok(api.create(&PostParams::default(), device).await?)
+    }
+
+    async fn patch(
+        &self,
+        name: &str,
+        namespace: &str,
+        patch: serde_json::Value,
+    ) -> Result<(), DpfError> {
+        let api: Api<DPUDevice> = self.api(namespace);
+        api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        Ok(())
     }
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError> {
@@ -324,6 +351,24 @@ impl DpuFlavorRepository for KubeRepository {
         let namespace = flavor.meta().namespace.as_deref().unwrap_or("default");
         let api = self.api(namespace);
         Ok(api.create(&PostParams::default(), flavor).await?)
+    }
+}
+
+#[async_trait]
+impl DpuFlavorTemplateRepository for KubeRepository {
+    async fn get(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Option<DPUFlavorTemplate>, DpfError> {
+        let api = self.api(namespace);
+        Ok(api.get_opt(name).await?)
+    }
+
+    async fn create(&self, template: &DPUFlavorTemplate) -> Result<DPUFlavorTemplate, DpfError> {
+        let namespace = template.meta().namespace.as_deref().unwrap_or("default");
+        let api = self.api(namespace);
+        Ok(api.create(&PostParams::default(), template).await?)
     }
 }
 
@@ -511,6 +556,30 @@ impl DpuServiceRepository for KubeRepository {
         let list = api.list(&ListParams::default()).await?;
         Ok(list.items)
     }
+
+    async fn create(&self, service: &DPUService) -> Result<DPUService, DpfError> {
+        let namespace = service.meta().namespace.as_deref().unwrap_or("default");
+        let api = self.api(namespace);
+        Ok(api.create(&PostParams::default(), service).await?)
+    }
+
+    async fn patch(
+        &self,
+        name: &str,
+        namespace: &str,
+        patch: serde_json::Value,
+    ) -> Result<(), DpfError> {
+        let api: Api<DPUService> = self.api(namespace);
+        api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        Ok(())
+    }
+
+    async fn delete(&self, name: &str, namespace: &str) -> Result<(), DpfError> {
+        let api: Api<DPUService> = self.api(namespace);
+        api.delete(name, &Default::default()).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -569,6 +638,29 @@ impl K8sConfigRepository for KubeRepository {
         match api.get_opt(name).await? {
             Some(cm) => Ok(cm.data),
             None => Ok(None),
+        }
+    }
+
+    async fn create_configmap(
+        &self,
+        name: &str,
+        namespace: &str,
+        data: BTreeMap<String, String>,
+    ) -> Result<bool, DpfError> {
+        let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+        let cm = ConfigMap {
+            metadata: kube::core::ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            data: Some(data),
+            ..Default::default()
+        };
+        match api.create(&PostParams::default(), &cm).await {
+            Ok(_) => Ok(true),
+            Err(kube::Error::Api(err)) if err.is_already_exists() => Ok(false),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -646,13 +738,21 @@ impl K8sConfigRepository for KubeRepository {
 
 #[async_trait]
 impl DpfOperatorConfigRepository for KubeRepository {
+    async fn get(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Option<DPFOperatorConfig>, DpfError> {
+        let api: Api<DPFOperatorConfig> = Api::namespaced(self.client.clone(), namespace);
+        Ok(api.get_opt(name).await?)
+    }
+
     async fn patch(
         &self,
         name: &str,
         namespace: &str,
         patch: serde_json::Value,
     ) -> Result<(), DpfError> {
-        use crate::crds::dpfoperatorconfigs_generated::DPFOperatorConfig;
         let api: Api<DPFOperatorConfig> = Api::namespaced(self.client.clone(), namespace);
         api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await?;

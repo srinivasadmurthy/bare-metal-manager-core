@@ -25,7 +25,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
-use carbide_uuid::machine::{MachineId, MachineIdSource, MachineInterfaceId, MachineType};
+use carbide_uuid::machine::{
+    DpuMachineId, MachineId, MachineIdSource, MachineInterfaceId, MachineType,
+};
 use carbide_uuid::network::NetworkSegmentId;
 use chrono::{DateTime, TimeZone, Utc};
 use config_version::ConfigVersion;
@@ -34,7 +36,7 @@ use health_report::HealthReport;
 use crate::bmc_info::BmcInfo;
 use crate::hardware_info::{
     BlockDevice, CpuInfo, DmiData, Gpu, HardwareInfo, InfinibandInterface, MachineInventory,
-    MachineInventorySoftwareComponent, MemoryDevice, NetworkInterface, NvmeDevice,
+    MachineInventorySoftwareComponent, MemoryDeviceGroup, NetworkInterface, NvmeDevice,
     PciDeviceProperties, TpmEkCertificate,
 };
 use crate::health::HealthReportSources;
@@ -62,7 +64,7 @@ pub fn host_machine_id() -> MachineId {
 }
 
 /// Deterministic machine ids for the fixture host's DPUs.
-pub fn dpu_machine_id(index: u8) -> MachineId {
+pub fn dpu_machine_id(index: u8) -> DpuMachineId {
     // Widen before adding: `0x20 + index` on a u8 overflows past index 223,
     // the same bound `fixture_dpu_index` documents. Fail with a clear message
     // instead of an overflow panic.
@@ -76,12 +78,14 @@ pub fn dpu_machine_id(index: u8) -> MachineId {
         [hash_byte as u8; 32],
         MachineType::Dpu,
     )
+    .try_into()
+    .unwrap()
 }
 
 /// Recovers the index a [`dpu_machine_id`] was created from, so id-keyed
 /// builders can give each fixture DPU its own hardware identity. `None` for
 /// ids that no fixture index produces.
-fn fixture_dpu_index(machine_id: MachineId) -> Option<u8> {
+fn fixture_dpu_index(machine_id: DpuMachineId) -> Option<u8> {
     // `dpu_machine_id` fills the id bytes with `0x20 + index`, so indexes
     // beyond `u8::MAX - 0x20` are not constructible.
     (0..=u8::MAX - 0x20).find(|&index| dpu_machine_id(index) == machine_id)
@@ -202,12 +206,11 @@ pub fn host_hardware_info() -> HardwareInfo {
                 platform_info: None,
             })
             .collect(),
-        memory_devices: (0..8)
-            .map(|_| MemoryDevice {
-                size_mb: Some(65536),
-                mem_type: Some("DDR5".to_string()),
-            })
-            .collect(),
+        memory_devices: vec![MemoryDeviceGroup {
+            size_mb: Some(65536),
+            mem_type: Some("DDR5".to_string()),
+            count: 8,
+        }],
         tpm_description: None,
     }
 }
@@ -243,7 +246,7 @@ fn interface(
     machine_id: MachineId,
     interface_type: InterfaceType,
     primary: bool,
-    attached_dpu: Option<MachineId>,
+    attached_dpu: Option<carbide_uuid::machine::DpuMachineId>,
     segment_type: Option<NetworkSegmentType>,
 ) -> MachineInterfaceSnapshot {
     MachineInterfaceSnapshot {
@@ -333,11 +336,13 @@ fn health_reports(agent_source: &str) -> HealthReportSources {
 /// `machine_type` decides between the host shape (8 GPUs, 9 NICs) and the
 /// DPU shape (BlueField hardware info, small interface set).
 pub fn machine_snapshot_pg_json(machine_id: MachineId) -> MachineSnapshotPgJson {
-    let is_dpu = machine_id.machine_type().is_dpu();
-    let hardware_info = if is_dpu {
-        dpu_hardware_info(fixture_dpu_index(machine_id).unwrap_or(0))
+    let (hardware_info, is_dpu) = if let Ok(dpu_machine_id) = DpuMachineId::try_from(machine_id) {
+        (
+            dpu_hardware_info(fixture_dpu_index(dpu_machine_id).unwrap_or(0)),
+            true,
+        )
     } else {
-        host_hardware_info()
+        (host_hardware_info(), false)
     };
     let interfaces = if is_dpu {
         vec![interface(
@@ -362,8 +367,10 @@ pub fn machine_snapshot_pg_json(machine_id: MachineId) -> MachineSnapshotPgJson 
 
     MachineSnapshotPgJson {
         machine_maintenance_requested: None,
+        decommission_requested: false,
         bmc_credential_rotation_requested: false,
         uefi_credential_rotation_requested: false,
+        lockdown_ikm_credential_rotation_requested: false,
         id: machine_id,
         rack_id: Some("rack-bench-01".parse().expect("valid rack id")),
         created: fixture_time(0),
@@ -399,7 +406,6 @@ pub fn machine_snapshot_pg_json(machine_id: MachineId) -> MachineSnapshotPgJson 
             client_certificate_expiry: Some(1_781_536_000),
             agent_version_superseded_at: None,
             instance_network_observation: None,
-            extension_service_observation: None,
             fabric_interfaces: vec![],
         }),
         infiniband_status_observation: Some(MachineInfinibandStatusObservation {
@@ -416,6 +422,7 @@ pub fn machine_snapshot_pg_json(machine_id: MachineId) -> MachineSnapshotPgJson 
         }),
         nvlink_status_observation: None,
         spx_status_observation: None,
+        extension_service_status_observations: Default::default(),
         controller_state_version: config_version(5).version_string(),
         controller_state: ManagedHostState::Ready,
         last_discovery_time: Some(fixture_time(200)),
@@ -485,6 +492,8 @@ pub fn machine_snapshot_pg_json(machine_id: MachineId) -> MachineSnapshotPgJson 
         desired_boot_interface_mac: None,
         desired_boot_interface_id: None,
         desired_boot_interface_version: None,
+        boot_interface_selection_source: None,
+        boot_interface_selection_updated_at: None,
         boot_interface_verified_version: None,
         boot_interface_observed_at: None,
         boot_interface_observation_assumed: false,
@@ -513,7 +522,7 @@ pub fn host_machine() -> Machine {
 
 /// A fully-populated DPU [`Machine`], as loaded from the database.
 pub fn dpu_machine(index: u8) -> Machine {
-    machine_snapshot_pg_json(dpu_machine_id(index))
+    machine_snapshot_pg_json(dpu_machine_id(index).into())
         .try_into()
         .expect("fixture DPU snapshot converts to Machine")
 }
@@ -531,5 +540,108 @@ pub fn managed_host_state_snapshot() -> ManagedHostStateSnapshot {
         managed_state,
         aggregate_health: health_report_with_source("aggregate-health"),
         rack_health_overrides: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::{Check, check_values};
+    use serde_json::json;
+
+    use super::*;
+
+    fn memory_devices(memory_devices_json: serde_json::Value) -> Vec<MemoryDeviceGroup> {
+        let json = json!({
+            "machine_type": "x86_64",
+            "memory_devices": memory_devices_json,
+        });
+        let info: HardwareInfo = serde_json::from_value(json).unwrap();
+        info.memory_devices
+    }
+
+    /// `HardwareInfo.memory_devices` accepts both the condensed `{size_mb, mem_type, count}`
+    /// shape and the legacy flat shape (`{size_mb, mem_type}`, one object per DIMM, implicit
+    /// `count: 1`). Consecutive entries with the same `(size_mb, mem_type)` merge regardless of
+    /// which shape produced them.
+    #[test]
+    fn hardware_info_normalizes_mixed_legacy_and_counted_memory_devices() {
+        check_values(
+            [
+                Check {
+                    scenario: "legacy entries without count merge like a single counted group",
+                    input: json!([
+                        {"size_mb": 16384, "mem_type": "DDR5"},
+                        {"size_mb": 16384, "mem_type": "DDR5"},
+                        {"size_mb": 16384, "mem_type": "DDR5"}
+                    ]),
+                    expect: vec![MemoryDeviceGroup {
+                        size_mb: Some(16384),
+                        mem_type: Some("DDR5".into()),
+                        count: 3,
+                    }],
+                },
+                Check {
+                    scenario: "a legacy entry directly followed by a counted entry of the same key merges",
+                    input: json!([
+                        {"size_mb": 16384, "mem_type": "DDR5"},
+                        {"size_mb": 16384, "mem_type": "DDR5", "count": 4}
+                    ]),
+                    expect: vec![MemoryDeviceGroup {
+                        size_mb: Some(16384),
+                        mem_type: Some("DDR5".into()),
+                        count: 5,
+                    }],
+                },
+                Check {
+                    scenario: "a counted entry directly followed by a legacy entry of the same key merges",
+                    input: json!([
+                        {"size_mb": 16384, "mem_type": "DDR5", "count": 4},
+                        {"size_mb": 16384, "mem_type": "DDR5"}
+                    ]),
+                    expect: vec![MemoryDeviceGroup {
+                        size_mb: Some(16384),
+                        mem_type: Some("DDR5".into()),
+                        count: 5,
+                    }],
+                },
+                Check {
+                    scenario: "legacy and counted entries with different keys stay separate",
+                    input: json!([
+                        {"size_mb": 8192, "mem_type": "DDR4"},
+                        {"size_mb": 16384, "mem_type": "DDR5", "count": 4},
+                        {"size_mb": 8192, "mem_type": "DDR4"}
+                    ]),
+                    expect: vec![
+                        MemoryDeviceGroup {
+                            size_mb: Some(8192),
+                            mem_type: Some("DDR4".into()),
+                            count: 1,
+                        },
+                        MemoryDeviceGroup {
+                            size_mb: Some(16384),
+                            mem_type: Some("DDR5".into()),
+                            count: 4,
+                        },
+                        MemoryDeviceGroup {
+                            size_mb: Some(8192),
+                            mem_type: Some("DDR4".into()),
+                            count: 1,
+                        },
+                    ],
+                },
+                Check {
+                    // Ties the legacy wire shape back to the fixture host's own memory
+                    // layout: 8 flat DIMM entries should normalize to exactly what
+                    // `host_hardware_info()` already carries as a single counted group.
+                    scenario: "a full host's worth of legacy DIMMs matches the fixture's counted group",
+                    input: json!(
+                        std::iter::repeat_n(json!({"size_mb": 65536, "mem_type": "DDR5"}), 8)
+                            .collect::<Vec<_>>()
+                    ),
+                    expect: host_hardware_info().memory_devices,
+                },
+            ],
+            memory_devices,
+        );
     }
 }

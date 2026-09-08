@@ -608,6 +608,26 @@ impl HealthProbeId {
     pub fn ib_port_down() -> Self {
         HealthProbeId("IbPortDown".to_string())
     }
+
+    /// The ID used by the FRR BGP health check.
+    pub fn bgp_stats() -> Self {
+        HealthProbeId("BgpStats".to_string())
+    }
+
+    /// The ID used when an expected DPU-to-ToR BGP session is unavailable.
+    pub fn bgp_peering_tor() -> Self {
+        HealthProbeId("BgpPeeringTor".to_string())
+    }
+
+    /// The ID used by the NVUE API availability check.
+    pub fn nvue_api_running() -> Self {
+        HealthProbeId("NvueApiRunning".to_string())
+    }
+
+    /// The ID used while a new HBN configuration waits for a later health sample.
+    pub fn post_config_check_wait() -> Self {
+        HealthProbeId("PostConfigCheckWait".to_string())
+    }
 }
 
 impl std::fmt::Debug for HealthProbeId {
@@ -746,6 +766,11 @@ mod tests {
             format!("{classification:?} {classification}").as_str(),
             "\"Network\" Network"
         );
+    }
+
+    #[test]
+    fn bgp_peering_tor_probe_id_string() {
+        assert_eq!(HealthProbeId::bgp_peering_tor().as_str(), "BgpPeeringTor");
     }
 
     #[test]

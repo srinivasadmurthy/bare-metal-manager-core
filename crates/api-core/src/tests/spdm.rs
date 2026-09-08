@@ -28,178 +28,55 @@ pub(in crate::tests) mod tests {
     //use sqlx::PgConnection;
     use tonic::Request;
 
+    use crate::cfg::file::CarbideConfig;
     use crate::tests::common::api_fixtures::{
-        RedfishOverrides, TestEnv, TestEnvOverrides, create_managed_host, create_test_env,
-        create_test_env_with_overrides,
+        TestEnv, TestEnvOverrides, create_managed_host, create_test_env,
+        create_test_env_with_overrides, get_config,
     };
-    // A simple test to test basic db functions.
+
+    /// The default test config leaves SPDM disabled, matching a fresh
+    /// deployment. `trigger_machine_attestation` refuses to schedule at a site
+    /// with it switched off, so every test that drives a trigger turns it on.
+    ///
+    /// Enabling it also makes `create_managed_host` attest the machine during
+    /// host init. Tests that model a misbehaving BMC therefore inject the fault
+    /// after setup, so it applies to the trigger under test rather than to that
+    /// unrelated attestation.
+    fn spdm_enabled_config() -> CarbideConfig {
+        let mut config = get_config();
+        config.spdm.enabled = true;
+        config
+    }
+
+    /// With SPDM off no state controller is spawned, so anything this scheduled
+    /// would sit unprocessed forever. The "enabled" half of the contract is
+    /// covered by every other test in this module, which all schedule
+    /// successfully with SPDM on.
     #[crate::sqlx_test]
-    async fn test_attestation_succeeds(pool: sqlx::PgPool) -> Result<(), eyre::Error> {
-        // trigger attestation - corresponding device attestations are created
-        // query attestation status - should be in progress
-        // run controller iterations - should be able to:
-        // - fetch metadata
-        // - fetch certificate,
-        // - schedule evidence
-        // - poll and collect evidence
-        // - do nras verification
-        // - apply appraisal policy
-        // - move into passed state
-        // verify the state in each iteration using direct db lookups
-
+    async fn trigger_is_refused_when_spdm_is_disabled_for_the_site(
+        pool: sqlx::PgPool,
+    ) -> Result<(), eyre::Error> {
         let env = create_test_env(pool).await;
-        let (machine_id, _dpu_id) = create_managed_host(&env).await.into();
-        let _ = env
-            .api
-            .trigger_machine_attestation(Request::new(SpdmMachineAttestationTriggerRequest {
-                machine_id: Some(machine_id),
-                redfish_timeout_secs: u32::MAX,
-            }))
-            .await?;
-
-        // device attestations should be created now
-        let statuses = list_machines_under_attestation(&env).await?;
-
-        assert_eq!(1, statuses.len());
-
-        let machine_id = statuses[0].machine_id.expect("missing machine id");
-
-        // check that attestation's status is InProgress
-        assert_eq!(
-            rpc::forge::SpdmAttestationStatus::SpdmAttInProgress,
-            rpc::forge::SpdmAttestationStatus::try_from(statuses[0].attestation_status)?
+        assert!(
+            !env.config.spdm.enabled,
+            "this test relies on the default config leaving SPDM disabled"
         );
 
-        // now, look at the state of the attestation and check that it is FetchMetadata
-        let mut txn = env.pool.begin().await.unwrap();
-
-        let object_ids = db::attestation::spdm::find_machine_ids_for_attestation(&mut txn)
+        let (machine_id, _dpu_id) = create_managed_host(&env).await.into();
+        let status = env
+            .api
+            .trigger_machine_attestation(Request::new(SpdmMachineAttestationTriggerRequest {
+                machine_id: Some(machine_id.into()),
+                redfish_timeout_secs: u32::MAX,
+            }))
             .await
-            .expect("Failed getting object ids for attestation");
+            .expect_err("a site with SPDM disabled must not start attestation");
 
-        for object_id in &object_ids {
-            let SpdmObjectId(_, device_id) = object_id;
-            let (attestation_state, _) = get_state_from_db(&mut txn, &machine_id, device_id)
-                .await
-                .expect("Failed getting attestation state from the DB");
+        assert_eq!(tonic::Code::Unavailable, status.code());
 
-            assert_eq!(SpdmAttestationState::FetchMetadata, attestation_state);
-        }
-
-        env.run_spdm_controller_iteration_no_requeue().await;
-
-        for object_id in &*object_ids {
-            let SpdmObjectId(_, device_id) = object_id;
-            let (attestation_state, _) = get_state_from_db(&mut txn, &machine_id, device_id)
-                .await
-                .expect("Failed getting attestation state from the DB");
-            assert_eq!(SpdmAttestationState::FetchCertificate, attestation_state);
-        }
-
-        // now proceed to FetchCertificate
-        env.run_spdm_controller_iteration_no_requeue().await;
-
-        let object_ids = db::attestation::spdm::find_machine_ids_for_attestation(&mut txn)
-            .await
-            .expect("Failed getting object ids for attestation");
-        assert_eq!(3, object_ids.len());
-
-        for object_id in &*object_ids {
-            let SpdmObjectId(_, device_id) = object_id;
-            let (attestation_state, _) = get_state_from_db(&mut txn, &machine_id, device_id)
-                .await
-                .expect("Failed getting attestation state from the DB");
-
-            assert!(
-                matches!(
-                    attestation_state,
-                    SpdmAttestationState::TriggerEvidenceCollection { .. }
-                ),
-                "expected TriggerEvidenceCollection, got: {:?}",
-                attestation_state
-            );
-        }
-
-        // now move onto PollEvidenceCollection
-        env.run_spdm_controller_iteration_no_requeue().await;
-
-        for object_id in &*object_ids {
-            let SpdmObjectId(_, device_id) = object_id;
-            let (attestation_state, _) = get_state_from_db(&mut txn, &machine_id, device_id)
-                .await
-                .expect("Failed getting attestation state from the DB");
-
-            assert!(
-                matches!(
-                    attestation_state,
-                    SpdmAttestationState::PollEvidenceCollection { .. }
-                ),
-                "expected PollEvidenceCollection, got: {:?}",
-                attestation_state
-            );
-        }
-
-        // after we collected the evidence, do the NRAS verification
-        env.run_spdm_controller_iteration_no_requeue().await;
-
-        for object_id in &*object_ids {
-            let SpdmObjectId(_, device_id) = object_id;
-            let (attestation_state, _) = get_state_from_db(&mut txn, &machine_id, device_id)
-                .await
-                .expect("Failed getting attestation state from the DB");
-
-            assert!(
-                matches!(attestation_state, SpdmAttestationState::NrasVerification),
-                "expected NrasVerification, got: {:?}",
-                attestation_state
-            );
-        }
-
-        // do the policy appraisal
-        env.run_spdm_controller_iteration_no_requeue().await;
-
-        for object_id in &*object_ids {
-            let SpdmObjectId(_, device_id) = object_id;
-            let (attestation_state, _) = get_state_from_db(&mut txn, &machine_id, device_id)
-                .await
-                .expect("Failed getting attestation state from the DB");
-
-            assert!(
-                matches!(
-                    attestation_state,
-                    SpdmAttestationState::ApplyAppraisalPolicy
-                ),
-                "expected ApplyAppraisalPolicy, got: {:?}",
-                attestation_state
-            );
-        }
-
-        // and finally we should be in the Passed state
-        env.run_spdm_controller_iteration_no_requeue().await;
-
-        for object_id in &*object_ids {
-            let SpdmObjectId(_, device_id) = object_id;
-            let (attestation_state, _) = get_state_from_db(&mut txn, &machine_id, device_id)
-                .await
-                .expect("Failed getting attestation state from the DB");
-
-            assert!(
-                matches!(attestation_state, SpdmAttestationState::Passed),
-                "expected Passed, got: {:?}",
-                attestation_state
-            );
-        }
-
-        // now check the attestation history table
-        let mut txn = env.pool.begin().await.unwrap();
-        let devices_history =
-            sqlx::query("SELECT * FROM spdm_device_attestation_history WHERE machine_id=$1")
-                .bind(machine_id)
-                .fetch_all(&mut *txn)
-                .await?;
-        txn.commit().await.unwrap();
-
-        assert_eq!(devices_history.len(), 18);
+        // Refusing has to leave no work behind: a caller that retries after
+        // enabling SPDM should start from nothing.
+        assert_eq!(0, list_machines_under_attestation(&env).await?.len());
 
         Ok(())
     }
@@ -208,21 +85,24 @@ pub(in crate::tests) mod tests {
     async fn test_component_integrity_fails_no_attestation_started(
         pool: sqlx::PgPool,
     ) -> Result<(), eyre::Error> {
-        // set up redfish to return no component integrities
-        let overrides = TestEnvOverrides {
-            redfish_overrides: Some(RedfishOverrides {
-                no_component_integrities: true,
+        let env = create_test_env_with_overrides(
+            pool,
+            TestEnvOverrides {
+                config: Some(spdm_enabled_config()),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let env = create_test_env_with_overrides(pool, overrides).await;
+            },
+        )
+        .await;
 
         let (machine_id, _dpu_id) = create_managed_host(&env).await.into();
+
+        // set up redfish to return no component integrities
+        env.redfish_sim.set_no_component_integrities(true);
+
         let response = env
             .api
             .trigger_machine_attestation(Request::new(SpdmMachineAttestationTriggerRequest {
-                machine_id: Some(machine_id),
+                machine_id: Some(machine_id.into()),
                 redfish_timeout_secs: u32::MAX,
             }))
             .await?;
@@ -241,21 +121,24 @@ pub(in crate::tests) mod tests {
     async fn test_fetch_metadata_fails_state_does_not_change(
         pool: sqlx::PgPool,
     ) -> Result<(), eyre::Error> {
-        // set up redfish to return an error in FetchMetadata state
-        let overrides = TestEnvOverrides {
-            redfish_overrides: Some(RedfishOverrides {
-                firmware_for_component_error: true,
+        let env = create_test_env_with_overrides(
+            pool,
+            TestEnvOverrides {
+                config: Some(spdm_enabled_config()),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let env = create_test_env_with_overrides(pool, overrides).await;
+            },
+        )
+        .await;
 
         let (machine_id, _dpu_id) = create_managed_host(&env).await.into();
+
+        // set up redfish to return an error in FetchMetadata state
+        env.redfish_sim.set_firmware_for_component_error(true);
+
         let response = env
             .api
             .trigger_machine_attestation(Request::new(SpdmMachineAttestationTriggerRequest {
-                machine_id: Some(machine_id),
+                machine_id: Some(machine_id.into()),
                 redfish_timeout_secs: u32::MAX,
             }))
             .await?;
@@ -298,21 +181,25 @@ pub(in crate::tests) mod tests {
     async fn test_poll_evidence_fails_controller_retries_then_fails(
         pool: sqlx::PgPool,
     ) -> Result<(), eyre::Error> {
-        // set up redfish to return an error in FetchMetadata state
-        let overrides = TestEnvOverrides {
-            redfish_overrides: Some(RedfishOverrides {
-                get_task_trigger_evidence_returns_interrupted: true,
+        let env = create_test_env_with_overrides(
+            pool,
+            TestEnvOverrides {
+                config: Some(spdm_enabled_config()),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let env = create_test_env_with_overrides(pool, overrides).await;
+            },
+        )
+        .await;
 
         let (machine_id, _dpu_id) = create_managed_host(&env).await.into();
+
+        // set up redfish to interrupt evidence collection
+        env.redfish_sim
+            .set_get_task_trigger_evidence_returns_interrupted(true);
+
         let response = env
             .api
             .trigger_machine_attestation(Request::new(SpdmMachineAttestationTriggerRequest {
-                machine_id: Some(machine_id),
+                machine_id: Some(machine_id.into()),
                 redfish_timeout_secs: u32::MAX,
             }))
             .await?;
@@ -385,12 +272,19 @@ pub(in crate::tests) mod tests {
         // -  cancel the whole thing - make sure it goes into cancelled state
         // verify the state in each iteration using direct db lookups
 
-        let env = create_test_env(pool).await;
+        let env = create_test_env_with_overrides(
+            pool,
+            TestEnvOverrides {
+                config: Some(spdm_enabled_config()),
+                ..Default::default()
+            },
+        )
+        .await;
         let (machine_id, _dpu_id) = create_managed_host(&env).await.into();
         let _ = env
             .api
             .trigger_machine_attestation(Request::new(SpdmMachineAttestationTriggerRequest {
-                machine_id: Some(machine_id),
+                machine_id: Some(machine_id.into()),
                 redfish_timeout_secs: u32::MAX,
             }))
             .await?;

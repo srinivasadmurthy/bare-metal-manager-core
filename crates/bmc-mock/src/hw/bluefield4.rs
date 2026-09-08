@@ -371,6 +371,7 @@ impl Bluefield4<'_> {
                 id: Cow::Borrowed(system_id),
                 manufacturer: Some("Nvidia".into()),
                 model: Some("BlueField-4".into()),
+                bios_version: None,
                 // BF4-26.04-10 exposes this collection with no members.
                 eth_interfaces: Some(vec![]),
                 chassis: vec![Self::BMC_CHASSIS_ID.into()],
@@ -393,7 +394,7 @@ impl Bluefield4<'_> {
                 storage: Some(vec![]),
                 processors: Some(vec![]),
                 memory: None,
-                serial_console: None,
+                serial_console: Some(hw::openbmc::enabled_serial_console()),
                 secure_boot_available: true,
             }],
         }

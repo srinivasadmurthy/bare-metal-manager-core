@@ -136,6 +136,7 @@ impl InternalRBACRules {
             vec![ForgeAdminCLI, Machineatron, SiteAgent],
         );
         x.perm("ReleaseInstance", vec![ForgeAdminCLI, SiteAgent]);
+        x.perm("ReleaseInstances", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("UpdateInstanceOperatingSystem", vec![SiteAgent]);
         x.perm("UpdateInstanceConfig", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("FindInstanceIds", vec![ForgeAdminCLI, SiteAgent]);
@@ -219,7 +220,7 @@ impl InternalRBACRules {
         x.perm("RenewMachineCertificate", vec![Agent]);
         x.perm("DiscoveryCompleted", vec![Machineatron, Scout]);
         x.perm("CleanupMachineCompleted", vec![Machineatron, Scout]);
-        x.perm("ReportForgeScoutError", vec![Scout]);
+        x.perm("ReportForgeScoutError", vec![Anonymous]);
         x.perm("ReportScoutFirmwareUpgradeStatus", vec![Scout]);
         x.perm("DiscoverDhcp", vec![Dhcp, Machineatron]);
         x.perm("ExpireDhcpLease", vec![Dhcp, Machineatron]);
@@ -303,8 +304,16 @@ impl InternalRBACRules {
         x.perm("FindExploredMlxDeviceHostIds", vec![ForgeAdminCLI]);
         x.perm("FindExploredMlxDevicesByIds", vec![ForgeAdminCLI]);
         x.perm("AdminForceDeleteMachine", vec![ForgeAdminCLI, Machineatron]);
+        x.perm(
+            "DecommissionManagedHost",
+            vec![ForgeAdminCLI, Machineatron, Flow],
+        );
         x.perm("AdminForceDeleteRack", vec![ForgeAdminCLI, Machineatron]);
         x.perm("AdminForceDeleteSwitch", vec![ForgeAdminCLI, Machineatron]);
+        x.perm(
+            "DecommissionSwitch",
+            vec![ForgeAdminCLI, Machineatron, Flow],
+        );
         x.perm(
             "AdminForceDeletePowerShelf",
             vec![ForgeAdminCLI, Machineatron],
@@ -334,6 +343,7 @@ impl InternalRBACRules {
         x.perm("GetCredentialRotationStatus", vec![ForgeAdminCLI]);
         x.perm("TriggerBmcCredentialRotation", vec![ForgeAdminCLI]);
         x.perm("TriggerUefiCredentialRotation", vec![ForgeAdminCLI]);
+        x.perm("TriggerNicLockdownCredentialRotation", vec![ForgeAdminCLI]);
         x.perm("GetRouteServers", vec![ForgeAdminCLI]);
         x.perm("AddRouteServers", vec![ForgeAdminCLI]);
         x.perm("RemoveRouteServers", vec![ForgeAdminCLI]);
@@ -497,6 +507,7 @@ impl InternalRBACRules {
         x.perm("GetIpxeTemplate", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("ListIpxeTemplates", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("FindRackStateHistories", vec![ForgeAdminCLI, Machineatron]);
+        x.perm("FindRackHealthHistories", vec![ForgeAdminCLI, Machineatron]);
         x.perm("RebootCompleted", vec![Machineatron, Scout]);
         x.perm("PersistValidationResult", vec![Scout, SiteAgent]);
         x.perm(
@@ -531,6 +542,7 @@ impl InternalRBACRules {
         x.perm("HeartbeatMachineValidationRun", vec![Scout, SiteAgent]);
         x.perm("AdminBmcReset", vec![ForgeAdminCLI]);
         x.perm("AdminPowerControl", vec![ForgeAdminCLI, SiteAgent, Flow]);
+        x.perm("AdminGpuReset", vec![ForgeAdminCLI, Flow]);
         x.perm("DisableSecureBoot", vec![ForgeAdminCLI]);
         x.perm("MachineSetup", vec![ForgeAdminCLI]);
         x.perm("SetDpuFirstBootOrder", vec![ForgeAdminCLI]);
@@ -573,7 +585,7 @@ impl InternalRBACRules {
         );
         x.perm(
             "MachineValidationTestVerfied",
-            vec![ForgeAdminCLI, Scout, SiteAgent],
+            vec![ForgeAdminCLI, SiteAgent],
         );
         x.perm(
             "MachineValidationTestNextVersion",
@@ -581,7 +593,11 @@ impl InternalRBACRules {
         );
         x.perm(
             "MachineValidationTestEnableDisableTest",
-            vec![ForgeAdminCLI, SiteAgent, Scout],
+            vec![ForgeAdminCLI, SiteAgent],
+        );
+        x.perm(
+            "MachineValidationTestApproveFullHost",
+            vec![ForgeAdminCLI, SiteAgent],
         );
         x.perm("UpdateMachineValidationRun", vec![Scout, SiteAgent]);
         x.perm("FindInstanceTypeIds", vec![SiteAgent, ForgeAdminCLI]);
@@ -728,6 +744,10 @@ impl InternalRBACRules {
             vec![ForgeAdminCLI, Machineatron, Flow],
         );
         x.perm("CreatePowerShelf", vec![ForgeAdminCLI, Machineatron]);
+        x.perm(
+            "DecommissionPowerShelf",
+            vec![ForgeAdminCLI, Machineatron, Flow],
+        );
         x.perm("DeletePowerShelf", vec![ForgeAdminCLI, Machineatron]);
         x.perm(
             "AddExpectedPowerShelf",
@@ -763,6 +783,10 @@ impl InternalRBACRules {
         );
         x.perm(
             "FindPowerShelfStateHistories",
+            vec![ForgeAdminCLI, Machineatron, Flow],
+        );
+        x.perm(
+            "FindPowerShelfHealthHistories",
             vec![ForgeAdminCLI, Machineatron, Flow],
         );
         x.perm(
@@ -842,6 +866,10 @@ impl InternalRBACRules {
         );
         x.perm(
             "FindSwitchStateHistories",
+            vec![ForgeAdminCLI, Machineatron, Flow],
+        );
+        x.perm(
+            "FindSwitchHealthHistories",
             vec![ForgeAdminCLI, Machineatron, Flow],
         );
         x.perm("FindRackIds", vec![ForgeAdminCLI, SiteAgent, Flow]);
@@ -951,8 +979,8 @@ impl InternalRBACRules {
     pub(super) fn allowed(&self, msg: &str, user_principals: &[crate::auth::Principal]) -> bool {
         if let Some(perm_info) = self.perms.get(msg) {
             if user_principals.is_empty() {
-                // No proper cert presented, but we will allow stuff that allows just Anonymous
-                return perm_info.principals.as_slice() == [Principal::Anonymous];
+                // No proper cert presented, but we allow any rule that lists Anonymous.
+                return perm_info.principals.contains(&Principal::Anonymous);
             }
             user_principals.iter().any(|user_principal| {
                 perm_info
@@ -1110,6 +1138,17 @@ mod rbac_rule_tests {
     }
 
     #[test]
+    fn anonymous_rules_allow_certless_callers() {
+        // Certless callers must be allowed when a rule lists Anonymous among other principals.
+        for method in ["GetJWKS", "GetOpenIDConfiguration"] {
+            assert!(
+                InternalRBACRules::allowed_from_static(method, &[]),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
     fn rbac_rule_tests() -> Result<(), eyre::Report> {
         assert!(InternalRBACRules::allowed_from_static(
             "Version",
@@ -1131,13 +1170,12 @@ mod rbac_rule_tests {
             "ReportForgeScoutError",
             &[Principal::SpiffeMachineIdentifier("foo".to_string())]
         ));
-        assert!(!InternalRBACRules::allowed_from_static(
+        // A machine reporting a pre-registration failure presents no certificate,
+        // so it arrives with no principals at all. That case is the reason this
+        // RPC is public.
+        assert!(InternalRBACRules::allowed_from_static(
             "ReportForgeScoutError",
-            &[Principal::ExternalUser(ExternalUserInfo::new(
-                None,
-                "any".to_string(),
-                None
-            ))]
+            &[]
         ));
         assert!(InternalRBACRules::allowed_from_static(
             "GetCloudInitInstructions",
