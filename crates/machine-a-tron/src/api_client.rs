@@ -298,6 +298,7 @@ impl ApiClient {
                 delete_bmc_suppressions: false,
                 delete_retained_boot_interfaces: false,
                 release_preserved_addresses: false,
+                wait_for_instance_dpu: false,
             })
             .await
             .map_err(ClientApiError::InvocationError)

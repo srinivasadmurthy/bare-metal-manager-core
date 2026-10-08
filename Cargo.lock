@@ -2640,6 +2640,8 @@ dependencies = [
 name = "carbide-macros"
 version = "0.0.0"
 dependencies = [
+ "carbide-test-support",
+ "carbide-uuid",
  "proc-macro2",
  "quote",
  "sqlx-macros-core",
@@ -2685,6 +2687,7 @@ dependencies = [
 name = "carbide-measured-boot"
 version = "0.0.0"
 dependencies = [
+ "carbide-macros",
  "carbide-test-support",
  "carbide-uuid",
  "chrono",
@@ -3083,6 +3086,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "carbide-resource-pool"
+version = "0.0.0"
+dependencies = [
+ "carbide-api-db",
+ "carbide-api-model",
+ "carbide-macros",
+ "carbide-sqlx-testing",
+ "carbide-test-support",
+ "ctor",
+ "sqlx",
+]
+
+[[package]]
 name = "carbide-rms-mock"
 version = "0.0.1"
 dependencies = [
@@ -3335,6 +3351,7 @@ dependencies = [
  "itertools 0.14.0",
  "libredfish",
  "mac_address",
+ "nv-redfish",
  "opentelemetry 0.32.0",
  "opentelemetry-prometheus",
  "opentelemetry_sdk",
