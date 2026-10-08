@@ -360,7 +360,12 @@ mod tests {
         assert_eq!(
             list.expected_machines
                 .iter()
-                .map(|machine| { machine.interfaces.as_ref().unwrap()[0].mac_address.as_str() })
+                .map(|machine| {
+                    machine.interfaces.as_ref().unwrap()[0]
+                        .mac_address
+                        .as_deref()
+                        .unwrap()
+                })
                 .collect::<Vec<_>>(),
             ["02:00:00:00:20:01", "02:00:00:00:20:02"],
         );

@@ -69,13 +69,13 @@ fn machine(id: Uuid, suffix: u8) -> forge::ExpectedMachine {
         }),
         host_nics: vec![
             forge::ExpectedInterface {
-                mac_address: bmc_mac_address,
+                mac_address: Some(bmc_mac_address),
                 role: Some(forge::ExpectedInterfaceRole::HostBmc as i32),
                 ip_allocation: Some(forge::ExpectedInterfaceIpAllocation::Retained as i32),
                 ..Default::default()
             },
             forge::ExpectedInterface {
-                mac_address: format!("02:00:00:01:59:{suffix:02x}"),
+                mac_address: Some(format!("02:00:00:01:59:{suffix:02x}")),
                 role: Some(forge::ExpectedInterfaceRole::DpuOs as i32),
                 ip_allocation: Some(forge::ExpectedInterfaceIpAllocation::Dynamic as i32),
                 ..Default::default()
@@ -442,7 +442,7 @@ async fn patch_expected_machine_replaces_interfaces_and_applies_selected_bmc_fie
                         ..Default::default()
                     },
                     forge::ExpectedInterface {
-                        mac_address: bmc_mac.clone(),
+                        mac_address: Some(bmc_mac.clone()),
                         ..Default::default()
                     },
                 ],
@@ -456,7 +456,7 @@ async fn patch_expected_machine_replaces_interfaces_and_applies_selected_bmc_fie
             name: "replacement changes nested allocation and ignores unselected top-level value",
             patch: forge::ExpectedMachine {
                 host_nics: vec![forge::ExpectedInterface {
-                    mac_address: bmc_mac.clone(),
+                    mac_address: Some(bmc_mac.clone()),
                     role: Some(forge::ExpectedInterfaceRole::HostBmc as i32),
                     ip_allocation: Some(forge::ExpectedInterfaceIpAllocation::Dynamic as i32),
                     ..Default::default()
@@ -472,7 +472,7 @@ async fn patch_expected_machine_replaces_interfaces_and_applies_selected_bmc_fie
             name: "selected top-level allocation overrides the list even when unchanged",
             patch: forge::ExpectedMachine {
                 host_nics: vec![forge::ExpectedInterface {
-                    mac_address: bmc_mac.clone(),
+                    mac_address: Some(bmc_mac.clone()),
                     role: Some(forge::ExpectedInterfaceRole::HostBmc as i32),
                     ip_allocation: Some(forge::ExpectedInterfaceIpAllocation::Retained as i32),
                     ..Default::default()
@@ -488,7 +488,7 @@ async fn patch_expected_machine_replaces_interfaces_and_applies_selected_bmc_fie
             name: "explicit allocation reset ignores an unselected interface list",
             patch: forge::ExpectedMachine {
                 host_nics: vec![forge::ExpectedInterface {
-                    mac_address: "invalid unselected MAC".to_string(),
+                    mac_address: Some("invalid unselected MAC".to_string()),
                     ..Default::default()
                 }],
                 bmc_ip_allocation: Some(forge::BmcIpAllocationType::Unspecified as i32),
@@ -502,7 +502,7 @@ async fn patch_expected_machine_replaces_interfaces_and_applies_selected_bmc_fie
             name: "nested address ignores an unselected top-level address",
             patch: forge::ExpectedMachine {
                 host_nics: vec![forge::ExpectedInterface {
-                    mac_address: bmc_mac.clone(),
+                    mac_address: Some(bmc_mac.clone()),
                     role: Some(forge::ExpectedInterfaceRole::HostBmc as i32),
                     fixed_ip: Some("192.0.2.245".to_string()),
                     ..Default::default()
@@ -528,7 +528,7 @@ async fn patch_expected_machine_replaces_interfaces_and_applies_selected_bmc_fie
             name: "selected empty top-level address clears a new nested address",
             patch: forge::ExpectedMachine {
                 host_nics: vec![forge::ExpectedInterface {
-                    mac_address: bmc_mac,
+                    mac_address: Some(bmc_mac),
                     role: Some(forge::ExpectedInterfaceRole::HostBmc as i32),
                     fixed_ip: Some("192.0.2.245".to_string()),
                     ..Default::default()

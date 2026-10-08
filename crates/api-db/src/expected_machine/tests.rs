@@ -40,7 +40,7 @@ async fn exercise_expected_machine_queries(
     let mut txn = connection.begin().await?;
     let id = Uuid::new_v4();
     let rack_id = RackId::new("projection-rack");
-    let interface_mac = "02:00:00:00:01:02".parse()?;
+    let interface_mac: MacAddress = "02:00:00:00:01:02".parse()?;
     let expected = ExpectedMachine {
         id: Some(id),
         bmc_mac_address: "02:00:00:00:01:01".parse()?,
@@ -56,7 +56,7 @@ async fn exercise_expected_machine_queries(
                 labels: HashMap::from([("location".to_string(), "rack-1".to_string())]),
             },
             interfaces: vec![ExpectedInterface {
-                mac_address: interface_mac,
+                mac_address: Some(interface_mac),
                 ip_allocation: Some(ExpectedInterfaceIpAllocation::Fixed),
                 fixed_ip: Some("192.0.2.11".parse()?),
                 fixed_mask: Some("255.255.255.0".to_string()),

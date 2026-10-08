@@ -1868,7 +1868,7 @@ fn host_mac_addresses_for_predicted_machine(
             .into_iter()
             .flat_map(|data| &data.interfaces)
             .filter(|interface| interface.role.is_host())
-            .map(|interface| interface.mac_address)
+            .filter_map(|interface| interface.mac_address)
             .collect::<Vec<_>>();
 
         return system_mac_addresses
@@ -1897,7 +1897,7 @@ fn host_mac_addresses_for_predicted_machine(
             data.interfaces
                 .iter()
                 .filter(|interface| interface.role.is_host())
-                .map(|interface| interface.mac_address)
+                .filter_map(|interface| interface.mac_address)
                 .unique()
                 .collect::<Vec<_>>()
         })
@@ -2016,8 +2016,8 @@ mod tests {
             MacAddress::new([0x00, 0x62, 0x0b, 0x4c, 0x28, 0xaa]),
             MacAddress::new([0x00, 0x62, 0x0b, 0x4c, 0x28, 0xab]),
         ];
-        let interface = |mac_address, role| ExpectedInterface {
-            mac_address,
+        let interface = |mac_address: MacAddress, role| ExpectedInterface {
+            mac_address: Some(mac_address),
             role,
             ..Default::default()
         };

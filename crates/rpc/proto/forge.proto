@@ -7431,7 +7431,7 @@ message IpxeTemplateList {
 message ExpectedHostNic {
   option (carbide.codegen.v1.message_derive) = "serde::Serialize";
   option (carbide.codegen.v1.message_derive) = "serde::Deserialize";
-  string mac_address = 1;
+  optional string mac_address = 1;
   // Legacy free-form segment hint (bf3, onboard, oob, ...). Kept for backward
   // compatibility; declare `network_segment_type` instead, which wins.
   optional string nic_type = 2;
@@ -7472,6 +7472,10 @@ message ExpectedHostNic {
   // the legacy Host case leaves `network_segment_type` as a first-DHCP
   // selection hint.
   optional ExpectedInterfaceIpAllocation ip_allocation = 9;
+
+  optional string name = 10;
+
+  optional string label = 11;
 }
 
 // Forge RPC representation of the per-host policy for how NICo treats DPU

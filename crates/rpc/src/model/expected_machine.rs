@@ -247,7 +247,9 @@ impl TryFrom<rpc::forge::ExpectedMachineRequest> for ExpectedMachineRequest {
 impl From<ExpectedInterface> for rpc::forge::ExpectedInterface {
     fn from(expected_interface: ExpectedInterface) -> Self {
         rpc::forge::ExpectedInterface {
-            mac_address: expected_interface.mac_address.to_string(),
+            mac_address: expected_interface.mac_address.map(|mac| mac.to_string()),
+            name: expected_interface.name,
+            label: expected_interface.label,
             nic_type: expected_interface.nic_type,
             fixed_ip: expected_interface.fixed_ip.map(|ip| ip.to_string()),
             fixed_mask: expected_interface.fixed_mask,
@@ -268,12 +270,18 @@ impl TryFrom<rpc::forge::ExpectedInterface> for ExpectedInterface {
     type Error = RpcDataConversionError;
 
     fn try_from(expected_interface: rpc::forge::ExpectedInterface) -> Result<Self, Self::Error> {
-        let mac_address = expected_interface.mac_address.parse().map_err(|_| {
-            RpcDataConversionError::InvalidMacAddress(expected_interface.mac_address.clone())
-        })?;
+        let mac_address = expected_interface
+            .mac_address
+            .map(|mac| {
+                mac.parse()
+                    .map_err(|_| RpcDataConversionError::InvalidMacAddress(mac))
+            })
+            .transpose()?;
 
         Ok(ExpectedInterface {
             mac_address,
+            name: expected_interface.name,
+            label: expected_interface.label,
             nic_type: expected_interface.nic_type,
             fixed_ip: match expected_interface.fixed_ip.as_deref() {
                 None | Some("") => None,
@@ -882,7 +890,7 @@ mod tests {
                 },
             ],
             |input| match ExpectedInterface::try_from(rpc::forge::ExpectedInterface {
-                mac_address: input.mac_address.to_string(),
+                mac_address: Some(input.mac_address.to_string()),
                 fixed_ip: input.fixed_ip.map(str::to_string),
                 fixed_gateway: input.fixed_gateway.map(str::to_string),
                 ..Default::default()
@@ -974,7 +982,7 @@ mod tests {
             ],
             |declaration| {
                 let model = ExpectedInterface::try_from(rpc::forge::ExpectedInterface {
-                    mac_address: "AA:BB:CC:DD:EE:FF".into(),
+                    mac_address: Some("AA:BB:CC:DD:EE:FF".into()),
                     fixed_ip: declaration.fixed_ip,
                     ip_allocation: declaration.policy,
                     ..Default::default()
@@ -1037,7 +1045,7 @@ mod tests {
         );
 
         let interface = rpc::forge::ExpectedInterface {
-            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            mac_address: Some("AA:BB:CC:DD:EE:FF".into()),
             ip_allocation: Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained as i32),
             ..Default::default()
         };
@@ -1048,7 +1056,7 @@ mod tests {
     #[test]
     fn expected_interface_ip_allocation_rejects_unknown_rpc_value() {
         let err = ExpectedInterface::try_from(rpc::forge::ExpectedInterface {
-            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            mac_address: Some("AA:BB:CC:DD:EE:FF".into()),
             ip_allocation: Some(i32::MAX),
             ..Default::default()
         })
@@ -1062,7 +1070,7 @@ mod tests {
         scenarios!(
             run = |role| {
                 let model = ExpectedInterface::try_from(rpc::forge::ExpectedInterface {
-                    mac_address: "AA:BB:CC:DD:EE:FF".into(),
+                    mac_address: Some("AA:BB:CC:DD:EE:FF".into()),
                     role,
                     ..Default::default()
                 })
@@ -1163,7 +1171,7 @@ mod tests {
         );
 
         let interface = rpc::forge::ExpectedInterface {
-            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            mac_address: Some("AA:BB:CC:DD:EE:FF".into()),
             role: Some(rpc::forge::ExpectedInterfaceRole::DpuBmc as i32),
             ..Default::default()
         };
@@ -1171,7 +1179,7 @@ mod tests {
         assert!(json.contains(r#""role":"dpu_bmc""#), "{json}");
 
         let host_bmc_interface = rpc::forge::ExpectedInterface {
-            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            mac_address: Some("AA:BB:CC:DD:EE:FF".into()),
             role: Some(rpc::forge::ExpectedInterfaceRole::HostBmc as i32),
             ..Default::default()
         };
@@ -1182,7 +1190,7 @@ mod tests {
         );
 
         let legacy_interface = rpc::forge::ExpectedInterface {
-            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            mac_address: Some("AA:BB:CC:DD:EE:FF".into()),
             role: None,
             ..Default::default()
         };
@@ -1194,7 +1202,7 @@ mod tests {
     #[test]
     fn expected_interface_role_rejects_unknown_rpc_value() {
         let err = ExpectedInterface::try_from(rpc::forge::ExpectedInterface {
-            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            mac_address: Some("AA:BB:CC:DD:EE:FF".into()),
             role: Some(i32::MAX),
             ..Default::default()
         })
@@ -1301,7 +1309,7 @@ mod tests {
     fn expected_machine_data_rejects_invalid_interface_mac_address() {
         let mut rpc_machine = make_rpc_expected_machine(None);
         rpc_machine.host_nics.push(rpc::forge::ExpectedInterface {
-            mac_address: "not-a-mac".into(),
+            mac_address: Some("not-a-mac".into()),
             ..Default::default()
         });
 
@@ -1318,7 +1326,7 @@ mod tests {
     fn expected_machine_serde_uses_canonical_interface_name() {
         let machine = rpc::forge::ExpectedMachine {
             host_nics: vec![rpc::forge::ExpectedInterface {
-                mac_address: "AA:BB:CC:DD:EE:FF".into(),
+                mac_address: Some("AA:BB:CC:DD:EE:FF".into()),
                 ..Default::default()
             }],
             replace_host_nics: true,
@@ -1335,7 +1343,7 @@ mod tests {
     fn expected_interface_alias_keeps_protobuf_bytes() {
         let machine = rpc::forge::ExpectedMachine {
             host_nics: vec![rpc::forge::ExpectedInterface {
-                mac_address: "a".into(),
+                mac_address: Some("a".into()),
                 ..Default::default()
             }],
             replace_host_nics: true,
@@ -1346,7 +1354,7 @@ mod tests {
         assert_eq!(bytes, [0x4a, 0x03, 0x0a, 0x01, b'a', 0x98, 0x01, 0x01],);
 
         let decoded = rpc::forge::ExpectedMachine::decode(bytes.as_slice()).unwrap();
-        assert_eq!(decoded.interfaces()[0].mac_address, "a");
+        assert_eq!(decoded.interfaces()[0].mac_address.as_deref(), Some("a"));
         assert!(decoded.replace_host_nics);
     }
 
@@ -1466,7 +1474,7 @@ mod tests {
             bmc_mac_address,
             data: ExpectedMachineData {
                 interfaces: vec![ExpectedInterface {
-                    mac_address: bmc_mac_address,
+                    mac_address: Some(bmc_mac_address),
                     role: ExpectedInterfaceRole::HostBmc,
                     ip_allocation: Some(ExpectedInterfaceIpAllocation::Fixed),
                     fixed_ip: Some(fixed_ip),
@@ -1507,7 +1515,7 @@ mod tests {
             bmc_mac_address,
             data: ExpectedMachineData {
                 interfaces: vec![ExpectedInterface {
-                    mac_address: bmc_mac_address,
+                    mac_address: Some(bmc_mac_address),
                     role: ExpectedInterfaceRole::HostBmc,
                     fixed_ip: Some(fixed_ip),
                     ..Default::default()

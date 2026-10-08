@@ -7852,7 +7852,14 @@ async fn test_bf4_astra_implicit_instance_vfs_use_static_inventory_on_create_and
                 .unwrap()
                 .expect("the fixture host includes an expected-machine declaration");
         expected_machine.data.interfaces.push(ExpectedInterface {
-            mac_address: mac_address::MacAddress::from([0x02, 0, 0, 0, 0, cx9_mac_suffix]),
+            mac_address: Some(mac_address::MacAddress::from([
+                0x02,
+                0,
+                0,
+                0,
+                0,
+                cx9_mac_suffix,
+            ])),
             nic_type: Some("CX9".to_string()),
             ..ExpectedInterface::default()
         });

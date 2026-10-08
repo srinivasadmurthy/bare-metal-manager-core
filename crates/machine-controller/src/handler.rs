@@ -2339,7 +2339,14 @@ impl MachineStateHandler {
         // The caller enumerates the declared CX9 NICs by index, so the expected
         // NIC for this card is simply the one at `nic_index`.
         let expected_nic = cx9_nics[nic_index as usize];
-        let mac_address = expected_nic.mac_address;
+        // The dpa_interface row is keyed by MAC, so a MAC-less declaration cannot be
+        // enabled for Astra.
+        let Some(mac_address) = expected_nic.mac_address else {
+            return Err(StateHandlerError::MissingData {
+                object_id: mh_snapshot.host_snapshot.id.to_string(),
+                missing: "expected_nic.mac_address",
+            });
+        };
 
         // Now enable EastWestControlEnabled on this card.
         redfish_client

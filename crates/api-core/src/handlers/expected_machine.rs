@@ -739,19 +739,20 @@ fn validate_expected_interface_role_and_allocation(
 ) -> Result<(), CarbideError> {
     let mut roles_by_mac = HashMap::new();
     for interface in interfaces {
+        let mac_display = interface
+            .mac_address
+            .map(|mac| mac.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
         interface.validate_ip_allocation().map_err(|message| {
-            CarbideError::InvalidArgument(format!(
-                "interfaces entry {}: {message}",
-                interface.mac_address,
-            ))
+            CarbideError::InvalidArgument(format!("interfaces entry {mac_display}: {message}"))
         })?;
         let host_bmc_compatibility_false =
             interface.role.is_host_bmc() && interface.primary == Some(false);
         if interface.primary.is_some() && !interface.role.is_host() && !host_bmc_compatibility_false
         {
             return Err(CarbideError::InvalidArgument(format!(
-                "only a role=host interface may set primary; {} has role {}",
-                interface.mac_address, interface.role,
+                "only a role=host interface may set primary; {mac_display} has role {}",
+                interface.role,
             )));
         }
         // One MAC may have separate IPv4 and IPv6 fixed reservations, so
@@ -763,8 +764,8 @@ fn validate_expected_interface_role_and_allocation(
             && existing_role != interface.role
         {
             return Err(CarbideError::InvalidArgument(format!(
-                "interfaces entries for MAC {} must use the same role; found {existing_role} and {}",
-                interface.mac_address, interface.role,
+                "interfaces entries for MAC {mac_display} must use the same role; found {existing_role} and {}",
+                interface.role,
             )));
         }
     }
@@ -794,16 +795,19 @@ fn validate_host_bmc_declaration(machine: &ExpectedMachine) -> Result<(), Carbid
     }
 
     if let Some(host_bmc) = host_bmcs.first() {
-        if host_bmc.mac_address != machine.bmc_mac_address {
+        let mac_display = host_bmc
+            .mac_address
+            .map(|mac| mac.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        if host_bmc.mac_address != Some(machine.bmc_mac_address) {
             return Err(CarbideError::InvalidArgument(format!(
-                "role=host_bmc interface MAC {} must match expected machine BMC MAC {}",
-                host_bmc.mac_address, machine.bmc_mac_address,
+                "role=host_bmc interface MAC {mac_display} must match expected machine BMC MAC {}",
+                machine.bmc_mac_address,
             )));
         }
         if host_bmc.primary == Some(true) {
             return Err(CarbideError::InvalidArgument(format!(
-                "role=host_bmc interface {} cannot set primary=true",
-                host_bmc.mac_address,
+                "role=host_bmc interface {mac_display} cannot set primary=true",
             )));
         }
     }
@@ -825,7 +829,7 @@ fn validate_bmc_identity_role(
         .interfaces
         .iter()
         .filter(|interface| {
-            interface.mac_address == machine.bmc_mac_address && !interface.role.is_host_bmc()
+            interface.mac_address == Some(machine.bmc_mac_address) && !interface.role.is_host_bmc()
         })
         .collect::<Vec<_>>();
     if conflicts.is_empty() {
@@ -838,7 +842,8 @@ fn validate_bmc_identity_role(
             .interfaces
             .iter()
             .filter(|interface| {
-                interface.mac_address == previous.bmc_mac_address && !interface.role.is_host_bmc()
+                interface.mac_address == Some(previous.bmc_mac_address)
+                    && !interface.role.is_host_bmc()
             })
             .collect::<Vec<_>>();
         conflicts.len() == previous_conflicts.len()
@@ -905,7 +910,11 @@ fn validate_at_most_one_primary_interface(
     let primaries: Vec<_> = interfaces
         .iter()
         .filter(|n| n.primary == Some(true))
-        .map(|n| n.mac_address.to_string())
+        .map(|n| {
+            n.mac_address
+                .map(|mac| mac.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        })
         .collect();
     if primaries.len() > 1 {
         return Err(CarbideError::InvalidArgument(format!(
@@ -963,20 +972,24 @@ fn preserve_omitted_rpc_role_and_allocation(
 
     let effective_host_bmc = existing.effective_host_bmc();
     for (index, interface) in replacement.interfaces_mut().iter_mut().enumerate() {
-        let Ok(mac_address) = interface.mac_address.parse::<MacAddress>() else {
+        let Some(Ok(mac_address)) = interface
+            .mac_address
+            .as_deref()
+            .map(|mac| mac.parse::<MacAddress>())
+        else {
             continue;
         };
         let Some(existing_interface) = existing
             .data
             .interfaces
             .get(index)
-            .filter(|candidate| candidate.mac_address == mac_address)
+            .filter(|candidate| candidate.mac_address == Some(mac_address))
             .or_else(|| {
                 existing
                     .data
                     .interfaces
                     .iter()
-                    .find(|candidate| candidate.mac_address == mac_address)
+                    .find(|candidate| candidate.mac_address == Some(mac_address))
             })
             .or_else(|| (mac_address == existing.bmc_mac_address).then_some(&effective_host_bmc))
         else {
@@ -1042,7 +1055,7 @@ async fn update_preallocated_interfaces(
         .data
         .interfaces
         .iter()
-        .filter(|interface| interface.mac_address != machine.bmc_mac_address)
+        .filter(|interface| interface.mac_address != Some(machine.bmc_mac_address))
     {
         if interface.fixed_ip.is_some() {
             preallocations.push(
@@ -1627,13 +1640,13 @@ mod tests {
     fn duplicate_expected_interface_macs_require_matching_roles() {
         let shared_mac: MacAddress = "7A:7B:7C:7D:7E:81".parse().unwrap();
         let other_mac: MacAddress = "7A:7B:7C:7D:7E:82".parse().unwrap();
-        let interface = |mac_address, role| ExpectedInterface {
-            mac_address,
+        let interface = |mac_address: MacAddress, role| ExpectedInterface {
+            mac_address: Some(mac_address),
             role,
             ..Default::default()
         };
         let fixed_host = |fixed_ip| ExpectedInterface {
-            mac_address: shared_mac,
+            mac_address: Some(shared_mac),
             fixed_ip: Some(fixed_ip),
             ..Default::default()
         };
@@ -1718,7 +1731,7 @@ mod tests {
             data: ExpectedMachineData {
                 interfaces: vec![
                     ExpectedInterface {
-                        mac_address,
+                        mac_address: Some(mac_address),
                         role: model::expected_machine::ExpectedInterfaceRole::DpuBmc,
                         ip_allocation: Some(
                             model::expected_machine::ExpectedInterfaceIpAllocation::Retained,
@@ -1729,7 +1742,7 @@ mod tests {
                         ..Default::default()
                     },
                     ExpectedInterface {
-                        mac_address,
+                        mac_address: Some(mac_address),
                         role: model::expected_machine::ExpectedInterfaceRole::DpuBmc,
                         ip_allocation: Some(
                             model::expected_machine::ExpectedInterfaceIpAllocation::Dynamic,
@@ -1743,12 +1756,12 @@ mod tests {
         let mut replacement = rpc::ExpectedMachine {
             host_nics: vec![
                 rpc::ExpectedInterface {
-                    mac_address: mac_address.to_string(),
+                    mac_address: Some(mac_address.to_string()),
                     primary: Some(false),
                     ..Default::default()
                 },
                 rpc::ExpectedInterface {
-                    mac_address: mac_address.to_string(),
+                    mac_address: Some(mac_address.to_string()),
                     ..Default::default()
                 },
             ],
@@ -1787,7 +1800,7 @@ mod tests {
             bmc_mac_address: "7A:7B:7C:7D:7E:92".parse().unwrap(),
             data: ExpectedMachineData {
                 interfaces: vec![ExpectedInterface {
-                    mac_address,
+                    mac_address: Some(mac_address),
                     role: model::expected_machine::ExpectedInterfaceRole::DpuBmc,
                     ..Default::default()
                 }],
@@ -1796,7 +1809,7 @@ mod tests {
         };
         let mut replacement = rpc::ExpectedMachine {
             host_nics: vec![rpc::ExpectedInterface {
-                mac_address: mac_address.to_string(),
+                mac_address: Some(mac_address.to_string()),
                 primary: Some(true),
                 ..Default::default()
             }],
