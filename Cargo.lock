@@ -804,7 +804,6 @@ dependencies = [
  "mac_address",
  "nv-redfish",
  "regex",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -3096,6 +3095,7 @@ dependencies = [
  "carbide-test-support",
  "ctor",
  "sqlx",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3180,6 +3180,7 @@ dependencies = [
  "tower",
  "trace-propagation",
  "tracing",
+ "tracing-subscriber",
  "tryhard",
  "uuid",
  "x509-parser",
@@ -6997,7 +6998,7 @@ dependencies = [
 [[package]]
 name = "libredfish"
 version = "0.0.0"
-source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.47.10#bcd34e1c8c09c10103c456690eb2cfd32b3c355d"
+source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.47.11#9da4784d22f3719005c8d81491e9ad63f10fc504"
 dependencies = [
  "chrono",
  "clap",

@@ -1826,11 +1826,8 @@ async fn test_expected_machine_device_type_metrics(
                 lockdown_status: None,
                 power_shelf_id: None,
                 switch_id: None,
-                compute_tray_index: None,
-                physical_slot_number: None,
-                revision_id: None,
-                topology_id: None,
                 remediation_error: None,
+                ..Default::default()
             }),
         ),
         (
@@ -1855,11 +1852,8 @@ async fn test_expected_machine_device_type_metrics(
                 lockdown_status: None,
                 power_shelf_id: None,
                 switch_id: None,
-                compute_tray_index: None,
-                physical_slot_number: None,
-                revision_id: None,
-                topology_id: None,
                 remediation_error: None,
+                ..Default::default()
             }),
         ),
         (
@@ -1884,11 +1878,8 @@ async fn test_expected_machine_device_type_metrics(
                 lockdown_status: None,
                 power_shelf_id: None,
                 switch_id: None,
-                compute_tray_index: None,
-                physical_slot_number: None,
-                revision_id: None,
-                topology_id: None,
                 remediation_error: None,
+                ..Default::default()
             }),
         ),
     ]);
@@ -2222,11 +2213,8 @@ async fn test_site_explorer_main(pool: PgPool) -> Result<(), Box<dyn std::error:
                 lockdown_status: None,
                 power_shelf_id: None,
                 switch_id: None,
-                compute_tray_index: None,
-                physical_slot_number: None,
-                revision_id: None,
-                topology_id: None,
                 remediation_error: None,
+                ..Default::default()
             }),
         ),
     ]);
@@ -2618,11 +2606,8 @@ async fn test_site_explorer_audit_exploration_results(
                 lockdown_status: None,
                 power_shelf_id: None,
                 switch_id: None,
-                compute_tray_index: None,
-                physical_slot_number: None,
-                revision_id: None,
-                topology_id: None,
                 remediation_error: None,
+                ..Default::default()
             },
         ),
         (
@@ -2652,11 +2637,8 @@ async fn test_site_explorer_audit_exploration_results(
                 lockdown_status: None,
                 power_shelf_id: None,
                 switch_id: None,
-                compute_tray_index: None,
-                physical_slot_number: None,
-                revision_id: None,
-                topology_id: None,
                 remediation_error: None,
+                ..Default::default()
             },
         ),
         (
@@ -2681,11 +2663,8 @@ async fn test_site_explorer_audit_exploration_results(
                 lockdown_status: None,
                 power_shelf_id: None,
                 switch_id: None,
-                compute_tray_index: None,
-                physical_slot_number: None,
-                revision_id: None,
-                topology_id: None,
                 remediation_error: None,
+                ..Default::default()
             },
         ),
         (
@@ -2714,11 +2693,8 @@ async fn test_site_explorer_audit_exploration_results(
                 lockdown_status: None,
                 power_shelf_id: None,
                 switch_id: None,
-                compute_tray_index: None,
-                physical_slot_number: None,
-                revision_id: None,
-                topology_id: None,
                 remediation_error: None,
+                ..Default::default()
             },
         ),
         (
