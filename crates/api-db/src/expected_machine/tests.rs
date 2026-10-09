@@ -45,6 +45,7 @@ async fn exercise_expected_machine_queries(
         id: Some(id),
         bmc_mac_address: "02:00:00:00:01:01".parse()?,
         data: ExpectedMachineData {
+            name: Some("projection-name".to_string()),
             bmc_username: "test-user".to_string(),
             bmc_password: "test-password".to_string(),
             serial_number: "projection-machine".to_string(),

@@ -168,6 +168,9 @@ pub(crate) struct ExpectedMachineJson {
     /// Per-host lifecycle profile for settings that affect state-machine progression.
     #[serde(default)]
     pub(crate) host_lifecycle_profile: Option<HostLifecycleProfile>,
+    /// Optional operator-assigned name presented to switches in LLDP responses.
+    #[serde(default)]
+    pub(crate) name: Option<String>,
 }
 
 impl ExpectedMachineJson {

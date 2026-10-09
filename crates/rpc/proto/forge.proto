@@ -7610,6 +7610,10 @@ message ExpectedMachine {
   // host_nics, including `[]`; older clients leave it false so an unknown
   // nested HostBmc is not removed by a read-modify-write.
   bool replace_host_nics = 19;
+  // The name field is optional and is used to identify the machine. This
+  // name will be presented to the switches in LLDP responses and is potentially
+  // used for cable validation, etc.
+  optional string name = 20;
 }
 
 message ExpectedMachineRequest {

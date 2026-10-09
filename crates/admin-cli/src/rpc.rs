@@ -1403,6 +1403,7 @@ impl ApiClient {
             replace_host_nics: replace_interfaces,
             host_lifecycle_profile: host_lifecycle_profile
                 .or(expected_machine.host_lifecycle_profile),
+            name: expected_machine.name,
         };
 
         self.0
@@ -1452,6 +1453,7 @@ impl ApiClient {
                             disable_lockdown: hlp.disable_lockdown,
                         }
                     }),
+                    name: machine.name,
                 })
                 .collect(),
         };

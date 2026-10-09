@@ -372,6 +372,7 @@ impl From<ExpectedMachine> for rpc::forge::ExpectedMachine {
                         .host_lifecycle_profile
                         .disable_lockdown,
                 }),
+            name: expected_machine.data.name,
         }
     }
 }
@@ -506,6 +507,7 @@ impl TryFrom<rpc::forge::ExpectedMachine> for ExpectedMachineData {
                     disable_lockdown: hlp.disable_lockdown,
                 })
                 .unwrap_or_default(),
+            name: em.name,
         })
     }
 }

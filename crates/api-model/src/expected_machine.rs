@@ -879,6 +879,10 @@ pub struct ExpectedMachineData {
     /// knobs should be added here rather than as new flat columns.
     #[serde(default)]
     pub host_lifecycle_profile: HostLifecycleProfile,
+    /// Optional operator-assigned name identifying the machine. Presented to
+    /// switches in LLDP responses and usable for cable validation.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 // Important : new fields for expected machine (and data) should be optional _and_ serde(default),
 // unless you want to go update all the files in each production deployment that autoload
@@ -937,6 +941,7 @@ impl<'r> FromRow<'r, PgRow> for ExpectedMachine {
             id: row.try_get("id")?,
             bmc_mac_address: row.try_get("bmc_mac_address")?,
             data: ExpectedMachineData {
+                name: row.try_get("name")?,
                 bmc_username: row.try_get("bmc_username")?,
                 serial_number: row.try_get("serial_number")?,
                 bmc_password: row.try_get("bmc_password")?,
