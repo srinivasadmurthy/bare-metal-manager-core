@@ -2418,35 +2418,7 @@ impl MachineStateHandler {
         // Look at the entry in the expected_machines table for this managed host, and retrieve the host_nics
         // field. If the host_nics is empty, just return.
 
-        // its unlikely we got here without a bmc mac
-        let Some(bmc_mac_address) = mh_snapshot.host_snapshot.status.bmc_info.mac else {
-            tracing::debug!(
-                machine_id = %mh_snapshot.host_snapshot.id,
-                "No BMC MAC address configured"
-            );
-            return Err(StateHandlerError::MissingData {
-                object_id: mh_snapshot.host_snapshot.id.to_string(),
-                missing: "bmc_mac_address",
-            });
-        };
-
-        let mut txn = ctx.services.db_pool.begin().await?;
-
-        // Retrieve the expected_machines table entry for this managed host.
-        let expected_machine =
-            db::expected_machine::find_by_bmc_mac_address(txn.as_mut(), bmc_mac_address)
-                .await
-                .map_err(|err| {
-                    tracing::error!(
-                        machine_id = %mh_snapshot.host_snapshot.id,
-                        %bmc_mac_address,
-                        error = %err,
-                        "Failed to look up expected machine for Astra enablement"
-                    );
-                    StateHandlerError::DBError(Box::new(err))
-                })?;
-
-        txn.commit().await?;
+        let expected_machine = get_expected_machine_for_mh(mh_snapshot, ctx).await;
 
         // No expected-machine entry means there are no declared host NICs to act on.
         let Some(expected_machine) = expected_machine else {
@@ -2701,6 +2673,66 @@ impl MachineStateHandler {
 
         Ok(None)
     }
+}
+
+/// Looks up the `expected_machines` entry for this managed host by the BMC
+/// MAC address recorded in its host snapshot.
+///
+/// Returns `None` when the host has no BMC MAC, when no matching row exists,
+/// or when a DB error occurs (logged); all are treated by callers as "no
+/// expected-machine declaration to act on".
+async fn get_expected_machine_for_mh(
+    mh_snapshot: &ManagedHostStateSnapshot,
+    ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
+) -> Option<model::expected_machine::ExpectedMachine> {
+    // its unlikely we got here without a bmc mac
+    let Some(bmc_mac_address) = mh_snapshot.host_snapshot.status.bmc_info.mac else {
+        tracing::debug!(
+            machine_id = %mh_snapshot.host_snapshot.id,
+            "No BMC MAC address configured"
+        );
+        return None;
+    };
+
+    let mut txn = match ctx.services.db_pool.begin().await {
+        Ok(txn) => txn,
+        Err(err) => {
+            tracing::error!(
+                machine_id = %mh_snapshot.host_snapshot.id,
+                %bmc_mac_address,
+                error = %err,
+                "Failed to begin transaction to look up expected machine"
+            );
+            return None;
+        }
+    };
+
+    // Retrieve the expected_machines table entry for this managed host.
+    let expected_machine =
+        match db::expected_machine::find_by_bmc_mac_address(txn.as_mut(), bmc_mac_address).await {
+            Ok(expected_machine) => expected_machine,
+            Err(err) => {
+                tracing::error!(
+                    machine_id = %mh_snapshot.host_snapshot.id,
+                    %bmc_mac_address,
+                    error = %err,
+                    "Failed to look up expected machine"
+                );
+                return None;
+            }
+        };
+
+    if let Err(err) = txn.commit().await {
+        tracing::error!(
+            machine_id = %mh_snapshot.host_snapshot.id,
+            %bmc_mac_address,
+            error = %err,
+            "Failed to commit transaction after expected machine lookup"
+        );
+        return None;
+    }
+
+    expected_machine
 }
 
 fn is_reprovision_restartable_failure(

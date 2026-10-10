@@ -7495,7 +7495,7 @@ message ExpectedHostNic {
   // selection hint.
   optional ExpectedInterfaceIpAllocation ip_allocation = 9;
 
-  optional string name = 10;
+  optional string cerebro_ifname = 10;
 
   optional string label = 11;
 }

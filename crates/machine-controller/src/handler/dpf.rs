@@ -593,9 +593,13 @@ fn dpf_deployment_migration_failed(
 /// transition all DPUs to WaitingForReady.
 async fn handle_dpf_provisioning(
     state: &ManagedHostStateSnapshot,
+    ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     dpf_sdk: &dyn DpfOperations,
     deployment_type: DpuDeploymentType,
 ) -> Result<StateHandlerOutcome<ManagedHostState>, StateHandlerError> {
+    // Looked up here for an upcoming change; not yet consumed.
+    let _expected_machine = super::get_expected_machine_for_mh(state, ctx).await;
+
     match create_and_register_dpudevices_and_dpunode(state, dpf_sdk, deployment_type).await {
         Ok(()) => {}
         Err(DpfResourceRegistrationError::CredentialUnavailable(error)) => {
@@ -997,6 +1001,9 @@ async fn handle_dpf_reprovisioning(
             machine_id = %state.host_snapshot.id,
             "DPUDevice/DPUNode CRs do not exist, creating them before reprovisioning"
         );
+        // Looked up here for an upcoming change; not yet consumed.
+        let _expected_machine = super::get_expected_machine_for_mh(state, ctx).await;
+
         match create_and_register_dpudevices_and_dpunode(state, dpf_sdk, deployment_type).await {
             Ok(()) => {}
             Err(DpfResourceRegistrationError::CredentialUnavailable(error)) => {
@@ -1208,7 +1215,9 @@ pub(super) async fn handle_dpf_state(
     }
 
     match dpf_state {
-        DpfState::Provisioning => handle_dpf_provisioning(state, dpf_sdk, deployment_type).await,
+        DpfState::Provisioning => {
+            handle_dpf_provisioning(state, ctx, dpf_sdk, deployment_type).await
+        }
         DpfState::WaitingForReady { phase_detail } => {
             handle_dpf_waiting_for_ready(
                 state,

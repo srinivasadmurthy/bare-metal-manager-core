@@ -332,7 +332,7 @@ pub struct ExpectedInterface {
     /// MAC address used to match DHCP and discovered interface traffic to this
     /// declaration.
     pub mac_address: Option<MacAddress>,
-    pub name: Option<String>,
+    pub cerebro_ifname: Option<String>,
     pub label: Option<String>,
     /// Which machine endpoint owns this interface. Missing values retain the
     /// legacy host-interface behavior.
@@ -543,7 +543,7 @@ impl ExpectedMachine {
 
         ExpectedInterface {
             mac_address: Some(self.bmc_mac_address),
-            name: None,
+            cerebro_ifname: None,
             label: None,
             role: ExpectedInterfaceRole::HostBmc,
             ip_allocation,
