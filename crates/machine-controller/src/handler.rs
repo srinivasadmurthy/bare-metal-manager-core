@@ -59,6 +59,7 @@ use libredfish::model::service_root::RedfishVendor;
 use libredfish::model::task::TaskState;
 use libredfish::model::update_service::{ComponentType, TransferProtocolType};
 use libredfish::{Boot, EnabledDisabled, Redfish, RedfishError, SystemPowerControl};
+use mac_address::MacAddress;
 use machine_validation::{handle_machine_validation_requested, handle_machine_validation_state};
 use measured_boot::records::MeasurementMachineState;
 use model::DpuModel;
@@ -2317,6 +2318,29 @@ impl MachineStateHandler {
         }
     }
 
+    // Function to return a cage index given a NIC index in Astra.
+    // Cage index is ((nic_index / 2) * 2) + 1
+    #[allow(dead_code)]
+    fn astra_get_cage_index(nic_index: u8) -> u8 {
+        ((nic_index / 2) * 2) + 1
+    }
+
+    // Function to return an MPO index given a NIC index in Astra.
+    // MPO index is (nic_index / 2) + 1
+    #[allow(dead_code)]
+    fn astra_get_mpo_index(nic_index: u8) -> u8 {
+        (nic_index / 2) + 1
+    }
+
+    // Function to return a string with Cage and MPO numbers encoded
+    // given a NIC index in Astra.
+    #[allow(dead_code)]
+    fn astra_get_cage_mpo_encoded_string(nic_index: u8) -> String {
+        let cage_index = Self::astra_get_cage_index(nic_index);
+        let mpo_index = Self::astra_get_mpo_index(nic_index);
+        format!("C{cage_index}_{mpo_index}")
+    }
+
     /// Enables Astra on a single NIC.
     /// We pass in the expected interfaces and the NIC index to enable Astra on.
     /// Returns `true` when the NIC was enabled and the caller
@@ -2339,23 +2363,74 @@ impl MachineStateHandler {
             .create_redfish_client_from_machine(&mh_snapshot.host_snapshot)
             .await?;
 
-        // The caller enumerates the declared CX9 NICs by index, so the expected
-        // NIC for this card is simply the one at `nic_index`.
-        let expected_nic = cx9_nics[nic_index as usize];
-        // The dpa_interface row is keyed by MAC, so a MAC-less declaration cannot be
-        // enabled for Astra.
-        let Some(mac_address) = expected_nic.mac_address else {
-            return Err(StateHandlerError::MissingData {
+        let mac_address = redfish_client
+            .get_spx_nic_mac_address(nic_index)
+            .await
+            .map_err(|e| redfish_error("get_spx_nic_mac_address", e))?
+            .ok_or_else(|| StateHandlerError::MissingData {
                 object_id: mh_snapshot.host_snapshot.id.to_string(),
-                missing: "expected_nic.mac_address",
-            });
-        };
+                missing: "spx_nic_mac_address",
+            })?;
+
+        let mac_address = MacAddress::from_str(&mac_address).map_err(|e| {
+            tracing::error!(
+                machine_id = %mh_snapshot.host_snapshot.id,
+                "Invalid SPX NIC MAC address {mac_address}: {e}"
+            );
+            StateHandlerError::GenericError(eyre!("invalid SPX NIC MAC address {mac_address}: {e}"))
+        })?;
 
         // Now enable EastWestControlEnabled on this card.
         redfish_client
             .set_spx_nic_east_west_control_enabled(nic_index, true)
             .await
             .map_err(|e| redfish_error("set_spx_nic_east_west_control_enabled", e))?;
+
+        let cage_mpo_encoded_string = Self::astra_get_cage_mpo_encoded_string(nic_index);
+
+        // We have to search through the cx9_nics array for all interfaces whose name starts with the cage_mpo_encoded_string.
+        // The entry in the cx9_nics array has this format:
+        //   {"cerebro_ifname":"C1-2-L1","ip":"100.65.2.210","nic_type":"CX9","logical_ifname":"eth_r0_p0"}
+        // Look in cx9_nics for an entry whose cerebro_ifname starts with cage_mpo_encoded_string and return the
+        // corresponding logical_ifname.
+        let fixed_ip = cx9_nics
+            .iter()
+            .find(|nic| {
+                nic.cerebro_ifname
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with(&cage_mpo_encoded_string))
+            })
+            .map(|nic| nic.fixed_ip);
+
+        // If fixed_ip is not found above, print an error and retrun error.
+        // Otherwise, keep the fixed_ip to use in the dpa_interface object.
+        let Some(fixed_ip) = fixed_ip else {
+            tracing::error!(
+                machine_id = %mh_snapshot.host_snapshot.id,
+                "Fixed IP not found for Astra enablement"
+            );
+            return Err(StateHandlerError::GenericError(eyre!(
+                "fixed IP not found for Astra enablement"
+            )));
+        };
+
+        // We need to retreive the DPU pci device name of this device using cage_mpo_encoded_string.
+        // Append the string "_L1" to cage_mpo_encoded_string and lookup that name in ASTRA_NIC_MAPPINGS
+        // and get the dpu_pci_address field.
+        let dpu_pci_address = model::machine::astra::astra_dpu_pci_address_for_cerebro_ifname(
+            &format!("{cage_mpo_encoded_string}_L1"),
+        )
+        .map(|addr| addr.to_string());
+        // If dpu_pci_address is not found above, print an error and retrun error.
+        let Some(dpu_pci_address) = dpu_pci_address else {
+            tracing::error!(
+                machine_id = %mh_snapshot.host_snapshot.id,
+                "DPU PCI address not found for Astra enablement"
+            );
+            return Err(StateHandlerError::GenericError(eyre!(
+                "DPU PCI address not found for Astra enablement"
+            )));
+        };
 
         // We have successfully enabled EastWestControlEnabled on this card.
         // Now add an entry for this NIC in the dpa_interface table.
@@ -2371,7 +2446,7 @@ impl MachineStateHandler {
                 machine_id: mh_snapshot.host_snapshot.id,
                 mac_address,
                 device_type: "Network Adapter Ethernet Interface".to_string(),
-                pci_name: format!("CX_{nic_index}"),
+                pci_name: dpu_pci_address,
                 device_description: Some("NVIDIA Dual ConnectX-9 SuperNIC C9280V for Vera Rubin NVL 144 systems, Crypto Enabled, Secure Boot Enabled, Liquid Cooled".to_string()),
                 interface_type: DpaInterfaceType::Astra,
             },
@@ -2379,7 +2454,7 @@ impl MachineStateHandler {
         )
         .await?;
 
-        dpa_interface.underlay_ip = expected_nic.fixed_ip;
+        dpa_interface.underlay_ip = fixed_ip;
 
         // Call the update_ip routine to update the underlay_ip address of this dpa object,
         // obtaining the underlay ip from the fixed_ip field of the ExpectedInterface object.
