@@ -333,7 +333,7 @@ pub struct ExpectedInterface {
     /// declaration.
     pub mac_address: Option<MacAddress>,
     pub cerebro_ifname: Option<String>,
-    pub label: Option<String>,
+    pub logical_ifname: Option<String>,
     /// Which machine endpoint owns this interface. Missing values retain the
     /// legacy host-interface behavior.
     #[serde(default, skip_serializing_if = "ExpectedInterfaceRole::is_host")]
@@ -544,7 +544,7 @@ impl ExpectedMachine {
         ExpectedInterface {
             mac_address: Some(self.bmc_mac_address),
             cerebro_ifname: None,
-            label: None,
+            logical_ifname: None,
             role: ExpectedInterfaceRole::HostBmc,
             ip_allocation,
             fixed_ip,

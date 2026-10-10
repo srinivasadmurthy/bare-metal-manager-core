@@ -249,7 +249,7 @@ impl From<ExpectedInterface> for rpc::forge::ExpectedInterface {
         rpc::forge::ExpectedInterface {
             mac_address: expected_interface.mac_address.map(|mac| mac.to_string()),
             cerebro_ifname: expected_interface.cerebro_ifname,
-            label: expected_interface.label,
+            logical_ifname: expected_interface.logical_ifname,
             nic_type: expected_interface.nic_type,
             fixed_ip: expected_interface.fixed_ip.map(|ip| ip.to_string()),
             fixed_mask: expected_interface.fixed_mask,
@@ -281,7 +281,7 @@ impl TryFrom<rpc::forge::ExpectedInterface> for ExpectedInterface {
         Ok(ExpectedInterface {
             mac_address,
             cerebro_ifname: expected_interface.cerebro_ifname,
-            label: expected_interface.label,
+            logical_ifname: expected_interface.logical_ifname,
             nic_type: expected_interface.nic_type,
             fixed_ip: match expected_interface.fixed_ip.as_deref() {
                 None | Some("") => None,
