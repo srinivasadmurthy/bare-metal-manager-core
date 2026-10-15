@@ -21,8 +21,10 @@ use arc_swap::ArcSwap;
 use carbide_ib_fabric::ib::IBFabricManager;
 use carbide_machine_controller::dpf::DpfOperations;
 use carbide_nvlink_manager::nvlink::test_support::NmxcSimClient;
+use carbide_rack_controller::firmware_object::FirmwareObjectFetcher;
 use carbide_redfish::libredfish::BmcCredentialOps;
 use carbide_redfish::libredfish::test_support::RedfishSim;
+use carbide_resource_pool::ResourcePoolRegistry;
 use carbide_secrets::credentials::CredentialManager;
 use carbide_secrets::test_support::certificates::TestCertificateProvider;
 use carbide_secrets::test_support::credentials::TestCredentialManager;
@@ -33,6 +35,7 @@ use carbide_site_explorer::{
 };
 use carbide_utils::test_support::test_meter::TestMeter;
 use db::work_lock_manager::WorkLockManagerHandle;
+use ipnetwork::IpNetwork;
 use libnmxc::NmxcPool;
 use librms::RmsApi;
 use model::resource_pool::common::CommonPools;
@@ -44,7 +47,7 @@ use super::Api;
 use crate::api::metrics::ApiMetricsEmitter;
 use crate::cfg::file::CarbideConfig;
 use crate::dynamic_settings::DynamicSettings;
-use crate::ethernet_virtualization::EthVirtData;
+use crate::ethernet_virtualization::{EthVirtData, SiteFabricPrefixList};
 use crate::logging::level_filter::ActiveLevel;
 use crate::logging::log_limiter::LogLimiter;
 use crate::scout_stream::ConnectionRegistry;
@@ -55,6 +58,7 @@ use crate::test_support::network::default_test_eth_virt_data;
 pub struct TestApiBuilder {
     db_pool: PgPool,
     common_pools: Arc<CommonPools>,
+    resource_pool_registry: ResourcePoolRegistry,
     work_lock_manager: WorkLockManagerHandle,
     runtime_config: Option<Arc<CarbideConfig>>,
     credential_manager: Option<Arc<dyn CredentialManager>>,
@@ -68,6 +72,8 @@ pub struct TestApiBuilder {
     component_manager: Option<Arc<component_manager::component_manager::ComponentManager>>,
     secrets_context: Option<crate::secrets::SecretsContext>,
     endpoint_explorer: Option<MockEndpointExplorer>,
+    console_log_source: Option<Arc<dyn crate::console_logs::ConsoleLogSource>>,
+    firmware_object_fetcher: Option<Arc<dyn FirmwareObjectFetcher>>,
 }
 
 impl TestApiBuilder {
@@ -79,6 +85,7 @@ impl TestApiBuilder {
         TestApiBuilder {
             db_pool,
             common_pools,
+            resource_pool_registry: ResourcePoolRegistry::default(),
             work_lock_manager,
             runtime_config: None,
             credential_manager: None,
@@ -92,6 +99,17 @@ impl TestApiBuilder {
             component_manager: None,
             secrets_context: None,
             endpoint_explorer: None,
+            console_log_source: None,
+            firmware_object_fetcher: None,
+        }
+    }
+
+    /// `with_resource_pool_registry` supplies the resolved pool backends used by the API.
+    /// Without one, pool lookups read the database in the caller's transaction.
+    pub fn with_resource_pool_registry(self, resource_pool_registry: ResourcePoolRegistry) -> Self {
+        Self {
+            resource_pool_registry,
+            ..self
         }
     }
 
@@ -132,6 +150,14 @@ impl TestApiBuilder {
             eth_data: Some(eth_data),
             ..self
         }
+    }
+
+    /// Replaces the site fabric ranges used to validate VPC and tenant network
+    /// segment prefixes in tests.
+    pub fn with_site_fabric_prefixes(mut self, prefixes: Vec<IpNetwork>) -> Self {
+        let eth_data = self.eth_data.get_or_insert_with(default_test_eth_virt_data);
+        eth_data.site_fabric_prefixes = SiteFabricPrefixList::from_ipnetwork_vec(prefixes);
+        self
     }
 
     pub fn with_dpf_sdk(self, dpf_sdk: Arc<dyn DpfOperations>) -> Self {
@@ -190,6 +216,27 @@ impl TestApiBuilder {
         }
     }
 
+    pub fn with_console_log_source(
+        self,
+        console_log_source: Arc<dyn crate::console_logs::ConsoleLogSource>,
+    ) -> Self {
+        Self {
+            console_log_source: Some(console_log_source),
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_firmware_object_fetcher(
+        self,
+        firmware_object_fetcher: Arc<dyn FirmwareObjectFetcher>,
+    ) -> Self {
+        Self {
+            firmware_object_fetcher: Some(firmware_object_fetcher),
+            ..self
+        }
+    }
+
     pub fn build(self) -> Api {
         let runtime_config = self
             .runtime_config
@@ -234,6 +281,8 @@ impl TestApiBuilder {
         let real_bmc_client = Arc::new(AuthenticatedBmcClient::new(
             redfish_pool.clone(),
             nv_redfish_pool,
+            // Tests run without [bmc_proxy]: everything dials the sim directly.
+            None,
             carbide_ipmi::test_support(),
             credential_manager.clone(),
         ));
@@ -293,8 +342,10 @@ impl TestApiBuilder {
             // dyn upcast: the ops handle is also the general pool in tests.
             redfish_pool: redfish_pool.clone(),
             bmc_credential_ops: redfish_pool,
+            bmc_proxy_passthrough: None,
             eth_data,
             common_pools: self.common_pools,
+            resource_pool_registry: self.resource_pool_registry,
             ib_fabric_manager,
             dynamic_settings,
             endpoint_explorer,
@@ -308,10 +359,16 @@ impl TestApiBuilder {
             machine_state_handler_enqueuer,
             metric_emitter,
             component_manager: self.component_manager.map(|cm| (*cm).clone()),
+            firmware_object_fetcher: self
+                .firmware_object_fetcher
+                .unwrap_or_else(|| Arc::new(reqwest::Client::new())),
             bmc_session_manager,
             bms_client: std::sync::OnceLock::new(),
             secrets_context: self.secrets_context,
             node_jwt_validator: None,
+            console_log_source: self
+                .console_log_source
+                .unwrap_or_else(|| Arc::new(crate::console_logs::UnavailableSource)),
         }
     }
 }

@@ -22,12 +22,15 @@ use std::time::Duration;
 use carbide_firmware::test_support::script_setup;
 use carbide_machine_controller::config::{FirmwareGlobal, TimePeriod};
 use carbide_machine_controller::handler::MAX_NEW_FIRMWARE_REPORTED_RESET_RETRIES;
-use carbide_uuid::machine::HostMachineId;
+use carbide_uuid::machine::StableHostMachineId;
 use common::api_fixtures::instance::TestInstance;
 use common::api_fixtures::{
     self, TestEnv, TestManagedHost, create_test_env_with_overrides, get_config,
 };
-use model::firmware::{Firmware, FirmwareComponent, FirmwareComponentType, FirmwareEntry};
+use model::controller_outcome::PersistentStateHandlerOutcome;
+use model::firmware::{
+    Firmware, FirmwareComponent, FirmwareComponentType, FirmwareEntry, FirmwareFileArtifact,
+};
 use model::instance::status::tenant::TenantState;
 use model::machine::{
     HostReprovisionState, InstanceState, MAX_FIRMWARE_UPGRADE_RETRIES, ManagedHostState,
@@ -165,15 +168,18 @@ async fn test_postingestion_bmc_upgrade_uefi(
         .report
         .versions
         .insert(FirmwareComponentType::Uefi, "1.13.2".to_string());
-    db::explored_endpoints::try_update(
-        host.status.bmc_info.ip_addr().unwrap(),
-        endpoint.report_version,
-        &endpoint.report,
-        false,
-        &mut txn,
-    )
-    .await
-    .unwrap();
+    assert_eq!(
+        db::explored_endpoints::try_update(
+            host.status.bmc_info.ip_addr().unwrap(),
+            endpoint.report_version,
+            &endpoint.report,
+            false,
+            &mut txn,
+        )
+        .await
+        .unwrap(),
+        db::ConditionalWrite::Applied(())
+    );
     txn.commit().await.unwrap();
 
     // Another state machine pass
@@ -294,14 +300,17 @@ async fn test_postingestion_bmc_upgrade_bmc(
         .report
         .versions
         .insert(FirmwareComponentType::Bmc, "6.00.30.00".to_string());
-    db::explored_endpoints::try_update(
-        host.status.bmc_info.ip_addr().unwrap(),
-        endpoint.report_version,
-        &endpoint.report,
-        false,
-        &mut txn,
-    )
-    .await?;
+    assert_eq!(
+        db::explored_endpoints::try_update(
+            host.status.bmc_info.ip_addr().unwrap(),
+            endpoint.report_version,
+            &endpoint.report,
+            false,
+            &mut txn,
+        )
+        .await?,
+        db::ConditionalWrite::Applied(())
+    );
     db::machine_topology::update_firmware_version_by_machine_id(
         &mut txn,
         &host.id,
@@ -708,6 +717,7 @@ async fn test_instance_upgrading_actual_part_2(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -750,6 +760,7 @@ async fn test_instance_upgrading_actual_part_2(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -802,6 +813,7 @@ async fn test_instance_upgrading_actual_part_2(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -819,7 +831,7 @@ async fn test_instance_upgrading_actual_part_2(
     );
     txn.commit().await.unwrap();
 
-    let request = Request::new(mh.id.into());
+    let request = Request::new(mh.id);
     env.api.reset_host_reprovisioning(request).await?;
 
     // Next one should start a UEFI upgrade
@@ -851,6 +863,7 @@ async fn test_instance_upgrading_actual_part_2(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -890,6 +903,7 @@ async fn test_instance_upgrading_actual_part_2(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -936,15 +950,18 @@ async fn test_instance_upgrading_actual_part_2(
         .report
         .versions
         .insert(FirmwareComponentType::Uefi, "1.13.2".to_string());
-    db::explored_endpoints::try_update(
-        host.status.bmc_info.ip_addr().unwrap(),
-        endpoint.report_version,
-        &endpoint.report,
-        false,
-        &mut txn,
-    )
-    .await
-    .unwrap();
+    assert_eq!(
+        db::explored_endpoints::try_update(
+            host.status.bmc_info.ip_addr().unwrap(),
+            endpoint.report_version,
+            &endpoint.report,
+            false,
+            &mut txn,
+        )
+        .await
+        .unwrap(),
+        db::ConditionalWrite::Applied(())
+    );
 
     // Check that the TenantState is what we expect based on the instance/machine state.
     let host = mh.host().db_machine(&mut txn).await;
@@ -953,6 +970,7 @@ async fn test_instance_upgrading_actual_part_2(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -992,6 +1010,7 @@ async fn test_instance_upgrading_actual_part_2(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -1059,6 +1078,7 @@ async fn test_instance_upgrading_actual_part_3(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -1130,6 +1150,7 @@ async fn test_instance_upgrading_actual_part_3(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -1159,15 +1180,18 @@ async fn test_instance_upgrading_actual_part_3(
         .report
         .versions
         .insert(FirmwareComponentType::Bmc, "6.00.30.00".to_string());
-    db::explored_endpoints::try_update(
-        host.status.bmc_info.ip_addr().unwrap(),
-        endpoint.report_version,
-        &endpoint.report,
-        false,
-        &mut txn,
-    )
-    .await
-    .unwrap();
+    assert_eq!(
+        db::explored_endpoints::try_update(
+            host.status.bmc_info.ip_addr().unwrap(),
+            endpoint.report_version,
+            &endpoint.report,
+            false,
+            &mut txn,
+        )
+        .await
+        .unwrap(),
+        db::ConditionalWrite::Applied(())
+    );
     db::machine_topology::update_firmware_version_by_machine_id(
         &mut txn,
         &host.id,
@@ -1199,6 +1223,7 @@ async fn test_instance_upgrading_actual_part_3(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -1238,6 +1263,7 @@ async fn test_instance_upgrading_actual_part_3(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -1275,6 +1301,7 @@ async fn test_instance_upgrading_actual_part_3(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -1307,6 +1334,7 @@ async fn test_instance_upgrading_actual_part_3(
     assert_eq!(
         instance_snapshot_derive_status(
             &instance,
+            &[],
             device_id_maps.1,
             host.primary_attached_dpu_machine_id(),
             host.state.clone().value,
@@ -1612,6 +1640,111 @@ async fn test_script_upgrade_failure(pool: sqlx::PgPool) -> CarbideResult<()> {
     Ok(())
 }
 
+/// A remote artifact that cannot be downloaded must surface on the machine: the request survives
+/// while the download runs, and the failure becomes a FailedFirmwareUpgrade with the error as its
+/// reason, so the retry budget applies instead of a silent loop from Ready.
+#[crate::sqlx_test]
+async fn test_artifact_download_failure_fails_upgrade(pool: sqlx::PgPool) -> CarbideResult<()> {
+    let cache_dir = TempDir::with_prefix("test_artifact_download_failure").unwrap();
+    let missing_url = format!("file://{}", cache_dir.path().join("missing.bin").display());
+    let mut entry = FirmwareEntry::standard("99.99.99.99");
+    entry.files = vec![FirmwareFileArtifact {
+        filename: None,
+        url: Some(missing_url),
+        sha256: String::new(),
+    }];
+
+    let mut config = get_config();
+    config.firmware_global.firmware_download_cache_directory = cache_dir.path().join("cache");
+    config.host_models = HashMap::from([(
+        "1".to_string(),
+        Firmware {
+            vendor: bmc_vendor::BMCVendor::Dell,
+            model: "PowerEdge R750".to_string(),
+            explicit_start_needed: false,
+            components: HashMap::from([(
+                FirmwareComponentType::Bmc,
+                FirmwareComponent {
+                    current_version_reported_as: Some(Regex::new("^Installed-.*__iDRAC.").unwrap()),
+                    preingest_upgrade_when_below: None,
+                    known_firmware: vec![entry],
+                },
+            )]),
+            ordering: vec![FirmwareComponentType::Bmc],
+        },
+    )]);
+    let env = create_test_env_with_overrides(pool, TestEnvOverrides::with_config(config)).await;
+    let mh = common::api_fixtures::create_managed_host(&env).await;
+    let update_manager = MachineUpdateManager::new(
+        env.pool.clone(),
+        env.config.clone(),
+        env.test_meter.meter(),
+        env.api.work_lock_manager_handle.clone(),
+        None,
+    );
+    update_manager.run_single_iteration().await.unwrap();
+
+    // The first pass starts the download and waits for it without dropping the request.
+    env.run_machine_state_controller_iteration().await;
+    let mut txn = env.pool.begin().await.unwrap();
+    let host = mh.host().db_machine(&mut txn).await;
+    assert_eq!(host.current_state(), &ManagedHostState::Ready);
+    assert!(host.host_reprovision_requested.is_some());
+    let Some(PersistentStateHandlerOutcome::Wait { reason, .. }) = &host.controller_state_outcome
+    else {
+        panic!(
+            "expected a Wait outcome, got {:?}",
+            host.controller_state_outcome
+        );
+    };
+    assert!(reason.contains("missing.bin"), "{reason}");
+    txn.commit().await.unwrap();
+
+    // The background download fails within milliseconds, but keep running passes until one
+    // records it so a slow runner cannot fail the test; the limit keeps it from hanging.
+    let mut failed_host = None;
+    for _ in 0..50 {
+        sleep(Duration::from_millis(100)).await;
+        env.run_machine_state_controller_iteration().await;
+        let mut txn = env.pool.begin().await.unwrap();
+        let host = mh.host().db_machine(&mut txn).await;
+        txn.commit().await.unwrap();
+        if host.current_state() != &ManagedHostState::Ready {
+            failed_host = Some(host);
+            break;
+        }
+    }
+    let host = failed_host.expect("the download failure was never recorded on the machine");
+    assert!(host.host_reprovision_requested.is_some());
+    let ManagedHostState::HostReprovision {
+        reprovision_state:
+            HostReprovisionState::FailedFirmwareUpgrade {
+                firmware_type,
+                reason: Some(reason),
+                ..
+            },
+        retry_count: 0,
+    } = host.current_state()
+    else {
+        panic!(
+            "expected FailedFirmwareUpgrade, got {:?}",
+            host.current_state()
+        );
+    };
+    assert_eq!(firmware_type, &FirmwareComponentType::Bmc);
+    assert!(
+        reason.contains("could not be downloaded") && reason.contains("missing.bin"),
+        "{reason}"
+    );
+    assert!(
+        host.health_reports
+            .merges
+            .contains_key(HOST_FW_UPDATE_HEALTH_REPORT_SOURCE)
+    );
+
+    Ok(())
+}
+
 #[crate::sqlx_test]
 async fn test_explicit_update(pool: sqlx::PgPool) -> CarbideResult<()> {
     let mut config = common::api_fixtures::get_config();
@@ -1650,7 +1783,7 @@ async fn test_explicit_update(pool: sqlx::PgPool) -> CarbideResult<()> {
 
     // Start time in the future
     db::machine::update_firmware_update_time_window_start_end(
-        &[mh.id.into()],
+        &[mh.id],
         chrono::Utc::now()
             .checked_add_signed(chrono::TimeDelta::seconds(100))
             .unwrap(),
@@ -1673,7 +1806,7 @@ async fn test_explicit_update(pool: sqlx::PgPool) -> CarbideResult<()> {
 
     // End time in the past
     db::machine::update_firmware_update_time_window_start_end(
-        &[mh.id.into()],
+        &[mh.id],
         chrono::Utc::now()
             .checked_add_signed(chrono::TimeDelta::seconds(-100))
             .unwrap(),
@@ -1696,7 +1829,7 @@ async fn test_explicit_update(pool: sqlx::PgPool) -> CarbideResult<()> {
 
     // Now a start and end around us
     db::machine::update_firmware_update_time_window_start_end(
-        &[mh.id.into()],
+        &[mh.id],
         chrono::Utc::now()
             .checked_add_signed(chrono::TimeDelta::seconds(-100))
             .unwrap(),
@@ -1850,15 +1983,18 @@ async fn test_manual_firmware_upgrade_workflow(pool: sqlx::PgPool) -> CarbideRes
         .report
         .versions
         .insert(FirmwareComponentType::Bmc, "6.00.30.00".to_string());
-    db::explored_endpoints::try_update(
-        host.status.bmc_info.ip_addr().unwrap(),
-        endpoint.report_version,
-        &endpoint.report,
-        false,
-        &mut txn,
-    )
-    .await
-    .unwrap();
+    assert_eq!(
+        db::explored_endpoints::try_update(
+            host.status.bmc_info.ip_addr().unwrap(),
+            endpoint.report_version,
+            &endpoint.report,
+            false,
+            &mut txn,
+        )
+        .await
+        .unwrap(),
+        db::ConditionalWrite::Applied(())
+    );
     txn.commit().await.unwrap();
 
     // NewFirmwareReportedWait -> CheckingFirmwareRepeat
@@ -1877,7 +2013,7 @@ async fn test_manual_firmware_upgrade_workflow(pool: sqlx::PgPool) -> CarbideRes
     env.run_machine_state_controller_iteration().await;
 
     // reboot makes it move forward from MachineValidating
-    common::api_fixtures::reboot_completed(&env, mh.host().id.into()).await;
+    common::api_fixtures::reboot_completed(&env, mh.host().id).await;
 
     // Validation (MachineValidating) -> HostInit
     env.run_machine_state_controller_iteration().await;
@@ -1897,7 +2033,7 @@ async fn test_manual_firmware_upgrade_workflow(pool: sqlx::PgPool) -> CarbideRes
 /// Helper: set `host` to WaitingForScoutUpgrade with the given deadline and result.
 async fn put_in_waiting_for_scout_upgrade(
     env: &common::api_fixtures::TestEnv,
-    host: &common::api_fixtures::test_machine::TestMachine<HostMachineId>,
+    host: &common::api_fixtures::test_machine::TestMachine<StableHostMachineId>,
     deadline: chrono::DateTime<chrono::Utc>,
     power_drains_needed: Option<u32>,
     result: Option<model::machine::ScoutUpgradeResult>,

@@ -13,6 +13,7 @@ use model::component_manager::{
 use model::rack_type::RackHardwareTopology;
 use model::switch::FabricManagerStatus;
 
+use crate::component_common::{ComponentPowerStateResult, PowerStateSource};
 use crate::error::ComponentManagerError;
 use crate::types::FirmwareUpdateOptions;
 
@@ -76,6 +77,47 @@ pub struct SwitchEndpoint {
     pub nvos_host_name: Option<String>,
 }
 
+/// NVOS endpoint used to install and bind switch certificate material.
+///
+/// # Examples
+///
+/// ```
+/// use std::net::{IpAddr, Ipv4Addr};
+///
+/// use carbide_secrets::credentials::Credentials;
+/// use component_manager::nv_switch_manager::SwitchCertificateEndpoint;
+/// use mac_address::MacAddress;
+///
+/// let endpoint = SwitchCertificateEndpoint {
+///     bmc_mac: MacAddress::new([0x02, 0, 0, 0, 0, 1]),
+///     nvos_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+///     nvos_mac: MacAddress::new([0x02, 0, 0, 0, 0, 2]),
+///     nvos_credentials: Credentials::new("admin", "password"),
+///     nvos_host_name: Some("switch.example.com".to_string()),
+/// };
+/// assert_eq!(
+///     endpoint.nvos_host_name.as_deref(),
+///     Some("switch.example.com")
+/// );
+/// ```
+#[derive(Debug, Clone)]
+pub struct SwitchCertificateEndpoint {
+    /// BMC MAC used only to resolve the switch's persisted RMS identity.
+    pub bmc_mac: MacAddress,
+
+    /// NVOS address used by RMS to install certificate material.
+    pub nvos_ip: IpAddr,
+
+    /// NVOS interface identity included in the RMS node description.
+    pub nvos_mac: MacAddress,
+
+    /// NVOS credentials used by RMS for certificate installation.
+    pub nvos_credentials: Credentials,
+
+    /// Fully qualified NVOS hostname used for TLS SNI when available.
+    pub nvos_host_name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SwitchComponentResult {
     pub bmc_mac: MacAddress,
@@ -97,23 +139,6 @@ pub struct SwitchSlotAndTrayResult {
     pub slot_number: Option<i32>,
     pub tray_index: Option<i32>,
     pub error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SwitchPowerStateResult {
-    pub bmc_mac: MacAddress,
-    pub power_state: Option<String>,
-    pub error: Option<String>,
-}
-
-impl crate::component_common::ComponentPowerStateResult for SwitchPowerStateResult {
-    fn power_state(&self) -> Option<&str> {
-        self.power_state.as_deref()
-    }
-
-    fn error(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,7 +241,8 @@ pub struct SwitchFactoryResetJobStatus {
 /// Implementations receive physical endpoint information (BMC + NVOS IPs/MACs)
 /// and handle registration with the backend service internally. The
 /// service-generated UUID is used for the actual operation and never exposed
-/// to the caller; results are keyed by `bmc_mac`.
+/// to the caller; results are keyed by the BMC MAC (`bmc_mac`, or `mac_address`
+/// for power observations).
 ///
 /// Password rotation is split into capability discovery, submission, and
 /// observation. This keeps backend-specific job handling here while leaving
@@ -224,6 +250,13 @@ pub struct SwitchFactoryResetJobStatus {
 #[async_trait::async_trait]
 pub trait NvSwitchManager: Send + Sync + Debug + 'static {
     fn name(&self) -> &str;
+
+    /// Identifies the source when `get_power_state` supports fresh, passive reads.
+    /// `None` means callers must reject passive reads before fetching credentials
+    /// or invoking a getter without that capability, such as NSM or mock.
+    fn power_state_source(&self) -> Option<PowerStateSource> {
+        None
+    }
 
     /// Reports whether this backend supports OS password rotation.
     ///
@@ -254,6 +287,9 @@ pub trait NvSwitchManager: Send + Sync + Debug + 'static {
         options: &FirmwareUpdateOptions,
     ) -> Result<Vec<SwitchComponentResult>, ComponentManagerError>;
 
+    /// Returns status for firmware jobs known to the backend.
+    ///
+    /// An endpoint may be omitted when the backend does not track a firmware job for it.
     async fn get_firmware_status(
         &self,
         endpoints: &[SwitchEndpoint],
@@ -266,10 +302,13 @@ pub trait NvSwitchManager: Send + Sync + Debug + 'static {
         endpoints: &[SwitchEndpoint],
     ) -> Result<Vec<SwitchSlotAndTrayResult>, ComponentManagerError>;
 
+    /// Reads power observations in endpoint order, identified by each switch's
+    /// BMC MAC. Per-switch absence and errors are represented in each result;
+    /// an error preparing the request can fail the whole call.
     async fn get_power_state(
         &self,
         endpoints: &[SwitchEndpoint],
-    ) -> Result<Vec<SwitchPowerStateResult>, ComponentManagerError>;
+    ) -> Result<Vec<ComponentPowerStateResult>, ComponentManagerError>;
     async fn configure_switch_certificate(
         &self,
         endpoint: &SwitchEndpoint,
@@ -277,6 +316,48 @@ pub trait NvSwitchManager: Send + Sync + Debug + 'static {
         services: Option<&[i32]>,
     ) -> Result<String, ComponentManagerError>;
 
+    /// Submits asynchronous certificate configuration for all `endpoints`.
+    ///
+    /// `endpoints` must be non-empty. A successful submission returns before
+    /// certificate configuration completes and provides a non-empty, opaque
+    /// parent job ID. Callers must pass that ID to
+    /// [`Self::get_configure_switch_certificate_job_status`] until the batch
+    /// reaches a terminal state. A present `domain_name` is passed to the
+    /// backend unchanged; `None` omits the domain. `services` contains backend
+    /// service identifiers, including duplicates, in slice order. `None` and an
+    /// empty slice request no explicit service bindings.
+    ///
+    /// A submission error does not establish that automatic resubmission is
+    /// safe unless it is [`ComponentManagerError::RejectedBeforeDispatch`] or
+    /// [`ComponentManagerError::Unsupported`]. Dispatch failures, failed
+    /// aggregate responses, and responses without a durable job ID return
+    /// [`ComponentManagerError::OperationOutcomeUnknown`]. A failed aggregate
+    /// can include a parent job ID covering only the accepted targets, so its
+    /// diagnostic retains that ID without reporting complete-batch acceptance.
+    /// Callers must not resubmit after an unknown outcome until reconciliation
+    /// establishes that retry is safe. The default implementation returns
+    /// [`ComponentManagerError::Unsupported`].
+    async fn batch_configure_switch_certificate(
+        &self,
+        _endpoints: &[SwitchCertificateEndpoint],
+        _domain_name: Option<&str>,
+        _services: Option<&[i32]>,
+    ) -> Result<String, ComponentManagerError> {
+        Err(ComponentManagerError::Unsupported(
+            "rack-wide switch certificate configuration is not supported by this backend"
+                .to_string(),
+        ))
+    }
+
+    /// Returns the aggregate state of a submitted certificate batch.
+    ///
+    /// [`ConfigureSwitchCertificateState::Started`] and
+    /// [`ConfigureSwitchCertificateState::InProgress`] are non-terminal.
+    /// [`ConfigureSwitchCertificateState::Completed`] and
+    /// [`ConfigureSwitchCertificateState::Failed`] are terminal. Observation
+    /// errors do not establish that resubmitting the certificate batch is safe.
+    /// [`ComponentManagerError::NotFound`] means the submitted job can no longer
+    /// be observed and the current workflow cannot continue.
     async fn get_configure_switch_certificate_job_status(
         &self,
         job_id: &str,

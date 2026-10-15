@@ -97,6 +97,8 @@ impl TestHarness {
             .api
             .create_domain(Request::new(rpc::protos::dns::CreateDomainRequest {
                 name: name.clone(),
+                default_ttl: None,
+                vpc_id: None,
             }))
             .await
             .unwrap()
@@ -143,6 +145,7 @@ impl TestHarness {
             api.runtime_config.rack_profiles.clone(),
             None,
             api.credential_manager().clone(),
+            false,
         );
         TestSiteExplorer::new(site_explorer, endpoint_explorer)
     }

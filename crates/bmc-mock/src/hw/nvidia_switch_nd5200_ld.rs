@@ -19,7 +19,11 @@ use std::borrow::Cow;
 
 use mac_address::MacAddress;
 
-use crate::redfish;
+use crate::{Callbacks, nvue, redfish};
+
+/// The system type NVOS reports for this tray.
+const SWITCH_MODEL: &str = "ND5200_LD";
+const SWITCH_PART_NUMBER: &str = "920-9K36W-00MV-GS0";
 
 pub(crate) struct NvidiaSwitchNd5200Ld<'a> {
     pub(crate) bmc_mac_address_eth0: MacAddress,
@@ -30,6 +34,27 @@ pub(crate) struct NvidiaSwitchNd5200Ld<'a> {
 }
 
 impl NvidiaSwitchNd5200Ld<'_> {
+    pub(crate) fn event_service_config(&self) -> Option<crate::EventServiceConfig> {
+        Some(crate::EventServiceConfig::default())
+    }
+
+    /// The NVOS this tray runs, served over NVUE at the switch's NVOS
+    /// address, whose management interface has `management_mac`, with
+    /// `admin` as its administrator.
+    pub(crate) fn nvue_config(
+        &self,
+        management_mac: Option<MacAddress>,
+        admin: nvue::Account,
+    ) -> nvue::Config {
+        super::nvos::nvl_switch_tray_config(
+            SWITCH_MODEL,
+            SWITCH_PART_NUMBER,
+            &self.switch_serial_number,
+            management_mac,
+            admin,
+        )
+    }
+
     pub(crate) fn manager_config(&self) -> redfish::manager::Config {
         let manager_id = "BMC_0";
         let eth_builder = |eth| {
@@ -62,7 +87,7 @@ impl NvidiaSwitchNd5200Ld<'_> {
         }
     }
 
-    pub(crate) fn system_config(&self) -> redfish::computer_system::Config {
+    pub(crate) fn system_config<C: Callbacks>(&self) -> redfish::computer_system::Config<C> {
         let system_id = "System_0";
 
         redfish::computer_system::Config {
@@ -161,7 +186,7 @@ impl NvidiaSwitchNd5200Ld<'_> {
                 redfish::chassis::SingleChassisConfig {
                     chassis_type: "Component".into(),
                     manufacturer: Some("NVIDIA".into()),
-                    part_number: Some("920-9K36W-00MV-GS0".into()),
+                    part_number: Some(SWITCH_PART_NUMBER.into()),
                     model: Some("N5200_LD".into()),
                     serial_number: Some(self.switch_serial_number.to_string().into()),
                     network_adapters: None,

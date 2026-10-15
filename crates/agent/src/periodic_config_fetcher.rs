@@ -17,32 +17,34 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use ::rpc::forge_tls_client::ForgeClientConfig;
 use ::rpc::{Instance, forge as rpc};
 use arc_swap::ArcSwapOption;
+use carbide_network::ip::{IdentifyAddressFamily, IpAddressFamily};
 use carbide_uuid::infiniband::IBPartitionId;
 use carbide_uuid::instance::InstanceId;
-use carbide_uuid::machine::{MachineId, MachineInterfaceId};
+use carbide_uuid::machine::{DpuMachineId, MachineId, MachineInterfaceId};
 use config_version::ConfigVersion;
 use eyre::Context;
 use forge_dpu_agent_utils::utils::create_forge_client;
+use ipnetwork::IpNetwork;
+use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
 use crate::instrumentation::ConfigFetch;
-use crate::util::{get_periodic_dpu_config, get_sitename};
+use crate::util::{get_periodic_dpu_config, get_sitename, jittered_interval};
 
 struct PeriodicFetcherState {
     config: PeriodicConfigFetcherConfig,
     netconf: ArcSwapOption<rpc::ManagedHostNetworkConfigResponse>,
     instmeta: ArcSwapOption<InstanceMetadata>,
-    is_cancelled: AtomicBool,
+    cancel_token: CancellationToken,
     sitename: Option<String>,
 }
 
-/// Fetches the desired network configuration for a managed host in regular intervals
+/// Fetches the desired network configuration for a managed host with jittered waits.
 pub(super) struct PeriodicConfigFetcher {
     state: Arc<PeriodicFetcherState>,
     join_handle: Option<tokio::task::JoinHandle<()>>,
@@ -116,11 +118,8 @@ impl PeriodicConfigFetcherReader {
 
 impl Drop for PeriodicConfigFetcher {
     fn drop(&mut self) {
-        // Signal the background task and wait for it to shut down
-        // TODO: Might be nicer if it would be interrupted during waiting for 30s
-        self.state
-            .is_cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Interrupt the wait; any fetch already in progress may finish before joining.
+        self.state.cancel_token.cancel();
         if let Some(jh) = self.join_handle.take() {
             tokio::spawn(async move {
                 jh.await.unwrap();
@@ -147,17 +146,24 @@ impl PeriodicConfigFetcher {
             instmeta: ArcSwapOption::default(),
             sitename,
             config,
-            is_cancelled: AtomicBool::new(false),
+            cancel_token: CancellationToken::new(),
         });
 
         // Do an initial synchronous fetch so that caller has data to use
         // This gets a DPU on the network immediately
-        single_fetch(&forge_client_config, state.clone()).await;
+        let next_fetch_delay = single_fetch(&forge_client_config, state.clone(), true).await;
 
         let task_state = state.clone();
         let join_handle = tokio::spawn(async move {
-            while single_fetch(&forge_client_config, task_state.clone()).await {
-                tokio::time::sleep(task_state.config.config_fetch_interval).await;
+            let mut next_fetch_delay = next_fetch_delay;
+            while let Some(delay) = next_fetch_delay {
+                tokio::select! {
+                    biased;
+                    () = task_state.cancel_token.cancelled() => break,
+                    () = tokio::time::sleep(delay) => {}
+                }
+                next_fetch_delay =
+                    single_fetch(&forge_client_config, task_state.clone(), false).await;
             }
         });
 
@@ -184,9 +190,10 @@ impl PeriodicConfigFetcher {
 }
 
 pub(super) struct PeriodicConfigFetcherConfig {
-    /// The interval in which the config is fetched
+    /// Wait between recurring fetches, plus up to 10% jitter. An initial
+    /// fetch failure gets one immediate background retry.
     pub(super) config_fetch_interval: Duration,
-    pub(super) machine_id: MachineId,
+    pub(super) machine_id: DpuMachineId,
     pub(super) forge_api: String,
     pub(super) forge_client_config: Arc<ForgeClientConfig>,
 }
@@ -203,16 +210,15 @@ async fn fetch_sitename(
     get_sitename(&mut client).await
 }
 
+/// Returns the next fetch delay, or `None` when the fetcher was dropped.
 async fn single_fetch(
     forge_client_config: &ForgeClientConfig,
     state: Arc<PeriodicFetcherState>,
-) -> bool {
-    if state
-        .is_cancelled
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    initial_fetch: bool,
+) -> Option<Duration> {
+    if state.cancel_token.is_cancelled() {
         trace!("Periodic fetcher was dropped. Stopping config reading");
-        return false;
+        return None;
     }
 
     trace!(
@@ -226,27 +232,26 @@ async fn single_fetch(
         forge_client_config,
     )
     .await;
-    // The outcome covers the whole fetch: a successful RPC whose instance
-    // metadata fails to convert is still a failed configuration fetch.
-    match result {
+    // A successful RPC whose instance metadata fails to convert is still a
+    // failed fetch, so finish conversion before choosing the retry delay.
+    let result = match result {
         Ok(resp) => {
             state.netconf.store(Some(Arc::new(resp.clone())));
-
-            match instance_metadata_from_instance(resp.instance, state.sitename.clone()) {
-                Ok(Some(config)) => {
-                    state.instmeta.store(Some(Arc::new(config)));
-                    ConfigFetch::Succeeded.emit();
-                }
-                Ok(None) => {
-                    state.instmeta.store(None);
-                    ConfigFetch::Succeeded.emit();
-                }
-                Err(err) => ConfigFetch::Failed {
-                    error: err.to_string(),
-                    retry_interval_seconds: state.config.config_fetch_interval.as_secs_f64(),
-                }
-                .emit(),
-            }
+            instance_metadata_from_instance(resp.instance, state.sitename.clone())
+        }
+        Err(err) => Err(err),
+    };
+    // Startup consumers can need the cached config before a normal interval
+    // passes. Preserve one immediate retry if the initial fetch fails.
+    let next_fetch_delay = if initial_fetch && result.is_err() {
+        Duration::ZERO
+    } else {
+        jittered_interval(state.config.config_fetch_interval, &mut rand::rng())
+    };
+    match result {
+        Ok(config) => {
+            state.instmeta.store(config.map(Arc::new));
+            ConfigFetch::Succeeded.emit();
         }
         Err(err) => match err.downcast_ref::<tonic::Status>() {
             Some(grpc_status) if grpc_status.code() == tonic::Code::NotFound => {
@@ -259,13 +264,13 @@ async fn single_fetch(
             }
             _ => ConfigFetch::Failed {
                 error: format!("{err:?}"),
-                retry_interval_seconds: state.config.config_fetch_interval.as_secs_f64(),
+                retry_interval_seconds: next_fetch_delay.as_secs_f64(),
             }
             .emit(),
         },
     }
 
-    true
+    Some(next_fetch_delay)
 }
 
 /// Make the network request to get network config
@@ -281,7 +286,8 @@ async fn fetch(
     Ok(response)
 }
 
-/// Projects the family-neutral address list into the compatibility fields used by the agent.
+/// Validates the family-neutral address list and copies it into the compatibility fields used by
+/// the agent.
 fn normalize_network_config_addresses(
     response: &mut rpc::ManagedHostNetworkConfigResponse,
 ) -> Result<(), eyre::Report> {
@@ -306,7 +312,8 @@ fn normalize_network_config_addresses(
     Ok(())
 }
 
-/// Preserves a legacy payload, or projects a populated `addresses` list into legacy fields.
+/// Preserves a legacy payload, or validates a populated `addresses` list and copies it into legacy
+/// fields.
 #[allow(deprecated)]
 fn normalize_interface_addresses(
     interface: &mut rpc::FlatInterfaceConfig,
@@ -325,12 +332,10 @@ fn normalize_interface_addresses(
     for address in &interface.addresses {
         let family = rpc::AddressFamily::try_from(address.address_family)
             .wrap_err_with(|| format!("unknown address family value {}", address.address_family))?;
-        let slot = match family {
-            rpc::AddressFamily::V4 => &mut ipv4,
-            rpc::AddressFamily::V6 => &mut ipv6,
-            rpc::AddressFamily::Unspecified => {
-                return Err(eyre::eyre!("address family must be V4 or V6"));
-            }
+        let declared_family = validate_interface_address(address, family)?;
+        let slot = match declared_family {
+            IpAddressFamily::Ipv4 => &mut ipv4,
+            IpAddressFamily::Ipv6 => &mut ipv6,
         };
 
         if slot.replace(address.clone()).is_some() {
@@ -390,6 +395,76 @@ fn normalize_interface_addresses(
         .or(prefixless_legacy_ipv6);
 
     Ok(())
+}
+
+fn validate_interface_address(
+    address: &rpc::InterfaceAddressConfig,
+    family: rpc::AddressFamily,
+) -> Result<IpAddressFamily, eyre::Report> {
+    let declared_family = match family {
+        rpc::AddressFamily::V4 => IpAddressFamily::Ipv4,
+        rpc::AddressFamily::V6 => {
+            if let Some(gateway) = address.gateway.as_deref() {
+                return Err(eyre::eyre!(
+                    "address configuration declared as V6 includes unsupported `gateway` value `{gateway}`"
+                ));
+            }
+            IpAddressFamily::Ipv6
+        }
+        rpc::AddressFamily::Unspecified => {
+            return Err(eyre::eyre!("address family must be V4 or V6"));
+        }
+    };
+
+    for (field, value) in [
+        (
+            "ip",
+            (!address.ip.is_empty()).then_some(address.ip.as_str()),
+        ),
+        (
+            "tenant_vrf_loopback_ip",
+            address.tenant_vrf_loopback_ip.as_deref(),
+        ),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        value
+            .parse::<IpAddr>()
+            .wrap_err_with(|| format!("invalid `{field}` value `{value}`"))?
+            .require_address_family_or_else(declared_family, |_| {
+                eyre::eyre!(
+                    "value `{value}` for `{field}` does not match declared {family:?} family"
+                )
+            })?;
+    }
+
+    for (field, value) in [
+        ("gateway", address.gateway.as_deref()),
+        (
+            "interface_prefix",
+            (!address.interface_prefix.is_empty()).then_some(address.interface_prefix.as_str()),
+        ),
+        (
+            "prefix",
+            (!address.prefix.is_empty()).then_some(address.prefix.as_str()),
+        ),
+        ("svi_ip", address.svi_ip.as_deref()),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        value
+            .parse::<IpNetwork>()
+            .wrap_err_with(|| format!("invalid `{field}` value `{value}`"))?
+            .require_address_family_or_else(declared_family, |_| {
+                eyre::eyre!(
+                    "value `{value}` for `{field}` does not match declared {family:?} family"
+                )
+            })?;
+    }
+
+    Ok(declared_family)
 }
 
 /// Picks the lowest address in each family across physical interfaces because HostInband status
@@ -483,7 +558,7 @@ fn instance_metadata_from_instance(
         instance_name,
         sitename,
         instance_id,
-        machine_id,
+        machine_id: machine_id.map(Into::into),
         user_data,
         ib_devices: devices,
         config_version: instance
@@ -592,7 +667,7 @@ mod tests {
         rpc::InterfaceAddressConfig {
             address_family: rpc::AddressFamily::V6.into(),
             ip: "2001:db8::1".to_string(),
-            interface_prefix: "2001:db8::/127".to_string(),
+            interface_prefix: "2001:db8::1/128".to_string(),
             prefix: "2001:db8::/64".to_string(),
             gateway: None,
             svi_ip: Some("2001:db8::2/64".to_string()),
@@ -631,7 +706,7 @@ mod tests {
             vlan_id: 100,
             ipv6_interface_config: Some(rpc::FlatInterfaceIpv6Config {
                 ip: "2001:db8::1".to_string(),
-                interface_prefix: "2001:db8::/127".to_string(),
+                interface_prefix: "2001:db8::1/128".to_string(),
                 svi_ip: Some("2001:db8::2/64".to_string()),
             }),
             addresses: vec![ipv6_address()],
@@ -647,7 +722,7 @@ mod tests {
         let mut dual_stack = expected_ipv4_interface();
         dual_stack.ipv6_interface_config = Some(rpc::FlatInterfaceIpv6Config {
             ip: "2001:db8::1".to_string(),
-            interface_prefix: "2001:db8::/127".to_string(),
+            interface_prefix: "2001:db8::1/128".to_string(),
             svi_ip: Some("2001:db8::2/64".to_string()),
         });
         dual_stack.addresses = vec![ipv6_address(), ipv4_address()];
@@ -663,7 +738,7 @@ mod tests {
         let mut dual_stack_without_ipv6_svi = expected_ipv4_interface();
         dual_stack_without_ipv6_svi.ipv6_interface_config = Some(rpc::FlatInterfaceIpv6Config {
             ip: "2001:db8::1".to_string(),
-            interface_prefix: "2001:db8::/127".to_string(),
+            interface_prefix: "2001:db8::1/128".to_string(),
             svi_ip: None,
         });
         dual_stack_without_ipv6_svi.addresses = vec![ipv4_address(), ipv6_without_svi.clone()];
@@ -677,6 +752,17 @@ mod tests {
             svi_ip: Some("2001:db8::2/64".to_string()),
         });
         expected_with_prefixless_ipv6.addresses = vec![ipv4_address(), prefixless_ipv6.clone()];
+
+        let mut slaac_ipv6 = ipv6_address();
+        slaac_ipv6.ip.clear();
+        let mut expected_slaac_ipv6 = expected_ipv6_interface();
+        expected_slaac_ipv6
+            .ipv6_interface_config
+            .as_mut()
+            .expect("IPv6 test fixture must include its compatibility fields")
+            .ip
+            .clear();
+        expected_slaac_ipv6.addresses = vec![slaac_ipv6.clone()];
 
         let ipv4_loopback = rpc::InterfaceAddressConfig {
             address_family: rpc::AddressFamily::V4.into(),
@@ -732,6 +818,9 @@ mod tests {
             "prefixless V6 address reconstructs the legacy sidecar" {
                 legacy_interface(vec![ipv4_address(), prefixless_ipv6]) => Yields(expected_with_prefixless_ipv6),
             }
+            "empty SLAAC host address remains empty" {
+                legacy_interface(vec![slaac_ipv6]) => Yields(expected_slaac_ipv6),
+            }
             "IPv4 loopback-only and IPv6 interface entries project by family" {
                 legacy_interface(vec![ipv4_loopback, ipv6_address()]) => Yields(expected_ipv6_with_ipv4_loopback),
             }
@@ -775,6 +864,137 @@ mod tests {
     }
 
     #[test]
+    fn family_neutral_addresses_reject_invalid_values() {
+        struct Case {
+            scenario: &'static str,
+            address: rpc::InterfaceAddressConfig,
+            expected_messages: &'static [&'static str],
+        }
+
+        let mut ipv4_gateway = ipv4_address();
+        ipv4_gateway.gateway = Some("2001:db8::1/64".to_string());
+        let mut ipv6_ip = ipv6_address();
+        ipv6_ip.ip = "192.0.2.10".to_string();
+        let mut ipv4_interface_prefix = ipv4_address();
+        ipv4_interface_prefix.interface_prefix = "2001:db8::10/128".to_string();
+        let mut ipv4_prefix = ipv4_address();
+        ipv4_prefix.prefix = "2001:db8::/64".to_string();
+        let mut ipv4_svi = ipv4_address();
+        ipv4_svi.svi_ip = Some("2001:db8::2/64".to_string());
+        let mut ipv4_loopback = ipv4_address();
+        ipv4_loopback.tenant_vrf_loopback_ip = Some("2001:db8::3".to_string());
+        let mut malformed_ip = ipv4_address();
+        malformed_ip.ip = "not-an-ip".to_string();
+        let mut malformed_prefix = ipv4_address();
+        malformed_prefix.prefix = "not-a-prefix".to_string();
+        let mut empty_ipv4_gateway = ipv4_address();
+        empty_ipv4_gateway.gateway = Some(String::new());
+        let mut empty_svi = ipv4_address();
+        empty_svi.svi_ip = Some(String::new());
+        let mut empty_loopback = ipv4_address();
+        empty_loopback.tenant_vrf_loopback_ip = Some(String::new());
+        let mut ipv6_gateway = ipv6_address();
+        ipv6_gateway.gateway = Some("2001:db8::1/64".to_string());
+        let mut empty_ipv6_gateway = ipv6_address();
+        empty_ipv6_gateway.gateway = Some(String::new());
+
+        let cases = [
+            Case {
+                scenario: "IPv4 gateway with IPv6 value",
+                address: ipv4_gateway,
+                expected_messages: &["`gateway`", "`2001:db8::1/64`", "declared V4 family"],
+            },
+            Case {
+                scenario: "IPv6 host IP with IPv4 value",
+                address: ipv6_ip,
+                expected_messages: &["`ip`", "`192.0.2.10`", "declared V6 family"],
+            },
+            Case {
+                scenario: "IPv4 interface prefix with IPv6 value",
+                address: ipv4_interface_prefix,
+                expected_messages: &[
+                    "`interface_prefix`",
+                    "`2001:db8::10/128`",
+                    "declared V4 family",
+                ],
+            },
+            Case {
+                scenario: "IPv4 network prefix with IPv6 value",
+                address: ipv4_prefix,
+                expected_messages: &["`prefix`", "`2001:db8::/64`", "declared V4 family"],
+            },
+            Case {
+                scenario: "IPv4 SVI with IPv6 value",
+                address: ipv4_svi,
+                expected_messages: &["`svi_ip`", "`2001:db8::2/64`", "declared V4 family"],
+            },
+            Case {
+                scenario: "IPv4 loopback with IPv6 value",
+                address: ipv4_loopback,
+                expected_messages: &[
+                    "`tenant_vrf_loopback_ip`",
+                    "`2001:db8::3`",
+                    "declared V4 family",
+                ],
+            },
+            Case {
+                scenario: "malformed host IP",
+                address: malformed_ip,
+                expected_messages: &["invalid `ip` value `not-an-ip`"],
+            },
+            Case {
+                scenario: "malformed network prefix",
+                address: malformed_prefix,
+                expected_messages: &["invalid `prefix` value `not-a-prefix`"],
+            },
+            Case {
+                scenario: "empty IPv4 gateway",
+                address: empty_ipv4_gateway,
+                expected_messages: &["invalid `gateway` value ``"],
+            },
+            Case {
+                scenario: "empty SVI address",
+                address: empty_svi,
+                expected_messages: &["invalid `svi_ip` value ``"],
+            },
+            Case {
+                scenario: "empty tenant VRF loopback",
+                address: empty_loopback,
+                expected_messages: &["invalid `tenant_vrf_loopback_ip` value ``"],
+            },
+            Case {
+                scenario: "IPv6 gateway",
+                address: ipv6_gateway,
+                expected_messages: &["declared as V6", "`gateway`", "`2001:db8::1/64`"],
+            },
+            Case {
+                scenario: "empty IPv6 gateway",
+                address: empty_ipv6_gateway,
+                expected_messages: &["declared as V6", "unsupported `gateway` value ``"],
+            },
+        ];
+
+        for Case {
+            scenario,
+            address,
+            expected_messages,
+        } in cases
+        {
+            let mut interface = legacy_interface(vec![address]);
+            let error = normalize_interface_addresses(&mut interface)
+                .expect_err("invalid address value must be rejected");
+            let message = format!("{error:#}");
+
+            for expected in expected_messages {
+                assert!(
+                    message.contains(expected),
+                    "{scenario}: expected `{expected}` in `{message}`"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn network_config_normalizes_admin_and_every_tenant_interface() {
         let mut response = rpc::ManagedHostNetworkConfigResponse {
@@ -799,7 +1019,7 @@ mod tests {
             response.tenant_interfaces[1].ipv6_interface_config,
             Some(rpc::FlatInterfaceIpv6Config {
                 ip: "2001:db8::1".to_string(),
-                interface_prefix: "2001:db8::/127".to_string(),
+                interface_prefix: "2001:db8::1/128".to_string(),
                 svi_ip: Some("2001:db8::2/64".to_string()),
             })
         );

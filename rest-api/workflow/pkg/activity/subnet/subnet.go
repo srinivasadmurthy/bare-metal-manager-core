@@ -25,6 +25,7 @@ import (
 
 	cwm "github.com/NVIDIA/infra-controller/rest-api/workflow/internal/metrics"
 	sc "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/client/site"
+	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/util"
 
 	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 
@@ -236,7 +237,7 @@ func (ms ManageSubnet) UpdateSubnetsInDB(ctx context.Context, siteID uuid.UUID, 
 	subnetsToDelete := []*cdbm.Subnet{}
 
 	// If inventory paging is enabled, we only need to do this once and we do it on the last page
-	if subnetInventory.InventoryPage == nil || subnetInventory.InventoryPage.TotalPages == 0 || (subnetInventory.InventoryPage.CurrentPage == subnetInventory.InventoryPage.TotalPages) {
+	if util.ShouldReconcileDeletions(subnetInventory.GetInventoryPage()) {
 		for _, subnet := range existingSubnetIDMap {
 			found := false
 
@@ -286,7 +287,7 @@ func (ms ManageSubnet) UpdateSubnetsInDB(ctx context.Context, siteID uuid.UUID, 
 					slogger.Error().Err(err).Msg("error committing Subnet delete transaction to DB")
 				} else {
 					// Add delete lifecycle event for metrics
-					slogger.Info().Str("Subnet ID", curSubnet.ID.String()).Msg("recording subnet delete lifecycle event")
+					slogger.Info().Msg("recording subnet delete lifecycle event")
 					subnetLifecycleEvents = append(subnetLifecycleEvents, cwm.InventoryObjectLifecycleEvent{ObjectID: curSubnet.ID, Deleted: cwutil.GetPtr(time.Now())})
 				}
 			}
@@ -461,7 +462,8 @@ func (ms ManageSubnet) createOrUpdateSubnetFromSite(
 		}
 
 		// If the Subnet is being undeleted, use its stored IPv4 Block. Otherwise
-		// find the most specific Ready tenant IPv4 Block that contains its Prefix.
+		// find the most specific Ready tenant IPv4 Block created through Allocation
+		// that contains its Prefix.
 		ipBlockDAO := cdbm.NewIPBlockDAO(ms.dbSession)
 		var ipBlock *cdbm.IPBlock
 		if existingSubnet != nil {
@@ -491,11 +493,18 @@ func (ms ManageSubnet) createOrUpdateSubnetFromSite(
 				return nil, nil
 			}
 		} else {
-			ipBlocks, _, ipBlockErr := ipBlockDAO.GetAll(ctx, tx, cdbm.IPBlockFilterInput{
-				SiteIDs:   []uuid.UUID{site.ID},
-				TenantIDs: []uuid.UUID{vpc.TenantID},
-				Statuses:  []string{cdbm.IPBlockStatusReady},
-			}, cdbp.PageInput{Limit: cwutil.GetPtr(cdbp.TotalLimit)}, nil)
+			filter := cdbm.IPBlockFilterInput{
+				SiteIDs:  []uuid.UUID{site.ID},
+				Statuses: []string{cdbm.IPBlockStatusReady},
+			}
+			filter.TenantAllocated(vpc.TenantID)
+			ipBlocks, _, ipBlockErr := ipBlockDAO.GetAll(
+				ctx,
+				tx,
+				filter,
+				cdbp.PageInput{Limit: cwutil.GetPtr(cdbp.TotalLimit)},
+				nil,
+			)
 			if ipBlockErr != nil {
 				return nil, fmt.Errorf("unable to create Subnet found on Site: failed to retrieve IPv4 Blocks, DB error: %w", ipBlockErr)
 			}
@@ -743,7 +752,7 @@ func (mslm ManageSubnetLifecycleMetrics) RecordSubnetStatusTransitionMetrics(ctx
 
 	siteName, err := mslm.siteNames.Get(ctx, mslm.dbSession, siteID)
 	if err != nil {
-		logger.Error().Err(err).Str("Site ID", siteID.String()).Msg("failed to retrieve Site from DB")
+		logger.Error().Err(err).Msg("failed to retrieve Site from DB")
 		return err
 	}
 

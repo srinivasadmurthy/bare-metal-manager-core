@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -157,12 +158,7 @@ func (s *PostgresStore) GetRacksByIDs(
 		return nil, errors.GRPCErrorInternal(err.Error())
 	}
 
-	results := make([]*rack.Rack, 0, len(rackDaos))
-	for _, rackDao := range rackDaos {
-		results = append(results, dao.RackFrom(&rackDao))
-	}
-
-	return results, nil
+	return s.racksFromDAOs(ctx, s.pg.DB, rackDaos)
 }
 
 // GetRacksByIDsIncludingDeleted retrieves multiple racks by UUID, including
@@ -181,11 +177,7 @@ func (s *PostgresStore) GetRacksByIDsIncludingDeleted(
 		return nil, s.checkDBGetError(err, "")
 	}
 
-	results := make([]*rack.Rack, 0, len(rackDaos))
-	for i := range rackDaos {
-		results = append(results, dao.RackFrom(&rackDaos[i]))
-	}
-	return results, nil
+	return s.racksFromDAOs(ctx, s.pg.DB, rackDaos)
 }
 
 // GetRackByExternalID retrieves a rack by its external ID.
@@ -207,7 +199,7 @@ func (s *PostgresStore) GetRackByExternalID(
 		return nil, s.checkDBGetError(err, fmt.Sprintf("rack with external id %s", externalID))
 	}
 
-	return dao.RackFrom(&rackDAO), nil
+	return s.rackFromDAO(ctx, s.pg.DB, &rackDAO)
 }
 
 // GetRackBySerial retrieves a rack by its serial number and manufacturer.
@@ -272,6 +264,7 @@ func (s *PostgresStore) GetRackByIdentifier(
 		&dbquery.Pagination{Limit: 2},
 		nil,
 		withComponents,
+		false,
 	)
 
 	if err != nil {
@@ -282,7 +275,7 @@ func (s *PostgresStore) GetRackByIdentifier(
 	if err != nil {
 		return nil, err
 	}
-	return dao.RackFrom(rackDao), nil
+	return s.rackFromDAO(ctx, s.pg.DB, rackDao)
 }
 
 func uniqueRackByName(racks []model.Rack, name string) (*model.Rack, error) {
@@ -342,20 +335,17 @@ func (s *PostgresStore) GetListOfRacks(
 	pagination *dbquery.Pagination,
 	orderBy *dbquery.OrderBy,
 	withComponents bool,
+	withExternalIDOnly bool,
 ) ([]*rack.Rack, int32, error) {
 	racks, total, err := model.GetListOfRacks(
-		ctx, s.pg.DB, info, manufacturerFilter, modelFilter, pagination, orderBy, withComponents,
+		ctx, s.pg.DB, info, manufacturerFilter, modelFilter, pagination, orderBy, withComponents, withExternalIDOnly,
 	)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	results := make([]*rack.Rack, 0, len(racks))
-	for _, rackDao := range racks {
-		results = append(results, dao.RackFrom(&rackDao))
-	}
-
-	return results, total, nil
+	results, err := s.racksFromDAOs(ctx, s.pg.DB, racks)
+	return results, total, err
 }
 
 // GetListOfComponents lists components matching the given criteria.
@@ -442,6 +432,9 @@ func (s *PostgresStore) GetComponentByBMCMAC(
 	}
 
 	c, err := model.GetComponentByBMCMAC(ctx, s.pg.DB, macAddress)
+	if stderrors.Is(err, model.ErrAmbiguousBMCMAC) {
+		return nil, status.Errorf(codes.FailedPrecondition, "component with BMC MAC %q is ambiguous", macAddress)
+	}
 	if err != nil {
 		return nil, s.checkDBGetError(err, fmt.Sprintf("component with BMC MAC %s", macAddress))
 	}
@@ -468,6 +461,7 @@ func (s *PostgresStore) GetComponentsByExternalIDs(
 		Where("c.external_id IN (?)", bun.In(externalIDs)).
 		Relation("BMCs").
 		Relation("Rack").
+		Relation("Rack.NVLDomain").
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query components by external IDs: %w", err)
@@ -656,9 +650,10 @@ func (s *PostgresStore) GetListOfNVLDomains(
 	ctx context.Context,
 	info dbquery.StringQueryInfo,
 	pagination *dbquery.Pagination,
+	options ...nvldomain.ListOptions,
 ) ([]*nvldomain.NVLDomain, int32, error) {
 	domains, total, err := model.GetListOfNVLDomains(
-		ctx, s.pg.DB, info, pagination,
+		ctx, s.pg.DB, info, pagination, options...,
 	)
 	if err != nil {
 		return nil, 0, err
@@ -672,14 +667,24 @@ func (s *PostgresStore) GetListOfNVLDomains(
 	return results, total, nil
 }
 
+// GetNVLDomain resolves typed internal or external domain identity.
+func (s *PostgresStore) GetNVLDomain(ctx context.Context, id identifier.Identifier) (*nvldomain.NVLDomain, error) {
+	domain, err := s.getNVLDomain(ctx, s.pg.DB, id)
+	if err != nil {
+		return nil, err
+	}
+	return dao.NVLDomainFrom(domain), nil
+}
+
 // GetRacksForNVLDomain retrieves all racks belonging to an NVL domain.
 func (s *PostgresStore) GetRacksForNVLDomain(
 	ctx context.Context,
 	nvlDomainID identifier.Identifier,
+	withComponents bool,
 ) ([]*rack.Rack, error) {
 	if !nvlDomainID.ValidateAtLeastOne() {
 		return nil, errors.GRPCErrorInvalidArgument(
-			"nvl domain id and name both are not specfied",
+			"nvl domain id, external id, or name is required",
 		)
 	}
 
@@ -702,13 +707,14 @@ func (s *PostgresStore) GetRacksForNVLDomain(
 			domainUUID = nvlDomain.ID
 		}
 
-		racks, err := model.GetRacksForNVLDomain(ctx, tx, domainUUID)
+		racks, err := model.GetRacksForNVLDomain(ctx, tx, domainUUID, withComponents)
 		if err != nil {
 			return err
 		}
 
-		for _, rack := range racks {
-			results = append(results, dao.RackFrom(&rack))
+		results, err = s.racksFromDAOs(ctx, tx, racks)
+		if err != nil {
+			return err
 		}
 
 		return nil
@@ -718,6 +724,37 @@ func (s *PostgresStore) GetRacksForNVLDomain(
 		return nil, err
 	}
 
+	return results, nil
+}
+
+// GetRacksForNVLDomains bounds database round trips independently of page size.
+// Unknown or empty domains have no members; the caller owns domain existence.
+func (s *PostgresStore) GetRacksForNVLDomains(ctx context.Context, domainIDs []uuid.UUID, withComponents bool) (map[uuid.UUID][]*rack.Rack, error) {
+	results := make(map[uuid.UUID][]*rack.Rack)
+	if len(domainIDs) == 0 {
+		return results, nil
+	}
+	err := s.runInTx(ctx, func(ctx context.Context, tx bun.Tx) error {
+		var rows []model.Rack
+		query := tx.NewSelect().Model(&rows).Where("nvldomain_id IN (?)", bun.In(domainIDs)).Order("r.id ASC")
+		if withComponents {
+			query = query.Relation("Components").Relation("Components.BMCs")
+		}
+		if err := query.Scan(ctx); err != nil {
+			return err
+		}
+		racks, err := s.racksFromDAOs(ctx, tx, rows)
+		if err != nil {
+			return err
+		}
+		for _, rack := range racks {
+			results[rack.NVLDomainID] = append(results[rack.NVLDomainID], rack)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	return results, nil
 }
 
@@ -757,6 +794,8 @@ func (s *PostgresStore) getNVLDomain(
 
 	if nvlDomainID.ID != uuid.Nil {
 		nvlDomain.ID = nvlDomainID.ID
+	} else if nvlDomainID.ExternalID != "" {
+		nvlDomain.ExternalID = &nvlDomainID.ExternalID
 	} else {
 		nvlDomain.Name = nvlDomainID.Name
 	}
@@ -783,7 +822,68 @@ func (s *PostgresStore) getRack(
 		return nil, err
 	}
 
-	return dao.RackFrom(cur), nil
+	return s.rackFromDAO(ctx, idb, cur)
+}
+
+func (s *PostgresStore) rackFromDAO(
+	ctx context.Context,
+	idb bun.IDB,
+	rackDAO *model.Rack,
+) (*rack.Rack, error) {
+	if rackDAO == nil {
+		return nil, nil
+	}
+
+	racks, err := s.racksFromDAOs(ctx, idb, []model.Rack{*rackDAO})
+	if err != nil {
+		return nil, err
+	}
+	return racks[0], nil
+}
+
+// racksFromDAOs converts racks and derives their operation statuses with one
+// bulk component-status read. The derivation is independent of whether the
+// caller requested component expansion.
+func (s *PostgresStore) racksFromDAOs(
+	ctx context.Context,
+	idb bun.IDB,
+	rackDAOs []model.Rack,
+) ([]*rack.Rack, error) {
+	rackIDs := make([]uuid.UUID, 0, len(rackDAOs))
+	for i := range rackDAOs {
+		rackIDs = append(rackIDs, rackDAOs[i].ID)
+	}
+
+	statuses, err := model.GetRackOperationStatuses(ctx, idb, rackIDs)
+	if err != nil {
+		return nil, errors.GRPCErrorInternal(err.Error())
+	}
+
+	results := make([]*rack.Rack, 0, len(rackDAOs))
+	domainIDs := make([]uuid.UUID, 0, len(rackDAOs))
+	for _, row := range rackDAOs {
+		if row.NVLDomainID != uuid.Nil {
+			domainIDs = append(domainIDs, row.NVLDomainID)
+		}
+	}
+	domainsByID := make(map[uuid.UUID]*model.NVLDomain)
+	if len(domainIDs) > 0 {
+		var domains []model.NVLDomain
+		err = idb.NewSelect().Model(&domains).Where("id IN (?)", bun.In(domainIDs)).Scan(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for i := range domains {
+			domainsByID[domains[i].ID] = &domains[i]
+		}
+	}
+	for i := range rackDAOs {
+		rackDAOs[i].NVLDomain = domainsByID[rackDAOs[i].NVLDomainID]
+		converted := dao.RackFrom(&rackDAOs[i])
+		converted.OperationStatus = statuses[rackDAOs[i].ID]
+		results = append(results, converted)
+	}
+	return results, nil
 }
 
 func (s *PostgresStore) getComponent(
@@ -1168,12 +1268,13 @@ func convertDriftsFromModel(drifts []model.ComponentDrift) []ComponentDrift {
 			})
 		}
 		result = append(result, ComponentDrift{
-			ID:          d.ID,
-			ComponentID: d.ComponentID,
-			ExternalID:  d.ExternalID,
-			DriftType:   string(d.DriftType),
-			Diffs:       fieldDiffs,
-			CheckedAt:   d.CheckedAt,
+			ID:            d.ID,
+			ComponentID:   d.ComponentID,
+			ExternalID:    d.ExternalID,
+			ComponentType: d.ComponentType,
+			DriftType:     string(d.DriftType),
+			Diffs:         fieldDiffs,
+			CheckedAt:     d.CheckedAt,
 		})
 	}
 	return result

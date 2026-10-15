@@ -16,7 +16,9 @@
  */
 
 mod client;
+mod extended_processor;
 mod on_change_processor;
+mod reconciliation;
 mod sample_processor;
 pub(in crate::collectors) mod subscriber;
 

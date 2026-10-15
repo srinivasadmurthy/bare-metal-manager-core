@@ -22,8 +22,7 @@ use std::time::{Duration, Instant};
 use bmc_mock::injection::InjectionStore;
 use bmc_mock::mac_address_pool::MacAddressPool;
 use bmc_mock::{
-    BmcCommand, DpuMachineInfo, DpuSettings, HardwareType, MachineInfo, SetSystemPowerResult,
-    SystemPowerControl,
+    ActionError, DpuMachineInfo, DpuSettings, HardwareType, MachineInfo, ResourceResetType,
 };
 use carbide_uuid::machine::MachineId;
 use eyre::Context;
@@ -33,6 +32,7 @@ use tokio::time::Interval;
 use tracing::instrument;
 use uuid::Uuid;
 
+use crate::bmc_mock_wrapper::BmcCommand;
 use crate::config::{MachineATronContext, PersistedDpuMachine};
 use crate::dhcp_wrapper::{DhcpRelayResult, DhcpResponseInfo, DpuDhcpRelay, DpuDhcpRelayServer};
 use crate::host_machine::HandleMessageResult;
@@ -131,7 +131,9 @@ impl DpuMachine {
             .dpu_firmware_versions
             .clone()
             .unwrap_or_default()
-            .fill_missing_from_desired_firmware(&app_context.desired_firmware_versions);
+            .fill_missing_from_desired_firmware(
+                &app_context.desired_firmware_versions.read().unwrap(),
+            );
 
         let dpu_info = DpuMachineInfo::new(
             hw_type,
@@ -323,8 +325,8 @@ impl DpuMachine {
 
 enum DpuMachineMessage {
     SetSystemPower {
-        request: SystemPowerControl,
-        reply: Option<oneshot::Sender<SetSystemPowerResult>>,
+        request: ResourceResetType,
+        reply: Option<oneshot::Sender<Result<(), ActionError>>>,
     },
     WaitUntilMachineUpWithApiState(String, oneshot::Sender<()>),
     SetPaused(bool),
@@ -364,6 +366,25 @@ impl DpuMachineHandle {
 
     pub fn machine_ip(&self) -> Option<Ipv4Addr> {
         self.0.live_state.read().unwrap().machine_ip
+    }
+
+    pub(super) fn tenant_network_config(
+        &self,
+    ) -> Option<crate::tenant_network::TenantNetworkConfig> {
+        self.0
+            .live_state
+            .read()
+            .unwrap()
+            .tenant_network_config
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_control_test_tenant_network(
+        &self,
+        config: Option<crate::tenant_network::TenantNetworkConfig>,
+    ) {
+        self.0.live_state.write().unwrap().tenant_network_config = config;
     }
 
     pub fn observed_machine_id(&self) -> Option<MachineId> {
@@ -406,7 +427,7 @@ impl DpuMachineHandle {
         }))
     }
 
-    pub fn set_system_power(&self, request: SystemPowerControl) -> eyre::Result<()> {
+    pub fn set_system_power(&self, request: ResourceResetType) -> eyre::Result<()> {
         Ok(self.0.message_tx.send(DpuMachineMessage::SetSystemPower {
             request,
             reply: None,
@@ -465,7 +486,7 @@ impl DpuMachineHandle {
             hardware_type: None,
             mat_state: live_state.state_string.map(ToOwned::to_owned),
             api_state: live_state.api_state.clone(),
-            power_state: live_state.power_state.to_string(),
+            power_state: live_state.power_state,
             machine_ip: live_state.machine_ip.map(|ip| ip.to_string()),
             nvos_ip: None,
             infiniband_ports: None,
@@ -492,6 +513,10 @@ impl DpuMachineHandle {
     }
 
     pub fn persisted(&self) -> PersistedDpuMachine {
+        let live_state = self.0.live_state.read().unwrap();
+        let installed_os = live_state.installed_os;
+        let bmc_state = live_state.bmc_persistence.persisted();
+        drop(live_state);
         PersistedDpuMachine {
             mat_id: self.0.mat_id,
             hw_type: self.0.dpu_info.hw_type,
@@ -500,8 +525,9 @@ impl DpuMachineHandle {
             oob_mac_address: self.0.dpu_info.oob_mac_address,
             serial: self.0.dpu_info.serial.clone(),
             settings: self.0.dpu_info.settings.clone(),
-            installed_os: self.0.live_state.read().unwrap().installed_os,
+            installed_os,
             dpu_index: self.0.dpu_index,
+            bmc_state,
         }
     }
 

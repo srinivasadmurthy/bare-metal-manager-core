@@ -40,6 +40,10 @@ pub(crate) struct LenovoGB300Nvl<'a> {
 }
 
 impl LenovoGB300Nvl<'_> {
+    pub(crate) fn event_service_config(&self) -> Option<crate::EventServiceConfig> {
+        Some(crate::EventServiceConfig::default())
+    }
+
     pub(crate) fn manager_config(&self) -> redfish::manager::Config {
         let bmc_manager_id = "BMC_0";
         let bmc_eth_builder = |eth| {
@@ -99,10 +103,10 @@ impl LenovoGB300Nvl<'_> {
         }
     }
 
-    pub(crate) fn system_config(
+    pub(crate) fn system_config<C: Callbacks>(
         &self,
-        callbacks: Arc<dyn Callbacks>,
-    ) -> redfish::computer_system::Config {
+        callbacks: Arc<C>,
+    ) -> redfish::computer_system::Config<C> {
         let system_id = "System_0";
         // TODO: It is PXE but apparently if enable HTTP in bios HTTP
         // (Uefi) boot options will show up here...
@@ -292,6 +296,7 @@ impl LenovoGB300Nvl<'_> {
                     .build()
                 })
                 .collect(),
+            advertise_legacy_http_push_uri: true,
             host_bmc_inventory_id: Some("BMC".to_string()),
             host_uefi_inventory_id: None,
             ..Default::default()
