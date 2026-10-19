@@ -1799,6 +1799,12 @@ async fn create_test_env_with_overrides_inner(
         SiteExplorerConfig {
             enabled: Arc::new(true.into()),
             retained_boot_interface_window: None,
+            admin_fnn_enabled: api
+                .runtime_config
+                .fnn
+                .as_ref()
+                .and_then(|fnn| fnn.admin_vpc.as_ref())
+                .is_some_and(|admin| admin.enabled),
             // run_interval shouldn't matter, this should not be run(), we only trigger intervals manually.
             run_interval: Duration::seconds(0).to_std().unwrap(),
             concurrent_explorations: 100,
