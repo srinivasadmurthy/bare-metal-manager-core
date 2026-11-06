@@ -12,7 +12,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/infra-controller/rest-api/api/pkg/api/handler/util/common"
 	"github.com/NVIDIA/infra-controller/rest-api/api/pkg/api/model"
@@ -20,6 +22,7 @@ import (
 	sc "github.com/NVIDIA/infra-controller/rest-api/api/pkg/client/site"
 	authz "github.com/NVIDIA/infra-controller/rest-api/auth/pkg/authorization"
 	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
+	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/ipam"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
@@ -29,11 +32,29 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"github.com/uptrace/bun"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"go.temporal.io/api/enums/v1"
 	tmocks "go.temporal.io/sdk/mocks"
 	tp "go.temporal.io/sdk/temporal"
 )
+
+type operatingSystemDeleteLockHook struct {
+	once      sync.Once
+	lockQuery string
+	attempted chan<- struct{}
+}
+
+func (h *operatingSystemDeleteLockHook) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
+	if strings.Contains(event.Query, h.lockQuery) {
+		h.once.Do(func() {
+			close(h.attempted)
+		})
+	}
+	return ctx
+}
+
+func (*operatingSystemDeleteLockHook) AfterQuery(context.Context, *bun.QueryEvent) {}
 
 func TestOperatingSystemHandler_Create(t *testing.T) {
 	ctx := context.Background()
@@ -507,7 +528,6 @@ func TestOperatingSystemHandler_GetAll(t *testing.T) {
 	common.TestBuildAllocation(t, dbSession, site2, tenant4, "test-allocation-4", tnu)
 
 	imageoss := []cdbm.OperatingSystem{}
-	imageossa := []cdbm.OperatingSystemSiteAssociation{}
 	ipxeoss := []cdbm.OperatingSystem{}
 	totalCount2 := 18
 
@@ -538,13 +558,12 @@ func TestOperatingSystemHandler_GetAll(t *testing.T) {
 			)
 			assert.Nil(t, err)
 
-			ossa := common.TestBuildOperatingSystemSiteAssociation(t, dbSession, os.ID, site2.ID, cutil.GetPtr("test"), cdbm.OperatingSystemSiteAssociationStatusSyncing, tnu)
+			common.TestBuildOperatingSystemSiteAssociation(t, dbSession, os.ID, site2.ID, cutil.GetPtr("test"), cdbm.OperatingSystemSiteAssociationStatusSyncing, tnu)
 			common.TestBuildStatusDetail(t, dbSession, os.ID.String(), cdbm.OperatingSystemStatusSyncing, cutil.GetPtr("received Operating System creation request, syncing"))
 			common.TestBuildStatusDetail(t, dbSession, os.ID.String(), cdbm.OperatingSystemStatusReady, cutil.GetPtr("Operating System is now ready for use"))
 
 			assert.Nil(t, err)
 			imageoss = append(imageoss, *os)
-			imageossa = append(imageossa, *ossa)
 
 		} else {
 			os, err := osDAO.Create(
@@ -960,7 +979,7 @@ func TestOperatingSystemHandler_GetByID(t *testing.T) {
 	assert.NotNil(t, os3)
 
 	ossaDAO := cdbm.NewOperatingSystemSiteAssociationDAO(dbSession)
-	ossaDAO.Create(
+	_, err = ossaDAO.Create(
 		ctx,
 		nil,
 		cdbm.OperatingSystemSiteAssociationCreateInput{
@@ -970,6 +989,7 @@ func TestOperatingSystemHandler_GetByID(t *testing.T) {
 			CreatedBy:         user.ID,
 		},
 	)
+	require.NoError(t, err)
 
 	// OTEL Spanner configuration
 	ctx = common.TestCommonTraceProviderSetup(t, ctx)
@@ -1286,7 +1306,7 @@ func TestOperatingSystemHandler_Update(t *testing.T) {
 	assert.NotNil(t, os5)
 
 	ossaDAO := cdbm.NewOperatingSystemSiteAssociationDAO(dbSession)
-	ossaDAO.Create(
+	_, err = ossaDAO.Create(
 		ctx,
 		nil,
 		cdbm.OperatingSystemSiteAssociationCreateInput{
@@ -1296,6 +1316,7 @@ func TestOperatingSystemHandler_Update(t *testing.T) {
 			CreatedBy:         user.ID,
 		},
 	)
+	require.NoError(t, err)
 
 	os6, err := osDAO.Create(
 		ctx,
@@ -1381,7 +1402,7 @@ func TestOperatingSystemHandler_Update(t *testing.T) {
 	assert.Nil(t, err)
 	assert.NotNil(t, os9)
 
-	ossaDAO.Create(
+	_, err = ossaDAO.Create(
 		ctx,
 		nil,
 		cdbm.OperatingSystemSiteAssociationCreateInput{
@@ -1391,6 +1412,7 @@ func TestOperatingSystemHandler_Update(t *testing.T) {
 			CreatedBy:         user.ID,
 		},
 	)
+	require.NoError(t, err)
 
 	// OS to be deactivated (1)
 	os10, err := osDAO.Create(
@@ -2053,7 +2075,7 @@ func TestOperatingSystemHandler_Delete(t *testing.T) {
 
 	// Add Operating System Site Association
 	ossaDAO := cdbm.NewOperatingSystemSiteAssociationDAO(dbSession)
-	ossaDAO.Create(
+	_, err = ossaDAO.Create(
 		ctx,
 		nil,
 		cdbm.OperatingSystemSiteAssociationCreateInput{
@@ -2064,6 +2086,7 @@ func TestOperatingSystemHandler_Delete(t *testing.T) {
 			CreatedBy:         tnu.ID,
 		},
 	)
+	require.NoError(t, err)
 
 	os6, err := osDAO.Create(
 		ctx,
@@ -2086,7 +2109,7 @@ func TestOperatingSystemHandler_Delete(t *testing.T) {
 	assert.NotNil(t, os6)
 
 	// Add Operating System Site Association
-	ossaDAO.Create(
+	_, err = ossaDAO.Create(
 		ctx,
 		nil,
 		cdbm.OperatingSystemSiteAssociationCreateInput{
@@ -2097,6 +2120,23 @@ func TestOperatingSystemHandler_Delete(t *testing.T) {
 			CreatedBy:         tnu.ID,
 		},
 	)
+	require.NoError(t, err)
+
+	raceOS, err := osDAO.Create(ctx, nil, cdbm.OperatingSystemCreateInput{
+		Name:               "delete-recovery-race",
+		Description:        cutil.GetPtr("Operating System recovered while delete waits for its lock"),
+		Org:                tnOrg1,
+		TenantID:           &tenant1.ID,
+		OsType:             cdbm.OperatingSystemTypeImage,
+		ImageURL:           cutil.GetPtr("https://example.invalid/delete-recovery-race.img"),
+		AllowOverride:      false,
+		EnableBlockStorage: true,
+		PhoneHomeEnabled:   false,
+		Status:             cdbm.OperatingSystemStatusReady,
+		CreatedBy:          tnu.ID,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, raceOS)
 
 	// OTEL Spanner configuration
 	ctx = common.TestCommonTraceProviderSetup(t, ctx)
@@ -2164,6 +2204,7 @@ func TestOperatingSystemHandler_Delete(t *testing.T) {
 
 	tscWithNICoNotFound.Mock.On("TerminateWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
+	var raceAssociationID uuid.UUID
 	tests := []struct {
 		name               string
 		reqOrgName         string
@@ -2174,6 +2215,8 @@ func TestOperatingSystemHandler_Delete(t *testing.T) {
 		verifyChildSpanner bool
 		tClient            *tmocks.Client
 		clientPool         *sc.ClientPool
+		runHandler         func(*testing.T, DeleteOperatingSystemHandler, echo.Context) error
+		check              func(*testing.T)
 	}{
 		{
 			name:           "error when user not found in request context",
@@ -2241,6 +2284,61 @@ func TestOperatingSystemHandler_Delete(t *testing.T) {
 			tClient:            tsc,
 		},
 		{
+			name:           "re-reads a Site association recovered while waiting for the OS lock",
+			reqOrgName:     tnOrg1,
+			user:           tnu,
+			osID:           raceOS.ID.String(),
+			expectedStatus: http.StatusAccepted,
+			clientPool:     scp,
+			tClient:        tsc,
+			runHandler: func(t *testing.T, handler DeleteOperatingSystemHandler, echoContext echo.Context) error {
+				lockTx, err := cdb.BeginTx(ctx, dbSession, nil)
+				require.NoError(t, err)
+				defer func() { _ = lockTx.Rollback() }()
+				require.NoError(t, lockTx.TryAcquireAdvisoryLock(ctx, cdb.GetAdvisoryLockIDFromString(raceOS.ID.String()), nil))
+
+				lockAttempted := make(chan struct{})
+				dbSession.DB.AddQueryHook(&operatingSystemDeleteLockHook{
+					lockQuery: fmt.Sprintf("pg_try_advisory_xact_lock(%d)", cdb.GetAdvisoryLockIDFromString(raceOS.ID.String())),
+					attempted: lockAttempted,
+				})
+				handlerResult := make(chan error, 1)
+				go func() {
+					handlerResult <- handler.Handle(echoContext)
+				}()
+
+				select {
+				case <-lockAttempted:
+				case <-time.After(5 * time.Second):
+					require.FailNow(t, "delete handler did not attempt to acquire the Operating System lock")
+				}
+
+				association, createErr := ossaDAO.Create(ctx, nil, cdbm.OperatingSystemSiteAssociationCreateInput{
+					OperatingSystemID: raceOS.ID,
+					SiteID:            site.ID,
+					Version:           cutil.GetPtr("recovered-version"),
+					Status:            cdbm.OperatingSystemSiteAssociationStatusSynced,
+					CreatedBy:         tnu.ID,
+				})
+				require.NoError(t, createErr)
+				raceAssociationID = association.ID
+				require.NoError(t, lockTx.Commit())
+
+				select {
+				case handleErr := <-handlerResult:
+					return handleErr
+				case <-time.After(5 * time.Second):
+					require.FailNow(t, "delete handler did not complete after the Operating System lock was released")
+					return nil
+				}
+			},
+			check: func(t *testing.T) {
+				association, err := ossaDAO.GetByID(ctx, nil, raceAssociationID, nil)
+				require.NoError(t, err)
+				assert.Equal(t, cdbm.OperatingSystemSiteAssociationStatusDeleting, association.Status)
+			},
+		},
+		{
 			name:               "workflow timeout failure",
 			reqOrgName:         tnOrg3,
 			user:               tnu,
@@ -2301,7 +2399,12 @@ func TestOperatingSystemHandler_Delete(t *testing.T) {
 				scp:       clientPool,
 				cfg:       cfg,
 			}
-			err := tah.Handle(ec)
+			var err error
+			if tc.runHandler != nil {
+				err = tc.runHandler(t, tah, ec)
+			} else {
+				err = tah.Handle(ec)
+			}
 			assert.Nil(t, err)
 
 			assert.Equal(t, tc.expectedStatus, rec.Code)
@@ -2325,6 +2428,9 @@ func TestOperatingSystemHandler_Delete(t *testing.T) {
 			if tc.verifyChildSpanner {
 				span := oteltrace.SpanFromContext(ec.Request().Context())
 				assert.True(t, span.SpanContext().IsValid())
+			}
+			if tc.check != nil {
+				tc.check(t)
 			}
 		})
 	}

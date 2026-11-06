@@ -25,7 +25,8 @@ use clap::{Args, Subcommand};
 use eyre::WrapErr;
 use libmlx::firmware::config::FirmwareSpec;
 use libmlx::firmware::preflight::{
-    FirmwareComparison, LocalFirmwareFiles, inspect_prepared_firmware, validate_preflight_request,
+    FirmwareComparison, FirmwarePreflightResult, LocalFirmwareFiles, inspect_prepared_firmware,
+    validate_preflight_request,
 };
 use reqwest::Url;
 use tokio::signal::unix::{SignalKind, signal};
@@ -41,7 +42,24 @@ const ARTIFACT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) enum FirmwareAction {
     #[command(
         about = "Verify firmware files and compare a live NIC with an exact target",
-        long_about = "Verify the image and optional device-config SHA-256 digests, then inspect the selected live NIC's part number, PSID, and firmware version. Requires --mode standalone. The query must report the same PCI address; MST aliases are not resolved.\n\nAn exact version match and a change needed both exit successfully; unavailable or incompatible device facts and download/checksum failures return an error. A newer installed version still means a change is needed. This does not interpret image or device-config contents, approve flashing, or change hardware.\n\nEach present input is staged and checked before the device query. Temporary files are removed on completion or catchable SIGINT/SIGTERM cancellation, not guaranteed after SIGKILL or power loss. Each artifact has a 600-second download/retry deadline (hashing follows it); the subsequent read-only device query has a 30-second deadline."
+        long_about = "Verify the image and optional device-config SHA-256 digests, then inspect \
+            the selected live NIC's part number, PSID, and firmware version. Requires --mode \
+            standalone. The query must report the same PCI address; MST aliases are not \
+            resolved.\n\n\
+            An exact version match and a change needed both exit successfully; unavailable or \
+            incompatible device facts and download/checksum failures return an error. A newer \
+            installed version still means a change is needed. This does not interpret image or \
+            device-config contents, approve flashing, or change hardware.\n\n\
+            Each present input is staged and checked before the device query. Temporary files \
+            are removed on completion or catchable SIGINT/SIGTERM cancellation, not guaranteed \
+            after SIGKILL or power loss. Each artifact has a 600-second download/retry deadline \
+            (hashing follows it). The subsequent read-only device query requires Linux and \
+            mlx-firmware-supervisor beside forge-scout. Its 30-second deadline includes the \
+            tool, all descendants, and output collection. Each output stream is capped at \
+            1 MiB. Query failure or timeout allows up to five seconds for cleanup and five \
+            more seconds to receive the result. Cancellation requests cleanup independently \
+            without waiting for confirmation. Terminating the helper, including the whole \
+            service control group, prevents its cleanup."
     )]
     Preflight(PreflightArgs),
 }
@@ -116,32 +134,43 @@ impl PreflightArgs {
         };
         validate_preflight_request(&self.device, &desired)?;
         let report = self
-            .inspect_with(async |files| {
+            .inspect_with(FirmwareStaging::new, async |files| {
                 Ok(inspect_prepared_firmware(&self.device, &desired, files).await?)
             })
             .await?;
 
+        print!("{}", self.format_report(&report));
+        Ok(())
+    }
+
+    fn format_report(&self, report: &FirmwarePreflightResult) -> String {
         let comparison = match report.comparison {
             FirmwareComparison::ExactMatch => "exact match",
             FirmwareComparison::ChangeRequired => "change needed",
         };
-        println!("Firmware comparison: {comparison}");
-        println!("Device: {}", report.device.pci_name);
-        if let Some(version) = report.device.fw_version_current {
-            println!("Installed firmware: {version}");
+        let mut output = format!(
+            "Firmware comparison: {comparison}\nDevice: {}\n",
+            report.device.pci_name
+        );
+        if let Some(version) = &report.device.fw_version_current {
+            output.push_str(&format!("Installed firmware: {version}\n"));
         }
-        println!("Target firmware: {}", self.version);
-        println!("Image SHA-256: verified (contents not interpreted)");
+        output.push_str(&format!("Target firmware: {}\n", self.version));
+        output.push_str("Image SHA-256: verified (contents not interpreted)\n");
         if self.device_config_url.is_some() {
-            println!("Device-config SHA-256: verified (contents not interpreted)");
+            output.push_str("Device-config SHA-256: verified (contents not interpreted)\n");
         }
-        println!("Read-only inspection; no hardware changes or flash approval.");
-        Ok(())
+        output.push_str("Read-only inspection; no hardware changes or flash approval.\n");
+        output
     }
 
     /// `inspect_with` keeps each present checked input alive through the
     /// inspector's await. A failed config download must not inspect a partial set.
-    async fn inspect_with<F, T>(&self, inspect: F) -> eyre::Result<T>
+    async fn inspect_with<F, T>(
+        &self,
+        new_staging: impl FnOnce() -> Result<FirmwareStaging, Box<dyn std::error::Error + Send + Sync>>,
+        inspect: F,
+    ) -> eyre::Result<T>
     where
         F: for<'files> AsyncFnOnce(LocalFirmwareFiles<'files>) -> eyre::Result<T>,
     {
@@ -155,7 +184,7 @@ impl PreflightArgs {
             }))
             .build()
             .wrap_err("failed to create artifact HTTP client")?;
-        let mut staging = FirmwareStaging::new().map_err(|error| eyre::eyre!(error))?;
+        let mut staging = new_staging().map_err(|error| eyre::eyre!(error))?;
         let image = staging
             .stage(
                 &client,
@@ -242,6 +271,7 @@ mod tests {
 
     use axum::Router;
     use axum::routing::get;
+    use carbide_instrument::testing::MetricsCapture;
     use carbide_test_support::{Check, check_values};
     use clap::Parser;
     use sha2::{Digest, Sha256};
@@ -269,6 +299,67 @@ mod tests {
         "test-psid",
         "--version",
     ];
+
+    #[test]
+    fn report_formats_comparison_and_checked_artifacts() {
+        check_values(
+            [
+                Check {
+                    scenario: "change needed without config",
+                    input: (FirmwareComparison::ChangeRequired, "32.42.1000", None),
+                    expect: concat!(
+                        "Firmware comparison: change needed\n",
+                        "Device: 03:00.0\n",
+                        "Installed firmware: 32.42.1000\n",
+                        "Target firmware: 32.43.1014\n",
+                        "Image SHA-256: verified (contents not interpreted)\n",
+                        "Read-only inspection; no hardware changes or flash approval.\n",
+                    )
+                    .to_string(),
+                },
+                Check {
+                    scenario: "exact match with config",
+                    input: (
+                        FirmwareComparison::ExactMatch,
+                        "32.43.1014",
+                        Some("https://example.test/config.bin"),
+                    ),
+                    expect: concat!(
+                        "Firmware comparison: exact match\n",
+                        "Device: 03:00.0\n",
+                        "Installed firmware: 32.43.1014\n",
+                        "Target firmware: 32.43.1014\n",
+                        "Image SHA-256: verified (contents not interpreted)\n",
+                        "Device-config SHA-256: verified (contents not interpreted)\n",
+                        "Read-only inspection; no hardware changes or flash approval.\n",
+                    )
+                    .to_string(),
+                },
+            ],
+            |(comparison, installed_version, device_config_url)| {
+                let args = PreflightArgs {
+                    device: "03:00.0".to_string(),
+                    part_number: "test-part".to_string(),
+                    psid: "test-psid".to_string(),
+                    version: "32.43.1014".to_string(),
+                    image_url: "https://example.test/image.bin".to_string(),
+                    image_sha256: DIGEST.to_string(),
+                    device_config_url: device_config_url.map(str::to_string),
+                    device_config_sha256: device_config_url.map(|_| DIGEST.to_string()),
+                };
+                let report = FirmwarePreflightResult {
+                    device: serde_json::from_value(serde_json::json!({
+                        "pci_name": "03:00.0",
+                        "device_type": "BlueField3",
+                        "fw_version_current": installed_version,
+                    }))
+                    .expect("device report fixture"),
+                    comparison,
+                };
+                args.format_report(&report)
+            },
+        );
+    }
 
     /// CLI parsing and URL admission require digests and an all-or-nothing
     /// device-config pair before creating a staging directory or HTTP client.
@@ -437,14 +528,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn preflight_rejects_invalid_urls_before_creating_staging() {
+        let args = PreflightArgs {
+            device: "03:00.0".to_string(),
+            part_number: "test-part".to_string(),
+            psid: "test-psid".to_string(),
+            version: "1.2.3".to_string(),
+            image_url: "https://user:secret-marker@example.test/image.bin".to_string(),
+            image_sha256: DIGEST.to_string(),
+            device_config_url: None,
+            device_config_sha256: None,
+        };
+        let staging_calls = Cell::new(0);
+        let error = args
+            .inspect_with(
+                || {
+                    staging_calls.set(staging_calls.get() + 1);
+                    Err(std::io::Error::other("staging unavailable").into())
+                },
+                async |_| Ok(()),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(staging_calls.get(), 0);
+        assert_eq!(
+            error.to_string(),
+            "invalid --image-url: artifact URL must not include authentication, query, or fragment"
+        );
+        assert!(!format!("{error:#}").contains("secret-marker"));
+    }
+
     /// Exercise the real staging consumer: either bad digest prevents all live
     /// inspection, while success passes local bytes without a second fetch.
     #[tokio::test]
-    async fn inspect_waits_for_both_checked_files() {
+    async fn inspect_waits_for_checked_files() {
         struct Case {
             scenario: &'static str,
             image_matches: bool,
-            config_matches: bool,
+            config_matches: Option<bool>,
             expected_requests: usize,
             expected_inspections: usize,
         }
@@ -453,7 +576,7 @@ mod tests {
             Case {
                 scenario: "bad image",
                 image_matches: false,
-                config_matches: true,
+                config_matches: Some(true),
                 expected_requests: 1,
                 expected_inspections: 0,
             },
@@ -461,7 +584,7 @@ mod tests {
             Case {
                 scenario: "bad config",
                 image_matches: true,
-                config_matches: false,
+                config_matches: Some(false),
                 expected_requests: 2,
                 expected_inspections: 0,
             },
@@ -469,8 +592,16 @@ mod tests {
             Case {
                 scenario: "both checked",
                 image_matches: true,
-                config_matches: true,
+                config_matches: Some(true),
                 expected_requests: 2,
+                expected_inspections: 1,
+            },
+            // An omitted config must reach inspection with only the image.
+            Case {
+                scenario: "image only",
+                image_matches: true,
+                config_matches: None,
+                expected_requests: 1,
                 expected_inspections: 1,
             },
         ];
@@ -518,30 +649,37 @@ mod tests {
                 } else {
                     "different bytes"
                 })),
-                device_config_url: Some(format!("http://{address}/config/input.bin")),
-                device_config_sha256: Some(hex::encode(Sha256::digest(if case.config_matches {
-                    "device config bytes"
-                } else {
-                    "different bytes"
-                }))),
+                device_config_url: case
+                    .config_matches
+                    .map(|_| format!("http://{address}/config/input.bin")),
+                device_config_sha256: case.config_matches.map(|matches| {
+                    hex::encode(Sha256::digest(if matches {
+                        "device config bytes"
+                    } else {
+                        "different bytes"
+                    }))
+                }),
             };
             let inspections = Cell::new(0);
             let result: eyre::Result<Vec<PathBuf>> = args
-                .inspect_with(async |files| {
+                .inspect_with(FirmwareStaging::new, async |files| {
                     inspections.set(inspections.get() + 1);
-                    let config = files
-                        .device_config
-                        .expect("the requested config must be staged");
                     assert_eq!(
                         tokio::fs::read(files.image).await.unwrap(),
                         b"firmware image bytes"
                     );
-                    assert_eq!(
-                        tokio::fs::read(config).await.unwrap(),
-                        b"device config bytes"
-                    );
-                    assert_ne!(files.image, config);
-                    Ok(vec![files.image.to_path_buf(), config.to_path_buf()])
+                    assert_eq!(files.device_config.is_some(), case.config_matches.is_some());
+                    if let Some(config) = files.device_config {
+                        assert_eq!(
+                            tokio::fs::read(config).await.unwrap(),
+                            b"device config bytes"
+                        );
+                        assert_ne!(files.image, config);
+                    }
+                    Ok(std::iter::once(files.image)
+                        .chain(files.device_config)
+                        .map(PathBuf::from)
+                        .collect())
                 })
                 .await;
 
@@ -559,17 +697,23 @@ mod tests {
                 "{}",
                 case.scenario
             );
-            match result {
-                Ok(paths) => {
-                    assert_eq!(case.expected_inspections, 1, "{}", case.scenario);
-                    // Temporary inputs must outlive inspection, not the command.
-                    assert!(paths.iter().all(|path| !path.exists()), "{}", case.scenario);
-                }
-                Err(error) => assert!(
+            if case.expected_inspections == 1 {
+                let paths = result.expect(case.scenario);
+                assert_eq!(
+                    paths.len(),
+                    1 + usize::from(case.config_matches.is_some()),
+                    "{}",
+                    case.scenario
+                );
+                // Temporary inputs must outlive inspection, not the command.
+                assert!(paths.iter().all(|path| !path.exists()), "{}", case.scenario);
+            } else {
+                let error = result.expect_err(case.scenario);
+                assert!(
                     error.to_string().contains("checksum mismatch"),
                     "{}: {error:#}",
                     case.scenario
-                ),
+                );
             }
         }
     }
@@ -598,6 +742,9 @@ mod tests {
                 expected_error: "unexpected HTTP status 302",
             },
         ];
+        // Exhausted artifact retries emit `give_up`, which another test counts
+        // exactly. Hold the shared capture lock until both cases finish.
+        let _metrics = MetricsCapture::start();
         for case in cases {
             let image_requests = Arc::new(AtomicUsize::new(0));
             let redirected_requests = Arc::new(AtomicUsize::new(0));
@@ -653,14 +800,25 @@ mod tests {
                 device_config_sha256: None,
             };
             let inspections = Cell::new(0);
-            let result = args
-                .inspect_with(async |_| {
-                    inspections.set(inspections.get() + 1);
-                    Ok(())
-                })
-                .await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                args.inspect_with(
+                    || {
+                        FirmwareStaging::new()
+                            .map(|staging| staging.with_retry_backoff(Duration::from_millis(10)))
+                    },
+                    async |_| {
+                        inspections.set(inspections.get() + 1);
+                        Ok(())
+                    },
+                ),
+            )
+            .await;
             stop.cancel();
-            server.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(30), server)
+                .await
+                .expect("redirect server did not stop")
+                .unwrap();
 
             // The retained staging retry policy retries only the original URL.
             assert_eq!(
@@ -676,7 +834,9 @@ mod tests {
                 case.scenario
             );
             assert_eq!(inspections.get(), 0, "{}", case.scenario);
-            let error = result.unwrap_err();
+            let error = result
+                .expect("redirect inspection did not finish")
+                .unwrap_err();
             assert!(
                 format!("{error:#}").contains(case.expected_error),
                 "{}: {error:#}",

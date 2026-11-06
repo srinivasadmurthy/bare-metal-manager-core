@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"gopkg.in/fsnotify.v1"
 )
 
 const (
@@ -33,7 +35,24 @@ const (
 	DefaultStatusPort = "8080"
 	// ParamName in URI
 	ParamName = "name"
+	// KubernetesSecretDataSymlink is the symlink Kubernetes projects Secret keys through.
+	// Kubelet replaces it atomically on every Secret update.
+	KubernetesSecretDataSymlink = "..data"
 )
+
+// IsProjectedSecretUpdate reports whether event changes a tracked file or swaps in a new
+// Kubernetes Secret data directory under dir. Removing a tracked file is not an update, since
+// there's nothing new to load, and kubelet removes the old generation's files after every swap.
+func IsProjectedSecretUpdate(event fsnotify.Event, files map[string]bool, dir string) bool {
+	eventPath := filepath.Clean(event.Name)
+	if files[eventPath] {
+		return event.Op&fsnotify.Remove == 0
+	}
+
+	return event.Op&fsnotify.Create != 0 &&
+		filepath.Dir(eventPath) == filepath.Clean(dir) &&
+		filepath.Base(eventPath) == KubernetesSecretDataSymlink
+}
 
 // CompStatus Component Status is used in prometheus metrics
 type CompStatus uint64
@@ -93,13 +112,29 @@ func RetryWithExponentialBackoff(client *http.Client, req *http.Request,
 		if resp.StatusCode != http.StatusOK {
 			badStatus := fmt.Errorf("bad status code: %v", resp.StatusCode)
 			log.Error().Msg(badStatus.Error())
+			_ = resp.Body.Close()
 			if !httpIsRetryable(resp) {
 				return nil, badStatus
 			}
+			if i == maxAttempts {
+				break
+			}
 			req.Body = io.NopCloser(bytes.NewReader(reqBody))
 			sleepTime := float64(delayMs) * math.Pow(backoff, float64(i+1))
-			log.Info().Msgf("sleeping for %v", sleepTime)
-			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
+			retryDelay := time.Duration(sleepTime) * time.Millisecond
+			log.Info().Msgf("sleeping for %v", retryDelay)
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-timer.C:
+			case <-req.Context().Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return nil, req.Context().Err()
+			}
 		} else {
 			return resp, nil
 		}

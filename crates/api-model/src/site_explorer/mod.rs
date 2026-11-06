@@ -191,6 +191,9 @@ pub struct EndpointExplorationReport {
     /// Vendor as reported by Redfish
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor: Option<bmc_vendor::BMCVendor>,
+    /// The Redfish service root as the BMC reported it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_root: Option<ServiceRoot>,
     /// The class [`derive_hardware_class`] derived from what the BMC reported.
     /// `None` if no exploration has recorded one for this endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,18 +362,6 @@ impl EndpointExplorationReport {
             .find(|e| e.mac_address == Some(mac))
             .and_then(|e| e.id.as_deref().none_if_empty())
     }
-
-    /// Yields a [`MachineBootInterface`] for every host ethernet interface that
-    /// reports both a MAC and a non-empty Redfish interface id -- for any NIC
-    /// type (integrated NICs, SuperNICs, DPUs in NIC mode, DPU host-PFs).
-    /// Interfaces missing either half are skipped (via
-    /// [`MachineBootInterface::from_parts`]).
-    pub fn complete_boot_interfaces(&self) -> impl Iterator<Item = MachineBootInterface> + '_ {
-        self.systems
-            .iter()
-            .flat_map(|s| s.ethernet_interfaces.iter())
-            .filter_map(|e| MachineBootInterface::from_parts(e.mac_address, e.id.clone()))
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,7 +378,7 @@ pub struct ExploredEndpoint {
     pub preingestion_state: PreingestionState,
     /// Indicates that preingestion is waiting for site explorer to refresh the state
     pub waiting_for_explorer_refresh: bool,
-    /// Whether the endpoint will be explored in the next site-explorer run
+    /// Whether exploration is queued. Pending requests remain queued while suppressed.
     pub exploration_requested: bool,
     /// Last BMC Reset issued through redfish
     pub last_redfish_bmc_reset: Option<chrono::DateTime<chrono::Utc>>,
@@ -416,7 +407,51 @@ impl Display for ExploredEndpoint {
     }
 }
 
+/// How many failed probes keep an expected, never-explored endpoint in the
+/// refresh-wait tier. Only failures advance the report version of a row that
+/// no exploration has typed, so the version counts them.
+const NEVER_EXPLORED_QUICK_RETRIES: u64 = 3;
+
 impl ExploredEndpoint {
+    /// The budget tier this endpoint competes in. `expected` says whether its
+    /// BMC MAC belongs to an expected machine, switch or power shelf. An
+    /// expected endpoint that no exploration has typed yet (a failed probe
+    /// stores its error on a report without an endpoint type) is a refresh
+    /// wait for its first [`NEVER_EXPLORED_QUICK_RETRIES`] failures whatever
+    /// its preingestion state, so a declared BMC whose first probe failed is
+    /// retried ahead of the routine refresh. After that it is routine, so
+    /// declared hardware that is not powered on yet does not hold refresh-wait
+    /// slots. An undeclared one is routine from the start: an underlay address
+    /// that never answers Redfish would otherwise hold a slot for good.
+    /// A BMC whose explorations timed out fewer than
+    /// `timeouts_before_prevent_allocations` times in a row is a refresh wait,
+    /// so it is re-explored ahead of the routine refresh to confirm or clear
+    /// the timeout; once its timeouts prevent allocations it is routine again.
+    pub fn exploration_tier(
+        &self,
+        expected: bool,
+        timeouts_before_prevent_allocations: u32,
+    ) -> ExplorationTier {
+        if self.exploration_requested {
+            ExplorationTier::Priority
+        } else if (expected
+            && self.report.endpoint_type == EndpointType::Unknown
+            && self.report_version.version_nr() <= NEVER_EXPLORED_QUICK_RETRIES)
+            || (self.waiting_for_explorer_refresh
+                && self.preingestion_state.parks_for_explorer_refresh())
+            || (self.report.endpoint_type == EndpointType::Bmc
+                && matches!(
+                    self.report.last_exploration_error,
+                    Some(EndpointExplorationError::ConnectionTimeout { consecutive_count, .. })
+                        if consecutive_count < timeouts_before_prevent_allocations
+                ))
+        {
+            ExplorationTier::RefreshWait
+        } else {
+            ExplorationTier::Routine
+        }
+    }
+
     /// Returns the fully-populated boot interface (MAC + Redfish interface id)
     /// for this endpoint, or `None` if either part is missing.
     ///
@@ -440,28 +475,34 @@ impl ExploredEndpoint {
         )
     }
 
+    /// find_inventory returns the first inventory entry matching the component's
+    /// `current_version_reported_as`; the entry may carry no version.
+    pub fn find_inventory(
+        &self,
+        fw_info: &Firmware,
+        firmware_type: FirmwareComponentType,
+    ) -> Option<&Inventory> {
+        self.report
+            .service
+            .iter()
+            .flat_map(|service| service.inventories.iter())
+            .find(|inventory| fw_info.matching_version_id(&inventory.id, firmware_type))
+    }
+
     /// find_version will locate a version number within an ExploredEndpoint
     pub fn find_version(
         &self,
         fw_info: &Firmware,
         firmware_type: FirmwareComponentType,
     ) -> Option<&String> {
-        for service in self.report.service.iter() {
-            if let Some(matching_inventory) = service
-                .inventories
-                .iter()
-                .find(|&x| fw_info.matching_version_id(&x.id, firmware_type))
-            {
-                tracing::debug!(
-                    bmc_ip_address = %self.address,
-                    firmware_type = ?firmware_type,
-                    version = ?matching_inventory.version,
-                    "Found matching firmware version",
-                );
-                return matching_inventory.version.as_ref();
-            };
-        }
-        None
+        let matching_inventory = self.find_inventory(fw_info, firmware_type)?;
+        tracing::debug!(
+            bmc_ip_address = %self.address,
+            firmware_type = ?firmware_type,
+            version = ?matching_inventory.version,
+            "Found matching firmware version",
+        );
+        matching_inventory.version.as_ref()
     }
 
     pub fn find_all_versions(
@@ -602,11 +643,19 @@ pub enum PreingestionState {
     BfbRecoveryNeeded {
         reason: String,
         host_bmc_ip: IpAddr,
+        /// DPU BMC identity captured when recovery was queued. Missing in legacy
+        /// states, which must be requeued before another copy or power-off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dpu_bmc_mac: Option<MacAddress>,
         #[serde(default)]
         pre_copy_powercycle: bool,
     },
     BfbPlatformPowercycle {
         host_bmc_ip: IpAddr,
+        /// DPU BMC identity captured when recovery was queued. Missing in legacy
+        /// states, which must be requeued before another copy or power-off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dpu_bmc_mac: Option<MacAddress>,
         phase: BfbPlatformPowercyclePhase,
         #[serde(default)]
         post_install: bool,
@@ -614,10 +663,18 @@ pub enum PreingestionState {
     BfbCopyInProgress {
         started_at: DateTime<Utc>,
         host_bmc_ip: IpAddr,
+        /// DPU BMC identity captured when recovery was queued. Missing in legacy
+        /// states, which must be requeued before another copy or power-off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dpu_bmc_mac: Option<MacAddress>,
     },
     BfbInstallationWait {
         started_at: DateTime<Utc>,
         host_bmc_ip: IpAddr,
+        /// DPU BMC identity captured when recovery was queued. Missing in legacy
+        /// states, which must be requeued before another copy or power-off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dpu_bmc_mac: Option<MacAddress>,
     },
     InitialReset {
         phase: InitialResetPhase,
@@ -638,6 +695,11 @@ pub enum PreingestionState {
         #[serde(default)]
         attempts: u32,
     },
+    /// The firmware check found the exploration report incomplete (no host
+    /// model, or a listed component without an inventory entry or version)
+    /// and asked the explorer for one refreshed report. The check runs again
+    /// on that report and decides on it whatever it says.
+    FirmwareCheckRefreshWait,
     TimeSyncReset {
         phase: TimeSyncResetPhase,
         last_time: DateTime<Utc>,
@@ -688,10 +750,23 @@ pub enum PreingestionState {
 }
 
 impl PreingestionState {
+    /// DPU BMC identity retained across BFB recovery phases and worker restarts.
+    /// `None` denotes a legacy unbound recovery or a state outside BFB recovery.
+    pub fn bfb_target_mac(&self) -> Option<MacAddress> {
+        match self {
+            Self::BfbRecoveryNeeded { dpu_bmc_mac, .. }
+            | Self::BfbPlatformPowercycle { dpu_bmc_mac, .. }
+            | Self::BfbCopyInProgress { dpu_bmc_mac, .. }
+            | Self::BfbInstallationWait { dpu_bmc_mac, .. } => *dpu_bmc_mac,
+            _ => None,
+        }
+    }
+
     /// Whether a `waiting_for_explorer_refresh` set in this state is a
     /// preingestion park that only a fresh exploration report can end. These
     /// are the states whose next step reads the report: the post-reset
-    /// inventory, the version check, and the two rechecks. Preingestion never
+    /// inventory, the firmware check's refresh wait, the version check, and
+    /// the two rechecks. Preingestion never
     /// sets the flag in `Initial` or the other in-progress states; a flag there
     /// came from a failed probe or an operator error clear, and the next
     /// successful exploration lifts it. `Complete` and `Failed` waits have no
@@ -701,11 +776,27 @@ impl PreingestionState {
             self,
             Self::InitialBMCReset {
                 phase: InitialBmcResetPhase::WaitForExplorerRefresh,
-            } | Self::RecheckVersions
+            } | Self::FirmwareCheckRefreshWait
+                | Self::RecheckVersions
                 | Self::NewFirmwareReportedWait { .. }
                 | Self::RecheckVersionsAfterFailure { .. }
         )
     }
+}
+
+/// The tier of the site explorer's `explorations_per_run` budget an endpoint
+/// competes in. Requests sit outside the budget; the other two tiers share it
+/// with the interfaces that have no endpoint yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplorationTier {
+    /// An operator requested the exploration.
+    Priority,
+    /// The endpoint waits on its next report: it is an expected BMC whose
+    /// first few probes failed, or preingestion parked it until the explorer
+    /// refreshes it.
+    RefreshWait,
+    /// The periodic refresh of a complete report.
+    Routine,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -934,8 +1025,6 @@ impl ExploredManagedHost {
 pub struct ExploredManagedSwitch {
     /// The Switch's BMC IP
     pub bmc_ip: IpAddr,
-    // Host mac address
-    pub nv_os_mac_addresses: Vec<MacAddress>,
     /// Exploration report for this switch endpoint
     pub report: EndpointExplorationReport,
 }
@@ -1122,7 +1211,8 @@ impl EndpointExplorationReport {
             .any(|c| c.id.to_lowercase().contains("mgx_nvswitch_0"))
     }
 
-    /// Return `DpuModel` if the explored endpoint is a DPU
+    /// Return `DpuModel` if the explored endpoint is a DPU.
+    /// Return `Unknown` if no DPU generation is recognized or recognized generations conflict.
     pub fn identify_dpu(&self) -> Option<DpuModel> {
         if !self
             .systems
@@ -1133,22 +1223,19 @@ impl EndpointExplorationReport {
             return None;
         }
 
-        let chassis_map = self
+        let mut models = self
             .chassis
             .iter()
-            .map(|x| (x.id.as_str(), x))
-            .collect::<HashMap<_, _>>();
-        let model = chassis_map
-            .get("Card1")
-            .and_then(|value| chassis_model(value))
-            .or_else(|| {
-                self.chassis
-                    .iter()
-                    .filter(|chassis| is_dpu_product_chassis_id(&chassis.id))
-                    .find_map(chassis_model)
-            })
-            .unwrap_or("");
-        Some(DpuModel::from(model))
+            .filter(|chassis| is_dpu_product_chassis_id(&chassis.id))
+            .filter_map(chassis_model)
+            .map(DpuModel::from)
+            .filter(|model| *model != DpuModel::Unknown);
+        let model = models.next().unwrap_or(DpuModel::Unknown);
+        Some(if models.all(|other| other == model) {
+            model
+        } else {
+            DpuModel::Unknown
+        })
     }
 
     pub fn create_temporary_dmi_data(
@@ -1507,7 +1594,12 @@ pub enum EndpointExplorationError {
     /// reachable, but the  port is not listening, see ConnectionRefused.
     #[error("site-explorer timed out communicating with the endpoint: {details:?}")]
     #[serde(rename_all = "PascalCase")]
-    ConnectionTimeout { details: String },
+    ConnectionTimeout {
+        details: String,
+        /// Explorations in a row that timed out, including this one.
+        #[serde(default)]
+        consecutive_count: u32,
+    },
     /// The connection to the configured endpoint was refused. This indicates
     /// that site-explorer probably has connectivity to the target IP (unless
     /// a network device in the path is sending an RST), and is able to positively
@@ -1805,6 +1897,8 @@ pub struct ComputerSystem {
     /// SSH port for the system's Redfish serial-console service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_console_ssh_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_number: Option<String>,
 }
 
 /// Minimal processor inventory with position normalized by the explorer.
@@ -1870,6 +1964,19 @@ pub enum PowerState {
     Unknown,
 }
 
+/// The Redfish `ServiceRoot` fields that identify a BMC.
+#[derive(Clone, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ServiceRoot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    /// Keys of the `Oem` object, for example `Ami` or `Dell`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oem_keys: Vec<String>,
+}
+
 /// `Manager` definition. Matches redfish definition
 #[derive(Clone, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -1879,6 +1986,10 @@ pub struct Manager {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipmi_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_version: Option<String>,
 }
 
 /// `EthernetInterface` definition. Matches redfish definition
@@ -2007,6 +2118,25 @@ pub struct Inventory {
     pub description: Option<String>,
     pub version: Option<String>,
     pub release_date: Option<String>,
+    /// The drive this entry reports, set only on entries that exploration
+    /// created from a Redfish Storage drive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive: Option<DriveIdentity>,
+}
+
+/// The drive behind a firmware inventory entry created from Redfish Storage.
+/// Host firmware configuration selects drive components by `model`.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct DriveIdentity {
+    /// The drive's Redfish `Model`, trimmed. Its form depends on the BMC: some
+    /// report the part number alone (`KCD8DPUG15T3` on Lenovo XCC), some add
+    /// the vendor (`SAMSUNG MZTL63T8HFLT-00AW7` on GB200), and Dell reports
+    /// its own name (`Dell Ent NVMe CM6 RI 1.92TB`).
+    pub model: String,
+    /// The drive's Redfish `MediaType` (`SSD`, `HDD` or `SMR`), for reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
 }
 
 /// The result of one Redfish machine-setup check.
@@ -2147,14 +2277,14 @@ pub fn is_bf4_dpu_part_number(part_number: &str) -> bool {
         || normalized_part_number.starts_with("900-9d4a4")
 }
 
-/// Whether a DPU BMC chassis member carries the card product identity
+/// Whether a DPU BMC chassis member can carry the card product identity
 /// (part/model/serial).
 ///
 /// Older Redfish reports publish this identity on `Card1`; newer BF4 firmware may
 /// instead publish it on the integrated BMC chassis (`Bluefield_BMC` or
-/// `BlueField_BMC_0`). These IDs are expected to be mutually exclusive as product
-/// identity sources in real reports, so callers can select the first matching
-/// chassis.
+/// `BlueField_BMC_0`). Reports can contain several of these chassis, including
+/// placeholders or BMC component models. Model identification requires the
+/// recognized DPU generations to agree.
 fn is_dpu_product_chassis_id(id: &str) -> bool {
     matches!(id, "Card1" | "Bluefield_BMC" | "BlueField_BMC_0")
 }
@@ -2177,7 +2307,12 @@ fn chassis_part_number(chassis: &Chassis) -> Option<&str> {
 }
 
 fn chassis_model(chassis: &Chassis) -> Option<&str> {
-    chassis.model.as_deref().map(str::trim).none_if_empty()
+    chassis
+        .model
+        .as_deref()
+        .map(str::trim)
+        .none_if_empty()
+        .filter(|model| !model.eq_ignore_ascii_case("n/a"))
 }
 
 // returns true if the passed in string is a BlueField part number
@@ -2884,6 +3019,71 @@ mod tests {
     use crate::firmware::FirmwareComponent;
     use crate::machine::machine_id::from_hardware_info;
 
+    #[test]
+    fn bfb_target_identity_survives_serialization() {
+        let mac: MacAddress = "02:00:00:00:84:76".parse().unwrap();
+        let cases = [
+            ("bfbrecoveryneeded", serde_json::json!({"reason": "test"})),
+            (
+                "bfbplatformpowercycle",
+                serde_json::json!({"phase": "poweroff"}),
+            ),
+            (
+                "bfbcopyinprogress",
+                serde_json::json!({"started_at": "2026-10-31T00:00:00Z"}),
+            ),
+            (
+                "bfbinstallationwait",
+                serde_json::json!({"started_at": "2026-10-31T00:00:00Z"}),
+            ),
+        ]
+        .into_iter()
+        .map(|(state, extra)| Check {
+            scenario: state,
+            input: (state, extra),
+            expect: (None, Some(mac), true),
+        });
+        check_values(cases, |(state, extra)| {
+            let mut stored = serde_json::json!({"state": state, "host_bmc_ip": "192.0.2.200"});
+            stored
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let legacy: PreingestionState = serde_json::from_value(stored.clone()).unwrap();
+            stored["dpu_bmc_mac"] = serde_json::to_value(mac).unwrap();
+            let pinned: PreingestionState = serde_json::from_value(stored).unwrap();
+            let restored: PreingestionState =
+                serde_json::from_str(&serde_json::to_string(&pinned).unwrap()).unwrap();
+            (
+                legacy.bfb_target_mac(),
+                restored.bfb_target_mac(),
+                restored == pinned,
+            )
+        });
+    }
+
+    /// Stored reports written before inventory entries carried drive data
+    /// still load, and the drive data round-trips.
+    #[test]
+    fn inventory_drive_identity_is_optional_in_stored_reports() {
+        let legacy: Inventory =
+            serde_json::from_str(r#"{"Id": "BMC-Primary", "Version": "1.0"}"#).unwrap();
+        assert_eq!(legacy.drive, None);
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("Drive"));
+
+        let drive = Inventory {
+            id: "Drive_KCD8DPUG15T3_drive_bay_0".into(),
+            version: Some("1XET7106".into()),
+            drive: Some(DriveIdentity {
+                model: "KCD8DPUG15T3".into(),
+                media_type: Some("SSD".into()),
+            }),
+            ..Default::default()
+        };
+        let stored = serde_json::to_string(&drive).unwrap();
+        assert_eq!(serde_json::from_str::<Inventory>(&stored).unwrap(), drive);
+    }
+
     fn processor_position_report() -> EndpointExplorationReport {
         EndpointExplorationReport {
             systems: vec![ComputerSystem {
@@ -3128,10 +3328,6 @@ mod tests {
         assert_eq!(multiple.model(), single.model());
         assert_eq!(multiple.primary_system().unwrap().id, "System_0");
         assert_eq!(multiple.all_mac_addresses(), single.all_mac_addresses());
-        assert_eq!(
-            multiple.complete_boot_interfaces().collect::<Vec<_>>(),
-            single.complete_boot_interfaces().collect::<Vec<_>>()
-        );
         let encoded = serde_json::to_string(&multiple).unwrap();
         assert_eq!(
             serde_json::from_str::<EndpointExplorationReport>(&encoded).unwrap(),
@@ -3243,6 +3439,108 @@ mod tests {
     }
 
     #[test]
+    fn identify_dpu_requires_agreeing_recognized_chassis_models() {
+        value_scenarios!(
+            run = |models: Vec<(&str, Option<&str>)>| {
+                let mut report = EndpointExplorationReport {
+                    systems: vec![ComputerSystem {
+                        id: "Bluefield".to_string(),
+                        ..Default::default()
+                    }],
+                    chassis: models.into_iter().map(|(id, model)| Chassis {
+                        id: id.to_string(),
+                        model: model.map(str::to_string),
+                        ..Default::default()
+                    }).collect(),
+                    ..Default::default()
+                };
+                let identified = report.identify_dpu();
+                assert!(report.is_dpu());
+                report.chassis.reverse();
+                assert_eq!(report.identify_dpu(), identified, "chassis order must not affect identification");
+                identified
+            };
+            "placeholder Card1 model allows either product BMC chassis" {
+                vec![("Card1", Some("N/A")), ("Bluefield_BMC", Some("BlueField-3 DPU"))]
+                    => Some(DpuModel::BlueField3),
+                vec![("Card1", Some(" n/a ")), ("BlueField_BMC_0", Some("BlueField-3 DPU"))]
+                    => Some(DpuModel::BlueField3),
+                vec![("Card1", None), ("Bluefield_BMC", Some("BlueField-3 DPU"))]
+                    => Some(DpuModel::BlueField3),
+                vec![("Card1", Some(" \t ")), ("Bluefield_BMC", Some("BlueField-3 DPU"))]
+                    => Some(DpuModel::BlueField3),
+            }
+            "placeholder BMC model does not mask another product model" {
+                vec![("Card1", Some("BlueField-3 DPU")), ("Bluefield_BMC", Some("N/A"))]
+                    => Some(DpuModel::BlueField3),
+                vec![("Card1", Some("N/A")), ("Bluefield_BMC", Some("N/A")), ("BlueField_BMC_0", Some("BlueField-3 DPU"))]
+                    => Some(DpuModel::BlueField3),
+            }
+            "equivalent model spellings agree" {
+                vec![("Card1", Some("NVIDIA BlueField 3 DPU")), ("Bluefield_BMC", Some("BlueField-3 DPU"))]
+                    => Some(DpuModel::BlueField3),
+            }
+            "conflicting recognized product models remain unknown" {
+                vec![("Card1", Some("BlueField-3 DPU")), ("Bluefield_BMC", Some("BlueField-2 DPU"))]
+                    => Some(DpuModel::Unknown),
+                vec![("Card1", Some("N/A")), ("Bluefield_BMC", Some("BlueField-3 DPU")), ("BlueField_BMC_0", Some("BlueField-2 DPU"))]
+                    => Some(DpuModel::Unknown),
+            }
+            "unrecognized chassis models do not mask a recognized DPU generation" {
+                vec![("Card1", Some("BlueField-3 DPU")), ("Bluefield_BMC", Some("unrecognized DPU"))]
+                    => Some(DpuModel::BlueField3),
+                vec![("Card1", Some("unrecognized DPU")), ("Bluefield_BMC", Some("BlueField-3 DPU"))]
+                    => Some(DpuModel::BlueField3),
+            }
+            "no usable product model still identifies a DPU" {
+                vec![] => Some(DpuModel::Unknown),
+                vec![("Card1", Some("N/A"))] => Some(DpuModel::Unknown),
+                vec![("Card1", Some("N/A")), ("unrelated", Some("BlueField-3 DPU"))]
+                    => Some(DpuModel::Unknown),
+            }
+        );
+    }
+
+    #[test]
+    fn dpu_hardware_info_skips_placeholder_part_descriptions() {
+        value_scenarios!(
+            run = |bmc_model: Option<&str>| {
+                let dpu = ExploredDpu {
+                    bmc_ip: "192.0.2.1".parse().unwrap(),
+                    host_pf_mac_address: Some("00:11:22:33:44:55".parse().unwrap()),
+                    host_chassis_id: None,
+                    report: Arc::new(EndpointExplorationReport {
+                        systems: vec![ComputerSystem {
+                            id: "Bluefield".to_string(),
+                            serial_number: Some("test-dpu".to_string()),
+                            ..Default::default()
+                        }],
+                        chassis: vec![
+                            Chassis {
+                                id: "Card1".to_string(),
+                                model: Some("N/A".to_string()),
+                                ..Default::default()
+                            },
+                            Chassis {
+                                id: "Bluefield_BMC".to_string(),
+                                model: bmc_model.map(str::to_string),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                };
+                dpu.hardware_info().unwrap().dpu_info.unwrap().part_description
+            };
+            "part description uses the next meaningful model or stays empty" {
+                Some(" BlueField-3 DPU ") => "BlueField-3 DPU".to_string(),
+                Some(" n/a ") => String::new(),
+                None => String::new(),
+            }
+        );
+    }
+
+    #[test]
     fn all_mac_addresses_combines_system_and_adapter_inventory_without_duplicates() {
         let system_mac = "02:aa:bb:cc:dd:01".parse().unwrap();
         let adapter_mac = "94:6d:ae:53:cb:9b".parse().unwrap();
@@ -3332,6 +3630,7 @@ mod tests {
                 description: None,
                 version: version.map(|v| v.to_string()),
                 release_date: None,
+                drive: None,
             })
             .collect();
 
@@ -3358,6 +3657,194 @@ mod tests {
             boot_interface_id: None,
             pause_ingestion_and_poweron: false,
         }
+    }
+
+    /// `exploration_tier` by request flag, report, state, wait flag, report
+    /// version and whether an expected machine, switch or power shelf declares
+    /// the BMC.
+    #[test]
+    fn exploration_tier_cases() {
+        let parked = || PreingestionState::InitialBMCReset {
+            phase: InitialBmcResetPhase::WaitForExplorerRefresh,
+        };
+        // input: (endpoint type, preingestion state, waiting for refresh, requested, expected, report version)
+        check_values(
+            [
+                Check {
+                    scenario: "a request is served first, even when parked",
+                    input: (EndpointType::Bmc, parked(), true, true, false, 1),
+                    expect: ExplorationTier::Priority,
+                },
+                Check {
+                    scenario: "a request on a never-explored endpoint",
+                    input: (
+                        EndpointType::Unknown,
+                        PreingestionState::Initial,
+                        false,
+                        true,
+                        true,
+                        1,
+                    ),
+                    expect: ExplorationTier::Priority,
+                },
+                Check {
+                    scenario: "an expected endpoint never explored, after a failed retry set the wait flag",
+                    input: (
+                        EndpointType::Unknown,
+                        PreingestionState::Initial,
+                        true,
+                        false,
+                        true,
+                        2,
+                    ),
+                    expect: ExplorationTier::RefreshWait,
+                },
+                Check {
+                    scenario: "an expected endpoint never explored on its last quick retry",
+                    input: (
+                        EndpointType::Unknown,
+                        PreingestionState::Initial,
+                        true,
+                        false,
+                        true,
+                        3,
+                    ),
+                    expect: ExplorationTier::RefreshWait,
+                },
+                Check {
+                    scenario: "an expected endpoint never explored past its quick retries, such as hardware not powered on yet",
+                    input: (
+                        EndpointType::Unknown,
+                        PreingestionState::Initial,
+                        true,
+                        false,
+                        true,
+                        4,
+                    ),
+                    expect: ExplorationTier::Routine,
+                },
+                Check {
+                    scenario: "an expected endpoint never explored under manual ingestion, which completes preingestion at insert",
+                    input: (
+                        EndpointType::Unknown,
+                        PreingestionState::Complete,
+                        false,
+                        false,
+                        true,
+                        1,
+                    ),
+                    expect: ExplorationTier::RefreshWait,
+                },
+                Check {
+                    scenario: "an undeclared endpoint never explored stays routine",
+                    input: (
+                        EndpointType::Unknown,
+                        PreingestionState::Initial,
+                        true,
+                        false,
+                        false,
+                        1,
+                    ),
+                    expect: ExplorationTier::Routine,
+                },
+                Check {
+                    scenario: "parked by preingestion",
+                    input: (EndpointType::Bmc, parked(), true, false, false, 1),
+                    expect: ExplorationTier::RefreshWait,
+                },
+                Check {
+                    scenario: "the wait flag outside a parking state",
+                    input: (
+                        EndpointType::Bmc,
+                        PreingestionState::Initial,
+                        true,
+                        false,
+                        false,
+                        1,
+                    ),
+                    expect: ExplorationTier::Routine,
+                },
+                Check {
+                    scenario: "a parking state without the wait flag",
+                    input: (
+                        EndpointType::Bmc,
+                        PreingestionState::RecheckVersions,
+                        false,
+                        false,
+                        false,
+                        1,
+                    ),
+                    expect: ExplorationTier::Routine,
+                },
+                Check {
+                    scenario: "a complete report on an expected endpoint",
+                    input: (
+                        EndpointType::Bmc,
+                        PreingestionState::Complete,
+                        false,
+                        false,
+                        true,
+                        1,
+                    ),
+                    expect: ExplorationTier::Routine,
+                },
+            ],
+            |(endpoint_type, state, waiting, requested, expected, version)| {
+                let mut endpoint = create_test_endpoint(Vec::new());
+                endpoint.report.endpoint_type = endpoint_type;
+                endpoint.preingestion_state = state;
+                endpoint.waiting_for_explorer_refresh = waiting;
+                endpoint.exploration_requested = requested;
+                endpoint.report_version = ConfigVersion::new(version);
+                endpoint.exploration_tier(expected, 1)
+            },
+        );
+    }
+
+    /// A BMC that timed out is a refresh wait until its timeouts reach the
+    /// threshold that prevents allocations.
+    #[test]
+    fn exploration_tier_timeout_cases() {
+        // input: (endpoint type, consecutive timeouts, threshold)
+        check_values(
+            [
+                Check {
+                    scenario: "a first timeout is retried on the next run",
+                    input: (EndpointType::Bmc, 1, 3),
+                    expect: ExplorationTier::RefreshWait,
+                },
+                Check {
+                    scenario: "a timeout one short of the threshold",
+                    input: (EndpointType::Bmc, 2, 3),
+                    expect: ExplorationTier::RefreshWait,
+                },
+                Check {
+                    scenario: "timeouts that prevent allocations go back to routine",
+                    input: (EndpointType::Bmc, 3, 3),
+                    expect: ExplorationTier::Routine,
+                },
+                Check {
+                    scenario: "a threshold of one keeps timeouts routine",
+                    input: (EndpointType::Bmc, 1, 1),
+                    expect: ExplorationTier::Routine,
+                },
+                Check {
+                    scenario: "an endpoint never explored as a BMC stays routine",
+                    input: (EndpointType::Unknown, 1, 3),
+                    expect: ExplorationTier::Routine,
+                },
+            ],
+            |(endpoint_type, consecutive_count, threshold)| {
+                let mut endpoint = create_test_endpoint(Vec::new());
+                endpoint.report.endpoint_type = endpoint_type;
+                endpoint.report.last_exploration_error =
+                    Some(EndpointExplorationError::ConnectionTimeout {
+                        details: "timeout".to_string(),
+                        consecutive_count,
+                    });
+                endpoint.exploration_tier(false, threshold)
+            },
+        );
     }
 
     #[test]
@@ -3695,6 +4182,7 @@ mod tests {
                     scenario: "connection timeout",
                     input: EndpointExplorationError::ConnectionTimeout {
                         details: "timeout".to_string(),
+                        consecutive_count: 1,
                     },
                     expect: expected_error_behavior(
                         ErrorCode::nico(SiteExplorer, 100),
@@ -4083,6 +4571,44 @@ mod tests {
         );
     }
 
+    /// `find_inventory` tells an entry without a version apart from no entry at all.
+    #[test]
+    fn find_inventory_keeps_an_entry_that_reports_no_version() {
+        let fw_info = create_test_firmware(FirmwareComponentType::Bmc, r"^BMC_Firmware$");
+        let endpoint =
+            create_test_endpoint(vec![("BMC_Firmware", None), ("DPU_UEFI", Some("4.5.6"))]);
+
+        let inventory = endpoint
+            .find_inventory(&fw_info, FirmwareComponentType::Bmc)
+            .expect("the entry matches even without a version");
+        assert_eq!(inventory.id, "BMC_Firmware");
+        assert_eq!(inventory.version, None);
+        assert_eq!(
+            endpoint.find_version(&fw_info, FirmwareComponentType::Bmc),
+            None
+        );
+
+        let absent = create_test_endpoint(vec![("DPU_UEFI", Some("4.5.6"))]);
+        assert!(
+            absent
+                .find_inventory(&fw_info, FirmwareComponentType::Bmc)
+                .is_none()
+        );
+    }
+
+    /// The refresh wait is a park only a fresh report ends, and it is stored
+    /// as the bare state tag like the other field-less states.
+    #[test]
+    fn firmware_check_refresh_wait_parks_and_round_trips() {
+        assert!(PreingestionState::FirmwareCheckRefreshWait.parks_for_explorer_refresh());
+        let stored = serde_json::to_string(&PreingestionState::FirmwareCheckRefreshWait).unwrap();
+        assert_eq!(stored, r#"{"state":"firmwarecheckrefreshwait"}"#);
+        assert_eq!(
+            serde_json::from_str::<PreingestionState>(&stored).unwrap(),
+            PreingestionState::FirmwareCheckRefreshWait
+        );
+    }
+
     struct FindAllVersionsInput {
         regex_pattern: &'static str,
         inventories: Vec<(&'static str, Option<&'static str>)>,
@@ -4271,6 +4797,7 @@ mod tests {
             description: Some("Host image".to_string()),
             version: uefi_version.clone(),
             release_date: None,
+            drive: None,
         };
         let report = EndpointExplorationReport {
             endpoint_type: EndpointType::Bmc,
@@ -4284,6 +4811,8 @@ mod tests {
                 ethernet_interfaces: vec![],
                 id: "bmc".to_string(),
                 ipmi_port: None,
+                firmware_version: None,
+                model: None,
             }],
             systems: vec![ComputerSystem {
                 ethernet_interfaces: vec![],
@@ -4303,6 +4832,7 @@ mod tests {
                 bios_version: None,
                 serial_console_ssh_port: None,
                 processors: None,
+                part_number: None,
             }],
             chassis: vec![Chassis {
                 id: "NIC.Slot.1".to_string(),
@@ -4448,6 +4978,8 @@ mod tests {
                 ethernet_interfaces: vec![],
                 id: "bmc".to_string(),
                 ipmi_port: None,
+                firmware_version: None,
+                model: None,
             }],
             systems: vec![ComputerSystem {
                 ethernet_interfaces: vec![],
@@ -4467,6 +4999,7 @@ mod tests {
                 bios_version: None,
                 serial_console_ssh_port: None,
                 processors: None,
+                part_number: None,
             }],
             chassis: vec![Chassis {
                 id: "NIC.Slot.1".to_string(),
@@ -4858,69 +5391,6 @@ mod tests {
             "empty id treated as absent (don't clobber stored boot interface)" {
                 (single_iface_report(Some(String::new())), mac) => Fails,
             }
-        );
-    }
-
-    #[test]
-    fn complete_boot_interfaces_yields_every_nic_regardless_of_type() {
-        let dpu_mac = MacAddress::new([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01]);
-        let integrated_mac = MacAddress::new([0xD4, 0x04, 0xE6, 0x84, 0x13, 0x98]);
-        let id_less_mac = MacAddress::new([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
-        let empty_id_mac = MacAddress::new([0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
-        let report = EndpointExplorationReport {
-            systems: vec![ComputerSystem {
-                ethernet_interfaces: vec![
-                    // A DPU host-PF -- the only kind the DPU-only capture reached...
-                    EthernetInterface {
-                        id: Some("NIC.Slot.7-1-1".to_string()),
-                        mac_address: Some(dpu_mac),
-                        ..Default::default()
-                    },
-                    // ...and a non-DPU integrated NIC, which is now yielded too.
-                    EthernetInterface {
-                        id: Some("NIC.Embedded.1-1-1".to_string()),
-                        mac_address: Some(integrated_mac),
-                        ..Default::default()
-                    },
-                    // No id -> can't form a pair, skipped.
-                    EthernetInterface {
-                        id: None,
-                        mac_address: Some(id_less_mac),
-                        ..Default::default()
-                    },
-                    // No MAC -> nothing to key on, skipped.
-                    EthernetInterface {
-                        id: Some("NIC.Embedded.2-1-1".to_string()),
-                        mac_address: None,
-                        ..Default::default()
-                    },
-                    // Empty id -> not a usable id, skipped (don't clobber last-known-good).
-                    EthernetInterface {
-                        id: Some(String::new()),
-                        mac_address: Some(empty_id_mac),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-
-        let boot_interfaces: Vec<MachineBootInterface> =
-            report.complete_boot_interfaces().collect();
-        assert_eq!(
-            boot_interfaces,
-            vec![
-                MachineBootInterface {
-                    mac_address: dpu_mac,
-                    interface_id: "NIC.Slot.7-1-1".to_string(),
-                },
-                MachineBootInterface {
-                    mac_address: integrated_mac,
-                    interface_id: "NIC.Embedded.1-1-1".to_string(),
-                },
-            ],
-            "complete_boot_interfaces should yield a MachineBootInterface for every NIC with both a MAC and a non-empty id -- DPU or not -- and skip the rest",
         );
     }
 

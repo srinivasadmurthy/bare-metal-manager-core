@@ -32,12 +32,14 @@ use crate::instance::config::infiniband::InstanceInfinibandConfig;
 use crate::instance::config::nvlink::InstanceNvLinkConfig;
 use crate::instance::config::spx::InstanceSpxConfig;
 use crate::instance::config::tenant_config::TenantConfig;
+use crate::instance::nic_firmware::InstanceNicFirmwareSnapshot;
 use crate::instance::status::InstanceStatusObservations;
 use crate::metadata::Metadata;
 use crate::os::{InlineIpxe, OperatingSystem, OperatingSystemVariant};
 use crate::tenant::TenantOrganizationId;
 
-/// Validates stored attachment identities and service-interface references.
+/// Validates stored attachment identities and the service-interface and
+/// VPC-local interface records that reference them.
 fn validate_extension_service_identities(
     config: &InstanceExtensionServicesConfig,
     network_config: &InstanceNetworkConfig,
@@ -78,6 +80,28 @@ fn validate_extension_service_identities(
             .map_err(|error| invalid_extension_service_identity(error.to_string()))?;
     }
 
+    let mut vpc_local_interface_ids = HashSet::new();
+    let mut vpc_local_interface_keys = HashSet::new();
+    for vpc_local_interface in &network_config.vpc_local_interfaces {
+        // The identity rules of a service interface, with the VPC in the key:
+        // one attachment serves each of a DPU's VPCs through its own record.
+        if vpc_local_interface.attachment_id.is_nil()
+            || !attachment_ids.contains(&vpc_local_interface.attachment_id)
+            || vpc_local_interface.internal_uuid.is_nil()
+            || !vpc_local_interface_ids.insert(vpc_local_interface.internal_uuid)
+            || !vpc_local_interface_keys.insert((
+                vpc_local_interface.attachment_id,
+                vpc_local_interface.interface_ordinal,
+                vpc_local_interface.dpu_id,
+                vpc_local_interface.vpc_id,
+            ))
+        {
+            return Err(invalid_extension_service_identity(
+                "VPC-local interface record contains a nil, duplicate, or dangling identity",
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -115,6 +139,10 @@ pub struct InstanceSnapshot {
     /// The Instance might not yet be in that state, but work would be underway
     /// to get the Instance into this state
     pub config: InstanceConfig,
+    /// Frozen operator firmware inputs and attachment bindings, outside replaceable
+    /// configuration. `None` means no snapshot was recorded, including legacy instances,
+    /// or instance deletion cleared the selection context during release/cancellation.
+    pub nic_firmware_snapshot: Option<InstanceNicFirmwareSnapshot>,
     /// Current version of all instance configurations except the networking related ones
     pub config_version: ConfigVersion,
 
@@ -182,6 +210,8 @@ pub struct InstanceSnapshotPgJson {
     nvlink_config_version: String,
     spx_config: InstanceSpxConfig,
     spx_config_version: String,
+    #[serde(default)]
+    nic_firmware_snapshot: Option<InstanceNicFirmwareSnapshot>,
     config_version: String,
     phone_home_last_contact: Option<DateTime<Utc>>,
     use_custom_pxe_on_boot: bool,
@@ -255,6 +285,7 @@ pub fn from_pg_json_and_os(
         instance_type_id: value.instance_type_id,
         metadata,
         config,
+        nic_firmware_snapshot: value.nic_firmware_snapshot,
         config_version: value.config_version.parse().map_err(|e| {
             sqlx::error::Error::ColumnDecode {
                 index: "config_version".to_string(),
@@ -380,6 +411,7 @@ impl TryFrom<InstanceSnapshotPgJson> for InstanceSnapshot {
             instance_type_id: value.instance_type_id,
             metadata,
             config,
+            nic_firmware_snapshot: value.nic_firmware_snapshot,
             config_version: value.config_version.parse().map_err(|e| {
                 sqlx::error::Error::ColumnDecode {
                     index: "config_version".to_string(),
@@ -445,15 +477,25 @@ mod tests {
     use std::str::FromStr;
 
     use carbide_test_support::Outcome::*;
-    use carbide_test_support::scenarios;
+    use carbide_test_support::{Check, check_values, scenarios};
     use chrono::Utc;
     use mac_address::MacAddress;
     use uuid::Uuid;
 
     use super::*;
     use crate::instance::config::extension_services::InstanceExtensionServiceConfig;
-    use crate::instance::config::network::InstanceServiceInterfaceConfig;
+    use crate::instance::config::network::{
+        InstanceServiceInterfaceConfig, InstanceVpcLocalInterfaceConfig,
+    };
+    use crate::instance::config::spx::{InstanceSpxAttachment, SpxAttachmentType};
+    use crate::instance::nic_firmware::NicFirmwareAllocationTarget;
+    use crate::nic_firmware::{
+        NicFirmwareApproach, NicFirmwareArtifact, NicFirmwareCardSelection,
+        NicFirmwareCardSelector, NicFirmwareProfile, NicFirmwareProfileConfig,
+        NicFirmwareProfileEntry, NicFirmwareProfileId,
+    };
     use crate::os::{InlineIpxe, OperatingSystemVariant};
+    use crate::tenant::TenantNicFirmwareConfig;
 
     /// Builds the smallest valid service-interface record so these tests can
     /// focus on attachment identity rather than point-to-point prefix validation.
@@ -471,6 +513,20 @@ mod tests {
             network_prefix_id: carbide_uuid::network::NetworkPrefixId::new(),
             link_prefix: "192.0.2.0/31".parse().expect("valid service prefix"),
             mac_address: MacAddress::new([0x02, 0, 0, 0, 0, 1]),
+            internal_uuid: Uuid::new_v4(),
+        }
+    }
+
+    fn vpc_local_interface(attachment_id: Uuid) -> InstanceVpcLocalInterfaceConfig {
+        InstanceVpcLocalInterfaceConfig {
+            attachment_id,
+            interface_ordinal: 0,
+            dpu_id: "fm100dsvstfujf6mis0gpsoi81tadmllicv7rqo4s7gc16gi0t2478672vg"
+                .parse()
+                .expect("valid DPU machine ID"),
+            slot_index: 0,
+            vpc_id: carbide_uuid::vpc::VpcId::new(),
+            mac_address: MacAddress::new([0x02, 0, 0, 0, 0, 2]),
             internal_uuid: Uuid::new_v4(),
         }
     }
@@ -495,6 +551,7 @@ mod tests {
             nvlink_config_version: version.clone(),
             spx_config: InstanceSpxConfig::default(),
             spx_config_version: version.clone(),
+            nic_firmware_snapshot: None,
             config_version: version.clone(),
             phone_home_last_contact: None,
             use_custom_pxe_on_boot: false,
@@ -540,22 +597,140 @@ mod tests {
         pg_json
     }
 
-    /// Verifies snapshots written before service interfaces existed remain
-    /// readable, because an omitted field means no stored service-interface records.
+    /// Both database loading paths must distinguish unrecorded legacy state,
+    /// captured absence and captured requirements without consulting live rows.
+    #[test]
+    fn nic_firmware_snapshot_preserves_presence_and_contents() {
+        let version = ConfigVersion::initial();
+        let profile_id: NicFirmwareProfileId = "frozen-profile".parse().expect("valid profile ID");
+        let mac_address = MacAddress::new([2, 0, 0, 0, 0, 1]);
+        let mut captured = InstanceNicFirmwareSnapshot {
+            tenant_organization_id: "TenantA".parse().expect("valid tenant ID"),
+            tenant: None,
+            machine_config_version: version,
+            machine_profile_id: Some(profile_id.clone()),
+            card_selections: vec![NicFirmwareCardSelection {
+                selector: NicFirmwareCardSelector::Mac(mac_address),
+                profile_id: profile_id.clone(),
+            }],
+            profiles: vec![NicFirmwareProfile {
+                id: profile_id.clone(),
+                version,
+                config: NicFirmwareProfileConfig {
+                    entries: vec![NicFirmwareProfileEntry {
+                        firmware: carbide_libmlx_model::firmware::FirmwareSpec {
+                            part_number: "PN".to_string(),
+                            psid: "PSID".to_string(),
+                            version: "1.0".to_string(),
+                        },
+                        image: NicFirmwareArtifact {
+                            url: "https://firmware.example/image.bin"
+                                .parse()
+                                .expect("valid URL"),
+                            sha256: "a".repeat(64),
+                        },
+                        device_config: Some(NicFirmwareArtifact {
+                            url: "https://firmware.example/config.bin"
+                                .parse()
+                                .expect("valid URL"),
+                            sha256: "b".repeat(64),
+                        }),
+                        approach: NicFirmwareApproach::Scout,
+                    }],
+                },
+            }],
+            targets: vec![NicFirmwareAllocationTarget {
+                attachment: InstanceSpxAttachment {
+                    device: "SuperNIC".to_string(),
+                    device_instance: 0,
+                    mac_address: Some(mac_address.to_string()),
+                    spx_partition_id: carbide_uuid::spx::SpxPartitionId::new(),
+                    attachment_type: SpxAttachmentType::Physical,
+                    attachment_vf: None,
+                    attachment_ovs: None,
+                },
+                dpa_interface_id: carbide_uuid::dpa_interface::DpaInterfaceId::new(),
+                machine_id: crate::test_support::machine_snapshot::host_machine_id().into(),
+                mac_address,
+                pci_name: "01:00.0".to_string(),
+                observed_device: None,
+                observed_at: None,
+                blocked_reason: "physical NIC update target is not qualified".to_string(),
+            }],
+        };
+        let missing_tenant = captured.clone();
+        captured.tenant = Some(TenantNicFirmwareConfig {
+            organization_id: captured.tenant_organization_id.clone(),
+            profile_id: None,
+            version,
+        });
+        let unselected_tenant = captured.clone();
+        captured
+            .tenant
+            .as_mut()
+            .expect("tenant is present")
+            .profile_id = Some(profile_id);
+
+        let cases = [
+            // Older row JSON has no snapshot field and must remain unrecorded.
+            ("legacy field omitted", None, true),
+            // SQL NULL records the same legacy absence without inventing inputs.
+            ("legacy SQL NULL", None, false),
+            // Missing tenant rows are valid allocation inputs, distinct from legacy absence.
+            ("missing tenant captured", Some(missing_tenant), false),
+            // An existing tenant with no selection still has a captured version.
+            ("unselected tenant captured", Some(unselected_tenant), false),
+            // Profile entries, both digests and blocked bindings must survive both decoders.
+            ("profile content captured", Some(captured), false),
+        ];
+        check_values(
+            cases.into_iter().map(|(scenario, captured, omit)| Check {
+                scenario,
+                input: (captured.clone(), omit),
+                expect: (captured.clone(), captured),
+            }),
+            |(captured, omit)| {
+                let mut row = minimal_pg_json();
+                row.os_ipxe_script = "#!ipxe".to_string();
+                row.nic_firmware_snapshot = captured;
+                let mut json = serde_json::to_value(row).expect("serialize instance row");
+                if omit {
+                    json.as_object_mut()
+                        .expect("instance row is an object")
+                        .remove("nic_firmware_snapshot");
+                }
+                let row: InstanceSnapshotPgJson =
+                    serde_json::from_value(json.clone()).expect("decode instance row");
+                let ordinary = InstanceSnapshot::try_from(row).expect("load ordinary snapshot");
+
+                let row = serde_json::from_value(json).expect("decode row with merged OS");
+                let merged = from_pg_json_and_os(row, ordinary.config.os)
+                    .expect("load snapshot with merged OS");
+                (ordinary.nic_firmware_snapshot, merged.nic_firmware_snapshot)
+            },
+        );
+    }
+
+    /// Verifies snapshots written before service interfaces or VPC-local
+    /// interfaces existed remain readable, because an omitted field means no
+    /// stored records of that kind.
     #[test]
     fn missing_service_interfaces_defaults_to_empty() {
-        // Remove the additive field to model JSON stored by an older binary.
+        // Remove the additive fields to model JSON stored by an older binary.
         let mut persisted = serde_json::to_value(minimal_pg_json()).expect("serialize snapshot");
-        persisted["network_config"]
-            .as_object_mut()
-            .expect("network config is an object")
-            .remove("service_interfaces")
-            .expect("current network config includes service interfaces");
+        for field in ["service_interfaces", "vpc_local_interfaces"] {
+            persisted["network_config"]
+                .as_object_mut()
+                .expect("network config is an object")
+                .remove(field)
+                .unwrap_or_else(|| panic!("current network config includes {field}"));
+        }
 
         // Decode through the production snapshot shape and preserve its legacy meaning.
         let decoded = serde_json::from_value::<InstanceSnapshotPgJson>(persisted)
             .expect("deserialize predecessor snapshot");
         assert!(decoded.network_config.service_interfaces.is_empty());
+        assert!(decoded.network_config.vpc_local_interfaces.is_empty());
     }
 
     /// Verifies an attachment written before IDs existed remains readable and
@@ -629,6 +804,60 @@ mod tests {
                 (vec![None], Some(attachment_id)) => Fails,
                 // A service-interface attachment ID must match an attachment in this instance.
                 (vec![Some(attachment_id)], Some(Uuid::new_v4())) => Fails,
+            }
+        );
+    }
+
+    /// Verifies a VPC-local interface record is held to the identity rules of
+    /// a service interface, keyed by VPC as well: a stored non-nil attachment,
+    /// a stable identity, and one record per attachment, position, DPU and VPC.
+    #[test]
+    fn vpc_local_interface_identity_is_validated() {
+        let attachment_id = Uuid::new_v4();
+        let attachments = |ids: Vec<Option<Uuid>>| InstanceExtensionServicesConfig {
+            service_configs: ids
+                .into_iter()
+                .map(|id| InstanceExtensionServiceConfig {
+                    id,
+                    dpu_target: None,
+                    service_id: carbide_uuid::extension_service::ExtensionServiceId::new(),
+                    version: ConfigVersion::initial(),
+                    removed: None,
+                })
+                .collect(),
+        };
+        // Each helper call draws a fresh VPC and identity for the same attachment.
+        let matching = vpc_local_interface(attachment_id);
+        let mut nil_identity = vpc_local_interface(attachment_id);
+        nil_identity.internal_uuid = Uuid::nil();
+        let mut reused_identity = vpc_local_interface(attachment_id);
+        reused_identity.interface_ordinal = 1;
+        reused_identity.internal_uuid = matching.internal_uuid;
+        let other_vpc = vpc_local_interface(attachment_id);
+        let mut same_position = vpc_local_interface(attachment_id);
+        same_position.vpc_id = matching.vpc_id;
+
+        scenarios!(
+            run = |(ids, records): (Vec<Option<Uuid>>, Vec<InstanceVpcLocalInterfaceConfig>)| {
+                let network = InstanceNetworkConfig {
+                    vpc_local_interfaces: records,
+                    ..Default::default()
+                };
+                validate_extension_service_identities(&attachments(ids), &network).map_err(drop)
+            };
+            "VPC-local interface references" {
+                (vec![Some(attachment_id)], vec![matching.clone()]) => Yields(()),
+                // A record cannot refer to an ID-less legacy attachment or to a foreign one.
+                (vec![None], vec![matching.clone()]) => Fails,
+                (vec![Some(Uuid::new_v4())], vec![matching.clone()]) => Fails,
+                // A nil internal identity cannot correlate the record across reconciliation.
+                (vec![Some(attachment_id)], vec![nil_identity]) => Fails,
+                // Distinct positions still need distinct stable identities.
+                (vec![Some(attachment_id)], vec![matching.clone(), reused_identity]) => Fails,
+                // One attachment serves a DPU's VPCs through one record each.
+                (vec![Some(attachment_id)], vec![matching.clone(), other_vpc]) => Yields(()),
+                // One attachment cannot own two records for the same VPC, position and DPU.
+                (vec![Some(attachment_id)], vec![matching, same_position]) => Fails,
             }
         );
     }

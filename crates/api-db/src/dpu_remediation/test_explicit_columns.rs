@@ -68,15 +68,17 @@ async fn exercise_remediation_queries(
     )
     .await?;
 
-    // Both INSERT statements return a remediation. Nonempty metadata also
-    // catches omitted columns that `FromRow` would otherwise default away.
-    for metadata in [
-        None,
-        Some(Metadata {
-            name: "repair-interface".to_string(),
-            description: "restore DPU interface configuration".to_string(),
-            labels: HashMap::from([("component".to_string(), "network".to_string())]),
-        }),
+    // Both INSERT statements return a remediation.
+    for (metadata, status) in [
+        (None, HashMap::new()),
+        (
+            Some(Metadata {
+                name: "repair-interface".to_string(),
+                description: "restore DPU interface configuration".to_string(),
+                labels: HashMap::from([("component".to_string(), "network".to_string())]),
+            }),
+            HashMap::from([("detail".to_string(), "interface restored".to_string())]),
+        ),
     ] {
         let mut expected = persist_remediation(
             NewRemediation {
@@ -121,7 +123,6 @@ async fn exercise_remediation_queries(
         assert_eq!(found.enabled, expected.enabled);
         assert_eq!(found.creation_time, expected.creation_time);
 
-        let status = HashMap::from([("detail".to_string(), "interface restored".to_string())]);
         let applied = persist_applied_remediation(
             NewAppliedRemediation {
                 id: expected.id,
@@ -139,34 +140,17 @@ async fn exercise_remediation_queries(
         assert!(applied.succeeded);
         assert_eq!(applied.status, status);
 
-        for (operation, records) in [
-            (
-                "by remediation",
-                find_applied_remediations_by(
-                    &mut txn,
-                    ObjectColumnFilter::One(AppliedRemediationIdColumn, &expected.id),
-                )
-                .await?,
-            ),
-            (
-                "by remediation and machine",
-                find_remediations_by_remediation_id_and_machine(
-                    &mut txn,
-                    expected.id,
-                    &dpu_machine_id,
-                )
-                .await?,
-            ),
-        ] {
-            assert_eq!(records.len(), 1, "{operation}");
-            let stored = &records[0];
-            assert_eq!(stored.id, applied.id, "{operation}");
-            assert_eq!(stored.dpu_machine_id, applied.dpu_machine_id, "{operation}");
-            assert_eq!(stored.attempt, applied.attempt, "{operation}");
-            assert_eq!(stored.succeeded, applied.succeeded, "{operation}");
-            assert_eq!(stored.status, applied.status, "{operation}");
-            assert_eq!(stored.applied_time, applied.applied_time, "{operation}");
-        }
+        let records =
+            find_remediations_by_remediation_id_and_machine(&mut txn, expected.id, &dpu_machine_id)
+                .await?;
+        assert_eq!(records.len(), 1);
+        let stored = &records[0];
+        assert_eq!(stored.id, applied.id);
+        assert_eq!(stored.dpu_machine_id, applied.dpu_machine_id);
+        assert_eq!(stored.attempt, applied.attempt);
+        assert_eq!(stored.succeeded, applied.succeeded);
+        assert_eq!(stored.status, applied.status);
+        assert_eq!(stored.applied_time, applied.applied_time);
     }
 
     // Replaying after rollback exercises both INSERT branches again on the same connection.

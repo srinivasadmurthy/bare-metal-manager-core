@@ -26,11 +26,8 @@ use crate::api::{Api, log_request_data};
 
 /// Per-RPC deadline for forwarding `GetVersion` to the RMS backend.
 ///
-/// `librms` applies per-stream connect/read/write timeouts at the transport
-/// layer, but those do not bound the total time an active stream can remain
-/// pending without completing.  This deadline caps the end-to-end duration of
-/// the RPC so a backend that keeps the stream open without responding does not
-/// hold the nico-api request indefinitely.
+/// Bounds the complete RPC, including connection setup, so an RMS backend that
+/// keeps the connection open without responding cannot hold the request indefinitely.
 const GET_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 // The `nico-admin-cli backend rms status` classifier
@@ -54,12 +51,12 @@ fn get_version_timeout_status() -> Status {
     ))
 }
 
-/// Status for a failed `GetVersion` call.
+/// Status for a failed RMS read.
 ///
 /// Preserves the gRPC status code from the RMS backend so the CLI can
 /// distinguish Unavailable, Unauthenticated, etc.  Going through
 /// `CarbideError` would collapse every variant into Internal.
-fn get_version_error_status(error: RackManagerError) -> Status {
+fn rms_error_status(error: RackManagerError) -> Status {
     match error {
         RackManagerError::ApiInvocationError(status) => Status::new(
             status.code(),
@@ -88,10 +85,53 @@ pub(crate) async fn get_rms_version(
     let resp = tokio::time::timeout(GET_VERSION_TIMEOUT, rms_client.get_version())
         .await
         .map_err(|_elapsed| get_version_timeout_status())?
-        .map_err(get_version_error_status)?;
+        .map_err(rms_error_status)?;
 
     Ok(Response::new(rpc::GetRmsVersionResponse {
         version: resp.version,
+    }))
+}
+
+/// Inspect the configured RMS backend's job records without applying workflow
+/// completion rules.
+pub(crate) async fn get_rms_job_status(
+    api: &Api,
+    request: Request<rpc::GetRmsJobStatusRequest>,
+) -> Result<Response<rpc::GetRmsJobStatusResponse>, Status> {
+    log_request_data(&request);
+    let request = request.into_inner();
+    if request.job_id.trim().is_empty() {
+        return Err(CarbideError::InvalidArgument("job_id must be non-empty".into()).into());
+    }
+    let Some(rms_client) = api.rms_client.as_ref() else {
+        return Err(CarbideError::UnavailableError(RMS_NOT_CONFIGURED_MESSAGE.into()).into());
+    };
+    let response = rms_client
+        .get_job_status(librms::protos::rack_manager::GetJobStatusRequest {
+            job_id: request.job_id,
+            include_child_job_states: request.include_child_job_states,
+        })
+        .await
+        .map_err(rms_error_status)?;
+    Ok(Response::new(rpc::GetRmsJobStatusResponse {
+        job_states: response
+            .job_states
+            .into_iter()
+            .map(|job| rpc::RmsJobStatus {
+                job_id: job.job_id,
+                parent_job_id: job.parent_job_id,
+                child_job_ids: job.child_job_ids,
+                execution_state: job.execution_state,
+                error_message: job.error_message,
+                error_code: job.error_code,
+                result_json: job.result_json,
+                state_description: job.state_description,
+                rack_id: job.rack_id,
+                node_id: job.node_id,
+                created_at: job.created_at.map(Into::into),
+                updated_at: job.updated_at.map(Into::into),
+            })
+            .collect(),
     }))
 }
 
@@ -145,7 +185,7 @@ mod tests {
         ];
 
         for (name, error, want_code, want_message) in cases {
-            let status = get_version_error_status(error);
+            let status = rms_error_status(error);
 
             assert_eq!(status.code(), want_code, "{name}: code");
             assert_eq!(status.message(), want_message, "{name}: message");

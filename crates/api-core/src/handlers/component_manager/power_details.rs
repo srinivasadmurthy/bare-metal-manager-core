@@ -17,16 +17,14 @@ use component_manager::core_compute_manager::CoreComputeTrayManager;
 use component_manager::error::ComponentManagerError;
 use component_manager::nv_switch_manager::SwitchEndpoint;
 use component_manager::power_shelf_manager::{PowerShelfEndpoint, PowerShelfVendor};
+use db::DbSessionGuard;
 use futures_util::{StreamExt, stream};
 use mac_address::MacAddress;
 use model::machine::PowerState;
 use model::machine::machine_search_config::MachineSearchConfig;
 use tonic::{Request, Response, Status};
 
-use super::{
-    fetch_compute_tray_bmc_credentials, fetch_powershelf_pmc_credentials,
-    fetch_switch_bmc_credentials, fetch_switch_nvos_credentials, is_rack_scale_server,
-};
+use super::{RackComponent, fetch_credentials, is_rack_scale_server};
 use crate::CarbideError;
 use crate::api::{Api, log_request_data};
 
@@ -63,76 +61,6 @@ enum PowerReadEndpoint {
 struct PendingDetails {
     details: rpc::ComponentPowerDetails,
     endpoint: Option<PowerReadEndpoint>,
-}
-
-/// `DbSessionGuard` owns a pooled connection until successful work explicitly
-/// returns it through `return_to_pool`. Dropping the guard before that discards
-/// the connection and immediately releases the local pool slot.
-///
-/// SQLx's normal cleanup can wait for a blocked query before rollback, so the
-/// guard also covers setup and network stalls that the statement cap cannot.
-struct DbSessionGuard {
-    connection: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
-}
-
-impl DbSessionGuard {
-    /// Wraps the pooled connection before `BEGIN`, so failed or cancelled
-    /// transaction startup still releases its pool slot.
-    async fn acquire(pool: &sqlx::PgPool) -> Result<Self, db::DatabaseError> {
-        Ok(Self {
-            connection: Some(pool.acquire().await.map_err(db::DatabaseError::acquire)?),
-        })
-    }
-
-    /// Starts a consistent, read-only snapshot with a transaction-local server
-    /// limit of at most `SNAPSHOT_TIMEOUT` per subsequent statement. A shorter
-    /// operator setting remains in effect. The separate client deadline covers
-    /// acquisition and setup; the server limit does not cover those stages.
-    async fn begin(&mut self) -> Result<db::Transaction<'_>, db::DatabaseError> {
-        let connection = self
-            .connection
-            .as_deref_mut()
-            .expect("the snapshot retains its connection until return_to_pool consumes it");
-        let mut txn = db::Transaction::begin_inner(connection).await?;
-        // Policy, identity and maintenance must share a snapshot, without row locks.
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(txn.as_pgconn())
-            .await
-            .map_err(|error| db::DatabaseError::query("set power details snapshot", error))?;
-
-        // `pg_settings` reports milliseconds. `NULLIF` turns a disabled (zero)
-        // timeout into NULL, which `LEAST` ignores when applying our cap. A
-        // shorter limit remains unchanged. The `true` argument makes this
-        // transaction-local, so the setting resets when the txn ends.
-        sqlx::query(
-            "SELECT set_config('statement_timeout', \
-                LEAST(NULLIF(setting::bigint, 0), $1::text::bigint)::text, true) \
-             FROM pg_settings WHERE name = 'statement_timeout'",
-        )
-        .bind(SNAPSHOT_TIMEOUT.as_millis().to_string())
-        .execute(txn.as_pgconn())
-        .await
-        .map_err(|error| db::DatabaseError::query("set power details statement timeout", error))?;
-        Ok(txn)
-    }
-
-    /// Returns a healthy connection through SQLx after its transaction commits.
-    fn return_to_pool(mut self) {
-        drop(self.connection.take());
-    }
-}
-
-impl Drop for DbSessionGuard {
-    fn drop(&mut self) {
-        if let Some(connection) = self.connection.take() {
-            // Detaching frees the local pool slot immediately. Closing the
-            // socket does not guarantee that PostgreSQL stops immediately;
-            // after snapshot setup, its statement timeout separately bounds
-            // each subsequent SQL statement. Discarded server sessions may
-            // briefly remain alongside replacements and exceed the pool limit.
-            drop(connection.detach());
-        }
-    }
 }
 
 /// Loads identity, policy and tracked maintenance in one snapshot, then releases
@@ -241,7 +169,9 @@ fn validate_ids<Id: Eq + Hash>(ids: &[Id]) -> Result<(), CarbideError> {
 /// one read-only transaction, releasing it before credentials or hardware I/O.
 async fn load_snapshot(api: &Api, target: Target) -> Result<Vec<PendingDetails>, CarbideError> {
     let mut connection = DbSessionGuard::acquire(api.pg_pool()).await?;
-    let mut txn = connection.begin().await?;
+    let mut txn = connection
+        .begin_read_only_snapshot(SNAPSHOT_TIMEOUT)
+        .await?;
     let entries = match target {
         Target::MachineIds(list) => {
             let machines = db::machine::find(
@@ -469,17 +399,12 @@ async fn read_actual(
         PowerReadEndpoint::Shelf(row) => row.pmc_mac,
     };
 
-    let credentials = match &endpoint {
-        PowerReadEndpoint::Compute { .. } => {
-            fetch_compute_tray_bmc_credentials(api.credential_manager.as_ref(), mac).await
-        }
-        PowerReadEndpoint::Switch(_) => {
-            fetch_switch_bmc_credentials(api.credential_manager.as_ref(), mac).await
-        }
-        PowerReadEndpoint::Shelf(_) => {
-            fetch_powershelf_pmc_credentials(api.credential_manager.as_ref(), mac).await
-        }
+    let credential_kind = match &endpoint {
+        PowerReadEndpoint::Compute { .. } => RackComponent::ComputeBmc,
+        PowerReadEndpoint::Switch(_) => RackComponent::SwitchBmc,
+        PowerReadEndpoint::Shelf(_) => RackComponent::PowerShelfPmc,
     };
+    let credentials = fetch_credentials(api, credential_kind, mac).await;
     // The caller's `timeout_at` polls ready results before checking expiry.
     // Check here so a late error cannot replace `DeadlineExceeded` and late
     // credentials cannot start another read.
@@ -515,8 +440,7 @@ async fn read_actual(
             let (Some(nvos_mac), Some(nvos_ip)) = (row.nvos_mac, row.nvos_ip) else {
                 return failed_observation(ErrorCode::EndpointUnavailable, Some(source));
             };
-            let nvos_credentials =
-                fetch_switch_nvos_credentials(api.credential_manager.as_ref(), mac).await;
+            let nvos_credentials = fetch_credentials(api, RackComponent::SwitchNvos, mac).await;
             // Apply the same guard before classifying the second credential lookup.
             if tokio::time::Instant::now() >= deadline {
                 return failed_observation(ErrorCode::DeadlineExceeded, Some(source));
@@ -641,6 +565,7 @@ fn backend_error_category(error: &ComponentManagerError) -> &'static str {
         ComponentManagerError::Unsupported(_) => "unsupported",
         ComponentManagerError::RejectedBeforeDispatch(_) => "rejected_before_dispatch",
         ComponentManagerError::OperationOutcomeUnknown(_) => "operation_outcome_unknown",
+        ComponentManagerError::SwitchCertificateSubmission { .. } => "operation_outcome_unknown",
         ComponentManagerError::Internal(_) => "internal",
         ComponentManagerError::Transport(_) => "transport",
         ComponentManagerError::Status(_) => "grpc_status",
@@ -676,6 +601,7 @@ fn failed_observation(
 
 #[cfg(test)]
 mod tests {
+    use carbide_instrument::testing::capture_logs;
     use carbide_test_support::Outcome::{FailsWith, Yields};
     use carbide_test_support::{Case, Check, check_cases, check_values};
     use carbide_uuid::machine::{HostMachineId, MachineId, MachineIdSource, MachineType};
@@ -683,66 +609,6 @@ mod tests {
     use carbide_uuid::switch::SwitchId;
 
     use super::*;
-
-    /// Snapshot setup must configure read-only, repeatable-read queries and the
-    /// server cap without extending a tighter operator limit or changing the
-    /// setting used by later pool borrowers.
-    #[crate::sqlx_test]
-    async fn snapshot_statement_timeout_is_capped_and_transaction_local(
-        pool: sqlx::PgPool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut connection = DbSessionGuard::acquire(&pool).await?;
-        for (configured_ms, expected_ms) in [
-            // A disabled server timeout still needs the snapshot's limit.
-            (0, 5000_i64),
-            // A broader site limit must not extend snapshot SQL work.
-            (60000, 5000),
-            // Preserve an operator's stricter limit.
-            (1000, 1000),
-        ] {
-            sqlx::query("SELECT set_config('statement_timeout', $1, false)")
-                .bind(configured_ms.to_string())
-                .execute(
-                    connection
-                        .connection
-                        .as_deref_mut()
-                        .expect("snapshot lease"),
-                )
-                .await?;
-
-            let mut txn = connection.begin().await?;
-            let effective_ms: i64 = sqlx::query_scalar(
-                "SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout'",
-            )
-            .fetch_one(txn.as_pgconn())
-            .await?;
-            assert_eq!(effective_ms, expected_ms, "configured {configured_ms}ms");
-            let (read_only, isolation): (String, String) = sqlx::query_as(
-                "SELECT current_setting('transaction_read_only'), \
-                        current_setting('transaction_isolation')",
-            )
-            .fetch_one(txn.as_pgconn())
-            .await?;
-            assert_eq!(read_only, "on");
-            assert_eq!(isolation, "repeatable read");
-            txn.commit().await?;
-
-            let restored_ms: i64 = sqlx::query_scalar(
-                "SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout'",
-            )
-            .fetch_one(
-                connection
-                    .connection
-                    .as_deref_mut()
-                    .expect("snapshot lease"),
-            )
-            .await?;
-            assert_eq!(restored_ms, configured_ms, "configured {configured_ms}ms");
-        }
-        connection.return_to_pool();
-
-        Ok(())
-    }
 
     /// Keep invalid batches out of snapshot acquisition while preserving each
     /// typed target arm and the inclusive request-size boundary.
@@ -799,11 +665,14 @@ mod tests {
     }
 
     /// Only one matching observation may become actual state with a receipt
-    /// time from this conversion. Malformed or failed evidence must select the
-    /// error outcome without leaking backend payloads.
+    /// time from this conversion. Malformed or failed evidence must return an
+    /// error without leaking backend payloads in responses or diagnostics.
+    /// Failure logs must still identify the source and requested management MAC.
     #[test]
     fn observations_preserve_unknown_and_reject_missing_or_mismatched_evidence() {
         use self::rpc::ComponentPowerErrorCode as ErrorCode;
+
+        const PRIVATE_PAYLOAD: &str = "private payload";
 
         let mac = MacAddress::new([1, 2, 3, 4, 5, 6]);
         let single = |mac_address, power_state| {
@@ -813,10 +682,9 @@ mod tests {
             }])
         };
 
-        // Cover wire states absent from the public acceptance fixtures here;
-        // rejected evidence shares the same projection and redaction contract.
-        check_values(
-            [
+        // Cover wire states absent from the public acceptance fixtures here.
+        let logs = capture_logs(|| {
+            let cases = [
                 Check {
                     scenario: "explicit unknown",
                     input: single(mac, Ok(Some(PowerState::Unknown))),
@@ -844,7 +712,7 @@ mod tests {
                 },
                 Check {
                     scenario: "per-target failure hides private payload",
-                    input: single(mac, Err("private payload".into())),
+                    input: single(mac, Err(PRIVATE_PAYLOAD.into())),
                     expect: Err(ErrorCode::ReadFailed),
                 },
                 Check {
@@ -856,13 +724,23 @@ mod tests {
                     expect: Err(ErrorCode::ReadFailed),
                 },
                 Check {
+                    // Malformed responses can contain errors as well as states;
+                    // logging the rejected result would expose its private text.
+                    scenario: "wrong identity with private failure text",
+                    input: single(
+                        MacAddress::new([6, 5, 4, 3, 2, 1]),
+                        Err(PRIVATE_PAYLOAD.into()),
+                    ),
+                    expect: Err(ErrorCode::ReadFailed),
+                },
+                Check {
                     scenario: "whole-call unsupported hides private payload",
-                    input: Err(ComponentManagerError::Unsupported("private payload".into())),
+                    input: Err(ComponentManagerError::Unsupported(PRIVATE_PAYLOAD.into())),
                     expect: Err(ErrorCode::Unsupported),
                 },
                 Check {
                     scenario: "whole-call failure hides private payload",
-                    input: Err(ComponentManagerError::Internal("private payload".into())),
+                    input: Err(ComponentManagerError::Internal(PRIVATE_PAYLOAD.into())),
                     expect: Err(ErrorCode::ReadFailed),
                 },
                 Check {
@@ -881,8 +759,8 @@ mod tests {
                     ]),
                     expect: Err(ErrorCode::ReadFailed),
                 },
-            ],
-            |result| {
+            ];
+            check_values(cases, |result| {
                 // The receipt timestamp must describe this conversion, not a
                 // default timestamp or a value cached by the backend.
                 let before = chrono::Utc::now();
@@ -890,7 +768,7 @@ mod tests {
                 let after = chrono::Utc::now();
 
                 assert_eq!(actual.source, Some(rpc::ComponentPowerSource::Rms as i32));
-                assert!(!format!("{actual:?}").contains("private payload"));
+                assert!(!format!("{actual:?}").contains(PRIVATE_PAYLOAD));
                 match actual.outcome.expect("every observation has an outcome") {
                     PowerOutcome::State(state) => {
                         let observed_at: chrono::DateTime<chrono::Utc> = actual
@@ -906,7 +784,74 @@ mod tests {
                         Err(ErrorCode::try_from(error.code).unwrap())
                     }
                 }
-            },
-        );
+            });
+        });
+
+        // Silence would also hide private text, so require the existing backend
+        // failure and malformed-response diagnostics before checking for leaks.
+        let expected_mac = mac.to_string();
+        for (category, level, message) in [
+            // An unsupported reader is a capability gap, not an operational warning.
+            (
+                "unsupported",
+                tracing::Level::DEBUG,
+                "passive power read is unsupported",
+            ),
+            // Whole-call failures must keep enough context to identify the backend.
+            (
+                "internal",
+                tracing::Level::WARN,
+                "component power read failed",
+            ),
+            // A failed target must still be diagnosable after discarding its text.
+            (
+                "per_target_failure",
+                tracing::Level::WARN,
+                "backend reported a component power read failure",
+            ),
+        ] {
+            let log = logs
+                .iter()
+                .find(|log| log.field("error_category") == Some(category))
+                .unwrap_or_else(|| panic!("missing {category} diagnostic"));
+            assert_eq!(log.level, level, "{category}");
+            assert_eq!(log.message, message, "{category}");
+            assert_eq!(log.field("source"), Some("Rms"));
+            assert_eq!(
+                log.field("management_mac_address"),
+                Some(expected_mac.as_str())
+            );
+            if category == "per_target_failure" {
+                assert_eq!(log.field("result_count"), Some("1"));
+            }
+        }
+
+        // Both a wrong MAC and duplicate results must retain the requested MAC
+        // and rejected result count without logging the results themselves.
+        for result_count in ["1", "2"] {
+            let log = logs
+                .iter()
+                .find(|log| {
+                    log.message
+                        == "component power results do not match the requested identity and count"
+                        && log.field("result_count") == Some(result_count)
+                })
+                .unwrap_or_else(|| {
+                    panic!("missing mismatch diagnostic for {result_count} results")
+                });
+            assert_eq!(log.level, tracing::Level::WARN);
+            assert_eq!(log.field("source"), Some("Rms"));
+            assert_eq!(
+                log.field("management_mac_address"),
+                Some(expected_mac.as_str())
+            );
+        }
+
+        assert!(logs.iter().all(|log| {
+            !log.message.contains(PRIVATE_PAYLOAD)
+                && log.fields.iter().all(|(name, value)| {
+                    !name.contains(PRIVATE_PAYLOAD) && !value.contains(PRIVATE_PAYLOAD)
+                })
+        }));
     }
 }

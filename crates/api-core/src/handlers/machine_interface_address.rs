@@ -90,12 +90,15 @@ async fn update_preallocated_expected_machine_interface_inner(
     expected_interface: &ExpectedInterface,
     retained_window: Option<chrono::Duration>,
 ) -> Result<PreallocationSuccess, CarbideError> {
+    let mac_address = expected_interface
+        .require_mac_address()
+        .map_err(|message| CarbideError::InvalidArgument(message.to_string()))?;
     let fixed_ip = expected_interface
         .fixed_reservation_ip()
         .map_err(|message| {
             CarbideError::InvalidArgument(format!(
                 "expected interface {}: {message}",
-                expected_interface.mac_address,
+                expected_interface.identity(),
             ))
         })?;
 
@@ -104,7 +107,7 @@ async fn update_preallocated_expected_machine_interface_inner(
     let mut savepoint = db::Transaction::begin_inner(txn).await?;
     let result = update_preallocated_machine_interface_with_settings(
         savepoint.as_pgconn(),
-        expected_interface.mac_address,
+        mac_address,
         fixed_ip,
         Some(ExpectedInterfaceSettings {
             interface_type: expected_interface.role.interface_type(),
@@ -299,6 +302,12 @@ fn emit_preallocation_error(
     result
 }
 
+/// Assign a static IP address to a machine interface.
+///
+/// Changing IPv4 keeps existing IPv6 addresses, and vice versa. If the new
+/// address moves the interface to another network segment, those retained
+/// addresses must also belong to that segment. Otherwise, reject the request
+/// without changing any addresses or interface settings.
 pub(crate) async fn assign_static_address(
     api: &Api,
     request: Request<rpc::AssignStaticAddressRequest>,
@@ -340,8 +349,7 @@ async fn assign_static_address_inner(
     let ip_address: std::net::IpAddr = req.ip_address.parse()?;
 
     let mut txn = api.txn_begin().await?;
-    let result =
-        db::machine_interface_address::assign_static(&mut txn, interface_id, ip_address).await?;
+    db::machine_interface::lock_for_address_assignment(txn.as_pgconn(), interface_id).await?;
 
     // Resolve the correct segment for this IP and update the interface
     // if needed. IPs within a managed prefix go on that prefix's segment.
@@ -350,6 +358,24 @@ async fn assign_static_address_inner(
         db::network_segment::for_static_address(txn.as_pgconn(), ip_address).await?;
 
     let current_iface = db::machine_interface::find_one(txn.as_pgconn(), interface_id).await?;
+    if current_iface.segment_id != target_segment.id
+        && let Some(sibling) = current_iface.addresses.iter().find(|address| {
+            address.address_family() != ip_address.address_family()
+                && !target_segment
+                    .prefixes
+                    .iter()
+                    .any(|prefix| prefix.prefix.contains(**address))
+        })
+    {
+        return Err(CarbideError::FailedPrecondition(format!(
+            "cannot assign {ip_address} to interface {interface_id}: retained address {sibling} \
+             is outside target network segment {} ({}); replace or remove {sibling} first",
+            target_segment.config.name, target_segment.id,
+        )));
+    }
+
+    let result =
+        db::machine_interface_address::assign_static(&mut txn, interface_id, ip_address).await?;
     if current_iface.segment_id != target_segment.id {
         db::machine_interface::update_segment_id(
             &mut txn,
@@ -664,7 +690,7 @@ mod tests {
         txn.commit().await?;
 
         let expected_interface = ExpectedInterface {
-            mac_address,
+            mac_address: Some(mac_address),
             ip_allocation: Some(model::expected_machine::ExpectedInterfaceIpAllocation::Fixed),
             fixed_ip: Some("192.0.2.240".parse()?),
             ..Default::default()

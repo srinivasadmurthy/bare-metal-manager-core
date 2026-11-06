@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use carbide_instrument::{Event, LabelValue, MetricFamily, Outcome};
 use carbide_uuid::machine::MachineId;
+use libmlx::firmware::operation::{FirmwareOperation, FirmwareOperationPhase};
 use rpc::forge_agent_control_response as fac;
 
 /// Which control-loop action scout handled, as a bounded metric label: one
@@ -43,6 +44,7 @@ pub(super) enum ScoutAction {
     LogError,
     MachineValidation,
     MlxAction,
+    MlxDeviceInfoReport,
     FirmwareUpgrade,
 }
 
@@ -58,6 +60,7 @@ impl From<&fac::Action> for ScoutAction {
             fac::Action::LogError(_) => Self::LogError,
             fac::Action::MachineValidation(_) => Self::MachineValidation,
             fac::Action::MlxAction(_) => Self::MlxAction,
+            fac::Action::MlxDeviceInfoReport(_) => Self::MlxDeviceInfoReport,
             fac::Action::FirmwareUpgrade(_) => Self::FirmwareUpgrade,
         }
     }
@@ -239,6 +242,7 @@ pub(super) enum ScoutMlxFailureStage {
     Lookup,
     Execute,
     Serialize,
+    Supervisor,
 }
 
 /// `ScoutMlxFailures` is the one metric behind every Scout MLX failure below:
@@ -880,15 +884,16 @@ impl ScoutMlxProfileApplyFailed {
     }
 }
 
-/// Scout could not initialize a firmware flasher for one MLX device.
+/// A durable receipt reports failed or uncertain firmware work. The receipt,
+/// not the latest Core profile, supplies the operation and phase context.
 #[derive(Event)]
 #[event(
-    event_name = "scout_mlx_firmware_flasher_initialization_failed",
+    event_name = "scout_mlx_firmware_receipt_failed",
     metric_family = ScoutMlxFailures,
     log = error,
-    message = "failed to create FirmwareFlasher"
+    message = "firmware operation requires attention"
 )]
-pub(super) struct ScoutMlxFirmwareFlasherInitializationFailed {
+pub(super) struct ScoutMlxFirmwareReceiptFailed {
     #[label]
     operation: ScoutMlxOperation,
     #[label]
@@ -896,36 +901,51 @@ pub(super) struct ScoutMlxFirmwareFlasherInitializationFailed {
     #[context]
     device: String,
     #[context]
-    part_number: String,
+    operation_id: String,
     #[context]
-    psid: String,
+    operation_state: String,
+    #[context]
+    operation_phase: String,
     #[context]
     error: String,
 }
 
-impl ScoutMlxFirmwareFlasherInitializationFailed {
-    pub(super) fn new(device: String, part_number: String, psid: String, error: String) -> Self {
-        let failure_stage = ScoutMlxFailureStage::Initialize;
+impl ScoutMlxFirmwareReceiptFailed {
+    /// Classify the failure counter from the recorded phase and keep the
+    /// receipt's diagnostics as log context.
+    pub(super) fn observed(device: &str, receipt: &FirmwareOperation) -> Self {
+        let failure_stage = match receipt.phase {
+            Some(FirmwareOperationPhase::Inspect) => ScoutMlxFailureStage::Initialize,
+            Some(_) => ScoutMlxFailureStage::Execute,
+            None => ScoutMlxFailureStage::Supervisor,
+        };
         Self {
             operation: ScoutMlxOperation::FirmwareFlash,
             failure_stage,
-            device,
-            part_number,
-            psid,
-            error,
+            device: device.to_string(),
+            operation_id: receipt.operation_id.clone(),
+            operation_state: format!("{:?}", receipt.state),
+            operation_phase: receipt
+                .phase
+                .map(|phase| format!("{phase:?}"))
+                .unwrap_or_else(|| "None".to_string()),
+            error: receipt
+                .diagnostic
+                .clone()
+                .unwrap_or_else(|| "firmware operation did not complete".to_string()),
         }
     }
 }
 
-/// Scout initialized a firmware flasher, but applying its profile failed.
+/// A failed supervisor request does not establish whether firmware work ran.
 #[derive(Event)]
 #[event(
-    event_name = "scout_mlx_firmware_flash_failed",
+    event_name = "scout_mlx_firmware_supervisor_request_failed",
     metric_family = ScoutMlxFailures,
     log = error,
-    message = "firmware flash failed"
+    message = "firmware supervisor request failed"
 )]
-pub(super) struct ScoutMlxFirmwareFlashFailed {
+pub(super) struct ScoutMlxFirmwareSupervisorRequestFailed {
     #[label]
     operation: ScoutMlxOperation,
     #[label]
@@ -933,35 +953,19 @@ pub(super) struct ScoutMlxFirmwareFlashFailed {
     #[context]
     device: String,
     #[context]
-    part_number: String,
-    #[context]
-    psid: String,
-    #[context]
-    firmware_url: String,
-    #[context]
-    target_version: String,
+    operation_id: String,
     #[context]
     error: String,
 }
 
-impl ScoutMlxFirmwareFlashFailed {
-    pub(super) fn execute(
-        device: String,
-        part_number: String,
-        psid: String,
-        firmware_url: String,
-        target_version: String,
-        error: String,
-    ) -> Self {
-        let failure_stage = ScoutMlxFailureStage::Execute;
+impl ScoutMlxFirmwareSupervisorRequestFailed {
+    /// A request failure identifies the supervisor boundary, not a flash outcome.
+    pub(super) fn failed(device: String, operation_id: String, error: String) -> Self {
         Self {
             operation: ScoutMlxOperation::FirmwareFlash,
-            failure_stage,
+            failure_stage: ScoutMlxFailureStage::Supervisor,
             device,
-            part_number,
-            psid,
-            firmware_url,
-            target_version,
+            operation_id,
             error,
         }
     }
@@ -1122,6 +1126,7 @@ mod tests {
         ApproxHistogramSum, CapturedFieldKind, MetricsCapture, capture_logs,
     };
     use carbide_test_support::{Check, check_values};
+    use libmlx::firmware::operation::FirmwareOperationState;
 
     use super::*;
 
@@ -1313,8 +1318,8 @@ mod tests {
         enum MutationCase {
             ProfileReset,
             ProfileApply,
-            FirmwareInitialize,
-            FirmwareExecute,
+            FirmwareReceipt,
+            FirmwareRequest,
         }
 
         struct Expected {
@@ -1353,29 +1358,27 @@ mod tests {
                     ("error", "failure"),
                 ],
             },
-            MutationCase::FirmwareInitialize => Expected {
+            MutationCase::FirmwareReceipt => Expected {
                 operation: "firmware_flash",
-                failure_stage: "initialize",
-                event_name: "scout_mlx_firmware_flasher_initialization_failed",
-                message: "failed to create FirmwareFlasher",
+                failure_stage: "execute",
+                event_name: "scout_mlx_firmware_receipt_failed",
+                message: "firmware operation requires attention",
                 context: vec![
                     ("device", "device"),
-                    ("part_number", "part-number"),
-                    ("psid", "psid"),
+                    ("operation_id", "receipt-id"),
+                    ("operation_state", "Failed"),
+                    ("operation_phase", "Burn"),
                     ("error", "failure"),
                 ],
             },
-            MutationCase::FirmwareExecute => Expected {
+            MutationCase::FirmwareRequest => Expected {
                 operation: "firmware_flash",
-                failure_stage: "execute",
-                event_name: "scout_mlx_firmware_flash_failed",
-                message: "firmware flash failed",
+                failure_stage: "supervisor",
+                event_name: "scout_mlx_firmware_supervisor_request_failed",
+                message: "firmware supervisor request failed",
                 context: vec![
                     ("device", "device"),
-                    ("part_number", "part-number"),
-                    ("psid", "psid"),
-                    ("firmware_url", "https://firmware.example/fw.bin"),
-                    ("target_version", "1.2.3"),
+                    ("operation_id", "receipt-id"),
                     ("error", "failure"),
                 ],
             },
@@ -1414,14 +1417,14 @@ mod tests {
                     expect: expected_observation(MutationCase::ProfileApply),
                 },
                 Check {
-                    scenario: "firmware flasher initialization failure",
-                    input: MutationCase::FirmwareInitialize,
-                    expect: expected_observation(MutationCase::FirmwareInitialize),
+                    scenario: "receipt reports an operation failure without fabricated hardware context",
+                    input: MutationCase::FirmwareReceipt,
+                    expect: expected_observation(MutationCase::FirmwareReceipt),
                 },
                 Check {
-                    scenario: "firmware flash execution failure",
-                    input: MutationCase::FirmwareExecute,
-                    expect: expected_observation(MutationCase::FirmwareExecute),
+                    scenario: "supervisor request failure does not claim that a flash ran",
+                    input: MutationCase::FirmwareRequest,
+                    expect: expected_observation(MutationCase::FirmwareRequest),
                 },
             ],
             |case| {
@@ -1437,22 +1440,25 @@ mod tests {
                         "profile".to_string(),
                         "failure".to_string(),
                     )),
-                    MutationCase::FirmwareInitialize => {
-                        emit(ScoutMlxFirmwareFlasherInitializationFailed::new(
-                            "device".to_string(),
-                            "part-number".to_string(),
-                            "psid".to_string(),
-                            "failure".to_string(),
+                    MutationCase::FirmwareReceipt => {
+                        emit(ScoutMlxFirmwareReceiptFailed::observed(
+                            "device",
+                            &FirmwareOperation {
+                                operation_id: "receipt-id".into(),
+                                state: FirmwareOperationState::Failed,
+                                phase: Some(FirmwareOperationPhase::Burn),
+                                report: Default::default(),
+                                diagnostic: Some("failure".into()),
+                            },
+                        ));
+                    }
+                    MutationCase::FirmwareRequest => {
+                        emit(ScoutMlxFirmwareSupervisorRequestFailed::failed(
+                            "device".into(),
+                            "receipt-id".into(),
+                            "failure".into(),
                         ))
                     }
-                    MutationCase::FirmwareExecute => emit(ScoutMlxFirmwareFlashFailed::execute(
-                        "device".to_string(),
-                        "part-number".to_string(),
-                        "psid".to_string(),
-                        "https://firmware.example/fw.bin".to_string(),
-                        "1.2.3".to_string(),
-                        "failure".to_string(),
-                    )),
                 });
                 let log = &logs[0];
 
@@ -1531,6 +1537,11 @@ mod tests {
                     scenario: "mlx action",
                     input: fac::Action::MlxAction(fac::MlxAction::default()),
                     expect: ScoutAction::MlxAction,
+                },
+                Check {
+                    scenario: "requested mlx inventory",
+                    input: fac::Action::MlxDeviceInfoReport(fac::MlxDeviceInfoReport {}),
+                    expect: ScoutAction::MlxDeviceInfoReport,
                 },
                 Check {
                     scenario: "firmware upgrade",

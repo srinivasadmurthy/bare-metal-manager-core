@@ -296,7 +296,7 @@ async fn redfish_browse_reports_http_failures_and_preserves_successes(pool: PgPo
         .host()
         .rpc_machine()
         .await
-        .bmc_info
+        .bmc
         .expect("host BMC")
         .ip()
         .to_string();
@@ -472,7 +472,7 @@ async fn redfish_browse_body_read_failure_reports_status_and_preserves_rpc_error
         .host()
         .rpc_machine()
         .await
-        .bmc_info
+        .bmc
         .expect("host BMC")
         .ip()
         .to_string();
@@ -542,7 +542,7 @@ async fn redfish_browse_core_proxy_preserves_credential_ownership_and_diagnostic
         .host()
         .rpc_machine()
         .await
-        .bmc_info
+        .bmc
         .expect("host BMC")
         .ip()
         .to_string();
@@ -632,7 +632,7 @@ async fn failed_claim_commit_does_not_dispatch_and_same_action_can_retry(pool: P
         .host()
         .rpc_machine()
         .await
-        .bmc_info
+        .bmc
         .expect("host BMC")
         .ip()
         .to_string();
@@ -670,9 +670,16 @@ async fn failed_claim_commit_does_not_dispatch_and_same_action_can_retry(pool: P
         .await
         .expect_err("claim commit must fail");
     assert_eq!(error.code(), tonic::Code::Internal);
+    assert_eq!(error.message(), "internal database error");
+    let source = std::error::Error::source(&error)
+        .expect("database status source")
+        .source()
+        .expect("original database error")
+        .downcast_ref::<db::DatabaseError>()
+        .expect("typed database error");
     assert!(
-        error.message().contains("test_applier_commit_failure"),
-        "{error}"
+        source.violates_constraint("test_applier_commit_failure"),
+        "{source}"
     );
     let action = fetch_action(&pool, request_id).await;
     assert!(action.applied_at.is_none());

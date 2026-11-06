@@ -204,7 +204,7 @@ pub async fn update(
 /// `delete` removes a profile whose complete version matches the caller's token.
 /// Missing profiles return `NotFoundError`; stale tokens return
 /// `ConcurrentModificationError` and leave the profile in place.
-/// A profile referenced by a site, machine, or card selection returns
+/// A profile referenced by a site, machine, card, or tenant selection returns
 /// `FailedPrecondition`.
 pub async fn delete(
     txn: &mut PgConnection,
@@ -237,6 +237,13 @@ pub async fn delete(
             {
                 DatabaseError::FailedPrecondition(
                     "profile is selected by a card NIC firmware selection".into(),
+                )
+            }
+            sqlx::Error::Database(error)
+                if error.constraint() == Some("tenants_nic_firmware_profile_id_fkey") =>
+            {
+                DatabaseError::FailedPrecondition(
+                    "profile is selected by a tenant NIC firmware selection".into(),
                 )
             }
             error => DatabaseError::query(query, error),
@@ -740,6 +747,7 @@ mod tests {
     fn observation(config: &NicFirmwareProfileConfig) -> MlxDeviceObservation {
         MlxDeviceObservation {
             observed_at: chrono::Utc::now(),
+            received_at: None,
             devices: config
                 .entries
                 .iter()
@@ -1240,7 +1248,14 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                before.status.mlx_device_observation, case.observation,
+                before
+                    .status
+                    .mlx_device_observation
+                    .as_ref()
+                    .map(|observation| (observation.observed_at, &observation.devices)),
+                case.observation
+                    .as_ref()
+                    .map(|observation| (observation.observed_at, &observation.devices)),
                 "{scenario}"
             );
             let mut txn = pool.begin().await.unwrap();
@@ -1454,6 +1469,13 @@ mod tests {
                 .unwrap(),
                 crate::ConditionalWrite::Applied(())
             );
+            let saved_observation =
+                crate::machine::find_one(&mut *scout, &host.id, Default::default())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .mlx_device_observation;
             let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
                 .fetch_one(&mut *scout)
                 .await
@@ -1513,8 +1535,7 @@ mod tests {
             );
             assert_eq!(stored.version, host.version, "{scenario}");
             assert_eq!(
-                stored.status.mlx_device_observation,
-                Some(changed_observation),
+                stored.status.mlx_device_observation, saved_observation,
                 "{scenario}"
             );
         }
@@ -1829,6 +1850,13 @@ mod tests {
                     crate::ConditionalWrite::Applied(())
                 );
             }
+            let saved_observation =
+                crate::machine::find_one(&mut *txn, &host.id, Default::default())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .mlx_device_observation;
             txn.commit().await.unwrap();
             let mut txn = pool.begin().await.unwrap();
             let updated = update(&mut txn, &id, &replacement, profile.version)
@@ -1879,8 +1907,7 @@ mod tests {
                 "{scenario}"
             );
             assert_eq!(
-                stored_host.status.mlx_device_observation,
-                Some(inventory),
+                stored_host.status.mlx_device_observation, saved_observation,
                 "{scenario}"
             );
         }
@@ -2049,6 +2076,13 @@ mod tests {
                             crate::ConditionalWrite::Applied(()),
                             "{drift}"
                         );
+                        let saved_observation =
+                            crate::machine::find_one(&mut *txn, &host.id, Default::default())
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .status
+                                .mlx_device_observation;
                         let updated = update(&mut txn, &id, &edited_config, profile_version)
                             .await
                             .unwrap();
@@ -2081,8 +2115,7 @@ mod tests {
                         );
                         assert_eq!(persisted_host.version, stored_host.version, "{drift}");
                         assert_eq!(
-                            persisted_host.status.mlx_device_observation,
-                            Some(observation),
+                            persisted_host.status.mlx_device_observation, saved_observation,
                             "{drift}"
                         );
 

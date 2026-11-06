@@ -639,7 +639,10 @@ mod tests {
     use crate::collectors::nvue::gnmi::sample_processor::{
         GnmiSampleProcessor, NVUE_GNMI_SAMPLE_STREAM_ID,
     };
-    use crate::collectors::nvue::gnmi::subscriber::{GnmiStreamMetrics, spawn_gnmi_collector};
+    use crate::collectors::nvue::gnmi::subscriber::{
+        GnmiCollectorSettings, GnmiStreamMetrics, spawn_gnmi_collector,
+        spawn_gnmi_collector_with_settings,
+    };
     use crate::config::{
         NvueGnmiConfig, NvueGnmiMetricConfig, NvueGnmiMetricOutput, NvueGnmiResponseKeyLabel,
         NvueGnmiSubscriptionConfig, NvueGnmiSubscriptionMode,
@@ -675,11 +678,24 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingMetricSink(StdMutex<Vec<(EventContext, MetricSample)>>);
+    struct RecordingMetricSink {
+        samples: StdMutex<Vec<(EventContext, MetricSample)>>,
+        pruned_keys: StdMutex<Vec<String>>,
+    }
 
     impl DataSink for RecordingMetricSink {
         fn sink_type(&self) -> &'static str {
             "recording_metric"
+        }
+
+        fn prune_metric_key(
+            &self,
+            _context: &EventContext,
+            key: &str,
+            _metric_type: &str,
+            _unit: &str,
+        ) {
+            self.pruned_keys.lock().unwrap().push(key.to_string());
         }
 
         fn try_handle_event(
@@ -688,7 +704,7 @@ mod tests {
             event: &CollectorEvent,
         ) -> Result<(), HealthError> {
             if let CollectorEvent::Metric(sample) = event {
-                self.0
+                self.samples
                     .lock()
                     .expect("recording sink lock")
                     .push((context.clone(), (**sample).clone()));
@@ -810,7 +826,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     let published = sink
-                        .0
+                        .samples
                         .lock()
                         .expect("recorded metrics")
                         .iter()
@@ -1345,7 +1361,7 @@ mod tests {
 
         assert_eq!(service.active_requests.load(Ordering::SeqCst), 1);
 
-        let samples = sink.0.lock().expect("recorded metric lock").clone();
+        let samples = sink.samples.lock().expect("recorded metric lock").clone();
         assert_eq!(samples.len(), 3);
 
         assert!(samples.iter().all(|(context, sample)| {
@@ -1402,6 +1418,7 @@ mod tests {
         subscriptions: &mut mpsc::Receiver<ControlledSubscription>,
         service: &TestGnmiService,
         sink: &RecordingMetricSink,
+        sockets: &AtomicUsize,
     ) {
         for stream_index in 0..3 {
             for retry in 0..2 {
@@ -1413,9 +1430,10 @@ mod tests {
                     tonic::Code::Unavailable
                 };
 
+                // The replacement may open before the server observes this RPC end.
+                // Check the count after receiving the replacement; `fail` still
+                // awaits this RPC's completion.
                 old.fail(code).await;
-
-                assert_eq!(service.active_requests.load(Ordering::SeqCst), 2);
 
                 if stream_index == 1 {
                     streams[0]
@@ -1434,11 +1452,31 @@ mod tests {
                     "reconnect must preserve requested paths and mode"
                 );
 
-                assert_eq!(service.active_requests.load(Ordering::SeqCst), 3);
+                assert_eq!(
+                    service.active_requests.load(Ordering::SeqCst),
+                    3,
+                    "active RPCs after reconnect for stream {stream_index}, retry {retry}"
+                );
 
                 replacement
                     .publish(sink, &format!("recovered-{stream_index}-{retry}"))
                     .await;
+
+                // Each stream uses a fresh client and one socket. Allow the old
+                // socket to close independently of the replacement opening.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while sockets.load(Ordering::SeqCst) != 3 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "expected 3 live sockets after stream {stream_index} recovery {retry}: sockets={}, active_requests={}",
+                        sockets.load(Ordering::SeqCst),
+                        service.active_requests.load(Ordering::SeqCst),
+                    )
+                });
 
                 streams.insert(stream_index, replacement);
             }
@@ -1481,9 +1519,12 @@ mod tests {
         config.paths.platform_general_enabled = false;
         config.paths.leak_sensors_enabled = true;
 
-        let collector = spawn_gnmi_collector(
+        let collector = spawn_gnmi_collector_with_settings(
             &endpoint,
-            &config,
+            GnmiCollectorSettings {
+                gnmi_config: &config,
+                initial_retry_delay: Duration::from_millis(10),
+            },
             credentials.clone(),
             registry,
             Some(sink.clone()),
@@ -1509,7 +1550,8 @@ mod tests {
 
         streams.sort_by_key(ControlledSubscription::stream_index);
 
-        assert_post_sync_reconnections(&mut streams, &mut subscriptions, service, &sink).await;
+        assert_post_sync_reconnections(&mut streams, &mut subscriptions, service, &sink, sockets)
+            .await;
 
         streams[2].fail(tonic::Code::Unauthenticated).await;
 
@@ -1599,12 +1641,10 @@ mod tests {
             .send(proto::subscribe_response::Response::SyncResponse(false))
             .await;
 
-        // A false sync must time out, release the entire RPC, and leave both rows exposed.
+        // A false sync must time out, release the entire RPC, and leave cached rows intact.
         wait_for_rpc_close(&mut incomplete.completed).await;
 
-        let export = metrics.export_telemetry().unwrap();
-        assert!(export.contains("instance_id=\"removed-event\""));
-        assert!(export.contains("instance_id=\"concurrent-event\""));
+        assert!(recording.pruned_keys.lock().unwrap().is_empty());
 
         for in_band_error in [true, false] {
             let mut failed = next_snapshot(subscriptions, live).await;
@@ -1616,8 +1656,7 @@ mod tests {
                 wait_for_rpc_close(&mut failed.completed).await;
             }
 
-            let export = metrics.export_telemetry().unwrap();
-            assert!(export.contains("instance_id=\"removed-event\""));
+            assert!(recording.pruned_keys.lock().unwrap().is_empty());
         }
 
         let mut snapshot = next_snapshot(subscriptions, live).await;
@@ -1635,8 +1674,18 @@ mod tests {
         wait_for_rpc_close(&mut snapshot.completed).await;
 
         let export = metrics.export_telemetry().unwrap();
-        assert!(!export.contains("instance_id=\"removed-event\""));
-        assert!(!export.contains("instance_id=\"concurrent-event\""));
+
+        let mut pruned = recording.pruned_keys.lock().unwrap().clone();
+        pruned.sort();
+
+        assert_eq!(
+            pruned,
+            [
+                "nvue_gnmi_events:concurrent-event",
+                "nvue_gnmi_events:removed-event"
+            ]
+        );
+
         assert!(export.contains("unrelated-interface"));
     }
 
@@ -1691,6 +1740,7 @@ mod tests {
         sink.handle_event(
             &crate::sink::EventContext::from_endpoint(&endpoint, NVUE_GNMI_SAMPLE_STREAM_ID),
             &CollectorEvent::Metric(Box::new(MetricSample {
+                semantics: crate::sink::MetricSemantics::Gauge,
                 key: "unrelated-interface".into(),
                 name: NVUE_GNMI_SAMPLE_STREAM_ID.into(),
                 metric_type: "interface_reading".into(),
@@ -1704,9 +1754,12 @@ mod tests {
             })),
         );
 
-        let collector = spawn_gnmi_collector(
+        let collector = spawn_gnmi_collector_with_settings(
             &endpoint,
-            &config,
+            GnmiCollectorSettings {
+                gnmi_config: &config,
+                initial_retry_delay: Duration::from_millis(10),
+            },
             Arc::new(DelayedRefreshProvider::default()),
             registry,
             Some(sink),
@@ -1734,15 +1787,27 @@ mod tests {
 
         live.publish(&recording, "repopulated-event").await;
 
-        let export = metrics.export_telemetry().unwrap();
-        assert!(export.contains("instance_id=\"repopulated-event\""));
+        assert!(
+            !recording
+                .pruned_keys
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|key| key.ends_with(":repopulated-event"))
+        );
 
         let mut interrupted = next_snapshot(&mut subscriptions, &live).await;
         live.fail(tonic::Code::Unavailable).await;
         wait_for_rpc_close(&mut interrupted.completed).await;
 
-        let export = metrics.export_telemetry().unwrap();
-        assert!(export.contains("instance_id=\"repopulated-event\""));
+        assert!(
+            !recording
+                .pruned_keys
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|key| key.ends_with(":repopulated-event"))
+        );
 
         let replacement = tokio::time::timeout(Duration::from_secs(4), subscriptions.recv())
             .await
@@ -1853,7 +1918,7 @@ mod tests {
 
             let mut snapshot = next_snapshot(&mut subscriptions, &live).await;
 
-            let emitted = recording.0.lock().unwrap().len();
+            let emitted = recording.samples.lock().unwrap().len();
 
             snapshot
                 .send(proto::subscribe_response::Response::SyncResponse(true))
@@ -1873,7 +1938,7 @@ mod tests {
             .await
             .unwrap();
 
-            assert_eq!(recording.0.lock().unwrap().len(), emitted);
+            assert_eq!(recording.samples.lock().unwrap().len(), emitted);
 
             live.publish(&recording, "restored-reading").await;
 
@@ -1911,7 +1976,7 @@ mod tests {
         );
 
         {
-            let samples = recording.0.lock().unwrap();
+            let samples = recording.samples.lock().unwrap();
 
             let (context, sample) = samples
                 .iter()
@@ -1938,7 +2003,7 @@ mod tests {
             .await;
 
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !recording.0.lock().unwrap().iter().any(|(_, sample)| {
+            while !recording.samples.lock().unwrap().iter().any(|(_, sample)| {
                 sample
                     .labels
                     .iter()
@@ -1951,7 +2016,7 @@ mod tests {
         .unwrap();
 
         {
-            let samples = recording.0.lock().unwrap();
+            let samples = recording.samples.lock().unwrap();
             let (context, sample) = samples.last().unwrap();
 
             assert_eq!(sample.value, 4.0);
@@ -2112,7 +2177,7 @@ mod tests {
                 }
 
                 tokio::time::timeout(Duration::from_secs(2), async {
-                    while recording.0.lock().unwrap().len() < 2 {
+                    while recording.samples.lock().unwrap().len() < 2 {
                         tokio::task::yield_now().await;
                     }
                 })

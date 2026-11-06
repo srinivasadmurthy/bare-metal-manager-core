@@ -19,11 +19,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use ::rpc::forge::{self as rpc, IsBmcInManagedHostResponse};
-use carbide_site_explorer::EndpointExplorationServiceError;
+use bmc_drivers::{Drivers, built_in_rules};
 use config_version::ConfigVersion;
 use db::ConditionalWrite::{Applied, NotApplied};
 use db::explored_endpoints::EndpointReportNotCurrent;
-use model::bmc_suppression::BmcSuppressionSubsystem;
 use tonic::{Request, Response, Status};
 
 use crate::CarbideError;
@@ -74,16 +73,12 @@ pub(crate) async fn find_explored_endpoints_by_ids(
         );
     }
 
-    let result = db::explored_endpoints::find_by_ips(&api.database_connection, ips)
-        .await
-        .map(|ep| ::rpc::site_explorer::ExploredEndpointList {
-            endpoints: ep
-                .into_iter()
-                .map(::rpc::site_explorer::ExploredEndpoint::from)
-                .collect(),
-        })
-        .map(Response::new)?;
-    Ok(result)
+    let endpoints = db::explored_endpoints::find_by_ips(&api.database_connection, ips).await?;
+    let mut endpoints = endpoints.into_iter().map(Into::into).collect::<Vec<_>>();
+    populate_dpf_suppression(api, &mut endpoints).await?;
+    Ok(Response::new(::rpc::site_explorer::ExploredEndpointList {
+        endpoints,
+    }))
 }
 
 pub(crate) async fn find_explored_managed_host_ids(
@@ -150,7 +145,24 @@ pub(crate) async fn get_site_exploration_report(
 
     let report = db::site_exploration_report::fetch(&mut api.db_reader()).await?;
 
-    Ok(tonic::Response::new(report.into()))
+    let mut report: ::rpc::site_explorer::SiteExplorationReport = report.into();
+    populate_dpf_suppression(api, &mut report.endpoints).await?;
+    Ok(tonic::Response::new(report))
+}
+
+async fn populate_dpf_suppression(
+    api: &Api,
+    endpoints: &mut [::rpc::site_explorer::ExploredEndpoint],
+) -> Result<(), CarbideError> {
+    let suppressed = db::bmc_suppression::dpf_suppressed_ips(&api.database_connection)
+        .await?
+        .into_iter()
+        .map(|ip| ip.to_string())
+        .collect::<std::collections::HashSet<_>>();
+    for endpoint in endpoints {
+        endpoint.exploration_paused_for_dpf = suppressed.contains(&endpoint.address);
+    }
+    Ok(())
 }
 
 pub(crate) async fn get_site_explorer_last_run(
@@ -297,21 +309,15 @@ pub(crate) async fn re_explore_endpoint(
         .into());
     }
 
-    if let Some(bmc_interface) = db::machine_interface::find_by_ip(&mut txn, bmc_ip).await?
-        && db::bmc_suppression::is_suppressed(
+    if let Some(bmc_interface) = db::machine_interface::find_by_ip(&mut txn, bmc_ip).await? {
+        carbide_site_explorer::suppression::check_exploration_allowed(
             txn.as_pgconn(),
+            bmc_ip,
             bmc_interface.mac_address,
-            BmcSuppressionSubsystem::SiteExplorer,
+            carbide_site_explorer::suppression::ExplorationRequest::ReExplore,
         )
-        .await?
-    {
-        return Err(
-            CarbideError::from(EndpointExplorationServiceError::Suppressed {
-                bmc_ip,
-                bmc_mac_address: bmc_interface.mac_address,
-            })
-            .into(),
-        );
+        .await
+        .map_err(CarbideError::from)?;
     }
 
     for ep in eps.iter() {
@@ -361,7 +367,9 @@ pub(crate) async fn refresh_endpoint_report(
         .await
         .map_err(CarbideError::from)?;
 
-    Ok(Response::new(endpoint.into()))
+    let mut endpoint = endpoint.into();
+    populate_dpf_suppression(api, std::slice::from_mut(&mut endpoint)).await?;
+    Ok(Response::new(endpoint))
 }
 
 pub(crate) async fn pause_explored_endpoint_remediation(
@@ -416,6 +424,38 @@ pub(crate) async fn is_bmc_in_managed_host(
 
     Ok(Response::new(IsBmcInManagedHostResponse {
         in_managed_host,
+    }))
+}
+
+pub(crate) async fn find_bmc_driver_selection(
+    api: &Api,
+    request: tonic::Request<::rpc::forge::BmcEndpointRequest>,
+) -> Result<Response<rpc::BmcDriverSelection>, tonic::Status> {
+    log_request_data(&request);
+    let bmc_ip = IpAddr::from_str(&request.into_inner().ip_address).map_err(CarbideError::from)?;
+    let Some(endpoint) =
+        db::explored_endpoints::find_by_ips(&api.database_connection, vec![bmc_ip])
+            .await?
+            .into_iter()
+            .next()
+    else {
+        return Err(CarbideError::NotFoundError {
+            kind: "explored_endpoint",
+            id: bmc_ip.to_string(),
+        }
+        .into());
+    };
+    // A report without the service root, from a failed first exploration or
+    // an older binary, cannot tell vendors apart, so it selects nothing.
+    if endpoint.report.service_root.is_none() {
+        return Ok(Response::new(rpc::BmcDriverSelection::default()));
+    }
+    let identity = bmc_explorer::platform_identity(&endpoint.report);
+    let selection = Drivers::select(&built_in_rules(), &identity)
+        .map_err(|error| CarbideError::internal(error.to_string()))?;
+    Ok(Response::new(rpc::BmcDriverSelection {
+        selection: Some(serde_json::to_string(&selection).map_err(CarbideError::from)?),
+        identity: Some(serde_json::to_string(&identity).map_err(CarbideError::from)?),
     }))
 }
 

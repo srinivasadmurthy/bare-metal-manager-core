@@ -32,6 +32,62 @@ async fn rejected_arguments_exit_before_contacting_core() {
     }
 
     for case in [
+        // An unsupported output format must not mutate Core and then emit YAML.
+        Case {
+            scenario: "prefix append rejects CSV before mutation",
+            args: &[
+                "--format=csv",
+                "--cloud-unsafe-op=prefix-validation",
+                "network-segment",
+                "add-prefix",
+                "--id=12345678-1234-5678-90ab-cdef01234567",
+                "--prefix=2001:db8::/64",
+            ],
+            diagnostic: "--format csv is not supported for prefix append",
+            usage: "Usage: nico-admin-cli network-segment add-prefix",
+        },
+        // Cross-field errors must take Clap's exit path, before the unsafe-op guard or RPC.
+        Case {
+            scenario: "prefix append requires its IPv4 gateway",
+            args: &[
+                "--cloud-unsafe-op=prefix-validation",
+                "network-segment",
+                "add-prefix",
+                "--id=12345678-1234-5678-90ab-cdef01234567",
+                "--prefix=192.0.2.0/24",
+            ],
+            diagnostic: "--gateway is required for an IPv4 --prefix",
+            usage: "Usage: nico-admin-cli network-segment add-prefix",
+        },
+        // A valid IPv4 gateway is still an invalid option for an IPv6 prefix.
+        Case {
+            scenario: "prefix append rejects an IPv6 gateway option",
+            args: &[
+                "--cloud-unsafe-op=prefix-validation",
+                "network-segment",
+                "add-prefix",
+                "--id=12345678-1234-5678-90ab-cdef01234567",
+                "--prefix=2001:db8::/64",
+                "--gateway=192.0.2.1",
+            ],
+            diagnostic: "--gateway is not accepted for an IPv6 --prefix",
+            usage: "Usage: nico-admin-cli network-segment add-prefix",
+        },
+        // Supplying the required gateway must not hide an IPv4/relay conflict.
+        Case {
+            scenario: "prefix append rejects a relay on IPv4",
+            args: &[
+                "--cloud-unsafe-op=prefix-validation",
+                "network-segment",
+                "add-prefix",
+                "--id=12345678-1234-5678-90ab-cdef01234567",
+                "--prefix=192.0.2.0/24",
+                "--gateway=192.0.2.1",
+                "--dhcpv6-link-address=2001:db8:ffff::1",
+            ],
+            diagnostic: "--dhcpv6-link-address requires an IPv6 --prefix",
+            usage: "Usage: nico-admin-cli network-segment add-prefix",
+        },
         Case {
             scenario: "excess IPv6 values fail before allocation",
             args: &[
@@ -228,6 +284,23 @@ async fn rejected_arguments_exit_before_contacting_core() {
             ],
             diagnostic: "must specify either --bmc-mac-address or --id",
             usage: "Usage: nico-admin-cli expected-switch update",
+        },
+        Case {
+            scenario: "switch add requires an NVOS port",
+            args: &[
+                "expected-switch",
+                "add",
+                "--bmc-mac-address",
+                "00:11:22:33:44:55",
+                "--bmc-username",
+                "admin",
+                "--bmc-password",
+                "test-password",
+                "--switch-serial-number",
+                "SWITCH-004",
+            ],
+            diagnostic: "--nvos-interface <MAC[,primary]>",
+            usage: "Usage: nico-admin-cli expected-switch add",
         },
         Case {
             scenario: "switch update rejects conflicting selectors",

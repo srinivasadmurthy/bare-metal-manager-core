@@ -122,18 +122,30 @@ fn replacement_has_effective_host_bmc(
                     == Some(rpc::ExpectedInterfaceRole::HostBmc);
             }
 
-            let Ok(mac_address) = replacement.mac_address.parse::<MacAddress>() else {
+            let Some(Ok(mac_address)) = replacement
+                .mac_address
+                .as_deref()
+                .map(|mac| mac.parse::<MacAddress>())
+            else {
                 return false;
             };
             let existing_interface = existing
                 .interfaces()
                 .get(index)
                 .filter(|candidate| {
-                    candidate.mac_address.parse::<MacAddress>().ok() == Some(mac_address)
+                    candidate
+                        .mac_address
+                        .as_deref()
+                        .and_then(|mac| mac.parse::<MacAddress>().ok())
+                        == Some(mac_address)
                 })
                 .or_else(|| {
                     existing.interfaces().iter().find(|candidate| {
-                        candidate.mac_address.parse::<MacAddress>().ok() == Some(mac_address)
+                        candidate
+                            .mac_address
+                            .as_deref()
+                            .and_then(|mac| mac.parse::<MacAddress>().ok())
+                            == Some(mac_address)
                     })
                 });
 
@@ -190,7 +202,7 @@ fn legacy_bmc_patch_fields(
 }
 
 // Benchmarks showed 4 had better overall performance while still overlapping page fetch latency.
-const PAGED_LIST_FETCH_CONCURRENCY: usize = 4;
+pub(crate) const PAGED_LIST_FETCH_CONCURRENCY: usize = 4;
 
 /// Attempt cap for retrying a single `RESOURCE_EXHAUSTED`-rejected call inside
 /// [`ApiClient::get_all_instances`]'s paged fetch (the id listing and each id
@@ -1391,6 +1403,7 @@ impl ApiClient {
             replace_host_nics: replace_interfaces,
             host_lifecycle_profile: host_lifecycle_profile
                 .or(expected_machine.host_lifecycle_profile),
+            server_name: expected_machine.server_name,
         };
 
         self.0
@@ -1440,6 +1453,7 @@ impl ApiClient {
                             disable_lockdown: hlp.disable_lockdown,
                         }
                     }),
+                    server_name: machine.server_name,
                 })
                 .collect(),
         };
@@ -1489,11 +1503,9 @@ impl ApiClient {
                     bmc_username: switch.bmc_username,
                     bmc_password: switch.bmc_password,
                     switch_serial_number: switch.switch_serial_number,
-                    nvos_mac_addresses: switch
-                        .nvos_mac_addresses
-                        .iter()
-                        .map(|m| m.to_string())
-                        .collect(),
+                    nvos_interfaces: crate::expected_switch::common::nvos_interfaces_wire(
+                        &switch.nvos_interfaces,
+                    ),
                     nvos_username: switch.nvos_username,
                     nvos_password: switch.nvos_password,
                     bmc_ip_address: switch
@@ -1654,6 +1666,7 @@ impl ApiClient {
                 svi_ip: None,
                 free_ip_count_v2: None,
                 free_ip_count_saturated: false,
+                dhcpv6_link_address: None,
             }],
             segment_type: NetworkSegmentType::Tenant as i32,
             id: Some(id),
@@ -1739,6 +1752,7 @@ impl ApiClient {
                 svi_ip: None,
                 free_ip_count_v2: None,
                 free_ip_count_saturated: false,
+                dhcpv6_link_address: None,
             }],
             segment_type: NetworkSegmentType::HostInband as i32,
             id: Some(id),
@@ -2374,6 +2388,7 @@ impl ApiClient {
                 labels,
             }),
             allow_unhealthy_machine: false,
+            external_validation_request_id: None,
         };
 
         tracing::trace!("{}", serde_json::to_string(&instance_request)?);
@@ -3487,7 +3502,7 @@ mod tests {
     /// Builds the smallest protobuf interface needed by the patch-field table.
     fn expected_interface(role: rpc::ExpectedInterfaceRole) -> rpc::ExpectedInterface {
         rpc::ExpectedInterface {
-            mac_address: "00:11:22:33:44:55".to_string(),
+            mac_address: Some("00:11:22:33:44:55".to_string()),
             role: Some(role as i32),
             ip_allocation: Some(rpc::ExpectedInterfaceIpAllocation::Dynamic as i32),
             ..Default::default()

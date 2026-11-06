@@ -6,6 +6,7 @@ package expectedmachine
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
@@ -82,6 +84,8 @@ func testExpectedMachineSetupSchema(t *testing.T, dbSession *cdb.Session) {
 	// create ExpectedMachine table
 	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.ExpectedMachine)(nil))
 	require.NoError(t, err)
+	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.PendingExpectedMachine)(nil))
+	require.NoError(t, err)
 	// create User table
 	err = dbSession.DB.ResetModel(context.Background(), (*cdbm.User)(nil))
 	require.NoError(t, err)
@@ -89,20 +93,27 @@ func testExpectedMachineSetupSchema(t *testing.T, dbSession *cdb.Session) {
 
 type testExpectedMachineReconcileContextKey struct{}
 
-type testExpectedMachineAfterReadHook struct {
+type testExpectedMachineReconcileHook struct {
 	afterRead    func()
+	beforeQuery  func(*bun.QueryEvent)
 	beforeCommit func()
 	rowID        uuid.UUID
 }
 
-func (h *testExpectedMachineAfterReadHook) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
-	if ctx.Value(testExpectedMachineReconcileContextKey{}) == h && event.Operation() == "COMMIT" && h.beforeCommit != nil {
+func (h *testExpectedMachineReconcileHook) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
+	if ctx.Value(testExpectedMachineReconcileContextKey{}) != h {
+		return ctx
+	}
+	if h.beforeQuery != nil {
+		h.beforeQuery(event)
+	}
+	if event.Operation() == "COMMIT" && h.beforeCommit != nil {
 		h.beforeCommit()
 	}
 	return ctx
 }
 
-func (h *testExpectedMachineAfterReadHook) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
+func (h *testExpectedMachineReconcileHook) AfterQuery(ctx context.Context, event *bun.QueryEvent) {
 	if h.rowID != uuid.Nil && (ctx.Value(testExpectedMachineReconcileContextKey{}) != h || !strings.Contains(event.Query, h.rowID.String())) {
 		return
 	}
@@ -138,7 +149,32 @@ func (h *testExpectedMachineBeforeDeleteHook) AfterQuery(ctx context.Context, ev
 	}
 }
 
+type testExpectedMachineWriteHook struct {
+	rowID       uuid.UUID
+	beforeWrite func(context.Context)
+	afterWrite  func(*bun.QueryEvent)
+}
+
+func (h *testExpectedMachineWriteHook) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
+	if h.beforeWrite != nil && (event.Operation() == "INSERT" || event.Operation() == "UPDATE") &&
+		strings.Contains(event.Query, `"expected_machine"`) && strings.Contains(event.Query, h.rowID.String()) {
+		beforeWrite := h.beforeWrite
+		h.beforeWrite = nil
+		beforeWrite(ctx)
+	}
+	return ctx
+}
+
+func (h *testExpectedMachineWriteHook) AfterQuery(_ context.Context, event *bun.QueryEvent) {
+	if h.afterWrite != nil && (event.Operation() == "INSERT" || event.Operation() == "UPDATE") &&
+		strings.Contains(event.Query, `"expected_machine"`) && strings.Contains(event.Query, h.rowID.String()) {
+		h.afterWrite(event)
+	}
+}
+
 func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
+	t.Run("pending batch recovery", testExpectedMachinePendingRecovery)
+
 	ctx := context.Background()
 
 	dbSession := testExpectedMachineInitDB(t)
@@ -626,59 +662,342 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 		})
 	}
 
-	t.Run("defer association until the linked machine exists in REST", func(t *testing.T) {
-		emID := uuid.New()
-		bmcMAC := "00:11:22:33:77:01"
-		predictedMachineID := "fm100p-predicted-host"
-		inventory := &corev1.ExpectedMachineInventory{
-			ExpectedMachines: []*corev1.ExpectedMachine{
-				{
-					Id:                  &corev1.UUID{Value: emID.String()},
+	foreignMachine := cwu.TestBuildMachine(t, dbSession, ip.ID, st.ID, nil, cutil.GetPtr(false), cdbm.MachineStatusReady)
+	for _, tc := range []struct {
+		name                 string
+		bmcMAC               string
+		rejectedMachineID    string
+		companionMachine     *cdbm.Machine
+		updatedChassisSerial string
+	}{
+		{
+			name:                 "defer association until the linked machine exists in REST",
+			bmcMAC:               "00:11:22:33:77:01",
+			rejectedMachineID:    "fm100p-predicted-host",
+			updatedChassisSerial: "SN-LINKED-MACHINE",
+		},
+		{
+			name:                 "foreign Site Machine cannot create or replace an association",
+			bmcMAC:               "00:11:22:33:77:02",
+			rejectedMachineID:    foreignMachine.ID,
+			companionMachine:     cwu.TestBuildMachine(t, dbSession, ip.ID, st4.ID, nil, cutil.GetPtr(false), cdbm.MachineStatusReady),
+			updatedChassisSerial: "SN-UPDATED-WITH-FOREIGN-LINK",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			emID := uuid.New()
+			inventory := &corev1.ExpectedMachineInventory{
+				ExpectedMachines: []*corev1.ExpectedMachine{
+					{
+						Id:                  &corev1.UUID{Value: emID.String()},
+						BmcMacAddress:       tc.bmcMAC,
+						ChassisSerialNumber: "SN-LINKED-MACHINE",
+					},
+				},
+				LinkedMachines: []*corev1.LinkedExpectedMachine{
+					{
+						BmcMacAddress: tc.bmcMAC,
+						MachineId:     &corev1.MachineId{Id: tc.rejectedMachineID},
+					},
+				},
+				Timestamp:       timestamppb.Now(),
+				InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+			}
+			var companionID uuid.UUID
+			if tc.companionMachine != nil {
+				companionID = uuid.New()
+				inventory.ExpectedMachines = append(inventory.ExpectedMachines, &corev1.ExpectedMachine{
+					Id:                  &corev1.UUID{Value: companionID.String()},
+					BmcMacAddress:       "00:11:22:33:77:03",
+					ChassisSerialNumber: "SN-SAME-SITE-COMPANION",
+				})
+				inventory.LinkedMachines = append(inventory.LinkedMachines, &corev1.LinkedExpectedMachine{
+					BmcMacAddress: "00:11:22:33:77:03",
+					MachineId:     &corev1.MachineId{Id: tc.companionMachine.ID},
+				})
+			}
+
+			mei := ManageExpectedMachine{dbSession: dbSession}
+			cwu.TestInventoryAgeUpdatedTimestamp(ctx, t, dbSession, (*cdbm.ExpectedMachine)(nil))
+			err := mei.UpdateExpectedMachinesInDB(ctx, st4.ID, inventory)
+			require.NoError(t, err)
+
+			reconciled, err := emDAO.Get(ctx, nil, emID, nil, false)
+			require.NoError(t, err)
+			assert.Equal(t, emID, reconciled.ID)
+			assert.Equal(t, st4.ID, reconciled.SiteID)
+			assert.Equal(t, tc.bmcMAC, reconciled.BmcMacAddress)
+			assert.Equal(t, "SN-LINKED-MACHINE", reconciled.ChassisSerialNumber)
+			assert.Nil(t, reconciled.MachineID)
+			if tc.companionMachine != nil {
+				companion, err := emDAO.Get(ctx, nil, companionID, nil, false)
+				require.NoError(t, err)
+				assert.Equal(t, st4.ID, companion.SiteID)
+				assert.Equal(t, &tc.companionMachine.ID, companion.MachineID)
+			}
+
+			permanentMachine := cwu.TestBuildMachine(t, dbSession, ip.ID, st4.ID, nil, cutil.GetPtr(false), cdbm.MachineStatusReady)
+			inventory.LinkedMachines[0].MachineId.Id = permanentMachine.ID
+
+			cwu.TestInventoryAgeUpdatedTimestamp(ctx, t, dbSession, (*cdbm.ExpectedMachine)(nil))
+			err = mei.UpdateExpectedMachinesInDB(ctx, st4.ID, inventory)
+			require.NoError(t, err)
+
+			reconciled, err = emDAO.Get(ctx, nil, emID, nil, false)
+			require.NoError(t, err)
+			assert.Equal(t, &permanentMachine.ID, reconciled.MachineID)
+
+			inventory.LinkedMachines[0].MachineId.Id = tc.rejectedMachineID
+			inventory.ExpectedMachines[0].ChassisSerialNumber = tc.updatedChassisSerial
+			cwu.TestInventoryAgeUpdatedTimestamp(ctx, t, dbSession, (*cdbm.ExpectedMachine)(nil))
+			beforeRejectedLink, err := emDAO.Get(ctx, nil, emID, nil, false)
+			require.NoError(t, err)
+			err = mei.UpdateExpectedMachinesInDB(ctx, st4.ID, inventory)
+			require.NoError(t, err)
+			reconciled, err = emDAO.Get(ctx, nil, emID, nil, false)
+			require.NoError(t, err)
+			assert.Equal(t, &permanentMachine.ID, reconciled.MachineID)
+			assert.Equal(t, emID, reconciled.ID)
+			assert.Equal(t, st4.ID, reconciled.SiteID)
+			assert.Equal(t, tc.updatedChassisSerial, reconciled.ChassisSerialNumber)
+			if tc.updatedChassisSerial == beforeRejectedLink.ChassisSerialNumber {
+				assert.Equal(t, beforeRejectedLink.Updated, reconciled.Updated)
+			} else {
+				assert.True(t, reconciled.Updated.After(beforeRejectedLink.Updated))
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		existing bool
+	}{
+		{name: "exclusive Expected Inventory lock defers inventory creation"},
+		{name: "exclusive Expected Inventory lock preserves an existing inventory row", existing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			site := cwu.TestBuildSite(t, dbSession, ip, tc.name, cdbm.SiteStatusRegistered, nil, ipu)
+			sku := cwu.TestBuildSku(t, dbSession, uuid.NewString(), site)
+			machineID, companionID := uuid.New(), uuid.New()
+			var before *cdbm.ExpectedMachine
+			if tc.existing {
+				_, err := emDAO.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
+					ExpectedMachineID: machineID, SiteID: site.ID, BmcMacAddress: "00:11:22:33:92:01",
+					ChassisSerialNumber: "original", Name: cutil.GetPtr("original"), CreatedBy: ipu.ID,
+				})
+				require.NoError(t, err)
+				cwu.TestInventoryAgeUpdatedTimestamp(ctx, t, dbSession, (*cdbm.ExpectedMachine)(nil))
+				before, err = emDAO.Get(ctx, nil, machineID, nil, false)
+				require.NoError(t, err)
+			}
+			inventory := &corev1.ExpectedMachineInventory{
+				InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+				ExpectedMachines: []*corev1.ExpectedMachine{
+					{
+						Id: &corev1.UUID{Value: machineID.String()}, BmcMacAddress: "00:11:22:33:92:01",
+						ChassisSerialNumber: "repeated-inventory-serial", SkuId: &sku.ID,
+						Metadata: &corev1.Metadata{Name: "inventory-name"},
+					},
+					{
+						Id: &corev1.UUID{Value: companionID.String()}, BmcMacAddress: "00:11:22:33:92:02",
+						ChassisSerialNumber: "repeated-inventory-serial", SkuId: &sku.ID,
+					},
+				},
+			}
+			lockID := cdbm.ExpectedInventoryMutationLockID(site.ID)
+			gateTx, err := cdb.BeginTx(ctx, dbSession, nil)
+			require.NoError(t, err)
+			defer func() {
+				rollbackErr := gateTx.Rollback()
+				if rollbackErr != nil {
+					require.ErrorIs(t, rollbackErr, sql.ErrTxDone)
+				}
+			}()
+			require.NoError(t, gateTx.AcquireAdvisoryLock(ctx, lockID, false))
+			gateReleased, prematureRowLock, probedSharedGate := false, false, false
+			hook := &testExpectedMachineReconcileHook{
+				beforeQuery: func(event *bun.QueryEvent) {
+					// Release after the first item's rejected transaction so later
+					// items can still reconcile in this same activity invocation.
+					if !gateReleased && event.Operation() == "ROLLBACK" {
+						gateReleased = true
+						require.NoError(t, gateTx.Rollback())
+						return
+					}
+					isSKURead := strings.Contains(event.Query, `FROM "sku"`)
+					if !gateReleased && (isSKURead || strings.Contains(event.Query, "FOR UPDATE")) {
+						prematureRowLock = true
+					}
+					if !gateReleased || !isSKURead || probedSharedGate {
+						return
+					}
+					probedSharedGate = true
+					probeTx, err := cdb.BeginTx(ctx, dbSession, nil)
+					require.NoError(t, err)
+					defer func() { require.NoError(t, probeTx.Rollback()) }()
+					var sharedAcquired, exclusiveAcquired bool
+					err = probeTx.GetBunTx().NewSelect().ColumnExpr("pg_try_advisory_xact_lock_shared(?)", lockID).Scan(ctx, &sharedAcquired)
+					require.NoError(t, err)
+					err = probeTx.GetBunTx().NewSelect().ColumnExpr("pg_try_advisory_xact_lock(?)", lockID).Scan(ctx, &exclusiveAcquired)
+					require.NoError(t, err)
+					require.True(t, sharedAcquired, "inventory must allow other ordinary writers")
+					require.False(t, exclusiveAcquired, "inventory must hold its shared Expected Inventory lock before SKU and row locks")
+				},
+			}
+			dbSession.DB.AddQueryHook(hook)
+			var logOutput bytes.Buffer
+			originalLogger := log.Logger
+			log.Logger = zerolog.New(&logOutput).Level(zerolog.WarnLevel)
+			t.Cleanup(func() { log.Logger = originalLogger })
+			mei := ManageExpectedMachine{dbSession: dbSession}
+			activityCtx := context.WithValue(ctx, testExpectedMachineReconcileContextKey{}, hook)
+			require.NoError(t, mei.UpdateExpectedMachinesInDB(activityCtx, site.ID, inventory))
+			require.True(t, gateReleased, "the first item's lock failure must roll back its transaction")
+			require.False(t, prematureRowLock, "the Expected Inventory lock must precede SKU and Expected Machine row locks")
+			require.True(t, probedSharedGate)
+			require.Contains(t, logOutput.String(), `"level":"warn"`)
+			require.Contains(t, logOutput.String(), "skipping ExpectedMachine after bounded Expected Inventory lock contention retries")
+			require.Contains(t, logOutput.String(), cdb.ErrXactAdvisoryLockFailed.Error())
+			require.Contains(t, logOutput.String(), machineID.String())
+			stored, err := emDAO.Get(ctx, nil, machineID, nil, false)
+			if tc.existing {
+				require.NoError(t, err)
+				require.Equal(t, before, stored)
+			} else {
+				require.ErrorIs(t, err, cdb.ErrDoesNotExist)
+			}
+			companion, err := emDAO.Get(ctx, nil, companionID, nil, false)
+			require.NoError(t, err, "one rejected item must not prevent later inventory writes")
+			require.Equal(t, &sku.ID, companion.SkuID)
+
+			// A later inventory retries the skipped item and still accepts repeated serials.
+			probedSharedGate = false
+			require.NoError(t, mei.UpdateExpectedMachinesInDB(activityCtx, site.ID, inventory))
+			require.True(t, probedSharedGate, "the retried create or update must acquire the shared Expected Inventory lock")
+			stored, err = emDAO.Get(ctx, nil, machineID, nil, false)
+			require.NoError(t, err)
+			require.Equal(t, companion.ChassisSerialNumber, stored.ChassisSerialNumber)
+			require.Equal(t, &sku.ID, stored.SkuID)
+			require.Equal(t, cutil.GetPtr("inventory-name"), stored.Name)
+		})
+	}
+
+	for i, tc := range []struct {
+		name         string
+		existing     bool
+		unchangedSKU bool
+	}{
+		{name: "foreign Site SKU defers inventory creation"},
+		{name: "foreign Site SKU preserves the entire existing machine", existing: true},
+		{name: "unchanged foreign Site SKU allows unrelated reconciliation", existing: true, unchangedSKU: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			site := cwu.TestBuildSite(t, dbSession, ip, tc.name, cdbm.SiteStatusRegistered, nil, ipu)
+			foreignSKU := cwu.TestBuildSku(t, dbSession, uuid.NewString(), st)
+			localSKU := cwu.TestBuildSku(t, dbSession, uuid.NewString(), site)
+			machineID, companionID := uuid.New(), uuid.New()
+			bmcMAC := fmt.Sprintf("00:11:22:33:91:%02d", i*2)
+			var before *cdbm.ExpectedMachine
+			if tc.existing {
+				initialSKU := localSKU
+				if tc.unchangedSKU {
+					initialSKU = foreignSKU
+				}
+				_, err := emDAO.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
+					ExpectedMachineID:   machineID,
+					SiteID:              site.ID,
 					BmcMacAddress:       bmcMAC,
-					ChassisSerialNumber: "SN-LINKED-MACHINE",
+					ChassisSerialNumber: "SN-SKU-ATTACHMENT",
+					SkuID:               &initialSKU.ID,
+					BmcIpAddress:        cutil.GetPtr("192.0.2.91"),
+					Name:                cutil.GetPtr("existing-name"),
+					CreatedBy:           ipu.ID,
+				})
+				require.NoError(t, err)
+				cwu.TestInventoryAgeUpdatedTimestamp(ctx, t, dbSession, (*cdbm.ExpectedMachine)(nil))
+				before, err = emDAO.Get(ctx, nil, machineID, nil, false)
+				require.NoError(t, err)
+			}
+			inventory := &corev1.ExpectedMachineInventory{
+				ExpectedMachines: []*corev1.ExpectedMachine{
+					{
+						Id:                  &corev1.UUID{Value: machineID.String()},
+						BmcMacAddress:       bmcMAC,
+						ChassisSerialNumber: "SN-SKU-ATTACHMENT",
+						SkuId:               &foreignSKU.ID,
+						Metadata:            &corev1.Metadata{Name: "inventory-name"},
+					},
+					{
+						Id:                  &corev1.UUID{Value: companionID.String()},
+						BmcMacAddress:       fmt.Sprintf("00:11:22:33:91:%02d", i*2+1),
+						ChassisSerialNumber: "SN-SKU-COMPANION",
+						SkuId:               &localSKU.ID,
+					},
 				},
-			},
-			LinkedMachines: []*corev1.LinkedExpectedMachine{
-				{
-					BmcMacAddress: bmcMAC,
-					MachineId:     &corev1.MachineId{Id: predictedMachineID},
-				},
-			},
-			Timestamp:       timestamppb.Now(),
-			InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
-		}
+				Timestamp:       timestamppb.Now(),
+				InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
+			}
+			probedSKU := false
+			var lockError error
+			if !tc.existing {
+				hook := &testExpectedMachineWriteHook{
+					rowID: companionID,
+					beforeWrite: func(ctx context.Context) {
+						probedSKU = true
+						ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+						defer cancel()
+						conn, err := dbSession.DB.DB.Conn(ctx)
+						if err != nil {
+							lockError = err
+							return
+						}
+						defer func() { require.NoError(t, conn.Close()) }()
+						var id string
+						lockError = conn.QueryRowContext(ctx, "SELECT id FROM sku WHERE id = $1 FOR UPDATE NOWAIT", localSKU.ID).Scan(&id)
+					},
+				}
+				dbSession.DB.AddQueryHook(hook)
+			}
+			mei := ManageExpectedMachine{dbSession: dbSession}
+			require.NoError(t, mei.UpdateExpectedMachinesInDB(ctx, site.ID, inventory))
+			if !tc.existing {
+				require.True(t, probedSKU, "the lock probe must run before the companion INSERT")
+				var pgErr *pgconn.PgError
+				require.ErrorAs(t, lockError, &pgErr)
+				assert.Equal(t, "55P03", pgErr.Code, "the attachment must hold the SKU lock before INSERT can acquire an FK lock")
+			}
 
-		mei := ManageExpectedMachine{dbSession: dbSession}
-		cwu.TestInventoryAgeUpdatedTimestamp(ctx, t, dbSession, (*cdbm.ExpectedMachine)(nil))
-		err := mei.UpdateExpectedMachinesInDB(ctx, st4.ID, inventory)
-		require.NoError(t, err)
+			stored, err := emDAO.Get(ctx, nil, machineID, nil, false)
+			if tc.unchangedSKU {
+				require.NoError(t, err)
+				assert.Equal(t, &foreignSKU.ID, stored.SkuID)
+				assert.Equal(t, cutil.GetPtr("inventory-name"), stored.Name)
+				assert.Nil(t, stored.BmcIpAddress)
+			} else if tc.existing {
+				require.NoError(t, err)
+				assert.Equal(t, before, stored, "a rejected SKU must not clear BMC IP or update metadata")
+			} else {
+				require.ErrorIs(t, err, cdb.ErrDoesNotExist)
+			}
+			companion, err := emDAO.Get(ctx, nil, companionID, nil, false)
+			require.NoError(t, err, "a rejected item must not prevent later inventory items from being saved")
+			assert.Equal(t, site.ID, companion.SiteID)
+			assert.Equal(t, &localSKU.ID, companion.SkuID)
+			if tc.unchangedSKU {
+				return
+			}
 
-		reconciled, err := emDAO.Get(ctx, nil, emID, nil, false)
-		require.NoError(t, err)
-		assert.Nil(t, reconciled.MachineID)
-
-		permanentMachine := cwu.TestBuildMachine(t, dbSession, ip.ID, st4.ID, nil, cutil.GetPtr(false), cdbm.MachineStatusReady)
-		inventory.LinkedMachines[0].MachineId.Id = permanentMachine.ID
-
-		cwu.TestInventoryAgeUpdatedTimestamp(ctx, t, dbSession, (*cdbm.ExpectedMachine)(nil))
-		err = mei.UpdateExpectedMachinesInDB(ctx, st4.ID, inventory)
-		require.NoError(t, err)
-
-		reconciled, err = emDAO.Get(ctx, nil, emID, nil, false)
-		require.NoError(t, err)
-		assert.Equal(t, &permanentMachine.ID, reconciled.MachineID)
-
-		inventory.LinkedMachines[0].MachineId.Id = predictedMachineID
-		cwu.TestInventoryAgeUpdatedTimestamp(ctx, t, dbSession, (*cdbm.ExpectedMachine)(nil))
-		beforeMissingTarget, err := emDAO.Get(ctx, nil, emID, nil, false)
-		require.NoError(t, err)
-		err = mei.UpdateExpectedMachinesInDB(ctx, st4.ID, inventory)
-		require.NoError(t, err)
-		reconciled, err = emDAO.Get(ctx, nil, emID, nil, false)
-		require.NoError(t, err)
-		assert.Equal(t, &permanentMachine.ID, reconciled.MachineID)
-		assert.Equal(t, beforeMissingTarget.Updated, reconciled.Updated)
-	})
+			require.NoError(t, cdbm.NewSkuDAO(dbSession).Delete(ctx, nil, foreignSKU.ID))
+			cwu.TestBuildSku(t, dbSession, foreignSKU.ID, site)
+			require.NoError(t, mei.UpdateExpectedMachinesInDB(ctx, site.ID, inventory))
+			stored, err = emDAO.Get(ctx, nil, machineID, nil, false)
+			require.NoError(t, err)
+			assert.Equal(t, site.ID, stored.SiteID)
+			assert.Equal(t, &foreignSKU.ID, stored.SkuID)
+			assert.Equal(t, cutil.GetPtr("inventory-name"), stored.Name)
+			assert.Nil(t, stored.BmcIpAddress)
+		})
+	}
 
 	t.Run("API write after inventory read survives reconciliation", func(t *testing.T) {
 		site := cwu.TestBuildSite(t, dbSession, ip, "concurrent-update-site", cdbm.SiteStatusRegistered, nil, ipu)
@@ -699,7 +1018,7 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 		var newer *cdbm.ExpectedMachine
 		var writeErr error
 		fired := false
-		hook := &testExpectedMachineAfterReadHook{afterRead: func() {
+		hook := &testExpectedMachineReconcileHook{afterRead: func() {
 			fired = true
 			newer, writeErr = emDAO.Update(ctx, nil, cdbm.ExpectedMachineUpdateInput{
 				ExpectedMachineID: row.ID,
@@ -881,7 +1200,7 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 			cancel()
 			workers.Wait()
 		}()
-		hook := &testExpectedMachineAfterReadHook{
+		hook := &testExpectedMachineReconcileHook{
 			rowID: row.ID,
 			afterRead: func() {
 				close(readReached)
@@ -919,49 +1238,55 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 			t.Fatal("activity did not reach its row reload: ", ctx.Err())
 		}
 
-		writerReady := make(chan int, 1)
+		assertRowLocked := func(locked bool) {
+			t.Helper()
+			conn, err := dbSession.DB.DB.Conn(ctx)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, conn.Close()) }()
+			var id uuid.UUID
+			err = conn.QueryRowContext(ctx, "SELECT id FROM expected_machine WHERE id = $1 FOR UPDATE NOWAIT", row.ID).Scan(&id)
+			if locked {
+				var pgErr *pgconn.PgError
+				require.ErrorAs(t, err, &pgErr)
+				require.Equal(t, "55P03", pgErr.Code, "reconciliation must retain its row lock")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, row.ID, id)
+		}
+		// The activity is the only writer so this probe identifies its row lock.
+		assertRowLocked(true)
+
+		writerReady := make(chan struct{})
 		workers.Go(func() {
 			writerErr = cdb.WithTx(ctx, dbSession, func(tx *cdb.Tx) error {
-				var pid int
-				err := tx.GetBunTx().NewSelect().ColumnExpr("pg_backend_pid()").Scan(ctx, &pid)
-				if err != nil {
-					return err
-				}
-				writerReady <- pid
-				_, err = emDAO.Update(ctx, tx, cdbm.ExpectedMachineUpdateInput{
+				close(writerReady)
+				_, err := emDAO.Update(ctx, tx, cdbm.ExpectedMachineUpdateInput{
 					ExpectedMachineID: row.ID,
 					Name:              cutil.GetPtr("API-name"),
 				})
 				return err
 			})
 		})
-		var writerPID int
 		select {
-		case writerPID = <-writerReady:
+		case <-writerReady:
 		case <-ctx.Done():
 			t.Fatal("API writer did not start: ", ctx.Err())
 		}
-		assertWriterBlocked := func() {
-			t.Helper()
-			require.Eventually(t, func() bool {
-				var blockers int
-				err := dbSession.DB.NewSelect().ColumnExpr("cardinality(pg_blocking_pids(?))", writerPID).Scan(ctx, &blockers)
-				return err == nil && blockers > 0
-			}, 5*time.Second, 10*time.Millisecond, "API write did not wait for reconciliation")
-		}
-		assertWriterBlocked()
+
 		releaseRead()
 		select {
 		case <-commitReached:
 		case <-ctx.Done():
 			t.Fatal("activity did not reach commit: ", ctx.Err())
 		}
-		// The writer must still wait after both the BMC clear and metadata write.
-		assertWriterBlocked()
+		// The row remains excluded after both the BMC clear and metadata write.
+		assertRowLocked(true)
 		releaseCommit()
 		workers.Wait()
 		require.NoError(t, activityErr)
 		require.NoError(t, writerErr)
+		assertRowLocked(false)
 		stored, err := emDAO.Get(ctx, nil, row.ID, nil, false)
 		require.NoError(t, err)
 		assert.Equal(t, cutil.GetPtr("API-name"), stored.Name)
@@ -1154,13 +1479,13 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 		site := cwu.TestBuildSite(t, dbSession, ip, "test-site-interfaces", cdbm.SiteStatusRegistered, nil, ipu)
 		emID := uuid.New()
 		initial := []cdbm.ExpectedMachineInterface{{
-			MacAddress: "02:00:00:00:00:09", NicType: cutil.GetPtr("CX9"), FixedIP: cutil.GetPtr("192.0.2.9"),
+			MacAddress: cutil.GetPtr("02:00:00:00:00:09"), NicType: cutil.GetPtr("CX9"), FixedIP: cutil.GetPtr("192.0.2.9"),
 			FixedMask: cutil.GetPtr("255.255.255.0"), FixedGateway: cutil.GetPtr("192.0.2.1"), Primary: cutil.GetPtr(true),
 			NetworkSegmentType: cutil.GetPtr(cdbm.ExpectedInterfaceNetworkSegmentTypeHostInband),
 			Role:               cutil.GetPtr(cdbm.ExpectedInterfaceRoleHost), IPAllocation: cutil.GetPtr(cdbm.ExpectedInterfaceIPAllocationFixed),
 		}}
 		changed := []cdbm.ExpectedMachineInterface{{
-			MacAddress: "02:00:00:00:00:09", NicType: cutil.GetPtr("CX9"), FixedIP: cutil.GetPtr("192.0.2.10"),
+			MacAddress: cutil.GetPtr("02:00:00:00:00:09"), NicType: cutil.GetPtr("CX9"), FixedIP: cutil.GetPtr("192.0.2.10"),
 		}}
 		steps := []struct {
 			name     string
@@ -1384,8 +1709,32 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			nonexistentSkuID := "nonexistent-sku"
+			sku := cwu.TestBuildSku(t, dbSession, uuid.NewString(), st)
+			_, err = dbSession.DB.ExecContext(ctx, `CREATE FUNCTION fail_expected_machine_sku_update() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				IF OLD.bmc_ip_address IS NOT NULL THEN
+					RAISE EXCEPTION 'BMC IP was not cleared';
+				END IF;
+				RAISE EXCEPTION 'injected failure after BMC IP clear';
+			END $$`)
+			require.NoError(t, err)
+			defer func() {
+				_, cleanupErr := dbSession.DB.ExecContext(ctx, "DROP FUNCTION fail_expected_machine_sku_update() CASCADE")
+				require.NoError(t, cleanupErr)
+			}()
+			_, err = dbSession.DB.ExecContext(ctx, fmt.Sprintf("CREATE TRIGGER fail_sku_update BEFORE UPDATE ON expected_machine FOR EACH ROW WHEN (OLD.id = '%s' AND NEW.sku_id IS DISTINCT FROM OLD.sku_id) EXECUTE FUNCTION fail_expected_machine_sku_update()", emID))
+			require.NoError(t, err)
+			var writes []error
+			hook := &testExpectedMachineWriteHook{
+				rowID: emID,
+				afterWrite: func(event *bun.QueryEvent) {
+					writes = append(writes, event.Err)
+				},
+			}
+			dbSession.DB.AddQueryHook(hook)
 			cwu.TestInventoryAgeUpdatedTimestamp(ctx, t, dbSession, (*cdbm.ExpectedMachine)(nil))
+			before, err := emDAO.Get(ctx, nil, emID, nil, false)
+			require.NoError(t, err)
 			err = mei.UpdateExpectedMachinesInDB(ctx, st.ID, &corev1.ExpectedMachineInventory{
 				ExpectedMachines: []*corev1.ExpectedMachine{
 					{
@@ -1393,18 +1742,20 @@ func TestManageExpectedMachine_UpdateExpectedMachinesInDB(t *testing.T) {
 						BmcMacAddress:       "00:11:22:33:66:04",
 						ChassisSerialNumber: "BMC-IP-SN-4",
 						BmcIpAddress:        nil,
-						SkuId:               &nonexistentSkuID,
+						SkuId:               &sku.ID,
 					},
 				},
 				Timestamp:       timestamppb.Now(),
 				InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
 			})
 			require.NoError(t, err, "per-record reconciliation errors remain best effort")
+			require.Len(t, writes, 2)
+			require.NoError(t, writes[0], "the BMC IP clear must execute before the failing update")
+			require.ErrorContains(t, writes[1], "injected failure after BMC IP clear")
 
 			unchanged, err := emDAO.Get(ctx, nil, emID, nil, false)
 			require.NoError(t, err)
-			assert.Equal(t, &originalBmcIP, unchanged.BmcIpAddress)
-			assert.Equal(t, &preservedName, unchanged.Name)
+			assert.Equal(t, before, unchanged, "the failed update must roll back the preceding BMC IP clear")
 		})
 	})
 
@@ -1509,6 +1860,8 @@ func TestNewManageExpectedMachine(t *testing.T) {
 			got := NewManageExpectedMachine(tt.args.dbSession, tt.args.siteClientPool)
 			assert.Equal(t, tt.want.dbSession, got.dbSession, "dbSession should match")
 			assert.Equal(t, tt.want.siteClientPool, got.siteClientPool, "siteClientPool should match")
+			assert.Equal(t, pendingBatchHistoryBudget, got.historyObservationBudget, "history observation must retain its aggregate bound")
+			assert.Equal(t, pendingBatchRecoveryBudget, got.recoveryBudget, "recovery must retain its activity-wide bound")
 		})
 	}
 }

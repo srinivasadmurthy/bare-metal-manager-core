@@ -461,8 +461,8 @@ func TestMachine_NewAPIMachine(t *testing.T) {
 
 	if apimi.Metadata != nil {
 		if apimi.Metadata.BMCInfo != nil {
-			assert.Equal(t, *apimi.Metadata.BMCInfo.IP, *machineInfo1.Machine.BmcInfo.Ip)
-			assert.Equal(t, *apimi.Metadata.BMCInfo.Mac, *machineInfo1.Machine.BmcInfo.Mac)
+			assert.Equal(t, *apimi.Metadata.BMCInfo.IP, *machineInfo1.Machine.BmcInfo.Ip)   //nolint:staticcheck // Verify the legacy Core response fixture.
+			assert.Equal(t, *apimi.Metadata.BMCInfo.Mac, *machineInfo1.Machine.BmcInfo.Mac) //nolint:staticcheck // Verify the legacy Core response fixture.
 		}
 
 		if apimi.Metadata.DMIData != nil {
@@ -555,6 +555,199 @@ func TestMachine_NewAPIMachine(t *testing.T) {
 		require.NotNil(t, response.InstanceID)
 		assert.Equal(t, instance.ID.String(), *response.InstanceID)
 		assert.Equal(t, cdbm.MachineStatusReady, ready.Status)
+	})
+	t.Run("empty metadata inventories serialize as arrays", func(t *testing.T) {
+		machine := *dbm
+		machine.Metadata = &cdbm.SiteControllerMachine{
+			Machine: &corev1.Machine{
+				Status: &corev1.MachineStatus{
+					DiscoveryInfo: &corev1.DiscoveryInfo{},
+				},
+			},
+		}
+
+		response := NewAPIMachine(&machine, nil, nil, nil, nil, true, true)
+		require.NotNil(t, response.Metadata)
+
+		payload, err := json.Marshal(response.Metadata)
+		require.NoError(t, err)
+
+		var fields map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(payload, &fields))
+		for _, field := range []string{"gpus", "networkInterfaces", "infinibandInterfaces"} {
+			value, found := fields[field]
+			require.True(t, found, "%s must be present", field)
+			assert.JSONEq(t, `[]`, string(value))
+		}
+	})
+}
+
+func TestAPIBMCInfo_FromProto(t *testing.T) {
+	cases := []struct {
+		name    string
+		machine *corev1.Machine
+		want    APIBMCInfo
+	}{
+		{
+			name: "nil machine clears reused receiver",
+		},
+		{
+			name:    "missing BMC messages clear reused receiver",
+			machine: &corev1.Machine{},
+		},
+		{
+			name: "endpoint without status clears old versions",
+			machine: &corev1.Machine{
+				Bmc: &corev1.BmcEndpoint{
+					Ip:  cutil.GetPtr("192.0.2.10"),
+					Mac: cutil.GetPtr("02:00:00:00:00:10"),
+				},
+			},
+			want: APIBMCInfo{
+				IP:  cutil.GetPtr("192.0.2.10"),
+				Mac: cutil.GetPtr("02:00:00:00:00:10"),
+			},
+		},
+		{
+			name: "status without endpoint clears old addresses",
+			machine: &corev1.Machine{
+				Status: &corev1.MachineStatus{
+					BmcStatus: &corev1.BmcStatus{
+						Version:         cutil.GetPtr("new-version"),
+						FirmwareVersion: cutil.GetPtr("new-firmware"),
+					},
+				},
+			},
+			want: APIBMCInfo{
+				Version:          cutil.GetPtr("new-version"),
+				FirmwareRevision: cutil.GetPtr("new-firmware"),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := APIBMCInfo{
+				IP:               cutil.GetPtr("192.0.2.99"),
+				Mac:              cutil.GetPtr("02:00:00:00:00:99"),
+				Version:          cutil.GetPtr("old-version"),
+				FirmwareRevision: cutil.GetPtr("old-firmware"),
+			}
+			info.FromProto(tc.machine)
+			assert.Equal(t, tc.want, info)
+		})
+	}
+}
+
+func TestAPIMachineMetadata_FromProto(t *testing.T) {
+	cases := []struct {
+		name               string
+		machine            *corev1.Machine
+		wantLifecycleState *APIMachineLifecycleState
+		wantJSON           string
+	}{
+		{
+			name: "missing machine clears metadata",
+			wantJSON: `{
+				"dmiData": null,
+				"bmcInfo": null,
+				"gpus": [],
+				"networkInterfaces": [],
+				"infinibandInterfaces": [],
+				"lifecycleState": null,
+				"lldpNeighbors": []
+			}`,
+		},
+		{
+			name:               "missing BMC data remains null",
+			machine:            &corev1.Machine{},
+			wantLifecycleState: &APIMachineLifecycleState{},
+			wantJSON: `{
+				"dmiData": null,
+				"bmcInfo": null,
+				"gpus": [],
+				"networkInterfaces": [],
+				"infinibandInterfaces": [],
+				"lifecycleState": {
+					"value": "",
+					"isAboveSLA": false,
+					"updated": null,
+					"slaSeconds": 0
+				},
+				"lldpNeighbors": []
+			}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			metadata := APIMachineMetadata{
+				DMIData:              &APIDMIData{},
+				BMCInfo:              &APIBMCInfo{},
+				GPUs:                 []APIMachineGPUInfo{{}},
+				NetworkInterfaces:    []APIMachineNetworkInterface{{}},
+				InfiniBandInterfaces: []APIMachineInfiniBandInterface{{}},
+				LifecycleState:       &APIMachineLifecycleState{},
+				LldpNeighbors:        []APIMachineLldpNeighbor{{}},
+			}
+
+			metadata.FromProto(tc.machine)
+
+			assert.Nil(t, metadata.DMIData)
+			assert.Nil(t, metadata.BMCInfo)
+			assert.NotNil(t, metadata.GPUs)
+			assert.Empty(t, metadata.GPUs)
+			assert.NotNil(t, metadata.NetworkInterfaces)
+			assert.Empty(t, metadata.NetworkInterfaces)
+			assert.NotNil(t, metadata.InfiniBandInterfaces)
+			assert.Empty(t, metadata.InfiniBandInterfaces)
+			assert.Equal(t, tc.wantLifecycleState, metadata.LifecycleState)
+			assert.NotNil(t, metadata.LldpNeighbors)
+			assert.Empty(t, metadata.LldpNeighbors)
+
+			payload, err := json.Marshal(metadata)
+			require.NoError(t, err)
+			assert.JSONEq(t, tc.wantJSON, string(payload))
+		})
+	}
+	t.Run("BMC split fields", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			legacy *corev1.BmcInfo
+		}{
+			{
+				name: "split fields without legacy data",
+			},
+			{
+				name: "split fields override legacy data",
+				legacy: &corev1.BmcInfo{
+					Ip:              cutil.GetPtr("192.0.2.20"),
+					Mac:             cutil.GetPtr("02:00:00:00:00:20"),
+					Version:         cutil.GetPtr("legacy-version"),
+					FirmwareVersion: cutil.GetPtr("legacy-firmware"),
+				},
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				machine := &corev1.Machine{
+					Bmc: &corev1.BmcEndpoint{
+						Ip:  cutil.GetPtr("192.0.2.10"),
+						Mac: cutil.GetPtr("02:00:00:00:00:10"),
+					},
+					Status: &corev1.MachineStatus{
+						BmcStatus: &corev1.BmcStatus{
+							Version:         cutil.GetPtr("new-version"),
+							FirmwareVersion: cutil.GetPtr("new-firmware"),
+						},
+					},
+					BmcInfo: tc.legacy, //nolint:staticcheck // Verify split fields win over the older representation.
+				}
+				metadata := APIMachineMetadata{}
+				metadata.FromProto(machine)
+				payload, err := json.Marshal(metadata.BMCInfo)
+				require.NoError(t, err)
+				assert.JSONEq(t, `{"ip":"192.0.2.10","mac":"02:00:00:00:00:10","version":"new-version","firmwareRevision":"new-firmware"}`, string(payload))
+			})
+		}
 	})
 }
 
@@ -864,6 +1057,28 @@ func TestAPIMachineUpdateRequest_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "test valid enter online repair request with Software issue",
+			fields: fields{
+				OnlineRepair: &APIMachineOnlineRepair{
+					Enabled: cutil.GetPtr(true),
+					Policy: &APIMachineOnlineRepairPolicy{
+						AllowAutoInstanceDeletionOnFailure: cutil.GetPtr(false),
+					},
+					Acknowledgments: &APIMachineOnlineRepairAcknowledgments{
+						AcceptDataCorruptionRisk:   cutil.GetPtr(true),
+						AcceptRepairTeamAccess:     cutil.GetPtr(true),
+						AcceptInstanceDeletionRisk: cutil.GetPtr(true),
+					},
+				},
+				HealthIssue: &APIMachineHealthIssue{
+					Category: HealthIssueSoftware,
+					Summary:  cutil.GetPtr("Software issue"),
+					Details:  cutil.GetPtr("driver service failed"),
+				},
+			},
+			wantErr: false,
+		},
+		{
 			name: "test invalid enter online repair without HealthIssue (APIMachineOnlineRepair.Enabled true requires non-nil HealthIssue)",
 			fields: fields{
 				OnlineRepair: &APIMachineOnlineRepair{
@@ -910,7 +1125,7 @@ func TestAPIMachineUpdateRequest_Validate(t *testing.T) {
 			name: "test invalid HealthIssue without onlineRepair",
 			fields: fields{
 				HealthIssue: &APIMachineHealthIssue{
-					Category: HealthIssueStorage,
+					Category: HealthIssueHardware,
 					Summary:  cutil.GetPtr("x"),
 					Details:  cutil.GetPtr("y"),
 				},
@@ -940,22 +1155,24 @@ func TestAPIMachineUpdateRequest_ToInsertHealthReportProto(t *testing.T) {
 		HealthIssue *APIMachineHealthIssue
 	}
 	tests := []struct {
-		name      string
-		machineID string
-		fields    fields
-		wantErr   bool
+		name         string
+		machineID    string
+		fields       fields
+		wantCategory string
+		wantErr      bool
 	}{
 		{
-			name:      "maps Storage health issue to proto payload with STORAGE issue_category",
+			name:      "maps Performance health issue to proto payload with PERFORMANCE issue_category",
 			machineID: "161c4de4-afb3-4839-a5bd-305f9dea8744",
 			fields: fields{
 				HealthIssue: &APIMachineHealthIssue{
-					Category: HealthIssueStorage,
-					Summary:  cutil.GetPtr("storage subsystem degraded"),
-					Details:  cutil.GetPtr("disk SMART errors in slot 2"),
+					Category: HealthIssuePerformance,
+					Summary:  cutil.GetPtr("sustained GPU throttling"),
+					Details:  cutil.GetPtr("dcgmi diag logs attached"),
 				},
 			},
-			wantErr: false,
+			wantCategory: "PERFORMANCE",
+			wantErr:      false,
 		},
 		{
 			name:      "maps Hardware health issue to proto payload with HARDWARE issue_category",
@@ -967,7 +1184,34 @@ func TestAPIMachineUpdateRequest_ToInsertHealthReportProto(t *testing.T) {
 					Details:  cutil.GetPtr("port 1 logs attached"),
 				},
 			},
-			wantErr: false,
+			wantCategory: "HARDWARE",
+			wantErr:      false,
+		},
+		{
+			name:      "maps Storage health issue to alert payload with STORAGE issue_category",
+			machineID: "361c4de4-afb3-4839-a5bd-305f9dea8744",
+			fields: fields{
+				HealthIssue: &APIMachineHealthIssue{
+					Category: HealthIssueStorage,
+					Summary:  cutil.GetPtr("storage subsystem degraded"),
+					Details:  cutil.GetPtr("disk SMART errors in slot 2"),
+				},
+			},
+			wantCategory: "STORAGE",
+			wantErr:      false,
+		},
+		{
+			name:      "maps Software health issue to alert payload with SOFTWARE issue_category",
+			machineID: "461c4de4-afb3-4839-a5bd-305f9dea8744",
+			fields: fields{
+				HealthIssue: &APIMachineHealthIssue{
+					Category: HealthIssueSoftware,
+					Summary:  cutil.GetPtr("driver service failed"),
+					Details:  cutil.GetPtr("service exited repeatedly"),
+				},
+			},
+			wantCategory: "SOFTWARE",
+			wantErr:      false,
 		},
 	}
 	for _, tt := range tests {
@@ -1011,7 +1255,7 @@ func TestAPIMachineUpdateRequest_ToInsertHealthReportProto(t *testing.T) {
 			}
 			require.NoError(t, json.Unmarshal([]byte(alert.Message), &payload))
 			assert.Equal(t, *mhi.Details, payload.Details)
-			assert.Equal(t, ValidHealthIssueCategoriesMap[mhi.Category], payload.IssueCategory)
+			assert.Equal(t, tt.wantCategory, payload.IssueCategory)
 			assert.Equal(t, *mhi.Summary, payload.Summary)
 		})
 	}
@@ -1043,6 +1287,54 @@ func TestAPIMachineUpdateRequest_ToRemoveHealthReportProto(t *testing.T) {
 			require.NotNil(t, got.MachineId)
 			assert.Equal(t, tt.machineID, got.MachineId.Id)
 			assert.Equal(t, tt.wantSource, got.GetSource())
+		})
+	}
+}
+
+func TestAPIMachineDeleteRequest_Validate(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		request   APIMachineDeleteRequest
+		wantError bool
+	}{
+		{name: "regular deletion"},
+		{name: "Instance Type override requires force", request: APIMachineDeleteRequest{AllowDeleteWithInstanceType: true}, wantError: true},
+		{name: "Instance override requires force", request: APIMachineDeleteRequest{AllowDeleteWithInstance: true}, wantError: true},
+		{name: "Allocation override requires force", request: APIMachineDeleteRequest{AllowDeleteWithAllocation: true}, wantError: true},
+		{name: "force permits independent overrides", request: APIMachineDeleteRequest{Force: true, AllowDeleteWithInstanceType: true, AllowDeleteWithInstance: true, AllowDeleteWithAllocation: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.request.Validate()
+			if tc.wantError {
+				require.ErrorContains(t, err, "requires force=true")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestAPIMachineDeleteRequest_ToProto(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		request      APIMachineDeleteRequest
+		wantType     bool
+		wantInstance bool
+	}{
+		{name: "force alone grants no override", request: APIMachineDeleteRequest{Force: true}},
+		{name: "Instance Type override", request: APIMachineDeleteRequest{Force: true, AllowDeleteWithInstanceType: true}, wantType: true},
+		{name: "Instance implies Instance Type despite explicit false", request: APIMachineDeleteRequest{Force: true, AllowDeleteWithInstance: true}, wantType: true, wantInstance: true},
+		{name: "Allocation acknowledgment grants no Core override", request: APIMachineDeleteRequest{Force: true, AllowDeleteWithAllocation: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.request.ToProto("host-machine")
+			require.Equal(t, &corev1.AdminForceDeleteMachineRequest{
+				HostQuery:                   "host-machine",
+				DeleteInterfaces:            true,
+				DeleteBmcInterfaces:         true,
+				AllowDeleteWithInstanceType: tc.wantType,
+				AllowDeleteWithInstance:     tc.wantInstance,
+			}, got)
 		})
 	}
 }

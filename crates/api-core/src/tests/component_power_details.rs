@@ -32,6 +32,7 @@ use mac_address::MacAddress;
 use model::address_selection_strategy::AddressSelectionStrategy;
 use model::expected_machine::ExpectedMachineData;
 use model::expected_power_shelf::ExpectedPowerShelf;
+use model::expected_switch::ExpectedSwitch;
 use model::hardware_info::{DmiData, HardwareInfo};
 use model::machine::{CURRENT_STATE_MODEL_VERSION, ManagedHostState};
 use model::machine_interface_address::MachineInterfaceAssociation;
@@ -234,7 +235,7 @@ impl GatedPowerCredentialReader {
         }
     }
 
-    /// Completes one lookup with missing credentials, freeing a read slot.
+    /// Completes one lookup with an error, freeing a read slot.
     fn release(&self, index: usize) {
         self.gates[index].1.notify_one();
     }
@@ -286,7 +287,10 @@ impl CredentialReader for GatedPowerCredentialReader {
         self.changed.notify_one();
         self.gates[index].1.notified().await;
         guard.completed = true;
-        Ok(None)
+        // Keep paused-clock scheduling tests independent of database fallback I/O.
+        Err(SecretsError::GenericError(eyre::eyre!(
+            "injected credential read failure"
+        )))
     }
 }
 
@@ -612,7 +616,7 @@ async fn read_deadline_and_caller_cancellation_drop_unfinished_work(
 }
 
 /// The deadline takes precedence over ready credential results, so an expired
-/// lookup neither starts more work nor reports a credential failure instead.
+/// lookup neither reaches the backend nor reports a credential failure instead.
 /// A switch exercises both the shared BMC check and the separate NVOS check.
 #[crate::sqlx_test]
 async fn credentials_finishing_after_deadline_do_not_start_more_work(
@@ -638,18 +642,27 @@ async fn credentials_finishing_after_deadline_do_not_start_more_work(
     let bmc_key = CredentialKey::BmcCredentials {
         credential_type: BmcCredentialType::BmcRoot { bmc_mac_address },
     };
-    let nvos_key = CredentialKey::SwitchNvosAdmin { bmc_mac_address };
-    let mut api = api_with_rms(&env, pool, power_profiles(0, 1, 0), PowerRole::Switch);
 
-    // Lookup errors and absence share a failure branch. One form at each lookup
-    // protects both expiry checks without repeating every failure combination.
-    for (scenario, blocked_key, blocked_result, expected_keys) in [
+    let nvos_key = CredentialKey::SwitchNvosAdmin { bmc_mac_address };
+    let limited_pool = single_connection_pool(&pool).await?;
+
+    let mut api = api_with_rms(
+        &env,
+        limited_pool.clone(),
+        power_profiles(0, 1, 0),
+        PowerRole::Switch,
+    );
+
+    // A Vault miss waits for the held pool connection until the outer timeout
+    // cancels the fallback and omits the source.
+    for (scenario, blocked_key, blocked_result, expected_keys, expected_source) in [
         // The first guard must stop before even asking for NVOS credentials.
         (
             "expired BMC success",
             bmc_key.clone(),
             Ok(Some(Credentials::new("power-reader", "test-password"))),
             vec![bmc_key.to_key_str().into_owned()],
+            Some(rpc::ComponentPowerSource::Rms as i32),
         ),
         // The second guard must stop before the completed endpoint reaches RMS.
         (
@@ -660,6 +673,7 @@ async fn credentials_finishing_after_deadline_do_not_start_more_work(
                 bmc_key.to_key_str().into_owned(),
                 nvos_key.to_key_str().into_owned(),
             ],
+            Some(rpc::ComponentPowerSource::Rms as i32),
         ),
         // A BMC lookup error must not replace the expired shared deadline.
         (
@@ -669,6 +683,7 @@ async fn credentials_finishing_after_deadline_do_not_start_more_work(
                 "injected credential read failure"
             ))),
             vec![bmc_key.to_key_str().into_owned()],
+            Some(rpc::ComponentPowerSource::Rms as i32),
         ),
         // The deadline also takes precedence over missing NVOS credentials.
         (
@@ -679,6 +694,7 @@ async fn credentials_finishing_after_deadline_do_not_start_more_work(
                 bmc_key.to_key_str().into_owned(),
                 nvos_key.to_key_str().into_owned(),
             ],
+            None,
         ),
     ] {
         let reader = Arc::new(ExpiringPowerCredentialReader {
@@ -708,6 +724,8 @@ async fn credentials_finishing_after_deadline_do_not_start_more_work(
         .await
         .unwrap_or_else(|_| panic!("{scenario}: snapshot must finish before pausing the clock"));
 
+        let fallback_connection = limited_pool.acquire().await?;
+
         // Leave the request unpolled until the credential is ready after expiry.
         // `timeout_at` polls that ready inner future before checking its timer.
         tokio::time::pause();
@@ -719,7 +737,9 @@ async fn credentials_finishing_after_deadline_do_not_start_more_work(
             .unwrap_or_else(|_| panic!("{scenario}: ready credential must finish"))
             .unwrap_or_else(|error| panic!("{scenario}: power details failed: {error}"))
             .into_inner();
+
         drop(request);
+        drop(fallback_connection);
 
         assert_eq!(response.entries.len(), 1, "{scenario}");
         let entry = &response.entries[0];
@@ -741,11 +761,7 @@ async fn credentials_finishing_after_deadline_do_not_start_more_work(
                 if error.code == rpc::ComponentPowerErrorCode::DeadlineExceeded as i32),
             "{scenario}: expected a deadline error, received {actual:?}"
         );
-        assert_eq!(
-            actual.source,
-            Some(rpc::ComponentPowerSource::Rms as i32),
-            "{scenario}"
-        );
+        assert_eq!(actual.source, expected_source, "{scenario}");
         assert_eq!(actual.observed_at, None, "{scenario}");
         assert_eq!(
             *reader.requested_keys.lock().unwrap(),
@@ -760,6 +776,8 @@ async fn credentials_finishing_after_deadline_do_not_start_more_work(
             "{scenario}"
         );
     }
+
+    limited_pool.close().await;
 
     Ok(())
 }
@@ -943,7 +961,7 @@ async fn power_policy_uses_the_machine_snapshot_during_concurrent_updates(
         &mut writer,
         host.0,
         "concurrent request",
-        model::machine::MachineMaintenanceOperation::PowerOn,
+        model::machine::MachineMaintenanceOperation::Reboot,
     )
     .await?;
     db::power_options::update_desired_state(
@@ -993,9 +1011,10 @@ async fn power_policy_uses_the_machine_snapshot_during_concurrent_updates(
         &rpc::ComponentPowerActionDetails {
             actions: vec![rpc::ComponentPowerAction {
                 status: rpc::ComponentPowerActionStatus::Pending as i32,
-                operation: rpc::ComponentPowerActionOperation::PowerOn as i32,
+                operation: rpc::ComponentPowerActionOperation::Reset as i32,
                 requested_at: submitted_at,
                 initiator: Some("concurrent request".into()),
+                graceful: Some(true),
                 ..Default::default()
             }],
             error: None,
@@ -1140,7 +1159,7 @@ async fn blocked_snapshots_release_pool_capacity(pool: sqlx::PgPool) -> TestResu
             env.test_credential_manager.clone(),
         ));
 
-        // The setup case blocks inside `begin`, before it can install the
+        // The setup case blocks inside `begin_read_only_snapshot`, before it can install the
         // server cap. The other cases stop an inventory read after setup.
         let (lock_statement, query_fragment) = match cancellation {
             Cancellation::SetupCallerDrop => (
@@ -1843,7 +1862,7 @@ async fn rms_switch_and_shelf_reads_use_their_roles_without_host_policy(
     let expected_switch = create_expected_switch(&mut txn, 0).await;
     let incomplete_switch = create_expected_switch(&mut txn, 1).await;
     let switch_mac = expected_switch.bmc_mac_address;
-    let nvos_mac = expected_switch.nvos_mac_addresses[0];
+    let nvos_mac = expected_switch.nvos_mac_addresses()[0];
     for (id, expected) in [
         (switch_id, Some(&expected_switch)),
         (incomplete_switch_id, Some(&incomplete_switch)),
@@ -1887,10 +1906,12 @@ async fn rms_switch_and_shelf_reads_use_their_roles_without_host_policy(
     }
     // The second switch has a valid BMC but no NVOS endpoint. Its NVOS
     // credentials are also withheld for a separate check after discovery.
-    db::expected_switch::update_nvos_mac_addresses(
+    db::expected_switch::update(
         &mut txn,
-        incomplete_switch.bmc_mac_address,
-        &[],
+        &ExpectedSwitch {
+            nvos_interfaces: Vec::new(),
+            ..incomplete_switch.clone()
+        },
     )
     .await?;
     let switch_ip = management_ip(&mut txn, switch_mac).await?;
@@ -1941,8 +1962,8 @@ async fn rms_switch_and_shelf_reads_use_their_roles_without_host_policy(
     let shelf_ip = management_ip(&mut txn, shelf_mac).await?;
     txn.commit().await?;
 
-    // Both prerequisites are absent: report missing BMC credentials before
-    // the missing NVOS endpoint, without attempting a second credential read.
+    // Expected inventory supplies BMC credentials after the Vault miss, so the
+    // missing NVOS endpoint is reported without a second credential read.
     let profiles = power_profiles(0, 2, 1);
     let reader = Arc::new(CountingCredentialReader::default());
     let mut incomplete_api = api_with_rms(&env, pool.clone(), profiles.clone(), PowerRole::Switch);
@@ -1966,10 +1987,10 @@ async fn rms_switch_and_shelf_reads_use_their_roles_without_host_policy(
     let actual = response.entries[0]
         .actual
         .as_ref()
-        .expect("missing BMC credential result");
+        .expect("missing NVOS endpoint result");
     assert_eq!(
         observation_error(actual).code,
-        rpc::ComponentPowerErrorCode::CredentialsUnavailable as i32
+        rpc::ComponentPowerErrorCode::EndpointUnavailable as i32
     );
     assert_eq!(actual.source, Some(rpc::ComponentPowerSource::Rms as i32));
     assert_eq!(actual.observed_at, None);
@@ -2230,12 +2251,7 @@ async fn rms_switch_and_shelf_reads_use_their_roles_without_host_policy(
     }
 
     let mut txn = pool.begin().await?;
-    db::expected_switch::update_nvos_mac_addresses(
-        &mut txn,
-        incomplete_switch.bmc_mac_address,
-        &incomplete_switch.nvos_mac_addresses,
-    )
-    .await?;
+    db::expected_switch::update(&mut txn, &incomplete_switch).await?;
     txn.commit().await?;
     let mut api = api_with_rms(&env, pool.clone(), profiles, PowerRole::Switch);
     api.credential_manager = credentials;
@@ -2445,7 +2461,8 @@ async fn tracked_actions_are_independent_of_live_reads_and_reject_invalid_storag
             }),
             rpc::ComponentPowerErrorCode::Disabled,
         ),
-        // Switch needs a strict pending read despite its permissive shared decoder.
+        // `db::switch::find_by` rejects malformed maintenance JSON before
+        // `db::switch::find_maintenance_requests` runs.
         (
             "switch",
             "UPDATE switches SET controller_state = $1, switch_maintenance_requested = $2 WHERE id::text = $3",
@@ -2455,7 +2472,8 @@ async fn tracked_actions_are_independent_of_live_reads_and_reject_invalid_storag
             }),
             rpc::ComponentPowerErrorCode::EndpointUnavailable,
         ),
-        // Shelf has a separate SQL path with the same potential silent decode loss.
+        // `db::power_shelf::find_by` rejects malformed maintenance JSON before
+        // `db::power_shelf::find_maintenance_requests` runs.
         (
             "shelf",
             "UPDATE power_shelves SET controller_state = $1, power_shelf_maintenance_requested = $2 WHERE id::text = $3",
