@@ -620,7 +620,7 @@ An error distinguishes a proven failure before tool launch from a result that is
 
 Direct CLI dry-run, verification, and reset actions catch SIGINT, SIGTERM, SIGHUP, and SIGQUIT, drop the operation, and close its per-command control channel. The helper requests bounded cleanup independently, including if that direct caller crashes or is killed; cancellation does not wait for confirmed cleanup. Supervised flash commands instead stop observing and leave the accepted operation running under `Continue`. The synchronous `config-reset` command keeps its existing signal behavior. Killing a per-command helper, losing power, or terminating its entire service cgroup can prevent cleanup. No process cleanup proves that work inside the device has stopped. Cancellation uses the required proc entry to locate the helper's adopted children.
 
-`FirmwareFlasher` and `discover_device_bounded` use these deadlines and helper limits. The [bounded lockdown methods](#lockdown) use the same helper, output, and cleanup limits, with a caller-supplied command deadline. The existing synchronous `FlintRunner` and `MlxFwResetRunner` methods, and `discover_device`/`discover_devices`, retain blocking execution without these deadlines or helper supervision.
+`FirmwareFlasher` and `discover_device_bounded` use these deadlines and helper limits. The [bounded lockdown methods](#lockdown) use the same helper, output, and cleanup limits, with a caller-supplied command deadline. The existing synchronous `FlintRunner` and `MlxFwResetRunner` methods, and `discover_device_with_settlement`/`discover_devices`, retain blocking execution without these deadlines or helper supervision.
 
 Dry-run still checks identity and prepares inputs, but starts no mutation or verification commands. Its report contains no observed version and does not claim completed phases: `flashed` is `false`, requested optional steps are `Some(false)`, and unrequested optional steps are `None`.
 
@@ -749,7 +749,7 @@ Device discovery, information, and filtering for Mellanox NICs.
 - **`MlxDeviceInfo`** — Container for device details (type, part number, firmware version, MAC, PCI name, etc.)
 - **`MlxDeviceReport`** — Full device report with discovery results
 - **`DeviceFilter`** / **`DeviceFilterSet`** — Filter rules for matching devices against registries
-- **`discover_device()`** — Discover Mellanox devices on the system via `mlxfwmanager`
+- **`discover_devices()`** — Discover Mellanox devices on the system via `mlxfwmanager`
 
 ### Protobuf Integration
 

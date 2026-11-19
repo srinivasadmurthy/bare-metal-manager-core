@@ -105,8 +105,52 @@ impl DeviceDiscoveryError {
     }
 }
 
-#[cfg(feature = "mockdpa")]
-const XML_CONTENT: &str = include_str!("mlxconfig.out");
+/// Canned `mlxfwmanager` inventory for `mockdpa` development builds, and `None`
+/// everywhere else, which makes the substitutions below inert.
+///
+/// Unit tests supply their own reports, so `cfg(test)` leaves this `None` even
+/// with the feature enabled. Substituting there would replace a test's own
+/// fixture output with this file.
+#[cfg(all(feature = "mockdpa", not(test)))]
+const MOCK_INVENTORY: Option<&str> = Some(include_str!("mlxconfig.out"));
+#[cfg(not(all(feature = "mockdpa", not(test))))]
+const MOCK_INVENTORY: Option<&str> = None;
+
+/// Report the canned inventory in place of what the host returned.
+///
+/// Spawning, exit-code handling, and XML parsing stay on their production paths
+/// so a development build still exercises them; only the device facts are
+/// mocked. A build without the fixture returns the report unchanged.
+fn substitute_mock_report(mut output: Output) -> Output {
+    if let Some(xml) = MOCK_INVENTORY {
+        output.stdout = xml.as_bytes().to_vec();
+    }
+    output
+}
+
+/// Narrow a mocked report to the one device the caller asked for.
+///
+/// The fixture always describes a whole host, so a single-device query has to
+/// apply the selection that the tool's own `--dev` argument would have made
+/// before the caller checks cardinality. Matching normalizes both sides so
+/// either PCI spelling resolves, and falls back to the literal locator for MST
+/// paths and other non-PCI arguments.
+fn select_mock_device(devices: Vec<MlxDeviceInfo>, device: &str) -> Vec<MlxDeviceInfo> {
+    if MOCK_INVENTORY.is_none() {
+        return devices;
+    }
+    let requested = normalize_pci_address(device);
+    devices
+        .into_iter()
+        .filter(|candidate| {
+            let found = normalize_pci_address(&candidate.pci_name);
+            match (&requested, &found) {
+                (Some(requested), Some(found)) => requested == found,
+                _ => candidate.pci_name == device,
+            }
+        })
+        .collect()
+}
 
 // DevicesXml represents the root XML structure
 // from mlxfwmanager output.
@@ -195,7 +239,7 @@ pub(crate) fn discover_devices_with_settlement() -> Result<Vec<MlxDeviceInfo>, D
 {
     debug!("Running mlxfwmanager to discover devices");
 
-    let output = execute_direct_query(&["--query-format", "xml"])?;
+    let output = substitute_mock_report(execute_direct_query(&["--query-format", "xml"])?);
     discover_devices_from_direct_output(output, Path::new("/sys"))
 }
 
@@ -218,42 +262,17 @@ fn discover_devices_from_direct_output(
         )));
     }
 
-    #[cfg(not(feature = "mockdpa"))]
-    {
-        let xml_content = String::from_utf8_lossy(&output.stdout);
-        warn!(xml = %xml_content, "mlxfwmanager XML output");
-        let mut devices =
-            parse_mlxfwmanager_xml(&xml_content).map_err(DeviceDiscoveryError::InvalidReport)?;
-        for device in &mut devices {
-            // XML parsing strips domain `0000`; normalize only the sysfs lookup
-            // so the report keeps its legacy PCI spelling.
-            device.fw_version_running = normalize_pci_address(&device.pci_name)
-                .and_then(|pci_name| running_firmware_version(sysfs, &pci_name));
-        }
-        Ok(devices)
+    let xml_content = String::from_utf8_lossy(&output.stdout);
+    warn!(xml = %xml_content, "mlxfwmanager XML output");
+    let mut devices =
+        parse_mlxfwmanager_xml(&xml_content).map_err(DeviceDiscoveryError::InvalidReport)?;
+    for device in &mut devices {
+        // XML parsing strips domain `0000`; normalize only the sysfs lookup
+        // so the report keeps its legacy PCI spelling.
+        device.fw_version_running = normalize_pci_address(&device.pci_name)
+            .and_then(|pci_name| running_firmware_version(sysfs, &pci_name));
     }
-    #[cfg(feature = "mockdpa")]
-    {
-        let xml_content = XML_CONTENT;
-        warn!(xml = %xml_content, "mlxfwmanager XML output");
-        let mut devices =
-            parse_mlxfwmanager_xml(&xml_content).map_err(DeviceDiscoveryError::InvalidReport)?;
-        for device in &mut devices {
-            // XML parsing strips domain `0000`; normalize only the sysfs lookup
-            // so the report keeps its legacy PCI spelling.
-            device.fw_version_running = normalize_pci_address(&device.pci_name)
-                .and_then(|pci_name| running_firmware_version(sysfs, &pci_name));
-        }
-        Ok(devices)
-    }
-}
-
-// discover_device loads a specific device using mlxfwmanager.
-// The actual XML returned is still "devices", but will only
-// contain the target device.
-#[cfg(not(feature = "mockdpa"))]
-pub fn discover_device(device: &str) -> Result<MlxDeviceInfo, String> {
-    discover_device_with_settlement(device).map_err(DeviceDiscoveryError::into_legacy_message)
+    Ok(devices)
 }
 
 /// `discover_device_with_settlement` preserves the process completion evidence
@@ -264,7 +283,12 @@ pub fn discover_device_with_settlement(
 ) -> Result<MlxDeviceInfo, DeviceDiscoveryError> {
     debug!(device, "Running mlxfwmanager to discover device");
 
-    let output = execute_direct_query(&["--dev", device, "--query-format", "xml"])?;
+    let output = substitute_mock_report(execute_direct_query(&[
+        "--dev",
+        device,
+        "--query-format",
+        "xml",
+    ])?);
 
     // In cases where DPUs are returned, it looks like DPUs that are
     // currently in lockdown won't return data to mlxfwmanager. The
@@ -286,6 +310,7 @@ pub fn discover_device_with_settlement(
 
     let devices =
         parse_mlxfwmanager_xml(&xml_content).map_err(DeviceDiscoveryError::InvalidReport)?;
+    let devices = select_mock_device(devices, device);
     if devices.len() > 1 {
         return Err(DeviceDiscoveryError::InvalidReport(format!(
             "only expected a single device returned for device: {device}"
@@ -297,27 +322,6 @@ pub fn discover_device_with_settlement(
         )));
     }
     Ok(devices.into_iter().next().unwrap())
-}
-
-#[cfg(feature = "mockdpa")]
-pub fn discover_device(device: &str) -> Result<MlxDeviceInfo, String> {
-    debug!("Running mlxfwmanager to discover device: {device}");
-
-    let xml_content = XML_CONTENT;
-    debug!("mlxfwmanager XML output: {}", xml_content);
-
-    let devices = parse_mlxfwmanager_xml(&xml_content)?;
-    if devices.is_empty() {
-        return Err(format!("no devices returned for device: {device}"));
-    }
-
-    for dev in devices {
-        if dev.pci_name == device {
-            return Ok(dev);
-        }
-    }
-
-    return Err(format!("no devices found in loop for device: {device}"));
 }
 
 // Splitting spawn from wait keeps a lost child result from becoming an
@@ -537,7 +541,7 @@ async fn discover_devices_with_program(
     executor: &FirmwareToolExecutor,
 ) -> Result<Vec<MlxDeviceInfo>, DeviceDiscoveryError> {
     let command = CommandSpec::new(program.to_string_lossy()).args(["--query-format", "xml"]);
-    let output = executor.execute(&command, timeout).await?;
+    let output = substitute_mock_report(executor.execute(&command, timeout).await?);
     parse_devices_output(output).map(|(devices, _)| devices)
 }
 
@@ -580,12 +584,16 @@ pub(crate) async fn discover_device_with_program(
         "--query-format",
         "xml",
     ]);
-    let output = executor.execute(&command, timeout).await?;
-    parse_query_output(output)
+    let output = substitute_mock_report(executor.execute(&command, timeout).await?);
+    parse_query_output(output, device)
 }
 
-fn parse_query_output(output: Output) -> Result<MlxDeviceInfo, DeviceDiscoveryError> {
+fn parse_query_output(
+    output: Output,
+    requested: &str,
+) -> Result<MlxDeviceInfo, DeviceDiscoveryError> {
     let (devices, diagnostics) = parse_devices_output(output)?;
+    let devices = select_mock_device(devices, requested);
     let [device]: [MlxDeviceInfo; 1] =
         devices.try_into().map_err(|devices: Vec<MlxDeviceInfo>| {
             DeviceDiscoveryError::InvalidReport(format!(
@@ -1037,11 +1045,14 @@ mod tests {
                 Some("query output is not UTF-8"),
             ),
         ] {
-            let result = parse_query_output(Output {
-                status: ExitStatus::from_raw(raw_status),
-                stdout: xml.to_vec(),
-                stderr: stderr.as_bytes().to_vec(),
-            });
+            let result = parse_query_output(
+                Output {
+                    status: ExitStatus::from_raw(raw_status),
+                    stdout: xml.to_vec(),
+                    stderr: stderr.as_bytes().to_vec(),
+                },
+                "ab:01.0",
+            );
             match expected_error {
                 None => {
                     let report = result.unwrap_or_else(|error| panic!("{name}: {error}"));

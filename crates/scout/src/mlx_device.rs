@@ -54,10 +54,8 @@ use crate::cfg::Options;
 use crate::client;
 use crate::metrics::{
     ScoutMlxConfigOperationFailed, ScoutMlxConfigRegistryLookupFailed,
-    ScoutMlxDeviceOperationFailed,
-    ScoutMlxFirmwareReceiptFailed,
-    ScoutMlxOperationFailed, ScoutMlxProfileOperationFailed,
-    ScoutMlxRegistryLookupFailed, ScoutMlxRequestRejected,
+    ScoutMlxDeviceOperationFailed, ScoutMlxFirmwareReceiptFailed, ScoutMlxOperationFailed,
+    ScoutMlxProfileOperationFailed, ScoutMlxRegistryLookupFailed, ScoutMlxRequestRejected,
 };
 use crate::mlx_access::{DirectMlxAccess, DirectMlxAccessError};
 
@@ -1927,7 +1925,7 @@ pub(crate) fn apply_profile(
         return (None, Some(true));
     };
 
-    let name = profile.name.clone();
+    let name = profile.name;
 
     (Some(name), Some(true))
 }
